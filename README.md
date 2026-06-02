@@ -114,7 +114,7 @@ sudo exportfs -ra
 
 ## 3. 部署平台、GPU Operator 與 DSAC Scheduler
 
-`deploy-2.sh` 會把平台主體、GPU Operator 與 live DSAC scheduler 一次收斂到最終狀態。它會先 build/import `slurm-rl-scheduler:m11`，再用一次 `helm upgrade --install` 部署 `slurm-platform` 並直接開啟 DSAC live 設定，最後用一次 Helm install/upgrade 收斂 NVIDIA GPU Operator；不需要額外 rollout restart。
+`deploy-2.sh` 會把平台主體、GPU Operator 與 live DSAC scheduler 一次收斂到最終狀態。它會先 build/import `slurm-rl-scheduler:m11`，再用一次 `helm upgrade --install` 部署 `slurm-platform`，直接開啟 DSAC live 設定與 `rl-snapshot-agent` 常駐 snapshot 更新，最後用一次 Helm install/upgrade 收斂 NVIDIA GPU Operator；不需要額外 rollout restart。
 
 ```bash
 export KUBECONFIG=~/.kube/config
@@ -129,7 +129,7 @@ SKIP_GPU_OPERATOR=1 bash scripts/deploy-2.sh
 SKIP_WAIT=1 bash scripts/deploy-2.sh
 ```
 
-DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`。`valueAbstain=-100000` 與 `snapshotTtlSeconds=86400` 是目前單機 live 實驗設定，用來避免 checkpoint value scale 與缺少常駐 snapshot collector 時讓所有 decision 都被 guardrail 擋掉。
+DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`。`rl-snapshot-agent` 會每 10 秒從 Slurm REST API 讀取 jobs/nodes，推送 `/snapshot`，避免 snapshot stale 後所有 decision 都被 guardrail 擋掉。`valueAbstain=-100000` 與 `snapshotTtlSeconds=86400` 是目前單機 live 實驗設定，用來避免 checkpoint value scale 造成誤擋。
 
 目前 `deploy-2.sh` 啟用的是 production-safe 的 DSAC live scheduling：RL 會影響 queue priority，實際 node / GPU / MPS placement 仍由 Slurm `select/cons_tres`、GRES、Kubernetes worker pool 與 NVIDIA runtime 執行。若要啟用研究用的 direct DRL placement daemon，必須在能連到 Slurm controller 且可執行 `squeue`、`scontrol`、`srun` 的環境執行，先用 shadow 模式確認 action 與 log，再關閉 shadow：
 
@@ -137,6 +137,8 @@ DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shado
 # 1) 確認 production DSAC live boost 已啟用
 kubectl -n slurm exec slurm-controller-0 -- \
   curl -fsS http://rl-scheduler:8002/healthz
+
+kubectl -n slurm logs deploy/rl-snapshot-agent --tail=20
 
 kubectl -n slurm exec slurm-controller-0 -- \
   curl -fsS http://rl-scheduler:8002/metrics | grep -E \

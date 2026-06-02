@@ -495,6 +495,26 @@ def decide(req: DecideRequest):
         mps_per_gpu=snap.mps_per_gpu,
     )
     obs, mask, top_ids = build_obs_and_mask(act_req)
+    expected_obs_dim = getattr(getattr(_holder, "agent", None), "obs_dim", None)
+    expected_actions = getattr(getattr(_holder, "agent", None), "n_actions", None)
+    if expected_obs_dim is not None and obs.shape[0] != expected_obs_dim:
+        reason = f"shape_mismatch_obs ({obs.shape[0]} != {expected_obs_dim})"
+        _set_last_decision(result="abstain", value=0.0, entropy=0.0, boost=0)
+        return DecideResponse(
+            priority_boost=0, rl_selected=False, abstain=True,
+            abstain_reason=reason, rl_selected_job_id=None,
+            node_j=None, gpu_k=None, value=0.0, entropy=0.0,
+            shadow=SHADOW_MODE,
+        )
+    if expected_actions is not None and mask.shape[0] != expected_actions:
+        reason = f"shape_mismatch_actions ({mask.shape[0]} != {expected_actions})"
+        _set_last_decision(result="abstain", value=0.0, entropy=0.0, boost=0)
+        return DecideResponse(
+            priority_boost=0, rl_selected=False, abstain=True,
+            abstain_reason=reason, rl_selected_job_id=None,
+            node_j=None, gpu_k=None, value=0.0, entropy=0.0,
+            shadow=SHADOW_MODE,
+        )
     action, value, entropy = _holder.select(obs, mask)
 
     n_placements = snap.n_nodes * snap.gpus_per_node

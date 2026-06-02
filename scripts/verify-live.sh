@@ -260,6 +260,7 @@ check_monitoring() {
   pod_ready "$MON_NAMESPACE" app=kube-state-metrics kube-state-metrics
   pod_ready "$NAMESPACE" app=slurm-exporter slurm-exporter
   pod_ready "$NAMESPACE" app=slurm-elastic-operator slurm-elastic-operator
+  pod_ready "$NAMESPACE" app=rl-snapshot-agent rl-snapshot-agent
 
   start_port_forward "$MON_NAMESPACE" prometheus 19090 9090
   http_contains http://localhost:19090/-/ready 'Ready' "Prometheus /-/ready"
@@ -277,10 +278,16 @@ check_dsac_smoke() {
   record_cmd "rl-scheduler healthz from controller" \
     kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS http://rl-scheduler:8002/healthz
 
-  record_cmd "push minimal DSAC snapshot" \
-    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS -X POST http://rl-scheduler:8002/snapshot \
-      -H 'Content-Type: application/json' \
-      -d '{"now":0,"pending_jobs":[],"nodes":[{"gpus":[{"free_mps":100,"running_jobs":0,"gpu_type":"rtx4070"}]}],"n_nodes":1,"gpus_per_node":1,"mps_per_gpu":100}'
+  record_cmd "rl-snapshot-agent recent logs" \
+    kubectl -n "$NAMESPACE" logs deploy/rl-snapshot-agent --tail=20
+
+  local snapshot_age
+  snapshot_age=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -lc "curl -fsS http://rl-scheduler:8002/metrics | awk '/^rl_scheduler_snapshot_age_seconds / {print int(\$2)}'")
+  if [[ -n "$snapshot_age" && "$snapshot_age" -lt 120 ]]; then
+    pass "rl-scheduler snapshot is fresh (${snapshot_age}s)"
+  else
+    fail "rl-scheduler snapshot is stale or missing (${snapshot_age:-empty}s)"
+  fi
 
   if kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS -X POST http://rl-scheduler:8002/decide \
       -H 'Content-Type: application/json' \

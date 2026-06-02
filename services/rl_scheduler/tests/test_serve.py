@@ -194,3 +194,33 @@ def test_decide_low_value_abstains(serve, client):
     assert body["abstain"] is True
     assert body["priority_boost"] == 0
     assert body["abstain_reason"].startswith("low_value")
+
+
+def test_decide_shape_mismatch_abstains_instead_of_500(serve, client):
+    serve._holder = _FakeHolder(action=0, value=5.0, entropy=0.0)
+    client.post(
+        "/snapshot",
+        json={
+            "now": 10.0,
+            "pending_jobs": [],
+            "nodes": [
+                {
+                    "gpus": [
+                        {"free_mps": 100, "running_jobs": 0, "gpu_type": "rtx4070"},
+                        {"free_mps": 100, "running_jobs": 0, "gpu_type": "rtx4070"},
+                    ]
+                }
+            ],
+            "n_nodes": 1,
+            "gpus_per_node": 2,
+            "mps_per_gpu": 100,
+        },
+    )
+
+    res = client.post("/decide", json=_decide_payload("job-1"))
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["abstain"] is True
+    assert body["priority_boost"] == 0
+    assert body["abstain_reason"].startswith("shape_mismatch_obs")

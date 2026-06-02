@@ -100,8 +100,15 @@ spec:
               selector="{{- range $k, $v := .selector }}{{ $k }}={{ $v }},{{- end }}"
               selector="${selector%,}"
               echo "[gpu-labeler] selector=$selector → config={{ $config }}"
-              kubectl label nodes -l "$selector" \
-                "nvidia.com/device-plugin.config={{ $config }}" --overwrite
+              nodes=$(kubectl get nodes -l "$selector" -o name)
+              if [ -z "$nodes" ]; then
+                echo "[gpu-labeler] no nodes matched selector=$selector; skipping"
+              else
+                for node in $nodes; do
+                  kubectl label "$node" \
+                    "nvidia.com/device-plugin.config={{ $config }}" --overwrite
+                done
+              fi
               {{- end }}
               echo "[gpu-labeler] done"
 {{- end }}

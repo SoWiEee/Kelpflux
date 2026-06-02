@@ -382,7 +382,7 @@ Predictor response：
 | Endpoint | 說明 |
 |----------|------|
 | `GET /healthz` | model readiness、obs/action shape、snapshot age、shadow mode |
-| `POST /snapshot` | 更新 cached cluster snapshot |
+| `POST /snapshot` | 由 `rl-snapshot-agent` 定期更新 cached cluster snapshot |
 | `POST /decide` | 對提交中的 job 回傳 priority boost / abstain / selected placement |
 | `GET /metrics` | Prometheus metrics |
 
@@ -415,7 +415,7 @@ DSAC 不直接執行 `srun --nodelist`，也不直接覆蓋 Slurm placement。`n
 }
 ```
 
-`/decide` 會在 snapshot 缺失或超過 `snapshotTtlSeconds` 時 abstain。
+`rl-snapshot-agent` 會定期從 Slurm REST API 讀取 jobs/nodes 並 POST `/snapshot`，讓 cached snapshot 保持 fresh。`/decide` 仍會在 snapshot 缺失或超過 `snapshotTtlSeconds` 時 abstain，避免使用過期 cluster state 做 live boost。
 
 ### 8.2 Decision Schema
 
@@ -550,6 +550,7 @@ kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 | `chart/templates/configmap-job-submit.yaml` | Generates `job_submit.lua` |
 | `chart/lua/rl_hook.lua` | Lua client for DSAC `/decide` |
 | `services/rl_scheduler/serve.py` | DSAC FastAPI service |
+| `services/rl_scheduler/snapshot_agent.py` | Periodic Slurm REST snapshot updater for `/snapshot` |
 | `services/rl_scheduler/live_daemon.py` | Direct placement prototype daemon; not enabled by `scripts/deploy-2.sh` by default |
 | `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
 | `services/runtime_predictor/` | Runtime prediction service |

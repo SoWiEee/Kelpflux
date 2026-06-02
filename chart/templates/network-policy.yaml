@@ -86,6 +86,7 @@ spec:
                   {{- end }}
                   - slurm-elastic-operator
                   - slurm-exporter
+                  - rl-snapshot-agent
       ports:
         - protocol: TCP
           port: 6817   # slurmctld

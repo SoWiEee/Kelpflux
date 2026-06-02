@@ -1,0 +1,98 @@
+{{- if and .Values.rlScheduler.enabled .Values.rlScheduler.snapshotAgent.enabled }}
+{{- $rl := .Values.rlScheduler -}}
+{{- $agent := .Values.rlScheduler.snapshotAgent -}}
+{{- $ns := .Values.cluster.namespace -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-snapshot-agent
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: rl-snapshot-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rl-snapshot-agent
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: rl-snapshot-agent
+    spec:
+      containers:
+        - name: snapshot-agent
+          image: "{{ $rl.image.repository }}:{{ $rl.image.tag }}"
+          imagePullPolicy: {{ $rl.image.pullPolicy }}
+          command: ["python", "-m", "services.rl_scheduler.snapshot_agent"]
+          env:
+            - name: SLURM_REST_URL
+              value: {{ default (printf "http://slurm-restapi.%s.svc.cluster.local:6820" $ns) $agent.slurmRestUrl | quote }}
+            - name: SLURM_REST_API_VERSION
+              value: {{ $agent.slurmRestApiVersion | quote }}
+            - name: SLURM_JWT_KEY_PATH
+              value: "/slurm-jwt/jwt_hs256.key"
+            - name: RL_SCHEDULER_URL
+              value: {{ default "http://rl-scheduler:8002" $agent.rlSchedulerUrl | quote }}
+            - name: SNAPSHOT_INTERVAL_SECONDS
+              value: {{ $agent.intervalSeconds | quote }}
+            - name: MPS_PER_GPU
+              value: {{ $agent.mpsPerGpu | quote }}
+            - name: GPUS_PER_NODE
+              value: {{ $agent.gpusPerNode | quote }}
+            - name: DEFAULT_RUNTIME_SECONDS
+              value: {{ $agent.defaultRuntimeSeconds | quote }}
+          resources:
+            {{- toYaml $agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: {{ .Values.secrets.jwt }}
+            defaultMode: 0400
+{{- if and .Values.networkPolicy.enabled $agent.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rl-snapshot-agent-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-snapshot-agent
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6820
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rl-scheduler
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}

@@ -507,6 +507,20 @@ rlScheduler:
   priorityBoost: 1000     # +X to priority of RL-picked job (shadow when shadowMode)
   networkPolicy:
     enabled: true
+  snapshotAgent:
+    enabled: true         # keep /snapshot fresh so live /decide does not stale-abstain
+    intervalSeconds: 10   # must stay below snapshotTtlSeconds
+    slurmRestUrl: ""      # defaults to slurm-restapi.<namespace>.svc:6820
+    slurmRestApiVersion: v0.0.37
+    rlSchedulerUrl: "http://rl-scheduler:8002"
+    mpsPerGpu: 100
+    gpusPerNode: 1
+    defaultRuntimeSeconds: 600
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 250m, memory: 256Mi }
+    networkPolicy:
+      enabled: true
   lua:
     enabled: false        # job_submit.lua does NOT call /decide unless true
     url: "http://rl-scheduler:8002/decide"

@@ -98,7 +98,12 @@ deploy_platform() {
   fi
 
   log "converging slurm-platform with live DSAC scheduler enabled"
-  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false     --set rlScheduler.valueAbstain=-100000     --set rlScheduler.snapshotTtlSeconds=86400
+  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set gpu.autoLabel=false     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false     --set rlScheduler.valueAbstain=-100000     --set rlScheduler.snapshotTtlSeconds=86400
+
+  if [[ "$SKIP_BUILD" != "1" || "$SKIP_IMPORT" != "1" ]]; then
+    log "restarting RL deployments to pick up mutable image tag $RL_IMAGE"
+    run kubectl -n "$NAMESPACE" rollout restart deployment/rl-scheduler deployment/rl-snapshot-agent
+  fi
 }
 
 install_gpu_operator() {
@@ -133,6 +138,7 @@ wait_for_final_state() {
   if [[ "$SKIP_PLATFORM" != "1" ]]; then
     log "waiting for slurm-platform workloads"
     run kubectl -n "$NAMESPACE" rollout status deployment/rl-scheduler --timeout=180s
+    run kubectl -n "$NAMESPACE" rollout status deployment/rl-snapshot-agent --timeout=180s
     run kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout=180s
   fi
 
@@ -148,6 +154,7 @@ summary() {
   printf '  kubectl -n %q get pods\n' "$NAMESPACE"
   printf '  kubectl -n %q get pods\n' "$GPU_OPERATOR_NAMESPACE"
   printf '  kubectl -n %q exec slurm-controller-0 -- curl -fsS http://rl-scheduler:8002/healthz\n' "$NAMESPACE"
+  printf '  kubectl -n %q logs deploy/rl-snapshot-agent --tail=50\n' "$NAMESPACE"
 }
 
 main() {
