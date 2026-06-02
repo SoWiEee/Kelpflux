@@ -76,7 +76,6 @@ spec:
         # nodes/gres.conf / task-prolog content changes via helm upgrade.
         checksum/config-static: {{ include (print $.Template.BasePath "/configmap-static.yaml") $ | sha256sum }}
         checksum/config-nodes: {{ include (print $.Template.BasePath "/configmap-nodes.yaml") $ | sha256sum }}
-        checksum/lmod: {{ include (print $.Template.BasePath "/lmod-modulefiles.yaml") $ | sha256sum }}
         {{- if $.Values.slurm.taskProlog }}
         checksum/task-prolog: {{ include (print $.Template.BasePath "/configmap-task-prolog.yaml") $ | sha256sum }}
         {{- end }}

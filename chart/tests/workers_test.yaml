@@ -68,6 +68,37 @@ tests:
           path: metadata.name
           value: slurm-worker-gpu-rtx4070
 
+  - it: workers mount Lmod modulefiles
+    template: workers.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: modulefile-gcc
+            mountPath: /opt/modulefiles/gcc
+            readOnly: true
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: modulefile-cuda
+            mountPath: /opt/modulefiles/cuda
+            readOnly: true
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: modulefile-openmpi
+            configMap:
+              name: slurm-modulefile-openmpi
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+
   - it: workers carry checksum annotations for ConfigMap content (R3)
     template: workers.yaml
     asserts:

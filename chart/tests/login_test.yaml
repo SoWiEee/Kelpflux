@@ -61,6 +61,30 @@ tests:
           content:
             name: slurm-jwt-secret
 
+  - it: login mounts Lmod modulefiles
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: modulefile-gcc
+            mountPath: /opt/modulefiles/gcc
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: modulefile-openmpi
+            mountPath: /opt/modulefiles/openmpi
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: modulefile-cuda
+            configMap:
+              name: slurm-modulefile-cuda
+
   - it: /shared mount only renders when storage.enabled AND mountInPods
     set:
       storage.enabled: true

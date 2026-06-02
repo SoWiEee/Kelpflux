@@ -36,8 +36,6 @@ spec:
       labels:
         {{- include "slurm-platform.labels" . | nindent 8 }}
         app: slurm-login
-      annotations:
-        checksum/lmod: {{ include (print $.Template.BasePath "/lmod-modulefiles.yaml") . | sha256sum }}
     spec:
       containers:
         - name: slurm-login
