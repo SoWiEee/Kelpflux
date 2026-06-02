@@ -1,6 +1,14 @@
 # Scheduler Production Spec
 
-本文件描述目前 Kelpflux 上線中的排程規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、weight tuner、DSAC live scheduler、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
+本文件描述目前 Kelpflux 上線中的排程與 placement 規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、weight tuner、DSAC live scheduler、Kubernetes / NVIDIA GPU stack、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
+
+Kelpflux 的主要貢獻不是取代 Slurm，而是在 Slurm 前後加入一層可訓練、可觀測、可回退的 ML placement control plane：
+
+- 將使用者的 CPU / GPU / VRAM / MPS 需求正規化成 Slurm 能執行的 placement contract。
+- 以 submit-time score 作為穩定 fallback，避免 RL service 不可用時影響提交。
+- 以 DSAC 在 live traffic 上介入 pending job 的排序，讓模型能根據 queue、MPS free slots、GPU state 與 runtime signal 選出較值得提前的 job。
+- 以 Slurm GRES、`select/cons_tres`、Kubernetes worker pool、NVIDIA runtime 與 MPS control daemon 共同完成硬體資源配置。
+- 以 Prometheus / Grafana / OpenTelemetry 暴露決策、queue、GPU、MPS 與 placement intent，讓非開發者也能看懂系統如何把 job 放到資源上。
 
 ## 1. 上線架構
 
@@ -13,18 +21,22 @@ Slurm job_submit.lua
     |-- score function: MPS / VRAM / fragmentation / runtime signal
     |-- runtime predictor: 可選，用於短工優先與 walltime 建議
     |-- weight tuner: 可選，載入目前最佳 score 係數
-    |-- DSAC scheduler: live 模式時可回傳 priority boost
+    |-- DSAC scheduler: live 模式時可回傳 priority boost + placement intent
     v
 Slurm priority + backfill + select/cons_tres
     v
-worker pool: CPU / GPU / MPS slots
+Kubernetes worker pool + NVIDIA runtime + Slurm GRES
+    v
+physical CPU / GPU / MPS slots
 ```
 
 核心原則：
 
 - Slurm 仍是最終資源分配與 job lifecycle owner。
-- `job_submit.lua` 只在提交時調整 priority / metadata，不阻塞 Slurm 的基本行為。
-- DSAC live scheduler 以 priority boost 介入排序；任何失敗都 fallback 到 score / Slurm 原生排程。
+- `job_submit.lua` 在提交時調整 priority / metadata / placement contract，不阻塞 Slurm 的基本行為。
+- DSAC live scheduler 以 priority boost 介入排序，並輸出 `node_j` / `gpu_k` placement intent 供 metrics 與後續直接 placement 使用。
+- 上線 production submit path 不直接覆蓋 Slurm node allocation；實際 placement 仍由 Slurm `select/cons_tres`、GRES、Kubernetes worker pool 與 NVIDIA runtime 執行。
+- 任何 DSAC 失敗都 fallback 到 score / Slurm 原生排程。
 - GPU live migration 不在上線規格內；若要處理 running job，只能走 application-level checkpoint + requeue。
 
 ## 2. Job Submit 決策流程
@@ -87,10 +99,104 @@ flowchart TD
 
 - helper 只補缺值，不覆蓋使用者已指定的 partition、memory 或 QoS。
 - score function 產生穩定的 submit-time priority delta，是 DSAC 不可用時的主要 fallback。
-- DSAC live scheduler 目前只加 priority boost，不直接指定 worker、node 或 GPU；實際硬體 placement 仍由 Slurm `select/cons_tres` 決定。
-- GPU job 的硬體資源由 Kubernetes worker pod、NVIDIA runtime、Slurm GRES 與 MPS slot 共同約束。
+- DSAC live scheduler 在 production submit path 會加 priority boost，並回傳 `node_j` / `gpu_k` 作為 placement intent 與觀測資料；實際硬體 placement 仍由 Slurm `select/cons_tres` 決定。
+- GPU job 的硬體資源由 Kubernetes worker pod、NVIDIA runtime、Slurm GRES 與 MPS slot 共同約束，這是目前客製 placement 的執行層。
 
-## 3. Slurm 基礎排程設定
+## 3. 完整排程與客製 Placement Stack
+
+Kelpflux 把「排程」拆成兩個互相銜接的問題：先決定哪個 pending job 應該更早被 Slurm 考慮，再用一組可被 Slurm / Kubernetes / NVIDIA stack 執行的 placement contract 把 job 放到硬體上。
+
+```mermaid
+flowchart LR
+    U["User intent<br/>sbatch flags"] --> H["Submit helper<br/>normalize request"]
+    H --> C["Placement contract<br/>partition / constraint / GRES / MPS / memory / QoS"]
+    C --> S["Score fallback<br/>MPS fit / VRAM fit / fragmentation / runtime"]
+    C --> R["DSAC live policy<br/>queue + GPU + MPS snapshot"]
+    S --> Q["Final priority"]
+    R --> Q
+    R --> I["Placement intent<br/>job_i, node_j, gpu_k"]
+    Q --> P["Slurm priority queue<br/>multifactor + backfill"]
+    C --> P
+    P --> T["select/cons_tres<br/>TRES / GRES allocation"]
+    T --> K["Kubernetes worker pool<br/>CPU/GPU StatefulSets"]
+    K --> N["NVIDIA GPU Operator<br/>device plugin + MPS"]
+    N --> G["Physical resources<br/>CPU cores / GPU / MPS slots"]
+    I --> M["Prometheus / Grafana<br/>visualized decision"]
+    G --> M
+```
+
+### 3.1 Placement Contract
+
+目前 production path 中，真正會被執行的 placement contract 由 submit helper、使用者 sbatch flags 與 Slurm config 共同決定：
+
+| Contract 欄位 | 來源 | 執行者 | 作用 |
+|---------------|------|--------|------|
+| `partition` | 使用者指定或 submit helper 補齊 | Slurm + Kelpflux operator | 決定 CPU / GPU worker pool，例如 `cpu`、`gpu-rtx4070` |
+| `constraint` / features | 使用者指定 | Slurm node feature matching | 約束 VRAM tier、GPU 型號或節點特徵 |
+| `gres/gpu` | `--gres` / `tres_per_node` | Slurm GRES + NVIDIA device plugin | 配置 GPU 類型與數量 |
+| `gres/mps` | `--gres` / `tres_per_node` | Slurm GRES + NVIDIA MPS control daemon | 配置單 GPU 上的 MPS slot |
+| `memory` | 使用者指定或 helper 估算 | Slurm cgroup / Kubernetes pod resources | 避免 job 在 placement 後因 memory 不足失敗 |
+| `qos` / priority | 使用者、helper、score、DSAC | Slurm priority queue | 決定 pending jobs 的排序與 backfill 機會 |
+| worker pool size | Slurm pending state | Kelpflux operator | 依 pending jobs 擴縮 Kubernetes worker StatefulSet |
+
+換句話說，Kelpflux 的客製 placement 不是單一 API call，而是一條可被多層系統共同執行的約束鏈：job submit 時建立 contract，Slurm 根據 contract 選資源，operator 確保 worker pool 存在，NVIDIA stack 提供 GPU / MPS isolation。
+
+### 3.2 DSAC 在 Placement 中的角色
+
+DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被解碼成 `(job_i, node_j, gpu_k)`，action mask 只允許選擇 MPS free slots 足夠的 placement。
+
+| DSAC 輸出 | Production submit path | 目前用途 |
+|-----------|------------------------|----------|
+| `job_i` | 間接生效 | 若選中的 job 是正在 submit 的 job，回傳 positive `priority_boost` |
+| `node_j` | 不直接生效 | 記錄為 placement intent，用於 metrics、Grafana 與訓練分析 |
+| `gpu_k` | 不直接生效 | 記錄為 placement intent，用於觀察模型偏好的 GPU slot |
+| `priority_boost` | 直接生效 | 加到 `job_desc.priority`，讓 Slurm 更早考慮該 job |
+| `abstain` | 直接生效 | guardrail 觸發時不 boost，回到 score + Slurm |
+
+這個設計讓 live cluster 可以先安全使用 RL 影響排序，同時保留完整 placement-aware state/action 資料。若要把 `node_j` / `gpu_k` 也變成 production hard placement，需要再接上一條 Slurm-safe 的直接 placement 執行路徑。
+
+### 3.3 Submit 到硬體分配的時序
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant L as job_submit.lua
+    participant R as DSAC /decide
+    participant S as Slurm queue
+    participant O as Kelpflux operator
+    participant K as K8s worker pool
+    participant G as NVIDIA / MPS
+    participant M as Metrics
+
+    U->>L: sbatch / srun with CPU/GPU/MPS intent
+    L->>L: Fill missing partition, memory, QoS
+    L->>L: Compute score fallback
+    L->>R: POST /decide with job + latest snapshot
+    R-->>L: priority_boost + job_i/node_j/gpu_k + safety state
+    L->>S: Submit final priority + placement contract
+    S->>S: Multifactor priority + backfill
+    S->>O: Pending job reveals required pool
+    O->>K: Scale CPU/GPU worker StatefulSet
+    K->>G: RuntimeClass + device plugin + MPS control daemon
+    S->>G: Allocate GRES gpu/mps and start job
+    R->>M: decision/value/entropy/placement intent
+    G->>M: GPU utilization and MPS free slots
+```
+
+### 3.4 直接 Placement 原型與上線邊界
+
+程式庫中保留 `services/rl_scheduler/live_daemon.py` 作為直接 placement 原型：它會輪詢 Slurm cluster state，讓 DSAC 選 `(job, node, gpu)`，再以 explicit `--nodelist` / `--gres=mps:N` 的方式執行 placement。這條路徑適合研究與 shadow logging，但不是目前 `scripts/deploy-2.sh` 的 production submit path。
+
+若要把直接 placement 變成上線規格，還需要補齊：
+
+- 穩定的 live snapshot collector，能把真實 Slurm node / GPU / MPS state 對應到 DSAC 的 `node_j` / `gpu_k`。
+- Slurm-safe 的 hard placement 執行方式，例如 hold-release、`scontrol update`、或受控 daemon，而不是在 `job_submit.lua` 內長時間阻塞。
+- 與 Slurm backfill / fairshare / preemption 的衝突處理規則。
+- 直接 placement 的 live 驗證腳本、rollback policy 與 Grafana 面板。
+
+因此目前可以對外描述為：Kelpflux 已完成 production-safe 的 DRL-based scheduling，並具備 placement-aware action space 與完整客製 placement stack；直接由 DRL hard-bind node/GPU 則是下一步上線強化項目。
+
+## 4. Slurm 基礎排程設定
 
 上線使用 Slurm 原生能力作為穩定底座：
 
@@ -114,7 +220,7 @@ flowchart TD
 | 跨節點 GPU memory 搬移 | 不支援 |
 | 強制 requeue running job | 非預設上線行為 |
 
-## 4. Submit Helper
+## 5. Submit Helper
 
 `job_submit.lua` 會先執行 submit helper，讓後續 score 與 DSAC 看到較完整的 job 描述。helper 不覆蓋使用者明確指定的欄位。
 
@@ -133,7 +239,7 @@ partition rule 預設：
 | `gpu:` | `gpu-rtx4070` |
 | no GPU match | `cpu` |
 
-## 5. Score Function
+## 6. Score Function
 
 score function 是 submit-time heuristic，用來產生 priority delta。分數越高，job 越值得被提前考慮。
 
@@ -157,7 +263,7 @@ if scoreApply=true and priority_delta > 0 and job_desc.priority is empty:
 
 `scoreGain` 預設為 `1000`，用來把 `[0,1]` score 轉成 Slurm priority delta。
 
-### 5.1 係數
+### 6.1 係數
 
 chart 預設係數：
 
@@ -171,7 +277,7 @@ chart 預設係數：
 
 若 `weight-tuner` 啟用，Lua plugin load 時會從 `GET /weights` 載入 `(α, δ, ε)`，`β` 固定，`γ` 維持 chart 設定。
 
-### 5.2 `f_mps_fit`
+### 6.2 `f_mps_fit`
 
 衡量 job MPS request 與單 GPU MPS 容量的配適程度。
 
@@ -183,7 +289,7 @@ chart 預設係數：
 | no MPS request | 回傳 `1.0` |
 | request 超過容量 | 回傳 `0.0` |
 
-### 5.3 `f_vram_fit`
+### 6.3 `f_vram_fit`
 
 依 `--constraint` 中的 `vram-*g` 需求選擇最小可用 VRAM tier，避免過度配置。
 
@@ -195,11 +301,11 @@ chart 預設係數：
 | 無 VRAM constraint | 回傳 `0.5` |
 | 無 tier 可容納 | 回傳 `0.0` |
 
-### 5.4 `f_topology`
+### 6.4 `f_topology`
 
 目前為保留欄位，Lua 回傳中性值 `0.5`。因 chart 預設 `γ=0`，此因子不影響上線 priority。
 
-### 5.5 `f_fragmentation`
+### 6.5 `f_fragmentation`
 
 目前使用 submit-time proxy，不讀 live cluster state。它懲罰最容易留下碎片的 MPS request。
 
@@ -211,7 +317,7 @@ chart 預設係數：
 | `mps_req >= mpsPerNode` | 回傳 `0.0` |
 | `mps_req = 50%` | 回傳接近 `1.0`，碎片化代價最高 |
 
-### 5.6 `f_pred_runtime`
+### 6.6 `f_pred_runtime`
 
 runtime predictor 啟用時，短 job 取得較高 score。predictor 不可用時回傳中性值。
 
@@ -251,7 +357,7 @@ Predictor response：
 
 `applyTimeLimit=true` 時，Lua 可把 `job_desc.time_limit` 改成預測值；上線建議只有在 predictor 經過校準後才開啟，避免模型低估造成 job timeout。
 
-## 6. Weight Tuner
+## 7. Weight Tuner
 
 `weight-tuner` 是可選 FastAPI service，用 UCB1 在離散 arm 空間中調整 score function 的 `(α, δ, ε)`。
 
@@ -269,7 +375,7 @@ Predictor response：
 - `β` 不由 tuner 調整。
 - live reward 以 completed jobs 的 mean JCT 轉換為負 reward。
 
-## 7. DSAC Live Scheduler
+## 8. DSAC Live Scheduler
 
 `rl-scheduler` 是 FastAPI service，載入目前 image 內的 DSAC checkpoint，提供 Slurm Lua hook 查詢。
 
@@ -290,7 +396,7 @@ job_submit.lua -> POST /decide
 
 DSAC 不直接執行 `srun --nodelist`，也不直接覆蓋 Slurm placement。`node_j` 與 `gpu_k` 會回傳並記錄，用於分析與後續 placement-aware 設計；目前上線仍讓 Slurm `select/cons_tres` 做實際 placement。
 
-### 7.1 Snapshot Schema
+### 8.1 Snapshot Schema
 
 ```json
 {
@@ -311,7 +417,7 @@ DSAC 不直接執行 `srun --nodelist`，也不直接覆蓋 Slurm placement。`n
 
 `/decide` 會在 snapshot 缺失或超過 `snapshotTtlSeconds` 時 abstain。
 
-### 7.2 Decision Schema
+### 8.2 Decision Schema
 
 Lua hook 送出的 request：
 
@@ -343,7 +449,7 @@ Service response：
 }
 ```
 
-### 7.3 Live Safety Gates
+### 8.3 Live Safety Gates
 
 | Gate | 行為 |
 |------|------|
@@ -357,7 +463,7 @@ Service response：
 
 目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。
 
-## 8. Boundary Policy
+## 9. Boundary Policy
 
 | Failure | 行為 |
 |---------|------|
@@ -371,7 +477,7 @@ Service response：
 | `scoreApply=false` | score 只記錄，不改 priority |
 | DSAC abstain | 不加 boost，交給 score + Slurm |
 
-## 9. Monitoring Metrics
+## 10. Monitoring Metrics
 
 `rl-scheduler` 暴露 Prometheus metrics，Grafana dashboard `Scheduler Live Resource View` 會使用這些指標。
 
@@ -392,7 +498,7 @@ Service response：
 | `rl_scheduler_last_node_index` | 最近一次 selected node index |
 | `rl_scheduler_last_gpu_index` | 最近一次 selected GPU index |
 
-## 10. Deployment Knobs
+## 11. Deployment Knobs
 
 常用 Helm values：
 
@@ -437,13 +543,14 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 ```
 
-## 11. Files
+## 12. Files
 
 | Path | Purpose |
 |------|---------|
 | `chart/templates/configmap-job-submit.yaml` | Generates `job_submit.lua` |
 | `chart/lua/rl_hook.lua` | Lua client for DSAC `/decide` |
 | `services/rl_scheduler/serve.py` | DSAC FastAPI service |
+| `services/rl_scheduler/live_daemon.py` | Direct placement prototype daemon; not enabled by `scripts/deploy-2.sh` by default |
 | `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
 | `services/runtime_predictor/` | Runtime prediction service |
 | `services/weight_tuner/` | UCB1 weight tuner |

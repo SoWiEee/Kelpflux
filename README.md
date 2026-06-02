@@ -131,6 +131,50 @@ SKIP_WAIT=1 bash scripts/deploy-2.sh
 
 DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`。`valueAbstain=-100000` 與 `snapshotTtlSeconds=86400` 是目前單機 live 實驗設定，用來避免 checkpoint value scale 與缺少常駐 snapshot collector 時讓所有 decision 都被 guardrail 擋掉。
 
+目前 `deploy-2.sh` 啟用的是 production-safe 的 DSAC live scheduling：RL 會影響 queue priority，實際 node / GPU / MPS placement 仍由 Slurm `select/cons_tres`、GRES、Kubernetes worker pool 與 NVIDIA runtime 執行。若要啟用研究用的 direct DRL placement daemon，必須在能連到 Slurm controller 且可執行 `squeue`、`scontrol`、`srun` 的環境執行，先用 shadow 模式確認 action 與 log，再關閉 shadow：
+
+```bash
+# 1) 確認 production DSAC live boost 已啟用
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS http://rl-scheduler:8002/healthz
+
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS http://rl-scheduler:8002/metrics | grep -E \
+  'rl_scheduler_shadow_mode|rl_scheduler_last_node_index|rl_scheduler_last_gpu_index'
+
+# 2) Direct placement daemon shadow run：只記錄 DSAC 選到的 job/node/gpu，不執行 srun
+SHADOW_MODE=true uv run python -m services.rl_scheduler.live_daemon \
+  --policy-dir runs/eval_mlp_20260514-210824/train \
+  --node-name slurm-worker-gpu-0 \
+  --gpus-per-node 1 \
+  --mps-per-gpu 100 \
+  --poll-interval 30 \
+  --log-dir live_logs/direct-placement-shadow
+
+# 3) Direct placement daemon live run：DSAC 會執行 explicit --nodelist + --gres=mps:N
+SHADOW_MODE=false uv run python -m services.rl_scheduler.live_daemon \
+  --policy-dir runs/eval_mlp_20260514-210824/train \
+  --node-name slurm-worker-gpu-0 \
+  --gpus-per-node 1 \
+  --mps-per-gpu 100 \
+  --poll-interval 30 \
+  --live-warmup 0 \
+  --log-dir live_logs/direct-placement-live
+```
+
+多節點 / 2x2 cluster 時，把 `--node-name` 改成實際 Slurm GPU node 清單，並把 `--gpus-per-node` 設為每台節點的 GPU 數，例如：
+
+```bash
+SHADOW_MODE=true uv run python -m services.rl_scheduler.live_daemon \
+  --policy-dir runs/eval_mlp_20260514-210824/train \
+  --node-name slurm-worker-gpu-0 slurm-worker-gpu-1 \
+  --gpus-per-node 2 \
+  --mps-per-gpu 100 \
+  --log-dir live_logs/direct-placement-2x2-shadow
+```
+
+> Direct placement daemon 目前不是 `deploy-2.sh` 的預設部署元件。它會嘗試用 `srun --jobid ... --nodelist ... --gres=mps:N` hard-bind placement，適合研究驗證與蒐集 RLPD transition；production 預設仍建議使用 DSAC priority boost + Slurm placement contract。
+
 預設行為（k3s overlay）：
 
 - `gpu.enabled=true`：在 `gpu-operator` namespace 放 device-plugin-config ConfigMap + 跨節點 labeler Job
