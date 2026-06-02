@@ -91,11 +91,27 @@ import_rl_image() {
   docker save "$RL_IMAGE" | sudo_cmd k3s ctr images import -
 }
 
+adopt_lmod_configmaps() {
+  local cm
+  for cm in slurm-modulefile-gcc slurm-modulefile-openmpi slurm-modulefile-python3 slurm-modulefile-cuda; do
+    if kubectl -n "$NAMESPACE" get configmap "$cm" >/dev/null 2>&1; then
+      log "adopting existing Lmod ConfigMap into Helm release: $cm"
+      run kubectl -n "$NAMESPACE" label configmap "$cm"         app.kubernetes.io/managed-by=Helm         --overwrite
+      run kubectl -n "$NAMESPACE" annotate configmap "$cm"         meta.helm.sh/release-name="$HELM_RELEASE"         meta.helm.sh/release-namespace="$NAMESPACE"         --overwrite
+      if [[ "$cm" == "slurm-modulefile-cuda" ]]; then
+        kubectl -n "$NAMESPACE" patch configmap "$cm" --type=json -p='[{"op":"remove","path":"/data/stub.lua"}]' >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+}
+
 deploy_platform() {
   if [[ "$SKIP_PLATFORM" == "1" ]]; then
     warn "SKIP_PLATFORM=1; skipping slurm-platform Helm deployment"
     return
   fi
+
+  adopt_lmod_configmaps
 
   log "converging slurm-platform with live DSAC scheduler enabled"
   run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set gpu.autoLabel=false     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false     --set rlScheduler.valueAbstain=-100000     --set rlScheduler.snapshotTtlSeconds=86400

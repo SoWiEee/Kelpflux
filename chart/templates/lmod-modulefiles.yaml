@@ -1,0 +1,129 @@
+{{/*
+Lmod modulefiles mounted into login and worker pods at /opt/modulefiles.
+The worker image provides the actual toolchains; these modulefiles only expose
+stable HPC-style names and environment variables to interactive shells and
+sbatch jobs.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-gcc
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  11.lua: |
+    whatis("GCC 11 — GNU C/C++/Fortran compiler with OpenMP support")
+
+    help([[
+    GNU compiler toolchain from Ubuntu 22.04.
+
+    OpenMP example:
+      source /etc/profile.d/lmod.sh
+      module load gcc/11
+      gcc -fopenmp omp_hello.c -o omp_hello
+    ]])
+
+    setenv("CC",  "gcc")
+    setenv("CXX", "g++")
+    setenv("FC",  "gfortran")
+    setenv("GCC_HOME", "/usr")
+
+    prepend_path("PATH", "/usr/bin")
+    prepend_path("MANPATH", "/usr/share/man")
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-openmpi
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  4.1.lua: |
+    whatis("OpenMPI 4.1 — Message Passing Interface")
+
+    help([[
+    OpenMPI 4.1 installed via apt (openmpi-bin + libopenmpi-dev).
+
+    Slurm integration:
+      Use 'srun --mpi=pmi2' for native Slurm process launching.
+
+    Example:
+      source /etc/profile.d/lmod.sh
+      module load gcc/11 openmpi/4.1
+      mpicc mpi_hello.c -o mpi_hello
+      srun --mpi=pmi2 ./mpi_hello
+    ]])
+
+    local ompi_root = "/usr/lib/x86_64-linux-gnu/openmpi"
+
+    prepend_path("PATH",            ompi_root .. "/bin")
+    prepend_path("LD_LIBRARY_PATH", ompi_root .. "/lib")
+    prepend_path("CPATH",           ompi_root .. "/include")
+    prepend_path("PKG_CONFIG_PATH", ompi_root .. "/lib/pkgconfig")
+
+    setenv("MPI_HOME", ompi_root)
+    setenv("MPI_RUN",  "mpirun")
+    setenv("OMPI_CC",  "gcc")
+    setenv("OMPI_CXX", "g++")
+    setenv("OMPI_FC",  "gfortran")
+
+    setenv("OMPI_MCA_btl_base_warn_component_unused", "0")
+    setenv("OMPI_MCA_plm_rsh_no_tree_spawn",          "1")
+    setenv("SLURM_MPI_TYPE", "pmi2")
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-python3
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  3.10.lua: |
+    whatis("Python 3.10 — Ubuntu 22.04 system Python")
+
+    help([[
+    System Python 3.10 (python3 / python3.10).
+    For isolated environments:
+      python3 -m venv /shared/venvs/myenv
+      source /shared/venvs/myenv/bin/activate
+    ]])
+
+    setenv("PYTHON_VERSION", "3.10")
+    setenv("PYTHON_HOME",    "/usr")
+
+    prepend_path("PATH", "/usr/bin")
+    prepend_path("MANPATH", "/usr/share/man")
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-cuda
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  12.4.lua: |
+    whatis("CUDA 12.4 — NVIDIA CUDA compiler and toolkit")
+
+    help([[
+    CUDA toolkit from the nvidia/cuda:12.4.1-devel-ubuntu22.04 worker image.
+
+    Example:
+      source /etc/profile.d/lmod.sh
+      module load gcc/11 cuda/12.4
+      nvcc vector_add.cu -o vector_add
+    ]])
+
+    local cuda_home = "/usr/local/cuda"
+
+    setenv("CUDA_HOME", cuda_home)
+    setenv("CUDA_ROOT", cuda_home)
+    setenv("CUDA_PATH", cuda_home)
+
+    prepend_path("PATH",            cuda_home .. "/bin")
+    prepend_path("LD_LIBRARY_PATH", cuda_home .. "/lib64")
+    prepend_path("CPATH",           cuda_home .. "/include")
+    prepend_path("LIBRARY_PATH",    cuda_home .. "/lib64")

@@ -312,11 +312,11 @@ check_dsac_smoke() {
 
 check_lmod() {
   [[ "$SKIP_LMOD" == "1" ]] && { warn "SKIP_LMOD=1; skipping Lmod checks"; return; }
-  log "Lmod"
-  if login_exec "source /etc/profile.d/lmod.sh; module avail >/tmp/verify-live-module-avail.txt 2>&1; module load openmpi/4.1; test -n "\$MPI_HOME"; test "\$SLURM_MPI_TYPE" = pmi2; module purge" >/tmp/verify-live-lmod.out 2>/tmp/verify-live-lmod.err; then
-    pass "Lmod module load/purge works in login pod"
+  log "Lmod and user toolchains"
+  if login_exec "source /etc/profile.d/lmod.sh; module avail >/tmp/verify-live-module-avail.txt 2>&1; module load gcc/11; command -v gcc; command -v g++; command -v gfortran; printf '#include <omp.h>\nint main(){return omp_get_max_threads()<1;}\n' >/tmp/verify-live-omp.c; gcc -fopenmp /tmp/verify-live-omp.c -o /tmp/verify-live-omp; module load openmpi/4.1; test -n "\$MPI_HOME"; test "\$SLURM_MPI_TYPE" = pmi2; command -v mpicc; module load cuda/12.4; test -n "\$CUDA_HOME"; command -v nvcc; nvcc --version >/tmp/verify-live-nvcc.txt; module purge" >/tmp/verify-live-lmod.out 2>/tmp/verify-live-lmod.err; then
+    pass "Lmod gcc/OpenMP/OpenMPI/CUDA modules work in login pod"
   else
-    fail "Lmod module load/purge failed in login pod"
+    fail "Lmod gcc/OpenMP/OpenMPI/CUDA module check failed in login pod"
     sed 's/^/    /' /tmp/verify-live-lmod.err >&2 || true
   fi
 }

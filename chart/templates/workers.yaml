@@ -76,6 +76,7 @@ spec:
         # nodes/gres.conf / task-prolog content changes via helm upgrade.
         checksum/config-static: {{ include (print $.Template.BasePath "/configmap-static.yaml") $ | sha256sum }}
         checksum/config-nodes: {{ include (print $.Template.BasePath "/configmap-nodes.yaml") $ | sha256sum }}
+        checksum/lmod: {{ include (print $.Template.BasePath "/lmod-modulefiles.yaml") $ | sha256sum }}
         {{- if $.Values.slurm.taskProlog }}
         checksum/task-prolog: {{ include (print $.Template.BasePath "/configmap-task-prolog.yaml") $ | sha256sum }}
         {{- end }}
@@ -180,6 +181,18 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: modulefile-gcc
+              mountPath: /opt/modulefiles/gcc
+              readOnly: true
+            - name: modulefile-openmpi
+              mountPath: /opt/modulefiles/openmpi
+              readOnly: true
+            - name: modulefile-python3
+              mountPath: /opt/modulefiles/python3
+              readOnly: true
+            - name: modulefile-cuda
+              mountPath: /opt/modulefiles/cuda
+              readOnly: true
             {{- if and $.Values.storage.enabled $.Values.storage.mountInPods }}
             - name: shared
               mountPath: /shared
@@ -197,6 +210,19 @@ spec:
             name: slurm-task-prolog
             defaultMode: 0755
         {{- end }}
+
+        - name: modulefile-gcc
+          configMap:
+            name: slurm-modulefile-gcc
+        - name: modulefile-openmpi
+          configMap:
+            name: slurm-modulefile-openmpi
+        - name: modulefile-python3
+          configMap:
+            name: slurm-modulefile-python3
+        - name: modulefile-cuda
+          configMap:
+            name: slurm-modulefile-cuda
         - name: slurm-secrets
           projected:
             sources:

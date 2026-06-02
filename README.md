@@ -328,58 +328,161 @@ bash scripts/verify-live.sh
 
 ## Lmod 模組系統教學
 
-Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`deploy-2.sh` 部署後即可使用 `module load`。Modulefile 定義由 chart 管理，live 驗證由 `scripts/verify-live.sh` 覆蓋。
+Lmod 是使用者在 login node 與 `sbatch` job 內切換 toolchain 的入口。Kelpflux 目前把 modulefile 納入 Helm chart，並掛載到 login pod 與所有 CPU/GPU worker pod 的 `/opt/modulefiles`。CPU/GPU worker 仍會依 pending jobs 由 operator 擴縮；只要 worker pod 被啟動，它會看到同一組 modulefile。
 
-**部署後的操作體驗：**
+> 重點：image build/import 發生在部署階段，不是在使用者 submit job 的時候。為了降低第一個 job 的等待時間，`slurm-worker-image-puller` 會預拉 `slurm-worker:latest` 到節點上。
+
+### 查看可用模組
 
 ```bash
-# 進 login pod（如同登入 HPC login node）
+# 進 login pod，如同登入 HPC login node
 kubectl -n slurm exec -it deploy/slurm-login -- bash
 
-# 查看可用模組
+source /etc/profile.d/lmod.sh
 module avail
-
-# 載入 OpenMPI
-module load openmpi/4.1
-
-# 確認環境變數已設定
-echo $MPI_HOME           # /usr/lib/x86_64-linux-gnu/openmpi
-echo $SLURM_MPI_TYPE     # pmi2
-
-# 卸載全部
-module purge
 ```
 
-**在 sbatch 腳本中使用 module（關鍵：需明確 source lmod.sh）：**
+目前內建模組：
+
+| 模組 | 用途 |
+|------|------|
+| `gcc/11` | GNU C/C++/Fortran compiler；OpenMP 透過 `gcc -fopenmp` / `g++ -fopenmp` 使用 |
+| `openmpi/4.1` | OpenMPI 4.1，設定 `MPI_HOME`、MPI wrapper 與 `SLURM_MPI_TYPE=pmi2` |
+| `python3/3.10` | Ubuntu 22.04 system Python |
+| `cuda/12.4` | CUDA toolkit / `nvcc`，由 `slurm-worker` CUDA devel image 提供 |
+
+### sbatch 內使用 module 的規則
+
+`sbatch` 腳本是 non-login shell，不會自動載入 `/etc/profile.d`。所以 job script 內要固定寫：
 
 ```bash
-cat > /tmp/my-mpi-job.sh << 'EOF'
-#!/bin/bash
-#SBATCH --ntasks=2
-#SBATCH --nodes=1
-
-source /etc/profile.d/lmod.sh   # 讓 module 指令在批次作業內可用
-module load openmpi/4.1
-
-srun --mpi=pmi2 /bin/sh -c 'echo "rank:${SLURM_PROCID} host:$(hostname)"'
-EOF
-
-sbatch /tmp/my-mpi-job.sh
+source /etc/profile.d/lmod.sh
+module load gcc/11
 ```
 
-> **為什麼要明確 source lmod.sh？**  
-> `sbatch` 執行腳本時使用非互動、非 login 的 bash，`/etc/profile.d/` 不會自動載入。  
-> 明確 source 是標準 HPC 做法，與 TACC、NCHC 等真實系統的 job script 寫法一致。
+如果 job 需要 MPI 或 CUDA，再額外載入：
 
-`scripts/verify-live.sh` 會檢查 login pod 內 `module avail`、`module load openmpi/4.1`、`MPI_HOME`、`SLURM_MPI_TYPE` 與 `module purge`。
+```bash
+module load openmpi/4.1
+module load cuda/12.4
+```
 
-目前內建模組如下：
+### OpenMP job 範例
 
-| 模組 | 描述 |
-|------|------|
-| `openmpi/4.1` | OpenMPI 4.1.2（Ubuntu 22.04 套件），設定 MPI_HOME、LD_LIBRARY_PATH、SLURM_MPI_TYPE=pmi2 |
-| `python3/3.10` | 系統 Python 3.10，設定 PYTHON_HOME |
-| `cuda/stub` | CUDA 佔位模組，示範 GPU 叢集的 modulefile 結構 |
+```bash
+cat > /shared/omp-test.sh << 'EOF'
+#!/bin/bash
+#SBATCH -J omp-test
+#SBATCH -p cpu
+#SBATCH -N 1
+#SBATCH -c 4
+
+source /etc/profile.d/lmod.sh
+module load gcc/11
+
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+
+cat > omp_hello.c <<'SRC'
+#include <omp.h>
+#include <stdio.h>
+int main() {
+#pragma omp parallel
+  printf("thread %d / %d\n", omp_get_thread_num(), omp_get_num_threads());
+  return 0;
+}
+SRC
+
+gcc -fopenmp omp_hello.c -o omp_hello
+srun ./omp_hello
+EOF
+
+sbatch /shared/omp-test.sh
+```
+
+### MPI job 範例
+
+```bash
+cat > /shared/mpi-test.sh << 'EOF'
+#!/bin/bash
+#SBATCH -J mpi-test
+#SBATCH -p cpu
+#SBATCH -N 1
+#SBATCH -n 2
+
+source /etc/profile.d/lmod.sh
+module load gcc/11 openmpi/4.1
+
+cat > mpi_hello.c <<'SRC'
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  printf("rank %d / %d\n", rank, size);
+  MPI_Finalize();
+  return 0;
+}
+SRC
+
+mpicc mpi_hello.c -o mpi_hello
+srun --mpi=pmi2 ./mpi_hello
+EOF
+
+sbatch /shared/mpi-test.sh
+```
+
+### CUDA / nvcc job 範例
+
+CUDA job 要提交到 GPU partition，並請求 GPU 或 MPS GRES。完整使用一張 GPU：
+
+```bash
+cat > /shared/cuda-test.sh << 'EOF'
+#!/bin/bash
+#SBATCH -J cuda-test
+#SBATCH -p gpu-rtx4070
+#SBATCH --gres=gpu:1
+#SBATCH -c 2
+
+source /etc/profile.d/lmod.sh
+module load gcc/11 cuda/12.4
+
+cat > hello_cuda.cu <<'SRC'
+#include <cstdio>
+__global__ void hello() {
+  printf("hello from cuda block=%d thread=%d\n", blockIdx.x, threadIdx.x);
+}
+int main() {
+  hello<<<1, 4>>>();
+  cudaDeviceSynchronize();
+  return 0;
+}
+SRC
+
+nvcc hello_cuda.cu -o hello_cuda
+srun ./hello_cuda
+EOF
+
+sbatch /shared/cuda-test.sh
+```
+
+若要走 MPS shared GPU，可以改成：
+
+```bash
+#SBATCH -p gpu-rtx4070
+#SBATCH --gres=mps:25
+```
+
+實際能否立即執行仍取決於 Slurm node 狀態與 operator 是否已把對應 GPU worker pool 擴起來。可用下列指令觀察：
+
+```bash
+squeue
+sinfo -Nel
+module list
+```
+
+`scripts/verify-live.sh` 會檢查 login pod 內 `module avail`、`gcc/11`、OpenMP 編譯、`openmpi/4.1`、`cuda/12.4` 與 `nvcc --version`。
 
 ---
 
@@ -401,7 +504,7 @@ sbatch /tmp/my-mpi-job.sh
 | `slurmdbd` | Slurm Database Daemon，將 job 會計紀錄（CPU-hours、用戶統計）持久化到 MySQL，為 Fair-Share 排程提供基礎 |
 | `mysql` | 後端資料庫（StatefulSet），儲存 slurmdbd 的會計資料，使用 5 Gi PVC |
 | NFS + RWX PVC | 跨所有節點的共享磁碟，job 輸出直接寫入 `/shared` |
-| `lmod` + modulefile ConfigMaps | HPC 標準模組系統；`module load openmpi/4.1` 等指令在 login pod 與 job 內均可用；modulefile 以 K8s ConfigMap 管理，`kubectl apply` 即可新增/更新模組 |
+| `lmod` + modulefile ConfigMaps | HPC 標準模組系統；`module load gcc/11 openmpi/4.1 cuda/12.4` 等指令在 login pod 與 job 內均可用；modulefile 由 Helm chart 產生為 K8s ConfigMap 並掛載到 login/worker pod |
 
 ---
 
@@ -449,7 +552,7 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | 網路介面 | Multus CNI + secondary NIC (net2) |
 | MPI | OpenMPI 4.1.2 + Slurm PMI2 整合 |
-| 模組系統 | Lmod 6.6；modulefile 以 K8s ConfigMap 管理，掛載至 `/opt/modulefiles/` |
+| 模組系統 | Lmod 6.6；modulefile 由 Helm chart 管理，掛載至 login/worker 的 `/opt/modulefiles/` |
 | 監控 | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
 | 告警 | 8 條 SLO 規則（provisioning latency、queue wait、flapping 等） |
 
