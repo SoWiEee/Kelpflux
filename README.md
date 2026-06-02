@@ -326,7 +326,7 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 bash scripts/verify-live.sh
 ```
 
-## Lmod 模組系統（已整合至核心）
+## Lmod 模組系統教學
 
 Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`deploy-2.sh` 部署後即可使用 `module load`。Modulefile 定義由 chart 管理，live 驗證由 `scripts/verify-live.sh` 覆蓋。
 
@@ -385,26 +385,6 @@ sbatch /tmp/my-mpi-job.sh
 
 # 🏗️ System Architecture
 
-用一句話說：你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。
-
-稍微展開一點：
-
-1. 使用者登入 Login Pod，用熟悉的 `sbatch` 指令提交訓練任務。
-2. Elastic Operator 偵測到有 pending job，自動擴充對應的 worker 節點（CPU / GPU-A10 / GPU-H100 各自獨立管理）。
-3. 訓練結果存在所有節點都能讀寫的 NFS 共享磁碟（`/shared`）。
-4. 任務結束後，Operator 確認節點閒置且 checkpoint 安全，才把資源縮回去。
-
-```
-使用者 → sbatch → Slurm Controller → 排程到 Worker Pod
-                        ↑
-              Elastic Operator（Python）
-              偵測 Queue → 擴 / 縮 Worker StatefulSet
-```
-
----
-
-## 系統架構
-
 <img width="4400" height="2280" alt="圖片" src="https://github.com/user-attachments/assets/5d27ca15-525c-4936-a447-252a8a081934" />
 
 
@@ -422,21 +402,6 @@ sbatch /tmp/my-mpi-job.sh
 | `mysql` | 後端資料庫（StatefulSet），儲存 slurmdbd 的會計資料，使用 5 Gi PVC |
 | NFS + RWX PVC | 跨所有節點的共享磁碟，job 輸出直接寫入 `/shared` |
 | `lmod` + modulefile ConfigMaps | HPC 標準模組系統；`module load openmpi/4.1` 等指令在 login pod 與 job 內均可用；modulefile 以 K8s ConfigMap 管理，`kubectl apply` 即可新增/更新模組 |
-
----
-
-# 🎯 Development Progress
-
-| Phase# | 狀態 | 內容 |
-|-------|------|------|
-| 1：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge 認證，靜態節點預宣告；slurmctld state PVC（job queue 持久化）；slurmdbd + MySQL 會計後端；PodDisruptionBudget 保護所有關鍵元件；**Lmod 整合**（modulefile ConfigMap，`module load` 開機即可用） |
-| 2：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護（Grace Period 支援）、drain-then-scale；Cooldown 持久化（StatefulSet annotation）；熔斷器 + readinessProbe；全套 NetworkPolicy（Ingress + Egress）|
-| 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
-| 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出；多節點 E2E 驗證通過（含 slurmctld IP cache 修正） |
-| 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
-| 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合、`/shared/jobs/` 路徑、Worker preStop Hook；Helm chart |
-| 6：自訂 Slurm 排程 | ✅ 開發中 | DRL 模型排程器插件 |
-| 7：分散式追蹤 + SSH Login | 🔄 進行中 | SSH Login（NodePort + key auth）✅；OpenTelemetry trace（Tempo + admin_comment propagation）📋 規劃中 |
 
 ---
 
@@ -471,17 +436,6 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 
 ---
 
-# 📊 Evaluation Metrics
-
-| 指標 | 描述 | 目標 |
-|------|------|------|
-| Provisioning Latency | 從 job 提交到 worker pod ready 的時間 | < 30 秒 |
-| Recovery Time | 節點故障到訓練恢復的時間 | < 60 秒 |
-| Resource Efficiency | 任務結束後閒置資源回收速度 | 任務結束 1 分鐘內釋放 |
-| Scheduling Overhead | Operator 本身的 CPU/Memory 佔用 | < 5% 總資源 |
-
----
-
 # 🧱 Tech Stack
 
 | 類別 | 工具 |
@@ -500,31 +454,6 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 | 告警 | 8 條 SLO 規則（provisioning latency、queue wait、flapping 等） |
 
 ---
-
-# 🔭 Roadmap
-
-> Phase 5 已完成（Lmod + Helm chart cutover）；Phase 6 的 score-based scheduling 主線已完成到 M8 evaluation。下一步重點是 Phase 7 補齊使用者體驗（端到端 trace + SSH Login），以及把 Phase 6 的 live-cluster E7 驗證與 production rollout policy 補完。
-> 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
-
-## Phase 7：分散式追蹤 + SSH Login
-
-### 7-A：OpenTelemetry 分散式追蹤 📋 規劃中
-
-**目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓使用者清楚看到時間花在哪裡（排隊、K8s 啟動、實際執行）。
-
-```
-[sbatch submit] → [pending in queue] → [Operator scale-up decision]
-  → [K8s pod provisioning] → [slurmd registration] → [job execution]
-    → [checkpoint write] → [Operator scale-down] → [job complete]
-```
-
-Trace context 傳播方式：`serve.py` 在 `/decide` 時建立 root span，將 W3C traceparent 寫入 Slurm job 的 `admin_comment`；Operator polling loop 讀取後 continue 同一條 trace。詳見 `docs/note.md § 7-A`。
-
-**需要做的事：**
-- `serve.py` 加入 `opentelemetry-sdk`，`/decide` 建立 `job_submit` span 並寫入 `admin_comment`
-- Operator（`app.py`）讀取 `admin_comment`，continue trace 建立後續 span
-- 部署 OTel Collector + Grafana Tempo（`chart/templates/monitoring/`）
-- Prometheus histogram exemplar → Tempo 連結，從 latency spike 直接跳到對應 trace
 
 ### 7-B：SSH Login ✅ 已完成
 
