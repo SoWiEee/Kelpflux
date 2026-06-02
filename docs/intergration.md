@@ -26,7 +26,9 @@
 ```bash
 export KUBECONFIG=~/.kube/config
 sudo cat /var/lib/rancher/k3s/server/node-token
+# K10f426aafcfab99a36047cb9ce0b00e29ab28ce22b7414dca085a80f968eeee42e::server:9a5e3e481545eb74945c29fa74b32acf
 hostname -I
+# 192.168.0.111
 kubectl get nodes -o wide
 ```
 
@@ -45,8 +47,8 @@ bash scripts/setup-linux-gpu.sh
 
 # 加入第一台 k3s server。gpu-host-class 依實際 GPU 型號調整。
 curl -sfL https://get.k3s.io | \
-  K3S_URL=https://<SERVER_IP>:6443 \
-  K3S_TOKEN=<NODE_TOKEN> \
+  K3S_URL=https://192.168.0.111:6443 \
+  K3S_TOKEN=K10f426aafcfab99a36047cb9ce0b00e29ab28ce22b7414dca085a80f968eeee42e::server:9a5e3e481545eb74945c29fa74b32acf \
   INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx4070' \
   sh -
 ```
@@ -72,9 +74,9 @@ kubectl label node <second-node-name> gpu-host-class=rtx4070 --overwrite
 在第二台確認：
 
 ```bash
-showmount -e <SERVER_IP>
+showmount -e 192.168.0.111
 sudo mkdir -p /mnt/kelpflux-nfs-test
-sudo mount -t nfs <SERVER_IP>:/srv/nfs/k8s /mnt/kelpflux-nfs-test
+sudo mount -t nfs 192.168.0.111:/srv/nfs/k8s /mnt/kelpflux-nfs-test
 touch /mnt/kelpflux-nfs-test/node2-write-test
 sudo umount /mnt/kelpflux-nfs-test
 ```
