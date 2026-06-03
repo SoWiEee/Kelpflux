@@ -298,6 +298,19 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 | `job_running` | job 進入 running，表示 Slurm 已完成 placement / allocation |
 | `scale_up_decision` / `k8s_provisioning` | 若 worker 需要啟動，會看到 operator 擴容與 pod ready 的耗時 |
 
+實測範例：OpenMP job `135` 在 `slurm-worker-cpu-0` 上執行，Tempo trace id 是 `462ec09dba445df68352c97812568f5a`。這筆 trace 同時包含 `slurm-rl-scheduler/job_submit` 與 `slurm-operator/job_running`，而且 `job_running` 的 parent span 會接到 `job_submit`，代表 submit hook、RL scheduler、operator lifecycle tracing 已串成同一條 trace。
+
+OpenMP 輸出範例：
+
+```text
+joined trace openmp thread 0 / 4
+joined trace openmp thread 1 / 4
+joined trace openmp thread 2 / 4
+joined trace openmp thread 3 / 4
+```
+
+這類 trace 可以用來回答「job 是否真的進入 Slurm」、「跑在哪個 node」、「operator 什麼時候看到 job running」這類問題。
+
 如果 Tempo 查不到 trace，先確認 job 是透過 Kelpflux login node 的 `sbatch` 提交，並把 `job_id`、提交時間、`scontrol show job <jobid>` 結果提供給管理者。
 
 ## 11. 最小檢查清單
