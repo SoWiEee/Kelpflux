@@ -464,8 +464,22 @@ def act(req: ActRequest):
     )
 
 
+def _decide_traceparent(req: DecideRequest) -> str:
+    # Every submit decision, including abstain/no-op, should be traceable.
+    if not _otel.enabled():
+        return ""
+    with _otel.job_submit_span(
+        job_id=req.job_id,
+        partition=getattr(_snapshot, "partition", "unknown") if _snapshot else "unknown",
+        gres=f"gpu:{req.gpu_count}" if req.gpu_count else "",
+        requested_cpus=0,
+    ) as tp:
+        return tp
+
+
 @app.post("/decide", response_model=DecideResponse)
 def decide(req: DecideRequest):
+    traceparent = _decide_traceparent(req)
     snap = _snapshot
     age  = (time.time() - snap.ts) if snap else None
     if snap is None or age is None or age > SNAPSHOT_TTL_S:
@@ -477,6 +491,7 @@ def decide(req: DecideRequest):
             abstain_reason=f"snapshot_stale (age={age}s)",
             rl_selected_job_id=None, node_j=None, gpu_k=None,
             value=0.0, entropy=0.0, shadow=SHADOW_MODE,
+            otel_traceparent=traceparent or None,
         )
 
     # Fuse submitting job into snapshot's pending list
@@ -505,6 +520,7 @@ def decide(req: DecideRequest):
             abstain_reason=reason, rl_selected_job_id=None,
             node_j=None, gpu_k=None, value=0.0, entropy=0.0,
             shadow=SHADOW_MODE,
+            otel_traceparent=traceparent or None,
         )
     if expected_actions is not None and mask.shape[0] != expected_actions:
         reason = f"shape_mismatch_actions ({mask.shape[0]} != {expected_actions})"
@@ -514,6 +530,7 @@ def decide(req: DecideRequest):
             abstain_reason=reason, rl_selected_job_id=None,
             node_j=None, gpu_k=None, value=0.0, entropy=0.0,
             shadow=SHADOW_MODE,
+            otel_traceparent=traceparent or None,
         )
     action, value, entropy = _holder.select(obs, mask)
 
@@ -529,6 +546,7 @@ def decide(req: DecideRequest):
             abstain_reason=None, rl_selected_job_id=None,
             node_j=None, gpu_k=None, value=value, entropy=entropy,
             shadow=SHADOW_MODE,
+            otel_traceparent=traceparent or None,
         )
 
     job_i  = action // n_placements
@@ -560,18 +578,6 @@ def decide(req: DecideRequest):
         node_j=(-1 if abstain else node_j),
         gpu_k=(-1 if abstain else gpu_k),
     )
-
-    # OTel Phase 7-A: emit job_submit span; pass traceparent back so the Lua
-    # hook can write it to job_desc.admin_comment as "otel=<traceparent>".
-    traceparent = ""
-    if _otel.enabled():
-        with _otel.job_submit_span(
-            job_id=req.job_id,
-            partition=getattr(_snapshot, "partition", "unknown") if _snapshot else "unknown",
-            gres=f"gpu:{req.gpu_count}" if req.gpu_count else "",
-            requested_cpus=0,
-        ) as tp:
-            traceparent = tp
 
     return DecideResponse(
         priority_boost=boost, rl_selected=rl_picked_me,

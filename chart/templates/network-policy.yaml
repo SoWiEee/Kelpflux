@@ -393,6 +393,7 @@ Cross-namespace allowances for the monitoring stack:
   • Prometheus (in monitoring namespace) → slurm-elastic-operator:8000
   • Prometheus (in monitoring namespace) → slurm-exporter:9341
   • Prometheus (in monitoring namespace) → rl-scheduler:8002
+  • OTel producers (operator / rl-scheduler) → otel-collector:4317/4318
   • slurm-exporter (in slurm namespace)  → controller:6820 (slurmrestd)
 */}}
 ---
@@ -480,5 +481,37 @@ spec:
       ports:
         - protocol: TCP
           port: 6820
+{{- if .Values.monitoring.otel.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - slurm-elastic-operator
+          - rl-scheduler
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+          podSelector:
+            matchLabels:
+              app: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+{{- end }}
 {{- end }}
 {{- end }}

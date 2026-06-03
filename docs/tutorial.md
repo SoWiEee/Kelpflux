@@ -277,7 +277,30 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 | GPU Utilisation | 查看 DCGM GPU utilization、VRAM、power、temperature |
 | Per-Job GPU Profile | 以 job / GPU 維度觀察使用狀態 |
 
-## 10. 最小檢查清單
+## 10. 查看 OpenTelemetry Trace
+
+一般使用者平常看 `squeue`、job output 和 Grafana dashboard 就夠了；當 job 等待時間異常、DSAC placement 看起來不符合預期、或需要向管理者回報一次完整決策流程時，再查 OTel trace。
+
+在 Grafana Explore 選擇 Tempo datasource，使用 TraceQL 以 job id 查詢：
+
+```text
+{ job_id = "<jobid>" }
+```
+
+也可以從 **Per-Job GPU Profile** dashboard 的 Tempo 連結進入。若是剛提交的 job，請把查詢時間範圍設成最近 15 分鐘到 1 小時。
+
+一筆完整 trace 通常會呈現：
+
+| Span | 意義 |
+|------|------|
+| `job_submit` | job 送進系統時，RL scheduler 建立決策 trace |
+| `queue_wait` | operator 觀察到 pending job 後接續 trace，代表排隊等待 |
+| `job_running` | job 進入 running，表示 Slurm 已完成 placement / allocation |
+| `scale_up_decision` / `k8s_provisioning` | 若 worker 需要啟動，會看到 operator 擴容與 pod ready 的耗時 |
+
+如果 Tempo 查不到 trace，先確認 job 是透過 Kelpflux login node 的 `sbatch` 提交，並把 `job_id`、提交時間、`scontrol show job <jobid>` 結果提供給管理者。
+
+## 11. 最小檢查清單
 
 使用者回報 job 跑不起來時，先收集：
 

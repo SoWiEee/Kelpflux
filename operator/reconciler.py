@@ -168,9 +168,19 @@ class ReconcilerMixin:
                             run_ctx.__enter__()
                             self._job_running_trace[jid] = (tp, run_ctx)
                         elif jid not in self._job_running_trace:
-                            # Job was already RUNNING when operator started — open span without parent.
+                            # Job was already RUNNING when first observed. It may still
+                            # carry the submit traceparent in AdminComment, especially
+                            # for short jobs that skip a visible PENDING interval.
+                            comment = self.rest.get_job_admin_comment(jid)
+                            tp = ""
+                            for part in (comment or "").split(";"):
+                                if part.strip().startswith("otel="):
+                                    tp = part.strip()[5:]
+                                    break
+                            parent_ctx = _otel.extract_context(tp) if tp else None
                             run_ctx = _otel.start_span(
                                 "job_running",
+                                parent_context=parent_ctx,
                                 attributes={
                                     "job_id": jid,
                                     "partition": partition_cfg.partition,
@@ -178,7 +188,7 @@ class ReconcilerMixin:
                                 },
                             )
                             run_ctx.__enter__()
-                            self._job_running_trace[jid] = ("", run_ctx)
+                            self._job_running_trace[jid] = (tp, run_ctx)
 
                 # Close spans for jobs that have left the visible set.
                 for jid in list(self._job_pending_trace):
