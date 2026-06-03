@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Kelpflux Architecture (v5)</title>
+  <title>Kelpflux Architecture (v6)</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -83,8 +83,8 @@
         <div class="pulse-dot"></div>
         <h1>Kelpflux — System Architecture</h1>
       </div>
-      <p class="subtitle">OTel trace bridge · MPS-aware score function · sim-to-real DRL platform</p>
-      <p class="meta-row">v5 snapshot — Phase 6/7-A/7-B complete · v5 review refactor (C2/C3/K1/R19/R20) merged</p>
+      <p class="subtitle">DSAC live scheduling · hold-release hard placement · MPS-aware Slurm on k3s</p>
+      <p class="meta-row">v6 snapshot — DSAC live boost · hard placement controller · running-job scale-down guard</p>
     </div>
 
     <div class="diagram-container">
@@ -134,8 +134,8 @@
         <text x="1060" y="802" fill="#94a3b8" font-size="9">(PSS=privileged · isolated)</text>
 
         <rect x="20" y="900" width="1280" height="160" rx="12" fill="rgba(30, 41, 59, 0.3)" stroke="#94a3b8" stroke-width="1" stroke-dasharray="8,4"/>
-        <text x="38" y="922" fill="#94a3b8" font-size="11" font-weight="600">Sim-to-Real Research Layer</text>
-        <text x="240" y="922" fill="#64748b" font-size="9">(off-cluster · feeds trained checkpoint to rl_scheduler.serve)</text>
+        <text x="38" y="922" fill="#94a3b8" font-size="11" font-weight="600">DRL Placement & Research Layer</text>
+        <text x="240" y="922" fill="#64748b" font-size="9">(sim training · live hard placement · feedback into DSAC checkpoint)</text>
 
         <!-- ============================================================== -->
         <!-- ARROWS (drawn first so they sit behind component boxes)         -->
@@ -235,13 +235,13 @@
         <line x1="580" y1="990" x2="640" y2="990" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
         <line x1="780" y1="990" x2="840" y2="990" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
 
-        <!-- live_daemon ↑ to controller -->
+        <!-- placement_controller hard placement path -->
         <path d="M 910 950 Q 910 700 470 200" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead)"/>
-        <text x="930" y="500" fill="#94a3b8" font-size="8" transform="rotate(-90 930 500)">polls squeue · logs JSONL</text>
+        <text x="930" y="500" fill="#94a3b8" font-size="8" transform="rotate(-90 930 500)">hold-release path · ReqNodeList + release</text>
 
-        <!-- sim_train → rl_scheduler.serve (checkpoint upload) -->
+        <!-- sim_train → rl_scheduler.serve (checkpoint topology must match) -->
         <path d="M 310 950 Q 310 350 600 280" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="6,4" marker-end="url(#arrowhead)"/>
-        <text x="340" y="540" fill="#94a3b8" font-size="8" transform="rotate(-75 340 540)">checkpoint upload</text>
+        <text x="340" y="540" fill="#94a3b8" font-size="8" transform="rotate(-75 340 540)">checkpoint topology must match</text>
 
         <!-- ============================================================== -->
         <!-- USER LAYER                                                     -->
@@ -287,7 +287,7 @@
 
         <rect x="560" y="85" width="280" height="115" rx="6" fill="#0f172a"/>
         <rect x="560" y="85" width="280" height="115" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="700" y="103" fill="white" font-size="11" font-weight="600" text-anchor="middle">worker StatefulSets (3 pools)</text>
+        <text x="700" y="103" fill="white" font-size="11" font-weight="600" text-anchor="middle">worker StatefulSets (CPU/GPU pools)</text>
         <rect x="572" y="113" width="80" height="44" rx="4" fill="rgba(15, 23, 42, 0.6)" stroke="#34d399" stroke-width="0.8"/>
         <text x="612" y="127" fill="#34d399" font-size="9" font-weight="600" text-anchor="middle">cpu</text>
         <text x="612" y="139" fill="#94a3b8" font-size="7" text-anchor="middle">1–4 nodes</text>
@@ -295,12 +295,12 @@
         <rect x="660" y="113" width="80" height="44" rx="4" fill="rgba(15, 23, 42, 0.6)" stroke="#34d399" stroke-width="0.8"/>
         <text x="700" y="127" fill="#34d399" font-size="9" font-weight="600" text-anchor="middle">gpu-4070</text>
         <text x="700" y="139" fill="#94a3b8" font-size="7" text-anchor="middle">0–2 nodes</text>
-        <text x="700" y="151" fill="#94a3b8" font-size="7" text-anchor="middle">MPS 100 slots</text>
+        <text x="700" y="151" fill="#94a3b8" font-size="7" text-anchor="middle">MPS:100 slots</text>
         <rect x="748" y="113" width="80" height="44" rx="4" fill="rgba(15, 23, 42, 0.6)" stroke="#34d399" stroke-width="0.8"/>
         <text x="788" y="127" fill="#34d399" font-size="9" font-weight="600" text-anchor="middle">gpu-4080</text>
         <text x="788" y="139" fill="#94a3b8" font-size="7" text-anchor="middle">0–2 nodes</text>
-        <text x="788" y="151" fill="#94a3b8" font-size="7" text-anchor="middle">MPS 100 slots</text>
-        <text x="700" y="173" fill="#94a3b8" font-size="8" text-anchor="middle">updateStrategy: OnDelete · preStop drain · PDB maxUnavailable=1</text>
+        <text x="788" y="151" fill="#94a3b8" font-size="7" text-anchor="middle">MPS:100 slots</text>
+        <text x="700" y="173" fill="#94a3b8" font-size="8" text-anchor="middle">OnDelete · preStop drain · running-job scale-down guard</text>
         <text x="700" y="188" fill="#94a3b8" font-size="8" text-anchor="middle">resources.requests = limits → Guaranteed QoS</text>
 
         <!-- ============================================================== -->
@@ -326,9 +326,9 @@
         <rect x="520" y="260" width="160" height="65" rx="6" fill="#0f172a"/>
         <rect x="520" y="260" width="160" height="65" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
         <text x="600" y="278" fill="white" font-size="11" font-weight="600" text-anchor="middle">rl_scheduler</text>
-        <text x="600" y="293" fill="#94a3b8" font-size="9" text-anchor="middle">:8002 /decide  /act</text>
-        <text x="600" y="306" fill="#94a3b8" font-size="8" text-anchor="middle">DSAC · shadow mode</text>
-        <text x="600" y="319" fill="#fb7185" font-size="7" text-anchor="middle">serve_otel → traceparent</text>
+        <text x="600" y="293" fill="#94a3b8" font-size="9" text-anchor="middle">:8002 /decide · /act</text>
+        <text x="600" y="306" fill="#94a3b8" font-size="8" text-anchor="middle">DSAC live · shadow=false</text>
+        <text x="600" y="319" fill="#fb7185" font-size="7" text-anchor="middle">boost + placement intent</text>
 
         <rect x="700" y="260" width="130" height="65" rx="6" fill="#0f172a"/>
         <rect x="700" y="260" width="130" height="65" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
@@ -345,7 +345,7 @@
         <text x="195" y="375" fill="#34d399" font-size="11" font-weight="700">slurm-elastic-operator (Deployment)</text>
         <text x="430" y="375" fill="#94a3b8" font-size="8">K1: 100m–500m CPU / 256–512Mi</text>
         <text x="620" y="375" fill="#94a3b8" font-size="8">RBAC: namespace Role (pods/exec)</text>
-        <text x="195" y="389" fill="#fb7185" font-size="8" font-style="italic">[v5 C2 refactor: 906 LoC → 5 mixin modules]</text>
+        <text x="195" y="389" fill="#fb7185" font-size="8" font-style="italic">[running-job guard: no scale-down while jobs are active]</text>
 
         <text x="240" y="413" fill="#94a3b8" font-size="9" font-weight="600">watchers.py — WatcherMixin (4 threads)</text>
 
@@ -380,7 +380,7 @@
         <text x="275" y="612" fill="white" font-size="10" font-weight="600" text-anchor="middle">reconciler.py</text>
         <text x="275" y="626" fill="#94a3b8" font-size="8" text-anchor="middle">_process_pool</text>
         <text x="275" y="640" fill="#94a3b8" font-size="8" text-anchor="middle">ghost detector</text>
-        <text x="275" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">checkpoint guard</text>
+        <text x="275" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">running-job guard</text>
         <text x="275" y="668" fill="#fb7185" font-size="7" text-anchor="middle">OTel job lifecycle</text>
 
         <rect x="370" y="595" width="170" height="80" rx="6" fill="#0f172a"/>
@@ -388,8 +388,8 @@
         <text x="455" y="612" fill="white" font-size="10" font-weight="600" text-anchor="middle">scale_actions.py</text>
         <text x="455" y="626" fill="#94a3b8" font-size="8" text-anchor="middle">_do_scale_up</text>
         <text x="455" y="640" fill="#94a3b8" font-size="8" text-anchor="middle">_do_scale_down</text>
-        <text x="455" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">drain-then-scale</text>
-        <text x="455" y="668" fill="#fb7185" font-size="7" text-anchor="middle">scale_up_decision span</text>
+        <text x="455" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">running jobs block scale-down</text>
+        <text x="455" y="668" fill="#fb7185" font-size="7" text-anchor="middle">drain only after idle</text>
 
         <rect x="550" y="595" width="170" height="80" rx="6" fill="#0f172a"/>
         <rect x="550" y="595" width="170" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
@@ -408,7 +408,7 @@
         <text x="780" y="668" fill="#fb7185" font-size="7" text-anchor="middle">+ exemplars</text>
 
         <text x="510" y="722" fill="#64748b" font-size="8" text-anchor="middle">munge + JWT secrets via projected volumes · NetworkPolicy default-deny + per-pod whitelist</text>
-        <text x="510" y="737" fill="#64748b" font-size="8" text-anchor="middle">ConfigMap checksum annotation triggers worker roll on slurm.conf change</text>
+        <text x="510" y="737" fill="#64748b" font-size="8" text-anchor="middle">Scale-down guard: running_jobs > 0 blocks drain/replica patch</text>
 
         <!-- ============================================================== -->
         <!-- MONITORING NAMESPACE                                            -->
@@ -455,7 +455,7 @@
 
         <rect x="920" y="455" width="330" height="34" rx="4" fill="rgba(15, 23, 42, 0.5)" stroke="#22d3ee" stroke-width="0.6"/>
         <text x="930" y="470" fill="white" font-size="9" font-weight="600">operator</text>
-        <text x="930" y="482" fill="#64748b" font-size="7">poll duration · scale events · checkpoint guard blocks</text>
+        <text x="930" y="482" fill="#64748b" font-size="7">poll duration · scale events · running-job guard blocks</text>
 
         <rect x="920" y="495" width="330" height="34" rx="4" fill="rgba(15, 23, 42, 0.5)" stroke="#22d3ee" stroke-width="0.6"/>
         <text x="930" y="510" fill="white" font-size="9" font-weight="600">sla-efficiency</text>
@@ -524,16 +524,16 @@
 
         <rect x="840" y="950" width="140" height="80" rx="6" fill="#0f172a"/>
         <rect x="840" y="950" width="140" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="910" y="970" fill="white" font-size="11" font-weight="600" text-anchor="middle">live_daemon</text>
-        <text x="910" y="986" fill="#94a3b8" font-size="9" text-anchor="middle">polls squeue</text>
-        <text x="910" y="1000" fill="#94a3b8" font-size="8" text-anchor="middle">→ POST /act</text>
-        <text x="910" y="1014" fill="#94a3b8" font-size="8" text-anchor="middle">logs JSONL</text>
-        <text x="910" y="1026" fill="#fbbf24" font-size="7" text-anchor="middle">SHADOW_MODE default</text>
+        <text x="910" y="970" fill="white" font-size="11" font-weight="600" text-anchor="middle">placement_controller</text>
+        <text x="910" y="986" fill="#94a3b8" font-size="9" text-anchor="middle">hold-release path</text>
+        <text x="910" y="1000" fill="#94a3b8" font-size="8" text-anchor="middle">POST /act → DSAC</text>
+        <text x="910" y="1014" fill="#94a3b8" font-size="8" text-anchor="middle">ReqNodeList + release</text>
+        <text x="910" y="1026" fill="#fbbf24" font-size="7" text-anchor="middle">held jobs only</text>
 
-        <text x="1130" y="985" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">tests: ruff clean</text>
-        <text x="1130" y="998" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">32 sim · 25 operator</text>
-        <text x="1130" y="1011" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">31 lua · 9 bandit</text>
-        <text x="1130" y="1024" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">97 PASS · 5 CI workflows</text>
+        <text x="1130" y="985" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">tests: local pass</text>
+        <text x="1130" y="998" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">32 sim · 28 operator</text>
+        <text x="1130" y="1011" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">31 lua · 19 rl</text>
+        <text x="1130" y="1024" fill="#64748b" font-size="9" font-style="italic" text-anchor="middle">CI: Helm · operator · RL</text>
 
         <!-- ============================================================== -->
         <!-- LEGEND (outside all boundaries)                                 -->
@@ -583,7 +583,7 @@
         <line x1="740" y1="1148" x2="756" y2="1148" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
         <text x="762" y="1152" fill="#94a3b8" font-size="8">enqueue event</text>
 
-        <text x="1280" y="1152" fill="#fb7185" font-size="8" text-anchor="end" font-weight="600">[NEW] = added in v5 review</text>
+        <text x="1280" y="1152" fill="#fb7185" font-size="8" text-anchor="end" font-weight="600">[NEW] = current live hard-placement path</text>
       </svg>
     </div>
 
@@ -606,30 +606,30 @@
       <div class="card">
         <div class="card-header">
           <div class="card-dot emerald"></div>
-          <h3>v5 C2 — operator/ refactor</h3>
+          <h3>Operator lifecycle guard</h3>
         </div>
         <ul>
-          <li>• <b>app.py</b> 353 LoC — wire + main loop + _PoolEventQueue + JsonLogger</li>
-          <li>• <b>watchers.py</b> 118 — STS/Pod/Slurm-diff/timer (4 threads)</li>
-          <li>• <b>reconciler.py</b> 210 — _process_pool + OTel job lifecycle</li>
-          <li>• <b>scale_actions.py</b> 234 — _do_scale_up/down/keep · drain-then-scale</li>
-          <li>• <b>fragmentation_loop.py</b> 118 — Gandiva-lite (shadow mode)</li>
-          <li>• Mixin pattern · zero behavior change · 25/25 tests pass</li>
+          <li>• <b>policy.py</b>: <code>running_jobs &gt; 0</code> returns <code>keep</code></li>
+          <li>• <b>scale_actions.py</b>: second guard prevents accidental drain/patch</li>
+          <li>• Keeps GPU workers alive while placed jobs are RUNNING/COMPLETING</li>
+          <li>• Avoids operator-scale-down / k8s-eviction during hard placement</li>
+          <li>• Busy-node safe floor still prevents shrinking below allocated nodes</li>
+          <li>• Operator tests: 28/28 passing</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>v5 R19 + R20 — submit helper & per-job dashboard</h3>
+          <h3>Submit path + live placement</h3>
         </div>
         <ul>
-          <li>• <b>submit_helper.lua</b>: auto <code>--mem</code> (gpu×4096 + cpu×256, clamped)</li>
-          <li>• auto <code>--partition</code> (GRES first-match) · auto <code>--qos</code> (account map)</li>
-          <li>• All silent-fallback · 26 unit tests in lua-test CI</li>
-          <li>• <b>per-job-gpu.json</b> dashboard: $hostname × $gpu × $job_id</li>
-          <li>• 5 DCGM panels + provisioning-latency exemplars → Tempo</li>
-          <li>• TraceQL deep-link <code>job_id=$job_id</code> jumps to span tree</li>
+          <li>• <b>job_submit.lua</b>: DSAC <code>/decide</code> live boost with silent fallback</li>
+          <li>• <b>placement_controller.py</b>: held queue → DSAC <code>/act</code> → <code>ReqNodeList</code></li>
+          <li>• Hard placement uses Slurm-native <code>scontrol update</code> + <code>release</code></li>
+          <li>• Node guard filters <code>DRAIN</code>, <code>DOWN</code>, <code>NOT_RESPONDING</code></li>
+          <li>• Current checkpoint is 1 node × 1 GPU; 2-node placement needs matching checkpoint</li>
+          <li>• RL scheduler tests: 19/19 passing</li>
         </ul>
       </div>
 
@@ -643,44 +643,45 @@
           <li>• weight_tuner failure → chart-default weights (load-time only)</li>
           <li>• runtime_predictor failure → <code>f_runtime_short = 0.5</code> (neutral)</li>
           <li>• rl_scheduler failure / abstain → score baseline takes over</li>
+          <li>• placement controller no-op → job remains held/pending</li>
           <li>• fragmentation reconciler → shadow mode + rate limit</li>
-          <li>• Operator circuit breaker (exponential backoff, max 60s)</li>
+          <li>• Operator circuit breaker + running-job scale-down guard</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot violet"></div>
-          <h3>Sim-to-Real research layer</h3>
+          <h3>DRL placement research layer</h3>
         </div>
         <ul>
           <li>• <code>sim/</code> discrete-event MPS-aware simulator (3 trace families)</li>
-          <li>• <code>sim_train.py</code> DSAC + PER + n-step + shaping + CQL + curriculum</li>
-          <li>• <code>eval_dsac_placement.py</code> paired CI vs score baseline (5 seeds × 3 fam)</li>
-          <li>• <code>rlpd_finetune.py</code> offline+online mixing (UTD=4)</li>
-          <li>• <code>live_daemon.py</code> SHADOW mode logs (obs, act, rew) JSONL</li>
-          <li>• Current eval: DRL trails baseline 42–386% — see docs/eval-writeup §6</li>
+          <li>• <code>sim_train.py</code> trains DSAC topology-specific checkpoints</li>
+          <li>• <code>eval_dsac_placement.py</code> validates placement policy vs score baseline</li>
+          <li>• <code>rlpd_finetune.py</code> mixes offline simulator and live transition logs</li>
+          <li>• <code>placement_controller.py</code> is the Slurm-safe live hard-placement bridge</li>
+          <li>• Multi-worker placement requires checkpoint topology = live node/GPU topology</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot orange"></div>
-          <h3>Hard engineering choices</h3>
+          <h3>Hard engineering guardrails</h3>
         </div>
         <ul>
           <li>• GPU Operator isolated to own namespace (PSS=privileged)</li>
-          <li>• Worker StatefulSet <code>updateStrategy: OnDelete</code> — helm upgrade doesn't kill jobs</li>
-          <li>• Drain-then-scale + R1 force-kill timeout for hung srun steps</li>
-          <li>• ConfigMap checksum annotations roll workers on config changes</li>
+          <li>• Worker StatefulSet <code>updateStrategy: OnDelete</code> avoids job-killing upgrades</li>
+          <li>• Scale-down requires no running jobs; action layer enforces the same guard</li>
+          <li>• Hard placement only touches held jobs and uses Slurm-native constraints</li>
+          <li>• Node filters exclude <code>DRAIN</code>, <code>DOWN</code>, <code>NOT_RESPONDING</code></li>
           <li>• Munge + JWT projected secrets · NetworkPolicy default-deny</li>
-          <li>• <code>requests = limits</code> Guaranteed QoS on all critical pods (K1 v5)</li>
         </ul>
       </div>
     </div>
 
     <p class="footer">
-      Kelpflux · main @ commit 2076c23 · Slurm 21.08 · Kubernetes 1.28+ · Helm chart slurm-platform 0.1.0
+      Kelpflux · main @ commit 18e9d4d · Slurm 21.08 · k3s + NVIDIA GPU · Helm chart slurm-platform 0.1.0
     </p>
   </div>
 </body>
