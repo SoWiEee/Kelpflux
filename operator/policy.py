@@ -39,20 +39,8 @@ class CheckpointAwareQueuePolicy:
             partition_cfg.max_replicas,
         )
 
-        if candidate_target < state.current_replicas and self.guard_enabled and state.running_jobs > 0:
-            if not partition_cfg.checkpoint_path:
-                # No checkpoint path configured — guard is effectively disabled for this pool.
-                pass
-            elif checkpoint_age_seconds is None:
-                # Checkpoint file not found.  Allow scale-down during the grace period
-                # so jobs that haven't written their first checkpoint yet are not blocked.
-                grace = partition_cfg.checkpoint_grace_seconds
-                if grace > 0 and missing_since_seconds is not None and missing_since_seconds < grace:
-                    pass  # within grace period — allow scale-down
-                else:
-                    return ScalingDecision(state.current_replicas, "keep", "checkpoint_unknown_block_scale_down")
-            elif checkpoint_age_seconds > partition_cfg.max_checkpoint_age_seconds:
-                return ScalingDecision(state.current_replicas, "keep", "checkpoint_stale_block_scale_down")
+        if candidate_target < state.current_replicas and state.running_jobs > 0:
+            return ScalingDecision(state.current_replicas, "keep", "running_jobs_block_scale_down")
 
         return self._to_decision(state.current_replicas, candidate_target, "no_pending_jobs")
 

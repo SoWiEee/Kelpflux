@@ -145,15 +145,15 @@ flowchart LR
 
 DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被解碼成 `(job_i, node_j, gpu_k)`，action mask 只允許選擇 MPS free slots 足夠的 placement。
 
-| DSAC 輸出 | Production submit path | 目前用途 |
-|-----------|------------------------|----------|
-| `job_i` | 間接生效 | 若選中的 job 是正在 submit 的 job，回傳 positive `priority_boost` |
-| `node_j` | 不直接生效 | 記錄為 placement intent，用於 metrics、Grafana 與訓練分析 |
-| `gpu_k` | 不直接生效 | 記錄為 placement intent，用於觀察模型偏好的 GPU slot |
-| `priority_boost` | 直接生效 | 加到 `job_desc.priority`，讓 Slurm 更早考慮該 job |
-| `abstain` | 直接生效 | guardrail 觸發時不 boost，回到 score + Slurm |
+| DSAC 輸出 | Submit-time live path | Hard placement controller |
+|-----------|-----------------------|---------------------------|
+| `job_i` | 若選中的 job 是正在 submit 的 job，回傳 positive `priority_boost` | 對 held pending queue 中被選到的 job 執行 placement |
+| `node_j` | 記錄為 placement intent，用於 metrics、Grafana 與訓練分析 | 映射到可用 Slurm GPU worker node，寫入 `ReqNodeList=<node>` |
+| `gpu_k` | 記錄為 placement intent，用於觀察模型偏好的 GPU slot | 目前 live worker 是 1 GPU / node，因此 `gpu_k=0`；多 GPU node 需要對應 GPU/MPS slot topology |
+| `priority_boost` | 加到 `job_desc.priority`，讓 Slurm 更早考慮該 job | 不使用；controller 透過 hold-release 控制何時進入 Slurm placement |
+| `abstain` / no-op | guardrail 觸發時不 boost，回到 score + Slurm | 不更新 job，保持 held/pending，等待下一輪或人工處理 |
 
-這個設計讓 live cluster 可以先安全使用 RL 影響排序，同時保留完整 placement-aware state/action 資料。若要把 `node_j` / `gpu_k` 也變成 production hard placement，需要再接上一條 Slurm-safe 的直接 placement 執行路徑。
+Production submit path 仍是低風險預設；hard placement controller 是受控上線路徑，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
 
 ### 3.3 Submit 到硬體分配的時序
 
@@ -183,18 +183,26 @@ sequenceDiagram
     G->>M: GPU utilization and MPS free slots
 ```
 
-### 3.4 直接 Placement 原型與上線邊界
+### 3.4 Hard Placement Controller
 
-程式庫中保留 `services/rl_scheduler/live_daemon.py` 作為直接 placement 原型：它會輪詢 Slurm cluster state，讓 DSAC 選 `(job, node, gpu)`，再以 explicit `--nodelist` / `--gres=mps:N` 的方式執行 placement。這條路徑適合研究與 shadow logging，但不是目前 `scripts/deploy-2.sh` 的 production submit path。
+`services/rl_scheduler/placement_controller.py` 是目前的 Slurm-safe hard placement 執行路徑。它輪詢 Slurm held queue 與 GPU worker state，呼叫 DSAC `/act`，把 action 解碼出的 `node_j` 映射到可用 worker，接著執行：
 
-若要把直接 placement 變成上線規格，還需要補齊：
+```bash
+scontrol update JobId=<job_id> ReqNodeList=<selected_node>
+scontrol release <job_id>
+```
 
-- 穩定的 live snapshot collector，能把真實 Slurm node / GPU / MPS state 對應到 DSAC 的 `node_j` / `gpu_k`。
-- Slurm-safe 的 hard placement 執行方式，例如 hold-release、`scontrol update`、或受控 daemon，而不是在 `job_submit.lua` 內長時間阻塞。
-- 與 Slurm backfill / fairshare / preemption 的衝突處理規則。
-- 直接 placement 的 live 驗證腳本、rollback policy 與 Grafana 面板。
+執行規則：
 
-因此目前可以對外描述為：Kelpflux 已完成 production-safe 的 DRL-based scheduling，並具備 placement-aware action space 與完整客製 placement stack；直接由 DRL hard-bind node/GPU 則是下一步上線強化項目。
+- 預設只處理 `JobHeldUser` / `JobHeldAdmin` pending jobs，避免碰到一般使用者已排隊的 job。
+- 使用者的 GPU/MPS 需求必須在提交時已存在，例如 `sbatch --hold -p gpu-rtx4070 --gres=mps:10 ...`；controller 不在 release 後修改 GRES。
+- 會排除 `DRAIN`、`DOWN`、`NOT_RESPONDING`、`FAIL` 的 worker node。
+- 會讀 `/healthz` 的 `n_actions`，若 node list 大於 checkpoint topology 支援的 placement 數，會自動修剪並在 log 中提示需要重新訓練 / 部署更大 topology checkpoint。
+- DSAC no-op 時不更新 job，維持 held/pending。
+
+Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131` 被更新為 `ReqNodeList=slurm-worker-gpu-rtx4070-1`，Slurm 隨後配置 `NodeList=slurm-worker-gpu-rtx4070-1`、`BatchHost=slurm-worker-gpu-rtx4070-1`、`TRES=gres/mps=10`。同次驗證也暴露 elastic operator 目前會在 `running_jobs=1` 但 `pending_jobs=0` 時繼續 scale down GPU StatefulSet，導致 worker eviction；這是 hard placement 常駐化前需要修正的 worker lifecycle guard。
+
+`services/rl_scheduler/live_daemon.py` 仍保留為研究原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，適合離線比較與 RLPD transition 蒐集，但不作為目前建議的 Slurm-safe hard placement path。
 
 ## 4. Slurm 基礎排程設定
 
@@ -551,7 +559,8 @@ kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 | `chart/lua/rl_hook.lua` | Lua client for DSAC `/decide` |
 | `services/rl_scheduler/serve.py` | DSAC FastAPI service |
 | `services/rl_scheduler/snapshot_agent.py` | Periodic Slurm REST snapshot updater for `/snapshot` |
-| `services/rl_scheduler/live_daemon.py` | Direct placement prototype daemon; not enabled by `scripts/deploy-2.sh` by default |
+| `services/rl_scheduler/placement_controller.py` | Slurm-safe DSAC hard placement controller using hold-release and `ReqNodeList` |
+| `services/rl_scheduler/live_daemon.py` | Direct placement research prototype; not enabled by `scripts/deploy-2.sh` by default |
 | `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
 | `services/runtime_predictor/` | Runtime prediction service |
 | `services/weight_tuner/` | UCB1 weight tuner |

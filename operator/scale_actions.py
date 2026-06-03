@@ -88,6 +88,23 @@ class ScaleActionsMixin:
 
     def _do_scale_down(self, partition_cfg: PartitionConfig, state, decision, key: str,
                        cooldown_elapsed: float, cooldown_remaining: int) -> None:
+        if state.running_jobs > 0:
+            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="running_jobs").inc()
+            self.logger.emit(
+                "scale_skipped",
+                policy=self.cfg.policy_name,
+                partition=partition_cfg.partition,
+                action="scale_down",
+                statefulset=partition_cfg.worker_statefulset,
+                from_replicas=state.current_replicas,
+                to_replicas=decision.target_replicas,
+                reason="running_jobs_block_scale_down",
+                pending_jobs=state.pending_jobs,
+                running_jobs=state.running_jobs,
+                busy_nodes=state.busy_nodes,
+            )
+            return
+
         if cooldown_elapsed < partition_cfg.scale_down_cooldown:
             _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="cooldown").inc()
             self.logger.emit(
