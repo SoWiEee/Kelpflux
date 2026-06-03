@@ -6,9 +6,9 @@ Kelpflux 的主要貢獻不是取代 Slurm，而是在 Slurm 前後加入一層�
 
 - 將使用者的 CPU / GPU / VRAM / MPS 需求正規化成 Slurm 能執行的 placement contract。
 - 以 submit-time score 作為穩定 fallback，避免 RL service 不可用時影響提交。
-- 以 DSAC 在 live traffic 上介入 pending job 的排序，讓模型能根據 queue、MPS free slots、GPU state 與 runtime signal 選出較值得提前的 job。
+- 以 DSAC 在 live traffic 上介入 pending job 的排序，並在 hard placement path 中把模型輸出的 `node_j` / `gpu_k` 轉成 Slurm 原生 placement constraint。
 - 以 Slurm GRES、`select/cons_tres`、Kubernetes worker pool、NVIDIA runtime 與 MPS control daemon 共同完成硬體資源配置。
-- 以 Prometheus / Grafana / OpenTelemetry 暴露決策、queue、GPU、MPS 與 placement intent，讓非開發者也能看懂系統如何把 job 放到資源上。
+- 以 Prometheus / Grafana / OpenTelemetry 暴露決策、queue、GPU、MPS、placement intent 與 hard placement action，讓非開發者也能看懂系統如何把 job 放到資源上。
 
 ## 1. 上線架構
 
@@ -21,9 +21,11 @@ Slurm job_submit.lua
     |-- score function: MPS / VRAM / fragmentation / runtime signal
     |-- runtime predictor: 可選，用於短工優先與 walltime 建議
     |-- weight tuner: 可選，載入目前最佳 score 係數
-    |-- DSAC scheduler: live 模式時可回傳 priority boost + placement intent
+    |-- DSAC scheduler: live 模式時可回傳 priority boost + placement action
     v
 Slurm priority + backfill + select/cons_tres
+    |
+    |-- optional hard placement controller: /act -> ReqNodeList -> release
     v
 Kubernetes worker pool + NVIDIA runtime + Slurm GRES
     v
@@ -34,8 +36,8 @@ physical CPU / GPU / MPS slots
 
 - Slurm 仍是最終資源分配與 job lifecycle owner。
 - `job_submit.lua` 在提交時調整 priority / metadata / placement contract，不阻塞 Slurm 的基本行為。
-- DSAC live scheduler 以 priority boost 介入排序，並輸出 `node_j` / `gpu_k` placement intent 供 metrics 與後續直接 placement 使用。
-- 上線 production submit path 不直接覆蓋 Slurm node allocation；實際 placement 仍由 Slurm `select/cons_tres`、GRES、Kubernetes worker pool 與 NVIDIA runtime 執行。
+- DSAC live scheduler 以 priority boost 介入排序；hard placement controller 會把 `node_j` / `gpu_k` action 轉成 Slurm `ReqNodeList` + release。
+- Submit-time path 不在 `job_submit.lua` 內覆蓋 node allocation；正式 hard placement path 透過 Slurm 原生 hold-release 與 `select/cons_tres` 執行。
 - 任何 DSAC 失敗都 fallback 到 score / Slurm 原生排程。
 - GPU live migration 不在上線規格內；若要處理 running job，只能走 application-level checkpoint + requeue。
 
@@ -99,7 +101,7 @@ flowchart TD
 
 - helper 只補缺值，不覆蓋使用者已指定的 partition、memory 或 QoS。
 - score function 產生穩定的 submit-time priority delta，是 DSAC 不可用時的主要 fallback。
-- DSAC live scheduler 在 production submit path 會加 priority boost，並回傳 `node_j` / `gpu_k` 作為 placement intent 與觀測資料；實際硬體 placement 仍由 Slurm `select/cons_tres` 決定。
+- DSAC live scheduler 在 submit-time path 會加 priority boost，並回傳 `node_j` / `gpu_k` 作為 placement intent；hard placement controller 會在 held job path 中把同一類 action 落成 `ReqNodeList`。
 - GPU job 的硬體資源由 Kubernetes worker pod、NVIDIA runtime、Slurm GRES 與 MPS slot 共同約束，這是目前客製 placement 的執行層。
 
 ## 3. 完整排程與客製 Placement Stack
@@ -114,32 +116,37 @@ flowchart LR
     C --> R["DSAC live policy<br/>queue + GPU + MPS snapshot"]
     S --> Q["Final priority"]
     R --> Q
-    R --> I["Placement intent<br/>job_i, node_j, gpu_k"]
+    R --> I["Placement action<br/>job_i, node_j, gpu_k"]
+    I --> HC["Hard placement controller<br/>held queue only"]
+    HC --> NRL["ReqNodeList + release"]
     Q --> P["Slurm priority queue<br/>multifactor + backfill"]
     C --> P
+    NRL --> P
     P --> T["select/cons_tres<br/>TRES / GRES allocation"]
     T --> K["Kubernetes worker pool<br/>CPU/GPU StatefulSets"]
     K --> N["NVIDIA GPU Operator<br/>device plugin + MPS"]
     N --> G["Physical resources<br/>CPU cores / GPU / MPS slots"]
     I --> M["Prometheus / Grafana<br/>visualized decision"]
+    HC --> M
     G --> M
 ```
 
 ### 3.1 Placement Contract
 
-目前 production path 中，真正會被執行的 placement contract 由 submit helper、使用者 sbatch flags 與 Slurm config 共同決定：
+Submit-time path 中，placement contract 由 submit helper、使用者 sbatch flags 與 Slurm config 共同決定；hard placement path 會在 held job release 前額外寫入 `ReqNodeList`：
 
 | Contract 欄位 | 來源 | 執行者 | 作用 |
 |---------------|------|--------|------|
 | `partition` | 使用者指定或 submit helper 補齊 | Slurm + Kelpflux operator | 決定 CPU / GPU worker pool，例如 `cpu`、`gpu-rtx4070` |
 | `constraint` / features | 使用者指定 | Slurm node feature matching | 約束 VRAM tier、GPU 型號或節點特徵 |
+| `ReqNodeList` | hard placement controller | Slurm scheduler / select plugin | 將 DSAC 選到的 worker node 轉成 hard placement constraint |
 | `gres/gpu` | `--gres` / `tres_per_node` | Slurm GRES + NVIDIA device plugin | 配置 GPU 類型與數量 |
 | `gres/mps` | `--gres` / `tres_per_node` | Slurm GRES + NVIDIA MPS control daemon | 配置單 GPU 上的 MPS slot |
 | `memory` | 使用者指定或 helper 估算 | Slurm cgroup / Kubernetes pod resources | 避免 job 在 placement 後因 memory 不足失敗 |
 | `qos` / priority | 使用者、helper、score、DSAC | Slurm priority queue | 決定 pending jobs 的排序與 backfill 機會 |
-| worker pool size | Slurm pending state | Kelpflux operator | 依 pending jobs 擴縮 Kubernetes worker StatefulSet |
+| worker pool size | Slurm pending/running state | Kelpflux operator | pending jobs 觸發 scale-up；running jobs 阻止 scale-down |
 
-換句話說，Kelpflux 的客製 placement 不是單一 API call，而是一條可被多層系統共同執行的約束鏈：job submit 時建立 contract，Slurm 根據 contract 選資源，operator 確保 worker pool 存在，NVIDIA stack 提供 GPU / MPS isolation。
+換句話說，Kelpflux 的客製 placement 不是單一 API call，而是一條可被多層系統共同執行的約束鏈：job submit 時建立 contract，Slurm 根據 contract 選資源，hard placement controller 可對 held jobs 寫入 `ReqNodeList`，operator 確保 worker pool 存在且不縮掉 running jobs，NVIDIA stack 提供 GPU / MPS isolation。
 
 ### 3.2 DSAC 在 Placement 中的角色
 
@@ -153,7 +160,7 @@ DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被
 | `priority_boost` | 加到 `job_desc.priority`，讓 Slurm 更早考慮該 job | 不使用；controller 透過 hold-release 控制何時進入 Slurm placement |
 | `abstain` / no-op | guardrail 觸發時不 boost，回到 score + Slurm | 不更新 job，保持 held/pending，等待下一輪或人工處理 |
 
-Production submit path 仍是低風險預設；hard placement controller 是受控上線路徑，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
+Submit-time path 仍是低風險預設；hard placement controller 是正式可用的 Slurm-safe placement path，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗與受控上線。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
 
 ### 3.3 Submit 到硬體分配的時序
 
@@ -161,7 +168,8 @@ Production submit path 仍是低風險預設；hard placement controller 是受�
 sequenceDiagram
     participant U as User
     participant L as job_submit.lua
-    participant R as DSAC /decide
+    participant R as DSAC /decide + /act
+    participant P as placement_controller
     participant S as Slurm queue
     participant O as Kelpflux operator
     participant K as K8s worker pool
@@ -174,12 +182,15 @@ sequenceDiagram
     L->>R: POST /decide with job + latest snapshot
     R-->>L: priority_boost + job_i/node_j/gpu_k + safety state
     L->>S: Submit final priority + placement contract
+    P->>R: POST /act for held placement queue
+    R-->>P: selected job_i/node_j/gpu_k
+    P->>S: scontrol update ReqNodeList + release
     S->>S: Multifactor priority + backfill
     S->>O: Pending job reveals required pool
     O->>K: Scale CPU/GPU worker StatefulSet
     K->>G: RuntimeClass + device plugin + MPS control daemon
     S->>G: Allocate GRES gpu/mps and start job
-    R->>M: decision/value/entropy/placement intent
+    R->>M: decision/value/entropy/placement action
     G->>M: GPU utilization and MPS free slots
 ```
 
@@ -200,9 +211,9 @@ scontrol release <job_id>
 - 會讀 `/healthz` 的 `n_actions`，若 node list 大於 checkpoint topology 支援的 placement 數，會自動修剪並在 log 中提示需要重新訓練 / 部署更大 topology checkpoint。
 - DSAC no-op 時不更新 job，維持 held/pending。
 
-Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131` 被更新為 `ReqNodeList=slurm-worker-gpu-rtx4070-1`，Slurm 隨後配置 `NodeList=slurm-worker-gpu-rtx4070-1`、`BatchHost=slurm-worker-gpu-rtx4070-1`、`TRES=gres/mps=10`。同次驗證也暴露 elastic operator 目前會在 `running_jobs=1` 但 `pending_jobs=0` 時繼續 scale down GPU StatefulSet，導致 worker eviction；這是 hard placement 常駐化前需要修正的 worker lifecycle guard。
+Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131` 被更新為 `ReqNodeList=slurm-worker-gpu-rtx4070-1`，Slurm 隨後配置 `NodeList=slurm-worker-gpu-rtx4070-1`、`BatchHost=slurm-worker-gpu-rtx4070-1`、`TRES=gres/mps=10`。後續已修正 elastic operator worker lifecycle guard：只要 pool 內 `running_jobs > 0`，policy 會回 `running_jobs_block_scale_down`，scale action 層也會阻止 drain / replica patch，因此 hard placement job 不會再因 `pending_jobs=0` 被 operator scale-down eviction。
 
-`services/rl_scheduler/live_daemon.py` 仍保留為研究原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，適合離線比較與 RLPD transition 蒐集，但不作為目前建議的 Slurm-safe hard placement path。
+`services/rl_scheduler/live_daemon.py` 保留為研究 / legacy 原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，適合離線比較與 RLPD transition 蒐集。正式 hard placement path 是 `services/rl_scheduler/placement_controller.py`，因為它使用 Slurm 原生 hold-release 與 `ReqNodeList`，可被 Slurm priority、backfill、GRES/MPS accounting 和 operator lifecycle guard 正常約束。
 
 ## 4. Slurm 基礎排程設定
 
@@ -212,7 +223,7 @@ Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131
 |------|---------------|------|
 | `SchedulerType` | `sched/backfill` | 允許不延後高優先 job 的前提下安排短 job 插隊 |
 | `SelectType` | `select/cons_tres` | 以 TRES 表示 CPU / GPU / MPS 資源 |
-| `SelectTypeParameters` | `CR_Core` | CPU core 級資源選擇；placement 仍由 Slurm 管理 |
+| `SelectTypeParameters` | `CR_Core` | CPU core 級資源選擇；submit-time 與 hard placement 都仍交由 Slurm 管理配置 |
 | `PriorityType` | `priority/multifactor` | 保留 Slurm age / job size / partition / qos 等基本排序 |
 | `AccountingStorageTRES` | `gres/gpu,gres/mps` | 讓 GPU 與 MPS usage 進 accounting |
 | `PreemptType` | 預設關閉 | 上線不主動踢 running job |
@@ -394,7 +405,7 @@ Predictor response：
 | `POST /decide` | 對提交中的 job 回傳 priority boost / abstain / selected placement |
 | `GET /metrics` | Prometheus metrics |
 
-目前 live 介入方式是 **priority boost**：
+目前 live 介入方式分成兩層：submit-time **priority boost** 是預設低風險路徑；hold-release **hard placement controller** 是正式可用的受控 placement 路徑。
 
 ```text
 job_submit.lua -> POST /decide
@@ -402,7 +413,9 @@ job_submit.lua -> POST /decide
         job_desc.priority += priority_boost
 ```
 
-DSAC 不直接執行 `srun --nodelist`，也不直接覆蓋 Slurm placement。`node_j` 與 `gpu_k` 會回傳並記錄，用於分析與後續 placement-aware 設計；目前上線仍讓 Slurm `select/cons_tres` 做實際 placement。
+在 submit-time `/decide` 路徑中，DSAC 不直接執行 `srun --nodelist`，也不在 `job_submit.lua` 內覆蓋 Slurm placement；`node_j` 與 `gpu_k` 會回傳並記錄為 placement intent，實際 placement 仍交給 Slurm `select/cons_tres`。
+
+若需要 DSAC 的 placement action 真正生效，使用 `services/rl_scheduler/placement_controller.py`：它對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到可用 GPU worker，寫入 `ReqNodeList=<selected_node>`，再 `scontrol release`。這條路徑已納入正式規格，但目前不由 `deploy-2.sh` 預設常駐啟動；啟用前需要確認 checkpoint topology 與 live node/GPU topology 一致。
 
 ### 8.1 Snapshot Schema
 
@@ -469,7 +482,7 @@ Service response：
 | invalid / masked action | 不 boost |
 | network / parse / Lua error | Lua hook no-op，submission 繼續 |
 
-目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。
+目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。hard placement controller 另以 `/act` 執行 held job placement，不受 Lua `shadowMode` 控制；controller 自身以 `--shadow / --no-shadow` 控制是否真的更新 Slurm job。
 
 ## 9. Boundary Policy
 
@@ -483,7 +496,10 @@ Service response：
 | score > 1 | clamp 到 1 |
 | `scoreGain=0` | score 只記錄，不改 priority |
 | `scoreApply=false` | score 只記錄，不改 priority |
-| DSAC abstain | 不加 boost，交給 score + Slurm |
+| DSAC abstain | submit-time 不加 boost；hard placement path 不 release / 不更新 placement |
+| DSAC no-op | submit-time 不 boost；hard placement job 維持 held/pending |
+| hard placement 選到 unavailable node | controller 過濾 DRAIN/DOWN/NOT_RESPONDING/FAIL，不更新該節點 |
+| operator scale-down during running job | policy/action guard 阻止 scale-down，保留 running/COMPLETING worker |
 
 ## 10. Monitoring Metrics
 
@@ -551,6 +567,26 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 ```
 
+Hard placement smoke check：
+
+```bash
+JOB_ID=$(kubectl -n slurm exec deploy/slurm-login -- \
+  sbatch --hold --parsable -J dsac-place-smoke \
+  -p gpu-rtx4070 --gres=mps:10 --time=00:03:00 \
+  --wrap 'hostname; sleep 10')
+
+PYTHONPATH=. python -m services.rl_scheduler.placement_controller \
+  --once --no-shadow --job-id "$JOB_ID" \
+  --node-name slurm-worker-gpu-rtx4070-0 \
+  --node-name slurm-worker-gpu-rtx4070-1 \
+  --scheduler-url http://rl-scheduler:8002 \
+  --scheduler-exec-prefix 'kubectl -n slurm exec pod/slurm-controller-0 --' \
+  --slurm-exec-prefix 'kubectl -n slurm exec deploy/slurm-login --'
+
+kubectl -n slurm exec deploy/slurm-login -- \
+  scontrol show job "$JOB_ID" | grep -E 'ReqNodeList|NodeList|BatchHost|TRES'
+```
+
 ## 12. Files
 
 | Path | Purpose |
@@ -560,7 +596,7 @@ kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 | `services/rl_scheduler/serve.py` | DSAC FastAPI service |
 | `services/rl_scheduler/snapshot_agent.py` | Periodic Slurm REST snapshot updater for `/snapshot` |
 | `services/rl_scheduler/placement_controller.py` | Slurm-safe DSAC hard placement controller using hold-release and `ReqNodeList` |
-| `services/rl_scheduler/live_daemon.py` | Direct placement research prototype; not enabled by `scripts/deploy-2.sh` by default |
+| `services/rl_scheduler/live_daemon.py` | Direct placement research / legacy prototype; not recommended for Slurm-safe production placement |
 | `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
 | `services/runtime_predictor/` | Runtime prediction service |
 | `services/weight_tuner/` | UCB1 weight tuner |
