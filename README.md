@@ -17,9 +17,9 @@ submit `sbatch` jobs against a cloud-native cluster that auto-scales CPU and
 GPU pools on demand — with MPS-based GPU sharing, checkpoint-aware draining,
 and full Prometheus observability.
  
-[快速開始](#-getting-started) ·
 [使用者教學](docs/tutorial.md) ·
 [叢集規格](docs/cluster.md) ·
+[系統架構圖](assets/architecture.html) ·
 [優化排程研究](docs/scheduler.md) ·
 [採坑紀錄和實作筆記](docs/note.md)
  
@@ -321,64 +321,13 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 bash scripts/verify-live.sh
 ```
 
-## 使用者操作教學
-
-使用者登入 login node、查看 queue、使用 Lmod、提交 OpenMP / MPI / CUDA / MPS jobs、查看輸出與 Grafana 觀測，請集中參考 [`docs/tutorial.md`](docs/tutorial.md)。
-
-README 的 Getting Started 只保留部署與驗證流程，避免部署步驟和使用者操作混在一起。
-
 ---
 
 # 🏗️ System Architecture
 
 <img width="4400" height="2280" alt="圖片" src="https://github.com/user-attachments/assets/5d27ca15-525c-4936-a447-252a8a081934" />
 
-
 > 完整架構圖請看 [`architecture.html`](assets/architecture.html)
-
-### 主要元件說明
-
-| 元件 | 角色 |
-|------|------|
-| `slurm-controller` | 執行 `slurmctld`，負責所有排程決策；job 狀態存於獨立 PVC（`slurm-ctld-state`），pod 重啟後 queue 不遺失 |
-| `slurm-login` | 使用者入口，提供 `sbatch`、`srun`、`squeue` 等指令 |
-| `slurm-worker-*` | 實際執行計算的節點，分 CPU / GPU-A10 / GPU-H100 三個池 |
-| `slurm-elastic-operator` | 自製 Python Operator，監控 Queue 狀態並動態調整各 pool 的 replicas；縮容前先 drain 節點，等待 job 完成後才減少 StatefulSet replica |
-| `slurmdbd` | Slurm Database Daemon，將 job 會計紀錄（CPU-hours、用戶統計）持久化到 MySQL，為 Fair-Share 排程提供基礎 |
-| `mysql` | 後端資料庫（StatefulSet），儲存 slurmdbd 的會計資料，使用 5 Gi PVC |
-| NFS + RWX PVC | 跨所有節點的共享磁碟，job 輸出直接寫入 `/shared` |
-| `lmod` + modulefile ConfigMaps | HPC 標準模組系統；`module load gcc/11 openmpi/4.1 cuda/12.4` 等指令在 login pod 與 job 內均可用；modulefile 由 Helm chart 產生為 K8s ConfigMap 並掛載到 login/worker pod |
-
----
-
-# ⚡ Useful Commands
-
-## Slurm Cluster
-
-```bash
-# 查看所有 pod 狀態
-kubectl -n slurm get pods -o wide
-
-# 查看 Operator 決策日誌（結構化 JSON）
-kubectl -n slurm logs deployment/slurm-elastic-operator -f | python3 -m json.tool
-
-# 查看 Slurm controller 日誌
-kubectl -n slurm logs statefulset/slurm-controller -f
-
-# 查詢 Operator 寫下的 cooldown 時間戳
-kubectl -n slurm get statefulset slurm-worker-cpu \
-  -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'
-
-# 查詢 job 會計紀錄（需要 slurmdbd 正常運行）
-kubectl -n slurm exec pod/slurm-controller-0 -- sacct -X --format=JobID,User,State,CPUTime,Start,End
-
-# 確認 slurmdbd / MySQL 狀態
-kubectl -n slurm get pods -l app=slurmdbd
-kubectl -n slurm get pods -l app=mysql
-
-# 進 login pod 提交 job
-kubectl -n slurm exec -it deploy/slurm-login -- bash
-```
 
 ---
 
@@ -398,54 +347,6 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 | 模組系統 | Lmod 6.6；modulefile 由 Helm chart 管理，掛載至 login/worker 的 `/opt/modulefiles/` |
 | 監控 | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
 | 告警 | 8 條 SLO 規則（provisioning latency、queue wait、flapping 等） |
-
----
-
-### 7-B：SSH Login ✅ 已完成
-
-使用者可用標準 SSH 直接進入 login pod，不需要安裝 kubectl 或持有 kubeconfig。
-
-```
-ssh -p 30022 root@<k3s-host-ip>
-       ↓
-NodePort :30022 → slurm-login pod
-                   ├── sbatch / squeue / sinfo（Slurm 指令即開即用）
-                   └── /shared/（NFS 掛載，模型 + 輸出共用）
-```
-
-**初次設定 SSH Key（在 k3s host 上執行）：**
-```bash
-# 1. 生成 key pair（私鑰存在 ~/.ssh/slurm_login_key）
-ssh-keygen -t ed25519 -f ~/.ssh/slurm_login_key -C "slurm-login"
-
-# 2. 把公鑰填進 chart/values-k3s.yaml 的 login.ssh.authorizedKeys
-cat ~/.ssh/slurm_login_key.pub
-
-# 3. 套用
-helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm --no-hooks
-
-# 4. 連線
-ssh -i ~/.ssh/slurm_login_key -p 30022 root@<k3s-host-ip>
-```
-
-**之後新增/移除 key（不需重新 helm install）：**
-```bash
-bash scripts/add-ssh-key.sh add    "ssh-ed25519 AAAA... user@laptop"
-bash scripts/add-ssh-key.sh remove "ssh-ed25519 AAAA... user@laptop"
-bash scripts/add-ssh-key.sh list
-```
-
-**`chart/values-k3s.yaml` 設定格式：**
-```yaml
-login:
-  ssh:
-    nodePort: 30022         # k3s NodePort 範圍 30000-32767；0 = 維持 ClusterIP
-    authorizedKeys: |
-      ssh-ed25519 AAAA... user@laptop   # 一行一個 key
-      ssh-ed25519 AAAA... user@workstation
-```
-
-sshd 已加固：`PasswordAuthentication no`、`PermitRootLogin prohibit-password`（key-only）。
 
 ---
 
