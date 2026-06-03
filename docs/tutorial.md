@@ -298,7 +298,175 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 | `job_running` | job 進入 running，表示 Slurm 已完成 placement / allocation |
 | `scale_up_decision` / `k8s_provisioning` | 若 worker 需要啟動，會看到 operator 擴容與 pod ready 的耗時 |
 
-實測範例：OpenMP job `135` 在 `slurm-worker-cpu-0` 上執行，Tempo trace id 是 `462ec09dba445df68352c97812568f5a`。這筆 trace 同時包含 `slurm-rl-scheduler/job_submit` 與 `slurm-operator/job_running`，而且 `job_running` 的 parent span 會接到 `job_submit`，代表 submit hook、RL scheduler、operator lifecycle tracing 已串成同一條 trace。
+實測範例：OpenMP job `135` 在 `slurm-worker-cpu-0` 上執行，Tempo trace id 是 `462ec09dba445df68352c97812568f5a`。這筆 trace 的完整資料存放在 Tempo；本文件只記錄可重查的 trace id、查詢方式與關鍵 span 摘要。
+
+可用 Tempo API 取回完整 trace：
+
+```bash
+kubectl -n monitoring exec deploy/grafana -- \
+  wget -qO- http://tempo:3200/api/traces/462ec09dba445df68352c97812568f5a
+```
+
+Tempo 實際記錄的關鍵 span：
+
+| Service | Span | Parent | 關鍵 attributes |
+|---------|------|--------|-----------------|
+| `slurm-rl-scheduler` | `job_submit` | root | `service.name=slurm-rl-scheduler` |
+| `slurm-operator` | `job_running` | `job_submit` | `job_id=135`, `partition=cpu`, `nodes=slurm-worker-cpu-0` |
+
+`job_running` 的 parent span 會接到 `job_submit`，代表 submit hook、RL scheduler、operator lifecycle tracing 已串成同一條 trace。注意：Slurm submit hook 呼叫 RL scheduler 時，Slurm job id 可能尚未完全定案；因此 root `job_submit` span 可能不適合只靠 `job_id` 搜尋。實務上可先用 `scontrol show job <jobid>` 找到 `AdminComment=otel=00-<trace_id>-...`，再用 `<trace_id>` 查 Tempo。
+
+完整 Tempo API response：
+
+```json
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.25.0"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "slurm-rl-scheduler"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "slurm-rl-scheduler"
+          },
+          "spans": [
+            {
+              "traceId": "Ri7AnbpEXfaDUsl4ElaPWg==",
+              "spanId": "5sgvbCvSHMo=",
+              "name": "job_submit",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1780493030006644883",
+              "endTimeUnixNano": "1780493030006665609",
+              "attributes": [
+                {
+                  "key": "job_id",
+                  "value": {
+                    "stringValue": "0"
+                  }
+                },
+                {
+                  "key": "partition",
+                  "value": {
+                    "stringValue": "unknown"
+                  }
+                },
+                {
+                  "key": "gres",
+                  "value": {
+                    "stringValue": "gpu:4294967294"
+                  }
+                },
+                {
+                  "key": "requested_cpus",
+                  "value": {
+                    "intValue": "0"
+                  }
+                }
+              ],
+              "status": {}
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.25.0"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "slurm-operator"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "slurm-operator"
+          },
+          "spans": [
+            {
+              "traceId": "Ri7AnbpEXfaDUsl4ElaPWg==",
+              "spanId": "NWfL9VTvFUs=",
+              "parentSpanId": "5sgvbCvSHMo=",
+              "name": "job_running",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1780493030335459570",
+              "endTimeUnixNano": "1780493090368100612",
+              "attributes": [
+                {
+                  "key": "job_id",
+                  "value": {
+                    "stringValue": "135"
+                  }
+                },
+                {
+                  "key": "partition",
+                  "value": {
+                    "stringValue": "cpu"
+                  }
+                },
+                {
+                  "key": "nodes",
+                  "value": {
+                    "stringValue": "slurm-worker-cpu-0"
+                  }
+                }
+              ],
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
 
 OpenMP 輸出範例：
 
