@@ -90,6 +90,8 @@ def sim_train(
     potential_shaping: bool = True,
     use_per: bool = True,
     use_iqn: bool = False,
+    risk_mode: str = "mean",
+    risk_alpha: float = 0.25,
     cql_alpha: float = 0.1,
     curriculum: bool = False,
     curriculum_stages: Optional[list] = None,
@@ -124,7 +126,8 @@ def sim_train(
     )
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
-        use_attention=use_attention, use_iqn=use_iqn, cql_alpha=cql_alpha,
+        use_attention=use_attention, use_iqn=use_iqn,
+        risk_mode=risk_mode, risk_alpha=risk_alpha, cql_alpha=cql_alpha,
     )
 
     if use_per:
@@ -275,7 +278,12 @@ def main(argv=None) -> int:
     # Architecture flags
     p.add_argument("--no-attention",         action="store_true")
     p.add_argument("--use-iqn",              action="store_true",
-                   help="IQN critic (quantile Huber loss)")
+                   help="IQN distributional critic (quantile Huber loss)")
+    p.add_argument("--risk-mode",            choices=["mean", "cvar"],
+                   default="mean",
+                   help="risk objective for IQN action selection")
+    p.add_argument("--risk-alpha",           type=float, default=0.25,
+                   help="lower-tail mass for CVaR risk mode")
     # Improvement flags
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable potential-based reward shaping")
@@ -300,6 +308,7 @@ def main(argv=None) -> int:
           f"trace={traces}  steps={args.total_steps:,}  "
           f"n_jobs={args.n_jobs}  nstep={args.nstep_n}  "
           f"PER={not args.no_per}  shaping={not args.no_potential_shaping}  "
+          f"risk={args.risk_mode}:{args.risk_alpha}  "
           f"CQL={args.cql_alpha}  curriculum={args.curriculum}  device={device}")
     sim_train(
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
@@ -313,6 +322,8 @@ def main(argv=None) -> int:
         potential_shaping=not args.no_potential_shaping,
         use_per=not args.no_per,
         use_iqn=args.use_iqn,
+        risk_mode=args.risk_mode,
+        risk_alpha=args.risk_alpha,
         cql_alpha=args.cql_alpha,
         curriculum=args.curriculum,
     )

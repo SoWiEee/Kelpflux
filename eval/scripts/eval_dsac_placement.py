@@ -129,6 +129,12 @@ def main(argv=None) -> int:
     p.add_argument("--gpus-per-node",  type=int, default=1)
     p.add_argument("--total-steps",    type=int, default=500_000,
                    help="sim training steps (ignored with --no-train)")
+    p.add_argument("--warmup-steps",   type=int, default=2_000,
+                   help="random/score warmup steps before gradient updates")
+    p.add_argument("--utd-ratio",      type=int, default=4,
+                   help="gradient updates per environment step")
+    p.add_argument("--batch-size",     type=int, default=256,
+                   help="training batch size")
     p.add_argument("--n-jobs",         type=int, default=50)
     p.add_argument("--seeds",          type=int, nargs="+",
                    default=[42, 43, 44, 45, 46])
@@ -149,7 +155,12 @@ def main(argv=None) -> int:
     p.add_argument("--no-attention",         action="store_true",
                    help="MLP Q-network instead of attention")
     p.add_argument("--use-iqn",              action="store_true",
-                   help="IQN critic (quantile Huber loss)")
+                   help="IQN distributional critic (quantile Huber loss)")
+    p.add_argument("--risk-mode",            choices=["mean", "cvar"],
+                   default="mean",
+                   help="risk objective for IQN action selection")
+    p.add_argument("--risk-alpha",           type=float, default=0.25,
+                   help="lower-tail mass for CVaR risk mode")
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable per-step potential shaping")
     p.add_argument("--no-per",               action="store_true",
@@ -169,15 +180,19 @@ def main(argv=None) -> int:
             print("error: --no-train requires --ckpt", file=sys.stderr)
             return 2
         print(f"[eval] loading checkpoint: {args.ckpt}")
-        agent = DSACAgent.load(args.ckpt)
+        agent = DSACAgent.load(
+            args.ckpt, risk_mode=args.risk_mode, risk_alpha=args.risk_alpha
+        )
     elif args.ckpt:
         print(f"[eval] loading checkpoint: {args.ckpt}")
-        agent = DSACAgent.load(args.ckpt)
+        agent = DSACAgent.load(
+            args.ckpt, risk_mode=args.risk_mode, risk_alpha=args.risk_alpha
+        )
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
         use_attention = not args.no_attention
         arch_parts = []
-        if args.use_iqn:         arch_parts.append("IQN")
+        if args.use_iqn:         arch_parts.append(f"IQN-{args.risk_mode}:{args.risk_alpha}")
         elif use_attention:       arch_parts.append("Attn")
         else:                     arch_parts.append("MLP")
         if not args.no_per:               arch_parts.append("PER")
@@ -191,11 +206,16 @@ def main(argv=None) -> int:
             n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
             trace_family=trains, n_jobs=args.n_jobs,
             total_steps=args.total_steps,
+            warmup_steps=args.warmup_steps,
+            utd_ratio=args.utd_ratio,
+            batch_size=args.batch_size,
             out_dir=out_dir / "train",
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
             use_attention=use_attention,
             use_iqn=args.use_iqn,
+            risk_mode=args.risk_mode,
+            risk_alpha=args.risk_alpha,
             potential_shaping=not args.no_potential_shaping,
             use_per=not args.no_per,
             cql_alpha=args.cql_alpha,

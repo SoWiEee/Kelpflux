@@ -1,8 +1,13 @@
-"""Discrete Soft Actor-Critic with action masking (DSAC).
+"""Distributional Soft Actor-Critic with action masking (DSAC).
 
-Policy is implicit: π(a|s) = softmax(min(Q1,Q2)(s,·) / α), no separate actor.
+The scheduler has a finite masked action set, so the policy is represented as π(a|s) = softmax(min(Q1,Q2)(s,·) / α) over feasible actions.
 Twin Q-networks with LayerNorm (RLPD-recommended for stable offline+online mixing).
 Temperature α auto-tuned via gradient on log_α.
+
+When ``use_iqn=True`` the critic is distributional: each Q-network predicts
+return quantiles with an Implicit Quantile Network. In that mode action
+selection can use either mean return or a lower-tail CVaR estimate, which is the
+risk-sensitive path used by Distributional Soft Actor-Critic style training.
 
 Two Q-network architectures available via use_attention flag:
   MLP  (default): flat concat of all obs dims → twin MLP Q-network.
@@ -10,7 +15,10 @@ Two Q-network architectures available via use_attention flag:
         invariant) + linear cluster encoder → fused Q-head.
 
 References:
+  Ma et al. 2020/2025, "DSAC: Distributional Soft Actor-Critic for
+        Risk-Sensitive Reinforcement Learning"
   Christodoulou 2019, "Soft Actor-Critic for Discrete Action Spaces"
+        (finite masked-action implementation detail)
   Kool et al. 2019 ICLR, "Attention, Learn to Solve Routing Problems!"
   Lee et al. 2019 ICML, "Set Transformer"
 """
@@ -192,13 +200,42 @@ class _IQNQNet(nn.Module):
         """Mean Q over quantile samples — used for action selection."""
         return self.quantile_q(obs).mean(dim=1)                 # (B, n_actions)
 
+    def risk_q(
+        self,
+        obs: torch.Tensor,
+        risk_mode: str = "mean",
+        risk_alpha: float = 0.25,
+        n_eval_quantiles: int = 64,
+    ) -> torch.Tensor:
+        """Return action values under a risk measure.
+
+        ``mean`` is risk-neutral. ``cvar`` averages the lower ``risk_alpha``
+        quantiles, making the scheduler prefer actions whose bad outcomes are
+        less severe. For scheduling this is useful when cold workers, stale
+        node state, or long-tail runtimes make the average outcome misleading.
+        """
+        B = obs.shape[0]
+        taus = (
+            torch.arange(n_eval_quantiles, device=obs.device, dtype=obs.dtype)
+            + 0.5
+        ) / float(n_eval_quantiles)
+        taus = taus.unsqueeze(0).expand(B, -1)
+        z = self.quantile_q(obs, taus)
+        if risk_mode == "mean":
+            return z.mean(dim=1)
+        if risk_mode == "cvar":
+            cutoff = max(1, int(math.ceil(n_eval_quantiles * risk_alpha)))
+            z_sorted = z.sort(dim=1).values
+            return z_sorted[:, :cutoff, :].mean(dim=1)
+        raise ValueError(f"unsupported risk_mode={risk_mode!r}")
+
 
 class DSACAgent:
-    """Discrete SAC agent for masked scheduling environments.
+    """Distributional SAC agent for masked scheduling environments.
 
     Two Q-network backends selectable via use_attention:
-      False (default on DSAC branch): flat MLP, hidden=(256,256)
-      True  (DSAC-attention branch):  self-attention over job queue tokens
+      False (default): flat MLP, hidden=(256,256)
+      True:            self-attention over job queue tokens
 
     Usage::
         agent = DSACAgent(obs_dim=192, n_actions=17, use_attention=True)
@@ -224,6 +261,8 @@ class DSACAgent:
         attn_n_heads: int = 4,
         attn_n_layers: int = 2,
         use_iqn: bool = False,        # Implicit Quantile Network critic
+        risk_mode: str = "mean",      # mean or cvar when use_iqn=True
+        risk_alpha: float = 0.25,     # lower-tail mass for CVaR
         cql_alpha: float = 0.1,       # Conservative Q-Learning penalty weight
         device: str = "cpu",
     ) -> None:
@@ -233,11 +272,17 @@ class DSACAgent:
         self.tau          = tau
         self.use_attention = use_attention
         self.use_iqn      = use_iqn
+        self.risk_mode    = risk_mode
+        self.risk_alpha   = risk_alpha
         self.cql_alpha    = cql_alpha
         self.device       = torch.device(device)
 
         if use_iqn and use_attention:
             raise ValueError("use_iqn and use_attention are mutually exclusive")
+        if risk_mode not in {"mean", "cvar"}:
+            raise ValueError("risk_mode must be 'mean' or 'cvar'")
+        if not (0.0 < risk_alpha <= 1.0):
+            raise ValueError("risk_alpha must be in (0, 1]")
 
         def _make_q():
             if use_iqn:
@@ -289,6 +334,21 @@ class DSACAgent:
         log_probs = log_probs.masked_fill(~mask, 0.0)
         return probs, log_probs
 
+    def _q_values(
+        self,
+        qnet: nn.Module,
+        obs: torch.Tensor,
+        risk_mode: str | None = None,
+    ) -> torch.Tensor:
+        if self.use_iqn:
+            assert isinstance(qnet, _IQNQNet)
+            return qnet.risk_q(
+                obs,
+                risk_mode=risk_mode or self.risk_mode,
+                risk_alpha=self.risk_alpha,
+            )
+        return qnet(obs)
+
     def _soft_value(
         self,
         obs: torch.Tensor,
@@ -297,9 +357,15 @@ class DSACAgent:
     ) -> torch.Tensor:
         """V_soft(s) = Σ_a π(a|s) [min_Q(s,a) − α log π(a|s)]."""
         if use_target:
-            q = torch.min(self.q1_target(obs), self.q2_target(obs))
+            q = torch.min(
+                self._q_values(self.q1_target, obs),
+                self._q_values(self.q2_target, obs),
+            )
         else:
-            q = torch.min(self.q1(obs), self.q2(obs))
+            q = torch.min(
+                self._q_values(self.q1, obs),
+                self._q_values(self.q2, obs),
+            )
         probs, log_probs = self._masked_policy(q, mask)
         return (probs * (q - self.alpha.detach() * log_probs)).sum(dim=-1)
 
@@ -329,13 +395,18 @@ class DSACAgent:
             torch.ones(len(obs), device=self.device)
 
         # ---- Critic update -------------------------------------------
-        with torch.no_grad():
-            v_next   = self._soft_value(next_obs, next_masks, use_target=True)
-            target_q = rews + gammas * (1.0 - dones) * v_next
-
         if self.use_iqn:
-            loss_q, td_errors = self._iqn_critic_loss(obs, acts, target_q, is_weights)
+            with torch.no_grad():
+                target_z = self._distributional_soft_target(
+                    rews, gammas, dones, next_obs, next_masks
+                )
+            loss_q, td_errors = self._iqn_critic_loss(
+                obs, acts, target_z, is_weights
+            )
         else:
+            with torch.no_grad():
+                v_next   = self._soft_value(next_obs, next_masks, use_target=True)
+                target_q = rews + gammas * (1.0 - dones) * v_next
             q1_all = self.q1(obs)
             q2_all = self.q2(obs)
             q1_a   = q1_all.gather(1, acts.unsqueeze(1)).squeeze(1)
@@ -370,7 +441,10 @@ class DSACAgent:
 
         if not self.fixed_alpha:
             with torch.no_grad():
-                q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
+                q_avg = (
+                    self._q_values(self.q1, obs)
+                    + self._q_values(self.q2, obs)
+                ) * 0.5
                 probs, log_probs = self._masked_policy(q_avg, masks)
             entropy = -(probs * log_probs).sum(dim=-1).mean()
 
@@ -404,11 +478,48 @@ class DSACAgent:
         }
 
     # ------------------------------------------------------------------
+    def _distributional_soft_target(
+        self,
+        rews: torch.Tensor,
+        gammas: torch.Tensor,
+        dones: torch.Tensor,
+        next_obs: torch.Tensor,
+        next_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build a distributional SAC target, shape (B, N_QUANT).
+
+        We sample the next action from the masked soft policy and bootstrap the
+        next return quantiles with the entropy bonus. This keeps the IQN critic
+        distributional instead of regressing every quantile to a scalar mean.
+        """
+        assert isinstance(self.q1_target, _IQNQNet)
+        assert isinstance(self.q2_target, _IQNQNet)
+        B = next_obs.shape[0]
+        N = self.q1_target.N_QUANT
+
+        q_next = torch.min(
+            self._q_values(self.q1_target, next_obs, risk_mode="mean"),
+            self._q_values(self.q2_target, next_obs, risk_mode="mean"),
+        )
+        probs, log_probs = self._masked_policy(q_next, next_masks)
+        next_acts = torch.multinomial(probs.clamp(min=0.0), num_samples=1).squeeze(1)
+        next_logp = log_probs.gather(1, next_acts.unsqueeze(1)).squeeze(1)
+
+        taus = torch.rand(B, N, device=next_obs.device)
+        z1 = self.q1_target.quantile_q(next_obs, taus)
+        z2 = self.q2_target.quantile_q(next_obs, taus)
+        z_next = torch.minimum(z1, z2).gather(
+            2, next_acts.view(B, 1, 1).expand(-1, N, 1)
+        ).squeeze(2)
+        z_next = z_next - self.alpha.detach() * next_logp.unsqueeze(1)
+        return rews.unsqueeze(1) + gammas.unsqueeze(1) * (1.0 - dones.unsqueeze(1)) * z_next
+
+    # ------------------------------------------------------------------
     def _iqn_critic_loss(
         self,
         obs: torch.Tensor,
         acts: torch.Tensor,
-        target_q: torch.Tensor,
+        target_z: torch.Tensor,
         is_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, np.ndarray]:
         """Quantile Huber loss for IQN critic. Returns (loss, td_errors)."""
@@ -425,20 +536,21 @@ class DSACAgent:
 
         z1 = _get_qa(self.q1, taus)
         z2 = _get_qa(self.q2, taus)
-        t  = target_q.unsqueeze(1).expand(-1, N)           # (B, N)
 
         def _qhuber(pred, target, taus_):
-            u      = target - pred                          # (B, N)
+            u      = target.unsqueeze(1) - pred.unsqueeze(2) # (B, N, N)
             kappa  = 1.0
             huber  = torch.where(
                 u.abs() < kappa,
                 0.5 * u ** 2,
                 kappa * (u.abs() - 0.5 * kappa),
             )
-            tau_w  = (taus_ - (u.detach() < 0).float()).abs()
-            return (tau_w * huber).mean(dim=1)              # (B,)
+            tau_w  = (
+                taus_.unsqueeze(2) - (u.detach() < 0).float()
+            ).abs()
+            return (tau_w * huber).mean(dim=(1, 2))          # (B,)
 
-        per_sample = _qhuber(z1, t, taus) + _qhuber(z2, t, taus)
+        per_sample = _qhuber(z1, target_z, taus) + _qhuber(z2, target_z, taus)
         loss = (is_weights * per_sample).mean()
         with torch.no_grad():
             td_errors = per_sample.detach().cpu().numpy()
@@ -453,7 +565,10 @@ class DSACAgent:
                                     device=self.device).unsqueeze(0)
             mask_t = torch.as_tensor(mask, dtype=torch.bool,
                                      device=self.device).unsqueeze(0)
-            q = torch.min(self.q1(obs_t), self.q2(obs_t))
+            q = torch.min(
+                self._q_values(self.q1, obs_t),
+                self._q_values(self.q2, obs_t),
+            )
             probs, _ = self._masked_policy(q, mask_t)
             probs_np = probs.squeeze(0).cpu().numpy()
         probs_np = probs_np * mask.astype(np.float32)
@@ -478,6 +593,8 @@ class DSACAgent:
             "fixed_alpha":  self.fixed_alpha,
             "use_attention": self.use_attention,
             "use_iqn":      self.use_iqn,
+            "risk_mode":    self.risk_mode,
+            "risk_alpha":   self.risk_alpha,
             "cql_alpha":    self.cql_alpha,
             "obs_dim":      self.obs_dim,
             "n_actions":    self.n_actions,
@@ -490,10 +607,13 @@ class DSACAgent:
         fixed_alpha   = data.get("fixed_alpha", False)
         use_attention = data.get("use_attention", False)
         use_iqn       = data.get("use_iqn", False)
+        risk_mode     = kwargs.pop("risk_mode", data.get("risk_mode", "mean"))
+        risk_alpha    = kwargs.pop("risk_alpha", data.get("risk_alpha", 0.25))
         cql_alpha     = data.get("cql_alpha", 0.0)
         agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"],
                     fixed_alpha=fixed_alpha, use_attention=use_attention,
-                    use_iqn=use_iqn, cql_alpha=cql_alpha,
+                    use_iqn=use_iqn, risk_mode=risk_mode,
+                    risk_alpha=risk_alpha, cql_alpha=cql_alpha,
                     **kwargs)
         agent.q1.load_state_dict(data["q1"])
         agent.q2.load_state_dict(data["q2"])
