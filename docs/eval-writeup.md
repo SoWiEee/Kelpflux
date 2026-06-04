@@ -1,380 +1,234 @@
-# Kubeflux — Scheduler Evaluation
+# Kelpflux Scheduler Evaluation
 
-> 對應 thesis evaluation 章節。圖表 → [`eval/figures/`](../eval/figures/)；原始資料 → [`eval/results/`](../eval/results/)；完整 milestone 規格 → [`docs/scheduler.md`](scheduler.md)。
+本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是清楚比較三種做法在同一套 simulator 與 live Slurm/k3s/GPU 環境中的行為：heuristic score、SAC、DSAC。
 
----
+## 1. 評估對象
 
-## 1. 動機與貢獻
+### 1.1 Heuristic score scheduler
 
-用 Slurm 排程 HPC workload 已經是標準做法，但有兩個現實沒被內建 scheduler 直接處理：
+heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練模型，而是直接用 job 需求與 cluster 狀態計算優先權，交給 Slurm `select/cons_tres` 做實際 placement。
 
-1. **GPU 共用透過 NVIDIA MPS**。一張卡可切成 100 個 mps slot 給多個 job 同時跑。Slurm 預設 priority 不知道「mps:25 的小 job 應該比 mps:100 的大 job 先排」，所以容易讓一個大 job 卡住一堆小 job。
-2. **Job runtime 不可預知**。同一個 user 提交相似 job 的實際時間可以差兩個數量級（幾分鐘到幾小時）。FCFS 跟 multifactor 都假設 runtime 不可知，SJF 反過來要求先知道誰短。
+核心直覺：
 
-我們想回答的問題：**透過設計 DRL 排程器，能不能在 GPU/MPS workload 上打贏 Slurm 預設？** 
+| 訊號 | 用途 |
+|---|---|
+| MPS fit | 小 MPS job 是否能塞進目前 GPU 的剩餘 slot，避免大 job 佔滿整張卡。 |
+| VRAM fit | job 需求是否符合 GPU tier，避免高階卡被低需求 job 浪費。 |
+| fragmentation penalty | 避免接受一個 job 後讓剩餘 MPS slot 過度碎片化。 |
+| runtime shortness | 若 runtime predictor 有可用估計，短 job 會得到額外 priority boost。 |
 
----
+相關實作：
 
-## 2. 系統設計
+| 層級 | 檔案 |
+|---|---|
+| simulator baseline | `sim/scheduler/score.py` |
+| live submit hook | `chart/templates/configmap-job-submit.yaml` |
+| Slurm priority path | `chart/templates/slurm-conf.yaml`、`chart/templates/login.yaml`、`chart/templates/workers.yaml` |
 
-完整設計請看 [`docs/scheduler.md`](scheduler.md)。這節只摘關鍵。
+### 1.2 SAC
 
-### 2.1 Score function
+SAC 是 Soft Actor-Critic。它的目標不是只最大化 reward，而是同時最大化 reward 與 policy entropy，因此會保留探索能力。標準 SAC 通常用在連續 action space，例如控制機器人的力矩或速度。
 
-```
-priority = α · f_mps_fit + β · f_vram_fit − δ · f_fragmentation + ε · f_runtime_short
-```
+Kelpflux 的排程 action 是離散且有 mask 的：每一步只能從 pending queue 中可行的 job、node、GPU/MPS placement 組合裡選一個，不能選資源不足的 action。因此目前沒有把「連續 SAC」直接作為 live scheduler；SAC 在本專案中主要作為 DSAC 的概念來源與比較基準。
 
-每個因子的直覺：
+### 1.3 DSAC
 
-| 因子 | 意義 | 高分代表 |
-|---|---|---|
-| `f_mps_fit` | job 申請的 mps slot vs node 剩餘 slot 的相對配適度 | 小 job 放空隙剛剛好 |
-| `f_vram_fit` | VRAM 需求 vs node tier 的相符程度 | 12g job 放 12g node（不浪費）|
-| `f_fragmentation` | 接受 job 後 cluster 的 free-MPS 分散程度（懲罰項）| 接了它後碎片化會變嚴重 |
-| `f_runtime_short` | `horizon / (horizon + pred_runtime)`，短 job → 接近 1 | 預計很快跑完 |
+DSAC 是 Discrete SAC。它把 SAC 的 maximum-entropy actor-critic 形式改成離散 action space，並支援 action masking。Kelpflux 目前使用 DSAC 作為 DRL scheduler/placement 的主要研究實作。
 
-預設權重 (α, β, δ, ε) = (0.40, 0.20, 0.20, 0.30)、β 為次要因子鎖在 0.20。M3 完成時 ε=0、M5 接上後切到 0.30。
+目前 DSAC 的 live path 是：
 
-### 2.2 Architecture（簡圖）
+1. `rl-snapshot-agent` 定期把 Slurm pending/running/node/GPU/MPS 狀態送到 `rl-scheduler`。
+2. `rl-scheduler` 用 DSAC checkpoint 對 masked action space 做推論。
+3. policy 若選中 job，live scheduler 回傳 priority boost 與 placement hints。
+4. hard placement controller 會把可安全介入的 placement 寫回 Slurm，使指定 job 傾向落到指定 worker/GPU/MPS slot。
+5. 若 snapshot stale、模型不可用、action confidence 不足或 placement 不安全，系統 abstain，回到 heuristic/Slurm fallback。
 
-```
-sbatch → [slurm-login] ──► slurmctld ──[lua job_submit]──► [predictor service]
-                                │                                       │
-                                ▼                                       ▼
-                          score → priority                       (user, mps, gpu) → pred_seconds
-                                │
-                                ▼
-       ┌──────── pending queue ──────► slurm scheduler + backfill ──► worker pods
-       │
-       ▼
-   [elastic-operator] ──── poll slurmrestd ──► autoscale StatefulSets
-                       └── fragmentation reconciler (shadow / live requeue)
-```
+相關實作：
 
-詳細元件 mapping 在 [`CLAUDE.md`](../CLAUDE.md)。
+| 層級 | 檔案 |
+|---|---|
+| DSAC agent | `services/rl_scheduler/dsac.py` |
+| masked scheduling env | `sim/gym_env.py` |
+| simulator training | `services/rl_scheduler/sim_train.py` |
+| live inference API | `services/rl_scheduler/serve.py` |
+| live daemon / placement path | `services/rl_scheduler/live_daemon.py`、`services/rl_scheduler/placement_controller.py` |
+| replay buffer / RLPD support | `services/rl_scheduler/replay_buffer.py`、`scripts/collect-live-trace.py` |
 
----
+## 2. Benchmark 方法
 
-## 3. 評估方法
+### 2.1 Simulator paired benchmark
 
-### 3.1 Trace families
+標準 simulator benchmark 使用相同 seed 對 DSAC 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。
 
-三個 synthetic generator 都在 `sim/loader.py`：
+本次設定：
 
-| Family | 特色 | 用來測什麼 |
-|---|---|---|
-| `philly` | Poisson arrival、log-normal runtime（median ~30 min, p95 ~6h）、~75% 單卡、30% 單卡 job 是 MPS-fractional | baseline workload，跟 Microsoft Philly trace shape 近似 |
-| `burst` | 同 job-size mix，arrival 集中在每 6h 一次的 2h 高峰窗 | 高 contention，測 scheduler 在排隊壓力下的行為 |
-| `ali` | Alibaba PAI-like：90% 單卡、median runtime ~13 min、60% 單卡 job MPS-fractional、晝夜節律 | 短 job 為主、低 util，測 scheduler 在沒 contention 時是否會 over-engineer |
+| 項目 | 值 |
+|---|---|
+| checkpoint | `runs/eval_mlp_20260514-210824/train/dsac.pt` |
+| mode | eval only, no training |
+| cluster | 1 node × 1 GPU |
+| jobs per trace | 50 |
+| trace families | `philly`, `burst`, `ali` |
+| seeds | 42, 43, 44, 45, 46 |
+| metric | mean job completion time, lower is better |
 
-每 family 跑 5 seeds（42–46），用 paired same-seed diff 做主要比較。Paired diff 把「不同 seed 帶來的 trace 變動」消掉，CI 比 unpaired 緊一個量級。
-
-### 3.2 Live submit-path chaos smoke（2026-05-31）
-
-目的：驗證 optional ML services 失效時，`sbatch` submit path 仍能成功並維持低 latency。測試指令：
-
-```bash
-KUBECONFIG=/home/acane/.kube/config SAMPLES=5 PARTITION=cpu \
-  bash scripts/chaos/submit-with-services-down.sh
-```
-
-環境：live k3s `slurm` namespace；`rl-scheduler` deployment 存在並由 script 暫時 scale to 0 / restore to 1。`runtime-predictor` 與 `weight-tuner` 在本次 live 環境未部署，script 以 warning skip；這仍驗證了 Lua submit path 在 optional service absent/down 時不阻塞提交。原始 TSV：`/tmp/kelpflux-submit-chaos-20260531-235939/latency.tsv`。
-
-| Phase | n | fail | p50 ms | p95 ms | p99 ms | max ms |
-|---|---:|---:|---:|---:|---:|---:|
-| baseline | 5 | 0 | 94 | 98 | 98 | 98 |
-| rl-scheduler-down | 5 | 0 | 99 | 105 | 105 | 105 |
-| runtime-predictor-down | 5 | 0 | 91 | 110 | 110 | 110 |
-| weight-tuner-down | 5 | 0 | 90 | 91 | 91 | 91 |
-| all-optional-services-down | 5 | 0 | 95 | 250 | 250 | 250 |
-
-結論：本次 smoke run 中所有 25 次 submit 皆成功，`rl-scheduler` down 時 p95 仍約 105 ms，符合 safe fallback 設計。`all-optional-services-down` 的單筆 250 ms outlier 仍低於目前 Lua curl timeout budget。正式論文數據建議把 `SAMPLES` 提高到 50 或 100，並在 runtime-predictor / weight-tuner 實際部署後重跑。
-
----
-
-## 4. DSAC Branch — Placement-aware 1×1 Scheduler（2026-05-14）
-
-### 4.1 架構改動
-
-| 項目 | 舊 | DSAC branch |
-|---|---|---|
-| 演算法 | MaskablePPO（sb3-contrib） | Discrete SAC（自實作，twin Q + LayerNorm）|
-| Cluster | 2×2 GPU（4 nodes, 8 GPU） | **1×1 GPU**（1 node, 1 GPU, 4 MPS slots）|
-| obs_dim | 視配置 | **192**（16×11 job + 1×6 GPU + 4 topo + 6 global）|
-| n_actions | 視配置 | **17**（16 job slots × 1 GPU + no-op）|
-| reward | wait-proxy / JCT-aligned | `jct_aligned`（每完成一 job 給 −JCT/scale）|
-| Alpha 調節 | N/A | auto-tune（SAC 標準）→ 最終改 fixed_alpha=0.1 |
-| 訓練步數 | 500k（PPO） | 50k online（DSAC + UTD=4）|
-
-### 4.2 Score Baseline 修正
-
-本次 session 在 sim 端發現兩個 score scheduler 的系統性問題並修正：
-
-| Bug | 舊行為 | 修正後 |
-|---|---|---|
-| `f_mps_fit` | `mps_req / MPS_PER_GPU`（固定分母，偏大 job）| `mps_req / best_gpu.free_mps`（bin-pack，獎勵當前狀態最緊配適）|
-| `epsilon`（SJF kicker）| 0.0（完全關掉）| **0.30**（短 job 顯著加分）|
-| `f_fragmentation`（single-node）| 以 node-level 殘差計算 | 改為 per-GPU MPS 殘差（更精確）|
-
-這些修正讓 score baseline 從 7.067h → 5.381h（philly，**−24%**），在 sim 上已有顯著且可立即部署的改善。
-
-### 4.3 DSAC 訓練結果（1×1 cluster，50k steps，3 family × 5 seeds）
-
-三次 eval，每次只改 alpha 配置，score baseline 固定（已修正版 5.381h）：
-
-| 配置 | Alpha | 訓練 trace | philly DSAC | burst DSAC | ali DSAC |
-|---|---|---|---|---|---|
-| Run A | 7.389（卡頂，原 bug）| philly-only | 2.663h | 3.513h | 1.145h |
-| Run B | 1.649（新上限 clamp）| mixed (p+b+a) | 7.476h | 4.455h | 3.214h |
-| Run C | **0.100（fixed）** | mixed (p+b+a) | 12.148h | 14.214h | 2.780h |
-
-**Score baseline（修正後，全三次相同）**：philly 5.381h / burst 6.775h / ali 0.786h
-
-Paired CI（Run C，正 = DSAC 比 Score 好）：
-
-| Family | Δ(score−dsac) | 95% CI | p | 結論 |
-|---|---:|---:|---:|---|
-| philly | −125.7% | [−262.6%, +11.1%] | 0.063 | 不顯著 |
-| burst | −109.8% | [−160.4%, −59.2%] | 0.004 | **顯著輸** |
-| ali | −253.5% | [−457.1%, −50.0%] | 0.026 | **顯著輸** |
-
-Run A 看起來 DSAC 贏，是因為 score baseline 尚未修正（7.067h 異常高）。修正後 DSAC 在所有配置下均輸給 score。
-
-### 4.4 Alpha 訓練不穩定性分析
-
-| Run | 問題 | 根因 |
-|---|---|---|
-| Run A | alpha 全程 = 7.389（= e²，上限）| target_entropy_ratio=0.98 >> 遮罩環境最大熵 log(5)=1.61 → log_α 無限上升 |
-| Run B | alpha 全程 = 1.649（= e⁰·⁵，新上限）| Q-network 學到信心 → entropy < target → Adam 向上推 → 卡在新 clamp |
-| Run C | alpha 固定 = 0.100（no update）| `fixed_alpha=True`，policy 完全貪婪 → 但 Q-values 在 50k steps 內未收斂 → near-greedy bad Q = worse than random |
-
-**50k steps / 19 episodes 不足**：每個 episode 平均 ~2,600 env steps，共 19 個完整 episode。Q-function 見過的 job 配置組合太少，固定 alpha 後 near-greedy 策略強壓一個未收斂的 Q → JCT 比隨機更差。
-
-### 4.5 Checkpoint 可用性驗證
-
-```bash
-from services.rl_scheduler.dsac import DSACAgent
-agent = DSACAgent.load('runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt')
-# → alpha=0.1000  log_alpha=-2.3026  fixed=True
-# → select_action(obs, mask, greedy=True) 正常回傳 action index
-```
-
-serve.py（FastAPI `/act` endpoint）可直接載入此 checkpoint 做 shadow-mode deployment，行為與 §E 的 PPO 版本相同（policy 尚不可信，abstain rate 預計 100%）。
-
-### 4.6 結論
-
-1. **Score baseline 修正（epsilon=0.30 + bin-pack f_mps_fit）是本次 branch 最大的實質貢獻**，philly −24%，已 commit 且可立即部署。
-2. **DSAC 需要更長訓練**。50k steps（19 episodes）遠不足以讓 Q-function 收斂並勝過手工調校的 score heuristic。預估需要 500k–1M steps 才有機會競爭。
-3. **Infrastructure 完整**：MDP wrapper、DSAC agent、ReplayBuffer、sim training loop、FastAPI serve、live daemon、RLPD fine-tune scaffold 全部實作並測試通過（26 sim tests pass），具備繼續訓練的完整 pipeline。
-4. **下一步（若繼續）**：以 `--total-steps 500000 --trace philly` 專一訓練，或啟用 GPU 大幅加速。
-
----
-
-## 5. MLP vs Attention 架構比較
-
-剛才確認 DSAC 在 fixed α=0.1 + 50k steps 下仍落後 score baseline。本節在 DSAC-attention branch 加入三項算法改進後，比較兩種 Q-network 架構的效果：
-
-**算法改進：**
-
-| 改進 | 說明 |
-|------|------|
-| n-step returns (n=10) | 預計算 10 步折扣回報再存入 replay buffer，降低稀疏 JCT reward 的 credit-assignment 延遲 |
-| Score-guided warmup | warmup 期間以 score scheduler 選 action，取代 uniform random，提升 buffer 初始品質 |
-| 短 episode (n_jobs=50) | 每集 50 個 job（原 100），同樣 steps 下產生約 2× 更多不同場景 |
-
-**兩種 Q-network 架構：**
-
-- **MLP**：twin Q + LayerNorm，obs → [256, 256] → n_actions（130k 參數）
-- **Attention**：16 個 job token（11 維）→ TransformerEncoder（d=64, 4 heads, 2 layers）→ mean-pool → fuse cluster state → Q-head（78k 參數），permutation invariant
-
-訓練設定：200k steps，CUDA，fixed α=0.1，UTD=4，n_jobs=50，seeds 42–46，philly/burst/ali 混合訓練。
-
----
-
-### 5.1 平均 JCT 結果
-
-| Family | MLP DSAC | Attention DSAC | Score baseline | MLP vs Score | Attn vs Score |
-|--------|----------|----------------|----------------|-------------|---------------|
-| philly | 4.815h | 5.396h | 2.621h | −83.7%\* | −105.9% |
-| burst | 5.025h | 7.754h | 3.541h | −41.9%\* | −119.0%\* |
-| ali | 1.991h | 3.952h | 1.383h | −44.0% | −185.9% |
-
-`*` p < 0.05（paired t-test，n=5 seeds）。Δ 為負代表 DSAC JCT 高於 score（即 DSAC 較差）。
-
-**MLP vs Attention 直接比較：**
-
-| Family | MLP | Attention | Attention 相對 MLP |
-|--------|-----|-----------|-------------------|
-| philly | 4.815h | 5.396h | +12% 更差 |
-| burst | 5.025h | 7.754h | +54% 更差 |
-| ali | 1.991h | 3.952h | +98% 更差 |
-
----
-
-### 5.2 Per-seed 分佈
-
-**MLP per-seed JCT（小時）：**
-
-| seed | philly | burst | ali |
-|------|--------|-------|-----|
-| 42 | 2.586 | 2.719 | 2.162 |
-| 43 | 4.405 | 4.364 | 1.883 |
-| 44 | 5.383 | 3.704 | 1.649 |
-| 45 | 6.462 | 5.609 | 2.742 |
-| 46 | 5.238 | 8.729 | 1.520 |
-
-**Attention per-seed JCT（小時）：**
-
-| seed | philly | burst | ali |
-|------|--------|-------|-----|
-| 42 | 3.966 | 2.664 | 7.703 |
-| 43 | 6.904 | 4.153 | 2.192 |
-| 44 | 4.160 | 9.212 | 1.892 |
-| 45 | 1.967 | 10.885 | 3.616 |
-| 46 | 9.984 | 11.857 | 4.359 |
-
-Attention 的 burst 結果呈現明顯遞增趨勢（seed 44→45→46：9.2→10.9→11.9h），顯示高方差與潛在發散。
-
----
-
-### 5.3 分析
-
-**Attention 為何在此設定下表現較差：**
-
-1. **Queue 規模太小**：16 個 job slot 對 TransformerEncoder 而言樣本數不足，attention 的 permutation invariance 優勢無法顯現；MLP 在小輸入下收斂更快。
-
-2. **Transformer critic 較難收斂**：DSAC 的 TD 目標本身帶有 bootstrap 雜訊，Transformer 的多層 attention 在此雜訊下需要更多 steps 才能穩定；200k steps 對 MLP 已接近收斂邊緣，對 Attention 可能仍在早期。
-
-3. **高方差**：Attention 各 seed 間的 JCT 差異（burst：2.7h 到 11.9h）遠大於 MLP（2.7h 到 8.7h），說明 Attention Q-net 對初始化敏感，訓練不穩定。
-
-4. **MLP 的 LayerNorm + 深層結構**在 DSAC 的 actor-critic 框架下已被廣泛驗證（DrQ-v2、RLPD 等），是更成熟的 inductive bias。
-
-算法改進（n-step、score warmup、短 episode）的貢獻難以單獨量化，因為 steps 從 50k 增至 200k、n_jobs 從 100 降至 50，兩者同步變動。但整體結果仍落後 score baseline，顯示核心瓶頸在於 reward 信號稀疏與 1×1 cluster 的訓練多樣性不足，並非架構本身。
-
----
-
-### 5.4 結論
-
-在當前 1×1 cluster（16-job queue）規模下：
-
-- **MLP 架構優於 Attention**：更穩定、方差更小、各 family 均較好
-- **Attention 需要更大 queue 或更多 steps** 才有意義（論文通常在 100+ job queue 下驗證）
-- **兩種架構均未超過 score baseline** — 根本問題為訓練多樣性不足（1×1 cluster action space 太小）與 JCT reward 稀疏性
-
-後續方向：(a) 增加 cluster 規模（2×2）擴大 queue + action space；(b) reward shaping 讓信號更密集；(c) RLPD 接入 live logs 提供真實分佈的 fine-tuning。
-
----
-
-### 5.5 重現
-
-```bash
-# MLP（預設架構）
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --n-nodes 1 --gpus-per-node 1 --total-steps 200000 --n-jobs 50 \
-    --trace-families philly burst ali --seeds 42 43 44 45 46 \
-    --device cuda --no-attention
-
-# Attention
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --n-nodes 1 --gpus-per-node 1 --total-steps 200000 --n-jobs 50 \
-    --trace-families philly burst ali --seeds 42 43 44 45 46 \
-    --device cuda
-```
-
-Artifacts：
-- `runs/eval_mlp_20260514-210824/` — MLP 結果（checkpoint + CSV + JSON）
-- `runs/eval_attn_cuda_20260514-232827/` — Attention 結果（checkpoint + CSV + JSON）
-
----
-
-## 6. 六項改進組合測試（v3, 500k steps）
-
-在確認 MLP 架構優於 Attention 後，v3 實驗將六項算法改進全部啟用並訓練至 500k steps：
-
-**啟用的改進項目：**
-
-| 項目 | 設定 |
-|------|------|
-| PER（優先經驗回放）| SumTree，α=0.6，β: 0.4→1.0 |
-| Potential shaping | φ(s) = −Σwait_time / (scale × n_jobs)，γ=0.99 |
-| CQL 正規化 | cql_alpha=0.1，抑制 Q 過估 |
-| Curriculum | n_jobs: 10（前 20%）→ 30（30%）→ 50（後 50%）|
-| n-step returns | n=10 |
-| Score warmup | 前期以 score scheduler 填充 buffer |
-
-訓練設定：500k steps，MLP 架構，CUDA，seeds 42–46，philly/burst/ali 混合訓練。
-
----
-
-### 6.1 平均 JCT 結果
-
-| Family | v3 DSAC (500k) | MLP DSAC (200k，§5) | Score baseline | v3 vs Score | 200k vs Score |
-|--------|---------------|---------------------|----------------|-------------|---------------|
-| philly | 6.295h | 4.815h | 2.621h | −140.2%\* | −83.7%\* |
-| burst | 15.228h | 5.025h | 3.541h | −330.0%\* | −41.9%\* |
-| ali | 6.727h | 1.991h | 1.383h | −386.5% | −44.0% |
-
-`*` p < 0.05。Δ 為負代表 DSAC JCT 高於 score baseline（即 DSAC 較差）。
-
-v3 在三個 family 上均比前一版 MLP (200k steps) **更差**，尤其 burst 出現嚴重衰退（15.2h vs 5.0h）。
-
----
-
-### 6.2 Per-seed 分佈
-
-**v3 per-seed JCT（小時）：**
-
-| seed | philly | burst | ali |
-|------|--------|-------|-----|
-| 42 | 3.910 | 5.767 | 4.128 |
-| 43 | 5.409 | 25.688 | 1.143 |
-| 44 | 5.851 | 20.014 | 7.797 |
-| 45 | 8.393 | 5.913 | 6.712 |
-| 46 | 7.913 | 18.758 | 13.853 |
-
-burst 的 seed 43/44/46 分別達到 25.7h / 20.0h / 18.8h，方差極大，顯示策略未收斂。
-
----
-
-### 6.3 根因分析
-
-**為什麼 v3 比 200k MLP 更差：**
-
-1. **Curriculum 稀釋了目標環境的訓練量**。500k steps 的時間分配為：n_jobs=10 佔前 100k，n_jobs=30 佔中間 150k，n_jobs=50 僅佔最後 250k——實際上只有約 **24 個完整 episode**（每集 max_steps=10000）在目標規模下訓練，遠不足以讓 Q-function 對 n_jobs=50 的分佈收斂。
-
-2. **CQL 在高方差獎勵下過度保守**。CQL 正則化懲罰高 Q 估計，在 score heuristic warmup buffer 的條件下，可能使策略過度依賴 warmup action 的分佈，抑制探索。burst trace 的 job 到達模式波動大，CQL 限制了策略對新情況的適應。
-
-3. **Shaping + sparse reward 交互作用**。potential shaping 提供稠密信號（每步 φ 差分），但在 curriculum 的 n_jobs=10 小環境中校準的信號尺度，可能不符合 n_jobs=50 切換後的新環境，造成前期訓練的 Q-value 偏移難以修正。
-
-4. **多干預同步啟用無法定位問題**。PER + CQL + shaping + curriculum 同時開啟，任何一個設定出問題都會互相掩蓋，且 500k steps 不足以讓這些機制在最終 n_jobs=50 分佈上充分交互學習。
-
----
-
-### 6.4 結論
-
-v3 實驗揭示了累積改進的陷阱：多項算法改進疊加並不保證效果相加，反而可能因 curriculum 設計與訓練量分配不當導致顯著衰退。
-
-**關鍵教訓：**
-
-- Curriculum 必須保證目標分佈（n_jobs=50）有足夠的 steps（建議 ≥ 200k）才能有效
-- CQL 在 sparse + noisy 獎勵環境下的 alpha 值需要仔細調校（0.1 可能已過大）
-- 改進應逐項 ablation 測試，而非一次全開
-
-目前已確認的最佳設定為 **MLP + 200k steps + n-step + score warmup**（§5 結果），其中 burst 5.025h / philly 4.815h 是現有最佳 DSAC 效果，但仍落後 score baseline 約 40–84%。
-
-根本瓶頸未變：**1×1 cluster 的 action space 太小、reward 信號稀疏**，下一步應擴展至 2×2 cluster 以提供更豐富的學習信號。
-
----
-
-### 6.5 重現
+重現指令：
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --n-nodes 1 --gpus-per-node 1 --total-steps 500000 \
-    --trace-families philly burst ali --seeds 42 43 44 45 46 \
-    --device cuda --curriculum
-    # PER + shaping + CQL=0.1 為預設，--curriculum 啟用 n_jobs ramp
+  --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
+  --no-train \
+  --n-nodes 1 --gpus-per-node 1 \
+  --n-jobs 50 \
+  --trace-families philly burst ali \
+  --seeds 42 43 44 45 46 \
+  --out-dir /tmp/kelpflux-dsac-score-bench-standard
 ```
 
-Artifacts：`runs/eval_v3_20260515-092645/`（checkpoint + CSV + JSON）
+### 2.2 Live cluster smoke A/B
+
+使用者要求 benchmark 要跑在 live cluster 上，因此本次也在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job。這不是大樣本統計 benchmark，而是 live path smoke A/B，用來驗證 DSAC live scheduler、Slurm placement、worker lifecycle 與 MPS allocation 是否真的能協同運作。
+
+live 環境：
+
+| 項目 | 值 |
+|---|---|
+| namespace | `slurm` |
+| login | `deploy/slurm-login` |
+| controller | `slurm-controller-0` |
+| GPU partition | `gpu-rtx4070` |
+| GPU worker | `slurm-worker-gpu-rtx4070-0`, `slurm-worker-gpu-rtx4070-1` |
+| GRES | `gpu:rtx4070:1,mps:rtx4070:100` per worker |
+
+live workload：6 個短 GPU/MPS sleep jobs，依序要求 `mps=25,25,100,25,50,25`。這組 workload 可以檢查小 MPS job 是否能共用 GPU，以及 full-GPU job 是否會排到獨立 worker。
+
+## 3. Simulator 結果
+
+| Family | DSAC mean JCT | Score mean JCT | Score − DSAC | 95% CI | p-value | 結論 |
+|---|---:|---:|---:|---:|---:|---|
+| philly | 4.815 h | 2.621 h | -83.7% | [-118.1%, -49.4%] | 0.002 | DSAC 顯著較差 |
+| burst | 5.025 h | 3.541 h | -41.9% | [-75.0%, -8.8%] | 0.025 | DSAC 顯著較差 |
+| ali | 1.991 h | 1.383 h | -44.0% | [-113.4%, +25.4%] | 0.153 | DSAC 較差但未達顯著 |
+
+解讀：目前這個 MLP DSAC checkpoint 在 1×1 simulator 上沒有打贏 heuristic score。philly 與 burst 的差距達統計顯著；ali 因 seed 間變異較大，方向仍是 DSAC 較差，但 p-value 未達 0.05。
+
+這個結果符合目前系統狀態：1×1 action space 的可學習結構有限，而 score baseline 已經把 MPS fit、短工作偏好與碎片化懲罰寫得很強。DSAC 的價值目前主要在於提供可上線的 DRL decision path 與後續 RLPD/live trace 訓練基礎，而不是目前 checkpoint 已經優於啟發式。
+
+## 4. Live cluster 結果
+
+### 4.1 DSAC live scheduler enabled
+
+提交 job：`136-141`。結果全部 `COMPLETED`。
+
+| Job | Name | Req MPS | State | Submit | Start | End | Wait | Runtime | JCT | Node |
+|---:|---|---:|---|---|---|---|---:|---:|---:|---|
+| 136 | bench-dsaclive-smallA | 25 | COMPLETED | 07:28:10 | 07:28:13 | 07:28:18 | 3s | 5s | 8s | gpu-rtx4070-0 |
+| 137 | bench-dsaclive-smallB | 25 | COMPLETED | 07:28:10 | 07:28:13 | 07:28:18 | 3s | 5s | 8s | gpu-rtx4070-0 |
+| 138 | bench-dsaclive-fullA | 100 | COMPLETED | 07:28:10 | 07:28:18 | 07:28:30 | 8s | 12s | 20s | gpu-rtx4070-0 |
+| 139 | bench-dsaclive-smallC | 25 | COMPLETED | 07:28:10 | 07:28:25 | 07:28:29 | 15s | 4s | 19s | gpu-rtx4070-1 |
+| 140 | bench-dsaclive-halfA | 50 | COMPLETED | 07:28:10 | 07:28:25 | 07:28:31 | 15s | 6s | 21s | gpu-rtx4070-1 |
+| 141 | bench-dsaclive-smallD | 25 | COMPLETED | 07:28:11 | 07:28:29 | 07:28:33 | 18s | 4s | 22s | gpu-rtx4070-1 |
+
+Summary：
+
+| Metric | Value |
+|---|---:|
+| completed jobs | 6 / 6 |
+| mean wait | 9.83s |
+| mean runtime | 6.33s |
+| mean JCT | 14.67s |
+| observed placement | first two 25-MPS jobs co-located on worker 0; 100-MPS job isolated during execution; later 25/50/25-MPS jobs co-located on worker 1 |
+
+這次 live run 證明 DSAC scheduler enabled 時，job submit、priority decision、Slurm placement、MPS GRES allocation 與 worker pod 都能完成一輪實際運作。
+
+### 4.2 Score-only fallback run
+
+為了比較 fallback 行為，測試中暫時把 `rl-scheduler` scale 到 0，提交相同 workload。提交 job：`142-147`。
+
+結果：score-only fallback run 沒有形成可比較的完成樣本。前三個 job 進入 worker 後變成 `NODE_FAIL` / `COMPLETING`，後三個 job 因 GPU worker unavailable/resource busy 留在 pending，之後已用 `scancel` 清掉 pending jobs，並用 Slurm `DOWN` / `RESUME` 流程清空 queue。`rl-scheduler` 已恢復為 1 replica。由於 elastic operator 在沒有 GPU job 時會把 GPU worker StatefulSet 縮到 0，Slurm 端後續會看到 GPU nodes 為 `idle*` / not responding，直到下一次 GPU workload 觸發 worker scale-up。
+
+`sacct` 摘要：
+
+| Job | Name | Req MPS | State | Start/End 狀態 | Node |
+|---:|---|---:|---|---|---|
+| 142 | bench-scoreonly-smallA | 25 | NODE_FAIL / COMPLETING | Start 曾在 07:30:21；End 07:30:32 | gpu-rtx4070-0 |
+| 143 | bench-scoreonly-smallB | 25 | NODE_FAIL / COMPLETING | Start 曾在 07:30:21；End 07:30:33 | gpu-rtx4070-0 |
+| 144 | bench-scoreonly-fullA | 100 | NODE_FAIL / COMPLETING | End 07:30:31；Slurm show job StartTime 為 Unknown | gpu-rtx4070-1 |
+| 145 | bench-scoreonly-smallC | 25 | PENDING, then cancelled | no node assigned | none |
+| 146 | bench-scoreonly-halfA | 50 | PENDING, then cancelled | no node assigned | none |
+| 147 | bench-scoreonly-smallD | 25 | PENDING, then cancelled | no node assigned | none |
+
+當時 node 狀態：
+
+```text
+slurm-worker-gpu-rtx4070-0  IDLE+COMPLETING+NOT_RESPONDING
+slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
+```
+
+這表示 live 對照組遇到 worker lifecycle / Slurm completion acknowledgement 問題。GPU worker pod 在測試期間被重新建立，導致 Slurm 將 node 視為 not responding，job 完成回報不乾淨。測試後已將 queue 清空；GPU worker StatefulSet 依目前 scale-to-zero 策略回到 0 replica。這個結果不能用來主張 score 比 DSAC 差；它只能說明目前 live benchmark 若要做嚴格 A/B，需要先固定 worker lifecycle 或在每個 phase 前重置成相同 warm/cold 狀態。
+
+## 5. 結論
+
+目前可誠實下的結論：
+
+| 問題 | 結論 |
+|---|---|
+| DSAC 是否能在 live 上跑？ | 可以。job `136-141` 全部完成，MPS allocation 與 worker placement 有實際生效。 |
+| DSAC checkpoint 是否在標準 simulator benchmark 打贏 score？ | 還沒有。`philly`、`burst` 顯著輸給 heuristic score，`ali` 方向也是輸但不顯著。 |
+| live A/B 是否已能公平比較 DSAC vs score？ | 還不能。score-only phase 暴露 worker lifecycle / Slurm completion acknowledgement 問題。 |
+| 目前最穩定的上線策略 | DSAC live scheduler 保持 enabled，但保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
+
+工程貢獻目前比較明確的是：
+
+1. 已有可上線的 DSAC inference path，而不是只停在 notebook/simulator。
+2. live path 能把 queue、node、GPU/MPS 狀態轉成模型輸入，並把決策回接到 Slurm submit/placement 流程。
+3. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
+4. benchmark 顯示目前 DSAC checkpoint 尚未優於 heuristic score，這讓後續研究方向更清楚：不是只宣稱「用了 DRL」，而是要改善訓練資料、reward fidelity 與 live latency/worker lifecycle model。
+
+## 6. 後續改進方向
+
+| 優先級 | 改進 | 原因 |
+|---|---|---|
+| P0 | 修正 live benchmark 的 worker lifecycle guard，讓 score-only 與 DSAC phase 都能在同樣 warm/cold 條件完成 | 沒有穩定 live A/B，就無法可信比較 scheduler。 |
+| P1 | 使用 `scripts/collect-live-trace.py` 長期收集 `sacct` normalized trace | DSAC 需要真實 arrival、runtime、wait、node placement 資料，而不是只依賴 synthetic simulator。 |
+| P1 | RLPD fine-tuning：score/Slurm trajectory 作為 demonstration replay，DSAC online replay 作為探索資料 | 可以降低純 simulator 訓練和 live 行為之間的落差。 |
+| P1 | 2×2 cluster benchmark | 目前 1×1 topology 太小，heuristic 很容易接近最佳；多 worker/GPU/MPS 才能凸顯 placement-aware policy 的價值。 |
+| P2 | latency model 納入 warm/cold worker、hard placement、pod startup、Slurm completing/not responding | simulator 若沒模擬這些 live failure mode，模型會學不到真正的部署成本。 |
+| P2 | residual DSAC：DSAC 學 score baseline 的修正量，而不是完全取代 score | 可以保留強 baseline，降低 DRL policy 早期不穩定造成的風險。 |
+
+## 7. 本次驗證指令
+
+Simulator：
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+  --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
+  --no-train \
+  --n-nodes 1 --gpus-per-node 1 \
+  --n-jobs 50 \
+  --trace-families philly burst ali \
+  --seeds 42 43 44 45 46 \
+  --out-dir /tmp/kelpflux-dsac-score-bench-standard
+```
+
+Live DSAC phase：
+
+```bash
+sudo kubectl exec -n slurm deploy/slurm-login -- bash -lc '
+phase=dsaclive
+for spec in smallA:25:4 smallB:25:4 fullA:100:12 smallC:25:4 halfA:50:6 smallD:25:4; do
+  IFS=: read -r name mps secs <<< "$spec"
+  sbatch --parsable -p gpu-rtx4070 --gres=mps:${mps} -c 1 --mem=512M --time=00:03:00 \
+    -J "bench-${phase}-${name}" \
+    --wrap "echo phase=${phase} name=${name} mps=${mps} start=\$(date -Is) host=\$(hostname); sleep ${secs}; echo end=\$(date -Is)"
+done
+'
+```
+
+Live result collection：
+
+```bash
+sudo kubectl exec -n slurm slurm-controller-0 -- bash -lc \
+  'sacct -X -P -j 136,137,138,139,140,141,142,143,144,145,146,147 \
+   --format=JobID,JobName,Partition,State,Submit,Start,End,ElapsedRaw,NodeList,AllocTRES%120,ReqTRES%120'
+```

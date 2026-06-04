@@ -65,7 +65,7 @@ user sbatch
 | Replay / fine-tune | `services/rl_scheduler/rlpd_finetune.py` | ReplayBuffer / PrioritizedReplayBuffer，支援 RLPD 方向 |
 | Live daemon | `services/rl_scheduler/live_daemon.py` | 連接 live cluster snapshot / placement |
 
-PPO 目前只剩 `smoke_ppo.py` 這類 smoke / historical utility，**不是目前 live scheduler 的主線**。文件若仍把 PPO 寫成主演算法，應修正為「歷史探索或 smoke test」。
+PPO / SB3 相關 smoke 與 paired-eval 工具已移除；目前 live scheduler 與 benchmark 主線都是 DSAC。若文件提到 PPO，應只作為歷史探索背景。
 
 ### 1.3 CI 與測試
 
@@ -282,7 +282,6 @@ rsize=1M,wsize=1M,hard,timeo=600,retrans=2
 
 | 項目 | 建議 |
 |---|---|
-| `services/rl_scheduler/smoke_ppo.py` | 改名或註解為 historical smoke，避免誤導目前仍用 PPO |
 | `docs/note.md` | 拆成 archive / experiment log，避免主要文件入口太雜 |
 | Dashboard screenshots | 把 scheduler-live / per-job-gpu 截圖放進 docs 或 thesis figures |
 | `values-k3s.yaml` drift check | 加 script 比對關鍵欄位：MPS slots、GPU type、shadowMode、image tags |
@@ -296,7 +295,7 @@ rsize=1M,wsize=1M,hard,timeo=600,retrans=2
 
 1. 跑一次 `scripts/chaos/submit-with-services-down.sh`，把 p50/p95/p99 latency 寫進 `docs/eval-writeup.md` 或 `docs/monitoring.md`。
 2. 補 `values-2x2.yaml` 草稿與 `docs/cluster.md` 第二台機器 join 流程。
-3. 清楚標註 PPO 不是目前 live 主線，避免口試時被問「到底用 PPO 還是 DSAC」。
+3. 確認 README / evaluation 指令皆指向 DSAC benchmark，避免口試時被問「到底用 PPO 還是 DSAC」。
 
 ### 接下來 2-3 週
 

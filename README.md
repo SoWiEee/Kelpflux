@@ -180,7 +180,7 @@ PYTHONPATH=. python -m services.rl_scheduler.placement_controller \
 
 LAN IP 不一樣時用 `VALUES_FILE=<your-values.yaml>` 或 Helm values 檔調整 `storage.nfsServer`。GPU Operator 使用 `driver.enabled=false` 與 `toolkit.enabled=false`，因為 host 已經由 `setup-linux-gpu.sh` 裝好驅動與 NVIDIA Container Toolkit。
 
-目前 live scheduler 主線是 **DSAC**。`services/rl_scheduler/smoke_ppo.py` 只是歷史 PPO smoke test，用來快速檢查 simulator API 與 SB3 相容性；不是目前 live cluster 使用的演算法。
+目前 live scheduler 主線是 **DSAC**。舊的 PPO / SB3 smoke 與 paired-eval 工具已移除，避免和目前的 SAC/DSAC 主線混淆。
 
 > 注意：目前 `slurm-rl-scheduler:m11` 映像會載入 `runs/eval_mlp_20260514-210824/train/dsac.pt`。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新執行 `bash scripts/deploy-2.sh`。
 
@@ -244,6 +244,23 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --total-steps 500000 \
     --out-dir runs/dsac_2x2_$(date +%Y%m%d)
 ```
+
+### 快速 benchmark：DSAC/SAC vs heuristic score
+
+這個 benchmark 固定同一批 synthetic trace seed，分別跑 DSAC policy 與啟發式 `score` scheduler，並用 paired difference 報告 `score - DSAC`。正值代表 DSAC/SAC 比 score 好；負值代表 score baseline 較好。
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
+    --no-train \
+    --n-nodes 1 --gpus-per-node 1 \
+    --n-jobs 50 \
+    --trace-families philly burst ali \
+    --seeds 42 43 44 45 46 \
+    --out-dir runs/bench_dsac_vs_score_$(date +%Y%m%d-%H%M%S)
+```
+
+若要比較新訓練的 checkpoint，把 `--ckpt` 換成新的 `dsac.pt`；若要先訓練再評估，拿掉 `--no-train` 並設定 `--total-steps`。
 
 ### 完整評估（3 families × 5 seeds，對比 score baseline）
 
