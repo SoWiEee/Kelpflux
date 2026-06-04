@@ -45,6 +45,7 @@ class Job:
     runtime: float
     mem_req: float
     mps_req: int  # per-GPU MPS slots; MPS_PER_GPU = whole-GPU
+    latency_class: str = ""  # optional live replay hint: cpu/gpu warm/cold/hard placement
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -69,6 +70,7 @@ def _job_from_dict(item: dict) -> Job:
         runtime=float(item["runtime"]),
         mem_req=float(item.get("mem_req", 0.0)),
         mps_req=int(item.get("mps_req", MPS_PER_GPU)),
+        latency_class=str(item.get("latency_class", "")),
     )
 
 

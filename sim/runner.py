@@ -27,6 +27,7 @@ from .loader import (
     Job, MPS_PER_GPU, TRACE_FAMILIES,
     generate_by_family, load_auto, write_normalized,
 )
+from .latency import LatencyModel
 from .metrics import MetricCollector
 from .scheduler import make as make_scheduler
 
@@ -39,6 +40,7 @@ def run(
     scheduler_name: str,
     mps_per_gpu: int = MPS_PER_GPU,
     dispatch_latency_seconds: float = 0.0,
+    latency_model: LatencyModel | None = None,
     scheduler_kwargs=None,
 ) -> Tuple[MetricCollector, Cluster]:
     """Run the trace through the simulator.
@@ -52,6 +54,7 @@ def run(
     cluster = Cluster(n_nodes=n_nodes, gpus_per_node=gpus_per_node, mps_per_gpu=mps_per_gpu)
     scheduler = make_scheduler(scheduler_name, **(scheduler_kwargs or {}))
     metrics = MetricCollector()
+    latency = latency_model or LatencyModel.none(dispatch_latency_seconds)
 
     pending: List[Job] = []
     by_id = {j.job_id: j for j in jobs}
@@ -75,8 +78,9 @@ def run(
         for j in list(ordered):
             if cluster.try_allocate(j) is not None:
                 pending.remove(j)
-                start_t = now + max(0.0, dispatch_latency_seconds)
+                start_t = now + latency.start_latency(j, now)
                 metrics.record_start(j.job_id, start_t)
+                latency.record_start(j)
                 heapq.heappush(events, (start_t + j.runtime, seq, "end", j.job_id))
                 seq += 1
             elif not scheduler.backfill:
@@ -90,6 +94,7 @@ def run(
         elif kind == "end":
             cluster.release(payload)
             metrics.record_end(payload, now)
+            latency.record_end(by_id[payload], now)
         try_dispatch()
         metrics.sample_util(now, cluster.utilization())
 
@@ -113,6 +118,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mps-per-gpu", type=int, default=MPS_PER_GPU)
     p.add_argument("--dispatch-latency-seconds", type=float, default=0.0,
                    help="fixed live dispatch/start latency added to each job start")
+    p.add_argument("--latency-model", choices=["none", "live-basic"], default="none",
+                   help="dispatch latency model for live replay")
+    p.add_argument("--cpu-warm-latency-seconds", type=float, default=0.0)
+    p.add_argument("--cpu-cold-latency-seconds", type=float, default=3.0)
+    p.add_argument("--gpu-warm-latency-seconds", type=float, default=3.0)
+    p.add_argument("--gpu-cold-latency-seconds", type=float, default=15.0)
+    p.add_argument("--hard-placement-latency-seconds", type=float, default=15.0)
+    p.add_argument("--cold-after-seconds", type=float, default=300.0)
     p.add_argument("--output", help="write per-job CSV here")
     p.add_argument("--write-trace", help="write the loaded/synthetic trace as normalized JSON")
     p.add_argument("--summary-json", help="write summary dict as JSON to this path")
@@ -140,6 +153,18 @@ def main(argv=None) -> int:
     sched_kwargs = {k: getattr(args, k) for k in ("alpha", "beta", "delta", "epsilon")
                     if getattr(args, k) is not None}
 
+    latency_model = None
+    if args.latency_model == "live-basic":
+        latency_model = LatencyModel.live_basic(
+            fixed_seconds=args.dispatch_latency_seconds,
+            cpu_warm_seconds=args.cpu_warm_latency_seconds,
+            cpu_cold_seconds=args.cpu_cold_latency_seconds,
+            gpu_warm_seconds=args.gpu_warm_latency_seconds,
+            gpu_cold_seconds=args.gpu_cold_latency_seconds,
+            hard_placement_seconds=args.hard_placement_latency_seconds,
+            cold_after_seconds=args.cold_after_seconds,
+        )
+
     t0 = time.monotonic()
     metrics, _cluster = run(
         jobs,
@@ -148,6 +173,7 @@ def main(argv=None) -> int:
         scheduler_name=args.scheduler,
         mps_per_gpu=args.mps_per_gpu,
         dispatch_latency_seconds=args.dispatch_latency_seconds,
+        latency_model=latency_model,
         scheduler_kwargs=sched_kwargs or None,
     )
     wall = time.monotonic() - t0
@@ -160,6 +186,13 @@ def main(argv=None) -> int:
         "gpus_per_node": args.gpus_per_node,
         "mps_per_gpu": args.mps_per_gpu,
         "dispatch_latency_seconds": args.dispatch_latency_seconds,
+        "latency_model": args.latency_model,
+        "cpu_warm_latency_seconds": args.cpu_warm_latency_seconds,
+        "cpu_cold_latency_seconds": args.cpu_cold_latency_seconds,
+        "gpu_warm_latency_seconds": args.gpu_warm_latency_seconds,
+        "gpu_cold_latency_seconds": args.gpu_cold_latency_seconds,
+        "hard_placement_latency_seconds": args.hard_placement_latency_seconds,
+        "cold_after_seconds": args.cold_after_seconds,
         "synth_seed": args.synth_seed if args.synth_jobs > 0 else None,
         "trace_family": args.trace_family if args.synth_jobs > 0 else "loaded",
         **sched_kwargs,
