@@ -262,6 +262,30 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 
 若要比較新訓練的 checkpoint，把 `--ckpt` 換成新的 `dsac.pt`；若要先訓練再評估，拿掉 `--no-train` 並設定 `--total-steps`。
 
+
+### Live trace RLPD fine-tune
+
+先從 live Slurm accounting 收集最近 7 天的 normalized trace，再把它作為 score demonstration replay 混入 RLPD fine-tune。這個流程會使用真實 submit/start/end、MPS request、node placement 與 wait time，降低只靠 synthetic simulator 訓練的落差。
+
+```bash
+PYTHONPATH=. python3 scripts/collect-live-trace.py \
+    --kubectl "sudo kubectl" \
+    --since now-7days \
+    --completed-only \
+    --output runs/live/live-trace.json \
+    --latency-summary runs/live/live-latency.json
+
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
+    --online-trace runs/live/live-trace.json \
+    --offline-steps 50000 \
+    --n-updates 200 \
+    --utd-ratio 20 \
+    --n-nodes 1 --gpus-per-node 1 \
+    --out-dir runs/rlpd_live_$(date +%Y%m%d-%H%M%S)
+```
+
+也可以同時混入 shadow-mode JSONL transition logs：加上 `--online-log 'runs/shadow/*.jsonl'`。
+
 ### 完整評估（3 families × 5 seeds，對比 score baseline）
 
 ```bash

@@ -39,7 +39,11 @@ class ScaleActionsMixin:
         # If nodes were draining for a previous scale-down, cancel so they can accept jobs again.
         draining = self._draining_nodes.pop(key, set())
         self._draining_started.pop(key, None)
-        for node_name in draining:
+        nodes_to_resume = draining | {
+            f"{partition_cfg.worker_statefulset}-{i}"
+            for i in range(decision.target_replicas)
+        }
+        for node_name in nodes_to_resume:
             try:
                 self.client.resume_slurm_node(node_name)
             except Exception:  # noqa: BLE001
@@ -191,6 +195,11 @@ class ScaleActionsMixin:
         )
         if all_idle:
             self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
+            for node_name in sorted(nodes_to_drain):
+                try:
+                    self.client.down_slurm_node(node_name, reason="operator-scale-down")
+                except Exception:  # noqa: BLE001
+                    pass
             self._draining_nodes.pop(key, None)
             self._draining_started.pop(key, None)
             _SCALE_DOWN_TOTAL.labels(pool=key).inc()
@@ -206,6 +215,7 @@ class ScaleActionsMixin:
                 pending_jobs=state.pending_jobs,
                 running_jobs=state.running_jobs,
                 busy_nodes=state.busy_nodes,
+                slurm_nodes_down=sorted(nodes_to_drain),
             )
         else:
             _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="draining").inc()

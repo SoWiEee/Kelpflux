@@ -31,6 +31,8 @@ from typing import Optional
 import numpy as np
 
 from sim.gym_env import KubefluxSchedEnv
+from sim.loader import load_auto
+from sim.scheduler.score import ScoreScheduler
 
 
 class SumTree:
@@ -297,6 +299,112 @@ def collect_sim_rollouts(*, n_transitions: int, trace_family: str,
     return buf
 
 
+def _add_transition(buf: ReplayBuffer, t: Transition) -> None:
+    if len(buf) >= buf.capacity:
+        return
+    buf.add(t)
+
+
+def _score_demo_action(env: KubefluxSchedEnv, scheduler: ScoreScheduler) -> int:
+    """Pick a legal action using the same score heuristic as the live fallback.
+
+    This turns a normalized live sacct trace into RLPD demonstration data. The
+    trace supplies real arrivals, runtimes, MPS requests, and observed latency
+    class; the action is the score baseline's choice under the current simulated
+    resource state. That makes the online buffer immediately usable even before
+    we have full shadow-mode obs/next_obs logs for every live decision.
+    """
+    st = env._state  # noqa: SLF001 - replay adapter intentionally uses env internals
+    assert st is not None
+    top = env._top_k_jobs()  # noqa: SLF001
+    mask = env.action_mask()
+    best: tuple[float, int] | None = None
+    for job_i, job in enumerate(top):
+        base = scheduler.score(job, st.cluster)
+        for node_j in range(env.n_nodes):
+            for gpu_k in range(env.gpus_per_node):
+                action = job_i * env._n_placements + node_j * env.gpus_per_node + gpu_k  # noqa: SLF001
+                if action >= len(mask) or not mask[action]:
+                    continue
+                gpu = st.cluster.nodes[node_j].gpus[gpu_k]
+                residual = gpu.free_mps - job.mps_req
+                placement_fit = 1.0 - max(0.0, residual) / max(1, st.cluster.mps_per_gpu)
+                value = base + 0.05 * placement_fit
+                if best is None or value > best[0]:
+                    best = (value, action)
+    return best[1] if best is not None else env._no_op  # noqa: SLF001
+
+
+def load_live_trace_rollouts(
+    paths: list[str],
+    *,
+    obs_dim: int,
+    n_actions: int,
+    capacity: int,
+    n_nodes: int,
+    gpus_per_node: int,
+    n_jobs: int,
+) -> ReplayBuffer:
+    """Replay normalized live traces into score-demonstration transitions.
+
+    The input is the JSON emitted by scripts/collect-live-trace.py. Unlike
+    load_live_shadow_log(), this does not require prior shadow-mode JSONL logs;
+    it reconstructs obs/action/reward/next_obs by running the same trace through
+    KubefluxSchedEnv and choosing score-policy actions.
+    """
+    buf = ReplayBuffer(capacity=capacity, obs_dim=obs_dim, n_actions=n_actions)
+    files: list[str] = []
+    for pattern in paths:
+        files.extend(glob.glob(pattern))
+    if not files:
+        print(f"[rlpd] no normalized live trace files matched {paths}", file=sys.stderr)
+        return buf
+
+    scheduler = ScoreScheduler()
+    for fp in files:
+        jobs = load_auto(fp)
+        if n_jobs > 0:
+            jobs = jobs[:n_jobs]
+        if not jobs:
+            continue
+        env = KubefluxSchedEnv(
+            lambda _jobs=jobs: list(_jobs),
+            n_nodes=n_nodes,
+            gpus_per_node=gpus_per_node,
+            max_steps=max(1000, len(jobs) * 200),
+            reward_mode="jct_aligned",
+        )
+        if env.observation_space.shape[0] != obs_dim or env.action_space.n != n_actions:
+            env.close()
+            raise ValueError(
+                f"live trace env dims mismatch for {fp}: "
+                f"obs={env.observation_space.shape[0]} actions={env.action_space.n}; "
+                f"expected obs={obs_dim} actions={n_actions}"
+            )
+        obs, _ = env.reset()
+        done = False
+        while not done and len(buf) < buf.capacity:
+            mask = env.action_mask()
+            act = _score_demo_action(env, scheduler)
+            next_obs, rew, term, trunc, _info = env.step(act)
+            next_mask = env.action_mask()
+            _add_transition(buf, Transition(
+                obs=obs.astype(np.float32),
+                act=int(act),
+                rew=float(rew),
+                next_obs=next_obs.astype(np.float32),
+                done=bool(term or trunc),
+                mask=mask,
+                next_mask=next_mask,
+            ))
+            obs = next_obs
+            done = bool(term or trunc)
+        env.close()
+        if len(buf) >= buf.capacity:
+            break
+    return buf
+
+
 def load_live_shadow_log(paths: list[str], *, obs_dim: int,
                           n_actions: int, capacity: int) -> ReplayBuffer:
     """Parse Phase D shadow-mode log lines (one JSON per /decide call) and
@@ -400,7 +508,13 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                                      online_ratio=online_ratio, rng=rng)
                 losses = agent.update(batch)
                 for k, v in losses.items():
-                    loss_acc[k] = loss_acc.get(k, 0.0) + v / utd_ratio
+                    if k == "td_errors":
+                        loss_acc["td_error_mean"] = (
+                            loss_acc.get("td_error_mean", 0.0)
+                            + float(np.mean(np.abs(v))) / utd_ratio
+                        )
+                        continue
+                    loss_acc[k] = loss_acc.get(k, 0.0) + float(v) / utd_ratio
 
             row = {"update": update, "online_size": len(online),
                    "offline_size": len(offline), **loss_acc}
@@ -461,7 +575,10 @@ def main(argv=None) -> int:
     p.add_argument("--base-policy", default=None,
                    help="dir with dsac.pt checkpoint to warm-start from (optional)")
     p.add_argument("--offline-steps", type=int, default=50_000)
-    p.add_argument("--online-log", nargs="*", default=[])
+    p.add_argument("--online-log", nargs="*", default=[],
+                   help="shadow-mode JSONL transition logs")
+    p.add_argument("--online-trace", nargs="*", default=[],
+                   help="normalized live trace JSON from scripts/collect-live-trace.py; replayed as score demonstrations")
     p.add_argument("--n-updates", type=int, default=200)
     p.add_argument("--utd-ratio", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=256)
@@ -489,12 +606,35 @@ def main(argv=None) -> int:
     )
     print(f"[rlpd] offline buffer size = {len(offline)}")
 
+    online_capacity = max(10_000, args.offline_steps)
     online = load_live_shadow_log(
         args.online_log,
         obs_dim=offline.obs.shape[1],
         n_actions=offline.masks.shape[1],
-        capacity=max(10_000, args.offline_steps),
+        capacity=online_capacity,
     )
+    if args.online_trace:
+        trace_online = load_live_trace_rollouts(
+            args.online_trace,
+            obs_dim=offline.obs.shape[1],
+            n_actions=offline.masks.shape[1],
+            capacity=online_capacity,
+            n_nodes=args.n_nodes,
+            gpus_per_node=args.gpus_per_node,
+            n_jobs=args.n_jobs,
+        )
+        for i in range(len(trace_online)):
+            if len(online) >= online.capacity:
+                break
+            online.add(Transition(
+                obs=trace_online.obs[i],
+                act=int(trace_online.acts[i]),
+                rew=float(trace_online.rews[i]),
+                next_obs=trace_online.next_obs[i],
+                done=bool(trace_online.dones[i]),
+                mask=trace_online.masks[i],
+                next_mask=trace_online.next_masks[i],
+            ), gamma=float(trace_online.gammas[i]))
     print(f"[rlpd] online buffer size = {len(online)} "
           f"(0 = cold start, 100% offline)")
 

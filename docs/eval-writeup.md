@@ -167,6 +167,21 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 這表示 live 對照組遇到 worker lifecycle / Slurm completion acknowledgement 問題。GPU worker pod 在測試期間被重新建立，導致 Slurm 將 node 視為 not responding，job 完成回報不乾淨。測試後已將 queue 清空；GPU worker StatefulSet 依目前 scale-to-zero 策略回到 0 replica。這個結果不能用來主張 score 比 DSAC 差；它只能說明目前 live benchmark 若要做嚴格 A/B，需要先固定 worker lifecycle 或在每個 phase 前重置成相同 warm/cold 狀態。
 
+### 4.3 P0 fix follow-up smoke
+
+後續修正兩個 live worker lifecycle 問題：
+
+1. operator 在 scale-down 成功 patch replicas 後，會把被移除的 Slurm worker nodes 標成 `DOWN`；下一次 scale-up 會先 `RESUME` 目標 StatefulSet ordinals。
+2. chart 不再於 k3s pod 的 GPU `gres.conf` 條目渲染 `Cores=`。live worker 曾因 `Cores=0-3` 和容器可見 CPU topology 不一致而在 slurmd log 出現 `Invalid GRES data for gpu, Cores=0-3`，導致 job stuck `COMPLETING`。
+
+部署後重新提交 GPU/MPS smoke job `149`：
+
+| Job | Name | Req MPS | State | Submit | Start | End | Runtime | Node |
+|---:|---|---:|---|---|---|---|---:|---|
+| 149 | p0-gres-smoke | 25 | COMPLETED | 07:56:55 | 07:56:59 | 07:57:15 | 16s | gpu-rtx4070-0 |
+
+測試後 queue 為空；GPU worker StatefulSet 回到 scale-to-zero 狀態，Slurm GPU nodes 保持 `DOWN` / `DRAIN`，等待下一批 GPU workload 由 operator scale-up 並 resume。
+
 ## 5. 結論
 
 目前可誠實下的結論：
@@ -189,10 +204,9 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 | 優先級 | 改進 | 原因 |
 |---|---|---|
-| P0 | 修正 live benchmark 的 worker lifecycle guard，讓 score-only 與 DSAC phase 都能在同樣 warm/cold 條件完成 | 沒有穩定 live A/B，就無法可信比較 scheduler。 |
-| P1 | 使用 `scripts/collect-live-trace.py` 長期收集 `sacct` normalized trace | DSAC 需要真實 arrival、runtime、wait、node placement 資料，而不是只依賴 synthetic simulator。 |
-| P1 | RLPD fine-tuning：score/Slurm trajectory 作為 demonstration replay，DSAC online replay 作為探索資料 | 可以降低純 simulator 訓練和 live 行為之間的落差。 |
-| P1 | 2×2 cluster benchmark | 目前 1×1 topology 太小，heuristic 很容易接近最佳；多 worker/GPU/MPS 才能凸顯 placement-aware policy 的價值。 |
+| P0 | 已改進並部署：operator scale-down 會將被移除的 Slurm nodes 標成 `DOWN`，下一次 scale-up 會先 `RESUME` 目標 ordinals；chart 也已移除 k3s pod 內會造成 invalid GRES 的 `Cores=` | live smoke job `149` 已完成，證明 scale-to-zero 後下一批 GPU/MPS job 可重新 scale-up、run、complete；仍需用更大樣本 A/B 驗證長時間穩定性。 |
+| P1 | 已改進：`scripts/collect-live-trace.py` 的 normalized trace 可直接餵給 `rlpd_finetune.py --online-trace` | live `sacct` 的 arrival/runtime/MPS/node/wait data 現在能變成 score demonstration replay，不再只停在報表資料。 |
+| P1 | 下一步：長期收集 shadow-mode JSONL transition logs，和 `--online-trace` demonstration replay 混合 | normalized trace 可提供真實 workload 分佈；完整 shadow log 才能補上 DSAC 當下 obs/action/confidence。 |
 | P2 | latency model 納入 warm/cold worker、hard placement、pod startup、Slurm completing/not responding | simulator 若沒模擬這些 live failure mode，模型會學不到真正的部署成本。 |
 | P2 | residual DSAC：DSAC 學 score baseline 的修正量，而不是完全取代 score | 可以保留強 baseline，降低 DRL policy 早期不穩定造成的風險。 |
 
