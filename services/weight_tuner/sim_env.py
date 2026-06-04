@@ -24,7 +24,7 @@ _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from sim.loader import generate_by_family  # noqa: E402
+from sim.loader import MPS_PER_GPU, generate_by_family  # noqa: E402
 from sim.runner import run as sim_run  # noqa: E402
 
 
@@ -47,7 +47,7 @@ def context_vector(spec: TraceSpec) -> Tuple[float, float, float]:
     """
     jobs = generate_by_family(spec.family, n_jobs=spec.n_jobs, seed=spec.seed)
     n = len(jobs)
-    mean_mps = sum(j.mps_req for j in jobs) / max(n, 1) / 4.0  # MPS_PER_GPU
+    mean_mps = sum(j.mps_req for j in jobs) / max(n, 1) / float(MPS_PER_GPU)
     mean_gpu = sum(j.gpu_count for j in jobs) / max(n, 1) / 8.0
     return (n / 2000.0, mean_mps, mean_gpu)
 
@@ -100,7 +100,6 @@ class SimPull:
                 "alpha": alpha, "beta": self.beta,
                 "delta": delta, "epsilon": epsilon,
             },
-            fragmentation=self.fragmentation,
         )
         jct_mean = metrics.summary()["jct_mean"]
         reward = -jct_mean / 3600.0  # negative hours; bandit maximises

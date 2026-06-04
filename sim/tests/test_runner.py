@@ -36,6 +36,24 @@ class RunnerTest(unittest.TestCase):
         # 20% slack — small N, long-tail JCTs are noisy.
         self.assertLess(score["jct_p50"], fcfs["jct_p50"] * 5.0)
 
+    def test_dispatch_latency_increases_wait_and_jct(self):
+        from sim.loader import Job, MPS_PER_GPU
+
+        jobs = [Job(
+            job_id="latency", user="u", gpu_count=1, gpu_type="rtx4070",
+            submit_ts=0.0, runtime=10.0, mem_req=0.0, mps_req=MPS_PER_GPU,
+        )]
+        metrics, _ = run(
+            jobs,
+            n_nodes=1,
+            gpus_per_node=1,
+            scheduler_name="fcfs",
+            dispatch_latency_seconds=12.5,
+        )
+        rec = metrics.records["latency"]
+        self.assertAlmostEqual(rec.wait, 12.5)
+        self.assertAlmostEqual(rec.jct, 22.5)
+
 
 if __name__ == "__main__":
     unittest.main()

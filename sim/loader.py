@@ -6,7 +6,8 @@ Two formats supported:
    dicts with keys ``job_id, user, gpu_count, gpu_type, submit_ts,
    runtime, mem_req, mps_req``. ``submit_ts`` and ``runtime`` are seconds
    (float). ``mps_req`` is the per-GPU MPS slot count in [1, MPS_PER_GPU];
-   for whole-GPU jobs use ``MPS_PER_GPU`` (default 4).
+   for whole-GPU jobs use ``MPS_PER_GPU`` (default 100, matching live Slurm
+   ``mps:100`` GRES).
 
 2. **Philly raw** (``cluster_log_data.json`` from
    https://github.com/msr-fiddle/philly-traces) — auto-detected by the
@@ -16,7 +17,7 @@ Two formats supported:
 The Philly trace itself does **not** include MPS data (jobs are scheduled
 in whole-GPU units). To exercise the M3 score factors we *augment* a
 configurable fraction of single-GPU jobs by lowering ``mps_req`` to a
-random tier {1, 2, 3, 4}. This is documented in §M4 of
+random tier such as {25, 50, 75}. This is documented in §M4 of
 ``docs/scheduler.md`` (risk note).
 """
 from __future__ import annotations
@@ -29,7 +30,9 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Iterable, List, Optional
 
-MPS_PER_GPU = 4
+MPS_PER_GPU = 100
+MPS_FRACTIONAL_TIERS = (25, 50, 75)
+MPS_SMALL_TIERS = (25, 50)
 
 
 @dataclass(frozen=True)
@@ -122,7 +125,7 @@ def load_philly(
             continue
         mps_req = MPS_PER_GPU
         if gpu_count == 1 and rng.random() < augment_mps_fraction:
-            mps_req = rng.choice([1, 2, 3])  # not 4 == whole
+            mps_req = rng.choice(MPS_FRACTIONAL_TIERS)  # not 100 == whole
         jobs.append(
             Job(
                 job_id=str(entry.get("jobid", len(jobs))),
@@ -166,7 +169,7 @@ def generate_philly_like(
     - Runtimes are heavy-tailed log-normal (median ~30 min, p95 ~6h).
     - Submit timestamps Poisson-arrival, mean rate tuned so a 1k subsample
       spans ~5 days.
-    - 30 % of single-GPU jobs are MPS-fractional ({1, 2, 3} slots).
+    - 30 % of single-GPU jobs are MPS-fractional ({25, 50, 75} slots).
     """
     rng = random.Random(seed)
     users = [f"u{i:02d}" for i in range(n_users)]
@@ -187,7 +190,7 @@ def generate_philly_like(
         runtime = max(60.0, rng.lognormvariate(7.5, 1.4))
         mps = MPS_PER_GPU
         if gpu == 1 and rng.random() < 0.30:
-            mps = rng.choice([1, 2, 3])
+            mps = rng.choice(MPS_FRACTIONAL_TIERS)
         jobs.append(
             Job(
                 job_id=f"phl-{i:05d}",
@@ -250,7 +253,7 @@ def generate_burst_heavy(
         runtime = max(60.0, rng.lognormvariate(7.5, 1.4))
         mps = MPS_PER_GPU
         if gpu == 1 and rng.random() < 0.30:
-            mps = rng.choice([1, 2, 3])
+            mps = rng.choice(MPS_FRACTIONAL_TIERS)
         jobs.append(
             Job(
                 job_id=f"burst-{i:05d}",
@@ -280,7 +283,7 @@ def generate_ali_like(
 
     - 90% single-GPU, 7% 2-GPU, 3% 4-GPU.
     - Runtimes shorter than Philly: median ~13 min, p95 ~3h (log-normal mu=6.8, sigma=1.2).
-    - 60% of single-GPU jobs are MPS-fractional, often <= 0.5 GPU (mps {1,2}).
+    - 60% of single-GPU jobs are MPS-fractional, often <= 0.5 GPU (mps {25,50}).
     - Diurnal arrival: rate doubles during the daytime 12h of each 24h cycle.
     """
     rng = random.Random(seed)
@@ -309,7 +312,7 @@ def generate_ali_like(
         runtime = max(60.0, rng.lognormvariate(6.8, 1.2))  # median ~900s, p95 ~3h
         mps = MPS_PER_GPU
         if gpu == 1 and rng.random() < 0.60:
-            mps = rng.choice([1, 2])
+            mps = rng.choice(MPS_SMALL_TIERS)
         jobs.append(
             Job(
                 job_id=f"ali-{i:05d}",

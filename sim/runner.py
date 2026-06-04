@@ -38,9 +38,17 @@ def run(
     gpus_per_node: int,
     scheduler_name: str,
     mps_per_gpu: int = MPS_PER_GPU,
+    dispatch_latency_seconds: float = 0.0,
     scheduler_kwargs=None,
 ) -> Tuple[MetricCollector, Cluster]:
-    """Run the trace through the simulator."""
+    """Run the trace through the simulator.
+
+    ``dispatch_latency_seconds`` models live Slurm/operator delay between a
+    scheduler decision and the job's observed start time. Keep it at 0.0 for
+    pure resource-allocation studies; set it from live accounting when replaying
+    k3s/Slurm traces that include worker startup, node registration, prolog, or
+    hold-release placement latency.
+    """
     cluster = Cluster(n_nodes=n_nodes, gpus_per_node=gpus_per_node, mps_per_gpu=mps_per_gpu)
     scheduler = make_scheduler(scheduler_name, **(scheduler_kwargs or {}))
     metrics = MetricCollector()
@@ -67,8 +75,9 @@ def run(
         for j in list(ordered):
             if cluster.try_allocate(j) is not None:
                 pending.remove(j)
-                metrics.record_start(j.job_id, now)
-                heapq.heappush(events, (now + j.runtime, seq, "end", j.job_id))
+                start_t = now + max(0.0, dispatch_latency_seconds)
+                metrics.record_start(j.job_id, start_t)
+                heapq.heappush(events, (start_t + j.runtime, seq, "end", j.job_id))
                 seq += 1
             elif not scheduler.backfill:
                 break
@@ -102,6 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nodes", type=int, default=4)
     p.add_argument("--gpus-per-node", type=int, default=4)
     p.add_argument("--mps-per-gpu", type=int, default=MPS_PER_GPU)
+    p.add_argument("--dispatch-latency-seconds", type=float, default=0.0,
+                   help="fixed live dispatch/start latency added to each job start")
     p.add_argument("--output", help="write per-job CSV here")
     p.add_argument("--write-trace", help="write the loaded/synthetic trace as normalized JSON")
     p.add_argument("--summary-json", help="write summary dict as JSON to this path")
@@ -136,6 +147,7 @@ def main(argv=None) -> int:
         gpus_per_node=args.gpus_per_node,
         scheduler_name=args.scheduler,
         mps_per_gpu=args.mps_per_gpu,
+        dispatch_latency_seconds=args.dispatch_latency_seconds,
         scheduler_kwargs=sched_kwargs or None,
     )
     wall = time.monotonic() - t0
@@ -146,6 +158,8 @@ def main(argv=None) -> int:
         "wall_seconds": round(wall, 3),
         "nodes": args.nodes,
         "gpus_per_node": args.gpus_per_node,
+        "mps_per_gpu": args.mps_per_gpu,
+        "dispatch_latency_seconds": args.dispatch_latency_seconds,
         "synth_seed": args.synth_seed if args.synth_jobs > 0 else None,
         "trace_family": args.trace_family if args.synth_jobs > 0 else "loaded",
         **sched_kwargs,

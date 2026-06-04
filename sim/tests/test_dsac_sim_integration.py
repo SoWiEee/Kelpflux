@@ -35,7 +35,7 @@ def _single_gpu_factory(n_jobs: int = 40, seed: int = 7):
         from sim.loader import MPS_PER_GPU
         jobs = []
         for i in range(n_jobs):
-            mps = int(rng.choice([1, 2, 4]))
+            mps = int(rng.choice([25, 50, 100]))
             jobs.append(Job(
                 job_id=f"j{i}", user="u0", gpu_count=1, gpu_type="rtx4070",
                 submit_ts=float(i * 5), runtime=float(rng.integers(20, 120)),

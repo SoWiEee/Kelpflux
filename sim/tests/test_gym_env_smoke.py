@@ -117,7 +117,7 @@ def _single_gpu_factory(n_jobs: int = 30, seed: int = 0):
     def _build():
         jobs = []
         for i in range(n_jobs):
-            mps = int(rng.choice([1, 2, 4]))   # fractions of MPS_PER_GPU
+            mps = int(rng.choice([25, 50, 100]))   # fractions of MPS_PER_GPU
             jobs.append(Job(
                 job_id=f"j{i}", user="u0", gpu_count=1, gpu_type="rtx4070",
                 submit_ts=float(i * 10), runtime=float(rng.integers(30, 300)),
