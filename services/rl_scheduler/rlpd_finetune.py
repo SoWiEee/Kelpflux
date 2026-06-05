@@ -522,7 +522,8 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
 
             if (update + 1) % 50 == 0:
                 print(f"  update {update+1:4d}/{n_updates}  "
-                      f"loss_q={loss_acc.get('loss_q', 0):.4f}  "
+                      f"loss_critic={loss_acc.get('loss_critic', 0):.4f}  "
+                      f"loss_actor={loss_acc.get('loss_actor', 0):.4f}  "
                       f"alpha={loss_acc.get('alpha', 0):.4f}  "
                       f"H={loss_acc.get('entropy', 0):.3f}")
 

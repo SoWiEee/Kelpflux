@@ -13,10 +13,8 @@ def test_distributional_cvar_agent_updates_and_selects_feasible_action():
     agent = DSACAgent(
         obs_dim=obs_dim,
         n_actions=n_actions,
-        use_iqn=True,
         risk_mode="cvar",
-        risk_alpha=0.25,
-        cql_alpha=0.0,
+        risk_beta=0.25,
         device="cpu",
     )
 
@@ -33,7 +31,7 @@ def test_distributional_cvar_agent_updates_and_selects_feasible_action():
 
     losses = agent.update(batch)
 
-    assert np.isfinite(losses["loss_q"])
+    assert np.isfinite(losses["loss_critic"])
     assert losses["td_errors"].shape == (8,)
 
     mask = np.array([False, True, False, True], dtype=np.bool_)

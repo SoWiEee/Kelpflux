@@ -208,6 +208,7 @@ class _RunState:
     n_jobs:           int
     jct_sum:          float
     completion_reward: float
+    jcts:             list = dataclasses.field(default_factory=list)
 
 
 # ── Environment ───────────────────────────────────────────────────────────
@@ -408,6 +409,7 @@ class KubefluxSchedEnv:
         j   = st.by_id[jid]
         jct = st.now - j.submit_ts
         st.jct_sum += jct
+        st.jcts.append(jct)
         if self.reward_mode == "shaped":
             b_jct, b_slow = self.reward_betas
             runtime  = max(1.0, j.runtime)
@@ -476,6 +478,10 @@ class KubefluxSchedEnv:
         n   = max(1, st.n_jobs)
         return -sum(max(0.0, now - j.submit_ts)
                     for j in st.pending) / (self.reward_scale * n)
+
+    def episode_jcts(self) -> list[float]:
+        """Per-job JCTs of completed jobs this episode (for tail metrics)."""
+        return [] if self._state is None else list(self._state.jcts)
 
     def render(self):
         return None

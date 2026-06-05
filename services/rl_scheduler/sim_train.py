@@ -34,6 +34,7 @@ import numpy as np
 from sim.gym_env import KubefluxSchedEnv, env_dims
 from sim.loader import generate_by_family
 from services.rl_scheduler.dsac import DSACAgent
+from services.rl_scheduler.distortion import RISK_MODES
 from services.rl_scheduler.rlpd_finetune import (
     PrioritizedReplayBuffer, ReplayBuffer, Transition,
 )
@@ -89,10 +90,8 @@ def sim_train(
     # New improvements
     potential_shaping: bool = True,
     use_per: bool = True,
-    use_iqn: bool = False,
     risk_mode: str = "mean",
-    risk_alpha: float = 0.25,
-    cql_alpha: float = 0.1,
+    risk_beta: float = 0.25,
     curriculum: bool = False,
     curriculum_stages: Optional[list] = None,
 ) -> DSACAgent:
@@ -126,8 +125,8 @@ def sim_train(
     )
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
-        use_attention=use_attention, use_iqn=use_iqn,
-        risk_mode=risk_mode, risk_alpha=risk_alpha, cql_alpha=cql_alpha,
+        use_attention=use_attention,
+        risk_mode=risk_mode, risk_beta=risk_beta,
     )
 
     if use_per:
@@ -277,20 +276,16 @@ def main(argv=None) -> int:
                    default=f"runs/dsac_sim_{time.strftime('%Y%m%d-%H%M%S')}")
     # Architecture flags
     p.add_argument("--no-attention",         action="store_true")
-    p.add_argument("--use-iqn",              action="store_true",
-                   help="IQN distributional critic (quantile Huber loss)")
-    p.add_argument("--risk-mode",            choices=["mean", "cvar"],
+    p.add_argument("--risk-mode",            choices=list(RISK_MODES),
                    default="mean",
-                   help="risk objective for IQN action selection")
-    p.add_argument("--risk-alpha",           type=float, default=0.25,
-                   help="lower-tail mass for CVaR risk mode")
+                   help="risk distortion in the RDSAC actor objective")
+    p.add_argument("--risk-beta",            type=float, default=0.25,
+                   help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
     # Improvement flags
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable potential-based reward shaping")
     p.add_argument("--no-per",               action="store_true",
                    help="disable Prioritized Experience Replay")
-    p.add_argument("--cql-alpha",            type=float, default=0.1,
-                   help="CQL penalty weight (0 = disabled)")
     p.add_argument("--curriculum",           action="store_true",
                    help="ramp n_jobs: 10→30→50 over training")
     args = p.parse_args(argv)
@@ -303,13 +298,13 @@ def main(argv=None) -> int:
 
     traces = args.trace if len(args.trace) > 1 else args.trace[0]
     use_attention = not args.no_attention
-    arch = "IQN" if args.use_iqn else ("Attention" if use_attention else "MLP")
+    arch = "IQN+Attention" if use_attention else "IQN+MLP"
     print(f"[sim_train] arch={arch}  n={args.n_nodes}×{args.gpus_per_node}  "
           f"trace={traces}  steps={args.total_steps:,}  "
           f"n_jobs={args.n_jobs}  nstep={args.nstep_n}  "
           f"PER={not args.no_per}  shaping={not args.no_potential_shaping}  "
-          f"risk={args.risk_mode}:{args.risk_alpha}  "
-          f"CQL={args.cql_alpha}  curriculum={args.curriculum}  device={device}")
+          f"risk={args.risk_mode}:{args.risk_beta}  "
+          f"curriculum={args.curriculum}  device={device}")
     sim_train(
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
         trace_family=traces, n_jobs=args.n_jobs,
@@ -321,10 +316,8 @@ def main(argv=None) -> int:
         use_attention=use_attention,
         potential_shaping=not args.no_potential_shaping,
         use_per=not args.no_per,
-        use_iqn=args.use_iqn,
         risk_mode=args.risk_mode,
-        risk_alpha=args.risk_alpha,
-        cql_alpha=args.cql_alpha,
+        risk_beta=args.risk_beta,
         curriculum=args.curriculum,
     )
     return 0

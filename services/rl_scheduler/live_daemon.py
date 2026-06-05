@@ -447,8 +447,8 @@ def _agent_select(
     with torch.no_grad():
         obs_t  = torch.as_tensor(obs,  dtype=torch.float32).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
-        q      = torch.min(agent.q1(obs_t), agent.q2(obs_t))
-        probs, log_probs = agent._masked_policy(q, mask_t)
+        probs, log_probs = agent.actor.policy(obs_t, mask_t)
+        q       = agent.action_values(obs_t)
         entropy = float(-(probs * log_probs).sum(dim=-1).item())
         value   = float((probs * q).sum(dim=-1).item())
         pnp     = probs.squeeze(0).cpu().numpy()

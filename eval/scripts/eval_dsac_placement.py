@@ -48,6 +48,7 @@ from sim.gym_env import KubefluxSchedEnv, env_dims
 from sim.loader import generate_by_family
 from sim.runner import run as sim_run
 from services.rl_scheduler.dsac import DSACAgent
+from services.rl_scheduler.distortion import RISK_MODES
 from services.rl_scheduler.sim_train import sim_train
 
 
@@ -60,8 +61,13 @@ def eval_dsac_jct(
     n_jobs: int,
     seeds: list[int],
     greedy: bool = True,
+    per_job_out: list | None = None,
 ) -> list[float]:
-    """Run agent over seeds, return list of avg_jct (seconds)."""
+    """Run agent over seeds, return list of avg_jct (seconds).
+
+    If ``per_job_out`` is given, per-job JCTs across all seeds are appended to it
+    (used for risk-sensitive tail metrics: p95/p99 JCT).
+    """
     total_gpus = n_nodes * gpus_per_node
     jcts = []
     for seed in seeds:
@@ -81,6 +87,8 @@ def eval_dsac_jct(
             act  = agent.select_action(obs, mask, greedy=greedy)
             obs, _, term, trunc, info = env.step(act)
             done = term or trunc
+        if per_job_out is not None:
+            per_job_out.extend(env.episode_jcts())
         env.close()
         jcts.append(info.get("avg_jct", float("nan")))
     return jcts
@@ -153,20 +161,16 @@ def main(argv=None) -> int:
     p.add_argument("--device",         default="cpu",
                    help="torch device for DSAC: 'cpu' or 'cuda'")
     p.add_argument("--no-attention",         action="store_true",
-                   help="MLP Q-network instead of attention")
-    p.add_argument("--use-iqn",              action="store_true",
-                   help="IQN distributional critic (quantile Huber loss)")
-    p.add_argument("--risk-mode",            choices=["mean", "cvar"],
+                   help="MLP critic trunk instead of attention")
+    p.add_argument("--risk-mode",            choices=list(RISK_MODES),
                    default="mean",
-                   help="risk objective for IQN action selection")
-    p.add_argument("--risk-alpha",           type=float, default=0.25,
-                   help="lower-tail mass for CVaR risk mode")
+                   help="risk distortion in the RDSAC actor objective")
+    p.add_argument("--risk-beta",            type=float, default=0.25,
+                   help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable per-step potential shaping")
     p.add_argument("--no-per",               action="store_true",
                    help="disable Prioritized Experience Replay")
-    p.add_argument("--cql-alpha",            type=float, default=0.1,
-                   help="CQL penalty weight (0 = disabled)")
     p.add_argument("--curriculum",           action="store_true",
                    help="ramp n_jobs 10→30→50 during training")
     args = p.parse_args(argv)
@@ -181,23 +185,20 @@ def main(argv=None) -> int:
             return 2
         print(f"[eval] loading checkpoint: {args.ckpt}")
         agent = DSACAgent.load(
-            args.ckpt, risk_mode=args.risk_mode, risk_alpha=args.risk_alpha
+            args.ckpt, risk_mode=args.risk_mode, risk_beta=args.risk_beta
         )
     elif args.ckpt:
         print(f"[eval] loading checkpoint: {args.ckpt}")
         agent = DSACAgent.load(
-            args.ckpt, risk_mode=args.risk_mode, risk_alpha=args.risk_alpha
+            args.ckpt, risk_mode=args.risk_mode, risk_beta=args.risk_beta
         )
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
         use_attention = not args.no_attention
-        arch_parts = []
-        if args.use_iqn:         arch_parts.append(f"IQN-{args.risk_mode}:{args.risk_alpha}")
-        elif use_attention:       arch_parts.append("Attn")
-        else:                     arch_parts.append("MLP")
+        arch_parts = [f"IQN-{args.risk_mode}:{args.risk_beta}"]
+        arch_parts.append("Attn" if use_attention else "MLP")
         if not args.no_per:               arch_parts.append("PER")
         if not args.no_potential_shaping: arch_parts.append("Shaping")
-        if args.cql_alpha > 0:            arch_parts.append(f"CQL={args.cql_alpha}")
         if args.curriculum:               arch_parts.append("Curr")
         arch_name = "+".join(arch_parts)
         print(f"[eval] training DSAC({arch_name}) for {args.total_steps:,} steps "
@@ -213,12 +214,10 @@ def main(argv=None) -> int:
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
             use_attention=use_attention,
-            use_iqn=args.use_iqn,
             risk_mode=args.risk_mode,
-            risk_alpha=args.risk_alpha,
+            risk_beta=args.risk_beta,
             potential_shaping=not args.no_potential_shaping,
             use_per=not args.no_per,
-            cql_alpha=args.cql_alpha,
             curriculum=args.curriculum,
         )
         print()
@@ -228,10 +227,11 @@ def main(argv=None) -> int:
     for family in args.trace_families:
         print(f"[eval] evaluating {family} ({len(args.seeds)} seeds) ...", end=" ",
               flush=True)
+        dsac_per_job: list = []
         dsac_jcts  = eval_dsac_jct(
             agent, n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
             trace_family=family, n_jobs=args.n_jobs,
-            seeds=args.seeds, greedy=args.greedy,
+            seeds=args.seeds, greedy=args.greedy, per_job_out=dsac_per_job,
         )
         score_jcts = eval_score_jct(
             n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
@@ -250,17 +250,23 @@ def main(argv=None) -> int:
             "ci95_hi_pct":      float(ci_hi / score_mean * 100),
             "p_value":          float(p_val),
             "significant":      bool(p_val < 0.05) if not np.isnan(p_val) else False,
+            # Risk-sensitive tail metrics (per-job JCT across all seeds, hours)
+            "dsac_jct_p95_h":   float(np.percentile(dsac_per_job, 95)) / 3600
+                                if dsac_per_job else float("nan"),
+            "dsac_jct_p99_h":   float(np.percentile(dsac_per_job, 99)) / 3600
+                                if dsac_per_job else float("nan"),
             "dsac_jcts_h":      [j / 3600 for j in dsac_jcts],
             "score_jcts_h":     [j / 3600 for j in score_jcts],
         })
-        print(f"Δ={pct:+.1f}%  p={p_val:.3f}")
+        p99h = rows[-1]["dsac_jct_p99_h"]
+        print(f"Δ={pct:+.1f}%  p={p_val:.3f}  p99={p99h:.2f}h")
 
     print_table(rows)
 
     # ── Save CSV (without list columns) ────────────────────────────────
     csv_cols = ["family", "dsac_jct_mean_h", "score_jct_mean_h",
                 "delta_pct", "ci95_lo_pct", "ci95_hi_pct",
-                "p_value", "significant"]
+                "p_value", "significant", "dsac_jct_p95_h", "dsac_jct_p99_h"]
     csv_path = out_dir / "eval_dsac_placement.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")

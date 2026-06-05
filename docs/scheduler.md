@@ -162,6 +162,16 @@ DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被
 
 Submit-time path 仍是低風險預設；hard placement controller 是正式可用的 Slurm-safe placement path，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗與受控上線。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
 
+#### 演算法：risk-sensitive distributional SAC（RDSAC）
+
+底層 agent（`services/rl_scheduler/dsac.py`）是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning〉(arXiv:2004.14547) 的**離散動作忠實轉寫**。連續控制的 reparameterised Gaussian actor 因為 placement 是離散動作而換成**顯式 categorical actor** `π(a|s;φ)`；分布式 critic 與 risk 機制依論文 §4.1（RDSAC）：
+
+- **雙分布 critic**：把 soft return 拆成 reward 分布 `Z_R` 與 entropy 分布 `Z_H`，各以 IQN(Dabney et al. 2018)的 quantile 表示、共用 trunk 只差最後一層；quantile Huber 回歸 + twin critic double learning。慣例採 α-external：`Z_H` 回歸純 entropy return，組合值為 `Q = E[Z_R] + α·E[Z_H]`。
+- **Risk 進策略目標**：actor 目標 `J_π = Σ_a π(a|s)·[α·logπ(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)]]`，distortion `ρ` 只作用在 reward 分布 `Z_R`，entropy 保持期望。
+- **Risk 旋鈕** `risk_mode ∈ {mean, cvar, wang, cpw, msd}`（`risk_beta` 為風險參數，見 `services/rl_scheduler/distortion.py`）：`mean` 為 risk-neutral，退化成穩定性導向的 distributional SAC；`cvar` 偏好下尾較不嚴重的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。temperature α 依 SAC 自動調（離散 target entropy = `ratio·log(n_valid)`）。
+
+`risk_mode=mean` 是預設;要尾部感知(p95/p99 JCT、tail slowdown,見 `sim/metrics.py`)時改用 `cvar`。
+
 ### 3.3 Submit 到硬體分配的時序
 
 ```mermaid
@@ -470,6 +480,8 @@ Service response：
 }
 ```
 
+`value` 為策略下的期望 risk-adjusted action value `Σ_a π(a|s)·(ρ[Z_R(s,a)] + α·E[Z_H(s,a)])`（由 `DSACAgent.action_values` 計算，受 `risk_mode` 影響）；`entropy` 為 categorical policy `π(a|s)` 的熵。兩者餵給下方 §8.3 的 `valueAbstain` / `entropyAbstain` guardrail。
+
 ### 8.3 Live Safety Gates
 
 | Gate | 行為 |
@@ -597,7 +609,8 @@ kubectl -n slurm exec deploy/slurm-login -- \
 | `services/rl_scheduler/snapshot_agent.py` | Periodic Slurm REST snapshot updater for `/snapshot` |
 | `services/rl_scheduler/placement_controller.py` | Slurm-safe DSAC hard placement controller using hold-release and `ReqNodeList` |
 | `services/rl_scheduler/live_daemon.py` | Direct placement research / legacy prototype; not recommended for Slurm-safe production placement |
-| `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
+| `services/rl_scheduler/dsac.py` | RDSAC (Ma et al.) — dual Z_R/Z_H IQN critic + categorical actor |
+| `services/rl_scheduler/distortion.py` | Risk distortions (CVaR/Wang/CPW/MSD) |
 | `services/runtime_predictor/` | Runtime prediction service |
 | `services/weight_tuner/` | UCB1 weight tuner |
 | `chart/dashboards/scheduler-live.json` | Live scheduler Grafana dashboard |

@@ -272,8 +272,8 @@ class _AgentHolder:
         with torch.no_grad():
             obs_t  = torch.as_tensor(obs,  dtype=torch.float32).unsqueeze(0)
             mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
-            q      = torch.min(self.agent.q1(obs_t), self.agent.q2(obs_t))
-            probs, log_probs = self.agent._masked_policy(q, mask_t)
+            probs, log_probs = self.agent.actor.policy(obs_t, mask_t)
+            q        = self.agent.action_values(obs_t)
             entropy  = float(-(probs * log_probs).sum(dim=-1).item())
             value    = float((probs * q).sum(dim=-1).item())
             probs_np = probs.squeeze(0).cpu().numpy()

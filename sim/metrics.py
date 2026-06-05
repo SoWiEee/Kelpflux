@@ -104,10 +104,13 @@ class MetricCollector:
             "jct_p50": _pct(jcts, 50),
             "jct_p90": _pct(jcts, 90),
             "jct_p95": _pct(jcts, 95),
+            "jct_p99": _pct(jcts, 99),
             "wait_mean": statistics.fmean(waits) if waits else 0.0,
             "wait_p90": _pct(waits, 90) if waits else 0.0,
             "slowdown_mean": statistics.fmean(slows) if slows else 0.0,
             "slowdown_p90": _pct(slows, 90) if slows else 0.0,
+            "slowdown_p95": _pct(slows, 95) if slows else 0.0,
+            "slowdown_p99": _pct(slows, 99) if slows else 0.0,
             "utilization": util,
             "bf_rate": bf / len(finished),
         }

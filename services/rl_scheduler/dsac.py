@@ -1,26 +1,35 @@
-"""Distributional Soft Actor-Critic with action masking (DSAC).
+"""Risk-sensitive Distributional Soft Actor-Critic (RDSAC) with action masking.
 
-The scheduler has a finite masked action set, so the policy is represented as π(a|s) = softmax(min(Q1,Q2)(s,·) / α) over feasible actions.
-Twin Q-networks with LayerNorm (RLPD-recommended for stable offline+online mixing).
-Temperature α auto-tuned via gradient on log_α.
+Faithful discrete transpose of Ma et al. 2020/2025, "DSAC: Distributional Soft
+Actor-Critic for Risk-Sensitive Reinforcement Learning" (arXiv:2004.14547),
+official repo https://github.com/xtma/dsac.
 
-When ``use_iqn=True`` the critic is distributional: each Q-network predicts
-return quantiles with an Implicit Quantile Network. In that mode action
-selection can use either mean return or a lower-tail CVaR estimate, which is the
-risk-sensitive path used by Distributional Soft Actor-Critic style training.
+The scheduler action space is finite and masked, so the continuous reparameterised
+Gaussian actor of the paper is replaced by an explicit **categorical actor**
+``π(a|s;φ)``; the distributional critic and the risk machinery follow the paper.
 
-Two Q-network architectures available via use_attention flag:
-  MLP  (default): flat concat of all obs dims → twin MLP Q-network.
-  Attn (this branch): self-attention over job queue tokens (permutation-
-        invariant) + linear cluster encoder → fused Q-head.
+Critic (per Ma et al. §4.1, "RDSAC"): the soft return is split into a reward
+distribution ``Z_R`` and an entropy distribution ``Z_H``, each parameterised by an
+Implicit Quantile Network (Dabney et al. 2018) over the same shared trunk (heads
+differ only in the final layer). Both are trained with quantile Huber regression
+and double learning (twin critics, per-quantile min on the target).
+
+Convention (α-external): ``Z_H`` regresses the pure entropy return in nats; the
+combined value is ``Q = E[Z_R] + α·E[Z_H]``. Because α is auto-tuned, keeping it
+outside means the entropy distribution does not relearn when α moves.
+
+Actor (Ma et al. §4.1 objective, discrete categorical sum, masked):
+
+    J_π(φ) = E_s Σ_a π(a|s) · [ α·log π(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)] ]
+
+where ρ is a risk distortion (mean / cvar / wang / cpw / msd) applied to the
+reward distribution only — risk is injected into the policy objective, not just at
+action selection. See ``distortion.py`` for the estimators.
 
 References:
-  Ma et al. 2020/2025, "DSAC: Distributional Soft Actor-Critic for
-        Risk-Sensitive Reinforcement Learning"
-  Christodoulou 2019, "Soft Actor-Critic for Discrete Action Spaces"
-        (finite masked-action implementation detail)
-  Kool et al. 2019 ICLR, "Attention, Learn to Solve Routing Problems!"
-  Lee et al. 2019 ICML, "Set Transformer"
+  Ma et al. 2020/2025 — DSAC (risk-sensitive distributional SAC)
+  Dabney et al. 2018 ICML — Implicit Quantile Networks
+  Christodoulou 2019 — Soft Actor-Critic for Discrete Action Spaces
 """
 from __future__ import annotations
 
@@ -32,6 +41,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from services.rl_scheduler.distortion import RISK_MODES, distorted_values
 
 
 def _build_mlp(in_dim: int, hidden: Sequence[int], out_dim: int,
@@ -52,195 +63,126 @@ def _build_mlp(in_dim: int, hidden: Sequence[int], out_dim: int,
     return nn.Sequential(*layers)
 
 
-class _QNet(nn.Module):
-    """Flat MLP Q-network (baseline)."""
+class _AttentionEncoder(nn.Module):
+    """Permutation-invariant trunk: self-attention over job tokens → (B, d).
+
+    Observation layout (must match gym_env.py _build_obs):
+        obs = [job_0 (JOB_DIM) … job_{K-1} (JOB_DIM), cluster (rest)]
+    Job slots whose features are all zero are treated as padding.
+    """
+
+    TOP_K: int = 16
+    JOB_DIM: int = 11
+
+    def __init__(self, obs_dim: int, d: int, n_heads: int = 4,
+                 n_layers: int = 2) -> None:
+        super().__init__()
+        self.cluster_dim = obs_dim - self.TOP_K * self.JOB_DIM
+        assert self.cluster_dim > 0, f"obs_dim={obs_dim} too small for attention trunk"
+        self.job_embed = nn.Linear(self.JOB_DIM, d)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d, nhead=n_heads, dim_feedforward=d * 2,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.cluster_embed = nn.Linear(self.cluster_dim, d)
+        self.proj = nn.Linear(d * 2, d)
+        for m in [self.job_embed, self.cluster_embed, self.proj]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        k, jd = self.TOP_K, self.JOB_DIM
+        jobs = obs[:, :k * jd].view(-1, k, jd)
+        cluster = obs[:, k * jd:]
+        pad = (jobs.abs().sum(dim=-1) == 0)
+        tok = F.relu(self.job_embed(jobs))
+        enc = self.transformer(tok, src_key_padding_mask=pad)
+        non_pad = (~pad).float().unsqueeze(-1)
+        n_valid = non_pad.sum(dim=1).clamp(min=1.0)
+        queue_ctx = (enc * non_pad).sum(dim=1) / n_valid
+        cluster_ctx = F.relu(self.cluster_embed(cluster))
+        return F.relu(self.proj(torch.cat([queue_ctx, cluster_ctx], dim=-1)))
+
+
+class _DualIQNCritic(nn.Module):
+    """Dual-head Implicit Quantile Network: reward return Z_R and entropy return Z_H.
+
+    Shared trunk (MLP or attention) → state embedding d; cosine-embedded quantile
+    fraction τ multiplies it elementwise; two linear heads emit Z_R and Z_H
+    quantiles, each (B, N_QUANT, n_actions).
+    """
+
+    N_QUANT: int = 32   # quantile samples per forward
+    N_COS: int = 64     # cosine embedding dimension for τ
+
     def __init__(self, obs_dim: int, n_actions: int,
-                 hidden: Sequence[int], layer_norm: bool) -> None:
+                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True,
+                 use_attention: bool = False) -> None:
+        super().__init__()
+        d = hidden[-1]
+        if use_attention:
+            self.encoder = _AttentionEncoder(obs_dim, d)
+        else:
+            enc_hidden = hidden[:-1] if len(hidden) > 1 else ()
+            self.encoder = _build_mlp(obs_dim, enc_hidden, d, layer_norm)
+        self.phi_embed = nn.Linear(self.N_COS, d)
+        self.head_r = nn.Linear(d, n_actions)
+        self.head_h = nn.Linear(d, n_actions)
+        for m in (self.phi_embed, self.head_r, self.head_h):
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+    def quantile_q(self, obs: torch.Tensor, taus: torch.Tensor | None = None
+                   ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (Z_R, Z_H), each (B, N_QUANT, n_actions)."""
+        b = obs.shape[0]
+        if taus is None:
+            taus = torch.rand(b, self.N_QUANT, device=obs.device)
+        s = F.relu(self.encoder(obs))                                  # (B, d)
+        i = torch.arange(1, self.N_COS + 1, device=obs.device, dtype=obs.dtype)
+        cos = torch.cos(math.pi * taus.unsqueeze(-1) * i)              # (B, N, N_COS)
+        phi = F.relu(self.phi_embed(cos))                              # (B, N, d)
+        combined = s.unsqueeze(1) * phi                                # (B, N, d)
+        return self.head_r(combined), self.head_h(combined)
+
+
+class _CategoricalActor(nn.Module):
+    """Explicit masked categorical policy π(a|s;φ)."""
+
+    def __init__(self, obs_dim: int, n_actions: int,
+                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True) -> None:
         super().__init__()
         self.net = _build_mlp(obs_dim, hidden, n_actions, layer_norm)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+    def policy(self, obs: torch.Tensor, mask: torch.Tensor
+               ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Masked (probs, log_probs), each (B, n_actions). Masked log_probs = 0."""
+        logits = self.net(obs).masked_fill(~mask, -1e9)
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        log_probs = log_probs.masked_fill(~mask, 0.0)
+        return probs, log_probs
 
 
-class _AttentionQNet(nn.Module):
-    """Q-network with self-attention over the job queue (permutation-invariant).
-
-    Observation layout (must match gym_env.py _build_obs):
-        obs = [job_0 (JOB_DIM), ..., job_{K-1} (JOB_DIM), cluster (obs_dim - K*JOB_DIM)]
-
-    Architecture:
-        1. job_embed:    Linear(JOB_DIM → d_model) + ReLU
-        2. transformer:  TransformerEncoder (pre-LN, batch_first)
-           → mean-pool non-padding tokens → queue_ctx (d_model)
-        3. cluster_embed: Linear(cluster_dim → d_model) + ReLU → cluster_ctx
-        4. q_head:       MLP([queue_ctx ‖ cluster_ctx] → n_actions)
-
-    Padding mask: job slots where all features == 0 are treated as padding
-    and excluded from the mean-pool (handles variable-length queues).
-    No positional encoding — job order is irrelevant for scheduling.
-    """
-
-    TOP_K: int = 16   # must match gym_env.TOP_K
-    JOB_DIM: int = 11  # features per job slot (must match gym_env.py)
-
-    def __init__(
-        self,
-        obs_dim: int,
-        n_actions: int,
-        d_model: int = 64,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        layer_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        self.top_k = self.TOP_K
-        self.job_dim = self.JOB_DIM
-        self.cluster_dim = obs_dim - self.TOP_K * self.JOB_DIM
-        assert self.cluster_dim > 0, (
-            f"obs_dim={obs_dim} too small for TOP_K={self.TOP_K} × JOB_DIM={self.JOB_DIM}"
-        )
-
-        self.job_embed = nn.Linear(self.JOB_DIM, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads,
-            dim_feedforward=d_model * 2,
-            dropout=0.0, batch_first=True,
-            norm_first=True,   # pre-LN: more stable than post-LN
-        )
-        # enable_nested_tensor=False: norm_first=True doesn't support nested
-        # tensors; disabling avoids a PyTorch UserWarning with no perf impact
-        # on our fixed-size (B, TOP_K, d_model) input.
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
-        )
-        self.cluster_embed = nn.Linear(self.cluster_dim, d_model)
-        self.q_head = _build_mlp(d_model * 2, (d_model,), n_actions, layer_norm)
-
-        for m in [self.job_embed, self.cluster_embed]:
-            nn.init.orthogonal_(m.weight, gain=1.0)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        # Split obs into job tokens and cluster state
-        job_flat = obs[:, :self.top_k * self.job_dim]          # (B, K*11)
-        cluster  = obs[:, self.top_k * self.job_dim:]           # (B, cluster_dim)
-
-        jobs = job_flat.view(-1, self.top_k, self.job_dim)      # (B, K, 11)
-
-        # Padding mask: slots where all features == 0 are empty queue entries
-        pad_mask = (jobs.abs().sum(dim=-1) == 0)                # (B, K)
-
-        job_tok = F.relu(self.job_embed(jobs))                  # (B, K, d)
-        job_enc = self.transformer(job_tok,
-                                   src_key_padding_mask=pad_mask)  # (B, K, d)
-
-        # Mean-pool over non-padding tokens → permutation-invariant queue ctx
-        non_pad = (~pad_mask).float().unsqueeze(-1)             # (B, K, 1)
-        n_valid = non_pad.sum(dim=1).clamp(min=1.0)            # (B, 1)
-        queue_ctx = (job_enc * non_pad).sum(dim=1) / n_valid   # (B, d)
-
-        cluster_ctx = F.relu(self.cluster_embed(cluster))       # (B, d)
-
-        fused = torch.cat([queue_ctx, cluster_ctx], dim=-1)    # (B, 2d)
-        return self.q_head(fused)                              # (B, n_actions)
-
-
-class _IQNQNet(nn.Module):
-    """Implicit Quantile Network for discrete actions (Dabney et al. ICML 2018).
-
-    Architecture:
-        1. State encoder : MLP(obs_dim → hidden → d) — same LayerNorm MLP as _QNet
-        2. Quantile embed : cos(π·i·τ) for i=1..N_COS → Linear → ReLU → d
-        3. Combine        : element-wise product of state and quantile embeddings
-        4. Q head         : Linear(d → n_actions)
-
-    forward(obs) returns mean Q over N_QUANT quantile samples → (B, n_actions).
-    quantile_q(obs, taus) returns (B, N_QUANT, n_actions) for training.
-    This allows drop-in replacement of _QNet for action selection, while
-    enabling quantile regression loss during critic updates.
-    """
-
-    N_QUANT: int = 32   # quantile samples per training step
-    N_COS:   int = 64   # cosine embedding dimension for τ
-
-    def __init__(
-        self,
-        obs_dim: int,
-        n_actions: int,
-        hidden: Sequence[int] = (256, 256),
-        layer_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        d = hidden[-1]
-        enc_hidden = hidden[:-1] if len(hidden) > 1 else ()
-        self.encoder    = _build_mlp(obs_dim, enc_hidden, d, layer_norm)
-        self.phi_embed  = nn.Linear(self.N_COS, d)
-        self.head       = nn.Linear(d, n_actions)
-        for m in [self.phi_embed, self.head]:
-            nn.init.orthogonal_(m.weight, gain=1.0)
-            nn.init.zeros_(m.bias)
-
-    def quantile_q(
-        self, obs: torch.Tensor, taus: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Returns (B, N_QUANT, n_actions)."""
-        B = obs.shape[0]
-        if taus is None:
-            taus = torch.rand(B, self.N_QUANT, device=obs.device)
-        s   = F.relu(self.encoder(obs))                         # (B, d)
-        i   = torch.arange(1, self.N_COS + 1,
-                           device=obs.device, dtype=obs.dtype)  # (N_COS,)
-        cos = torch.cos(math.pi * taus.unsqueeze(-1) * i)      # (B, N_QUANT, N_COS)
-        phi = F.relu(self.phi_embed(cos))                       # (B, N_QUANT, d)
-        combined = s.unsqueeze(1).expand_as(phi) * phi          # (B, N_QUANT, d)
-        return self.head(combined)                              # (B, N_QUANT, n_actions)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Mean Q over quantile samples — used for action selection."""
-        return self.quantile_q(obs).mean(dim=1)                 # (B, n_actions)
-
-    def risk_q(
-        self,
-        obs: torch.Tensor,
-        risk_mode: str = "mean",
-        risk_alpha: float = 0.25,
-        n_eval_quantiles: int = 64,
-    ) -> torch.Tensor:
-        """Return action values under a risk measure.
-
-        ``mean`` is risk-neutral. ``cvar`` averages the lower ``risk_alpha``
-        quantiles, making the scheduler prefer actions whose bad outcomes are
-        less severe. For scheduling this is useful when cold workers, stale
-        node state, or long-tail runtimes make the average outcome misleading.
-        """
-        B = obs.shape[0]
-        taus = (
-            torch.arange(n_eval_quantiles, device=obs.device, dtype=obs.dtype)
-            + 0.5
-        ) / float(n_eval_quantiles)
-        taus = taus.unsqueeze(0).expand(B, -1)
-        z = self.quantile_q(obs, taus)
-        if risk_mode == "mean":
-            return z.mean(dim=1)
-        if risk_mode == "cvar":
-            cutoff = max(1, int(math.ceil(n_eval_quantiles * risk_alpha)))
-            z_sorted = z.sort(dim=1).values
-            return z_sorted[:, :cutoff, :].mean(dim=1)
-        raise ValueError(f"unsupported risk_mode={risk_mode!r}")
+def _quantile_huber(pred: torch.Tensor, target: torch.Tensor,
+                    taus: torch.Tensor, kappa: float = 1.0) -> torch.Tensor:
+    """Per-sample quantile Huber loss. pred (B,Np), target (B,Nt), taus (B,Np) → (B,)."""
+    u = target.unsqueeze(1) - pred.unsqueeze(2)                        # (B, Np, Nt)
+    huber = torch.where(u.abs() < kappa, 0.5 * u ** 2,
+                        kappa * (u.abs() - 0.5 * kappa))
+    tau_w = (taus.unsqueeze(2) - (u.detach() < 0).float()).abs()       # (B, Np, Nt)
+    return (tau_w * huber).mean(dim=(1, 2))                            # (B,)
 
 
 class DSACAgent:
-    """Distributional SAC agent for masked scheduling environments.
-
-    Two Q-network backends selectable via use_attention:
-      False (default): flat MLP, hidden=(256,256)
-      True:            self-attention over job queue tokens
+    """Risk-sensitive distributional SAC for masked scheduling (Ma et al. discrete).
 
     Usage::
-        agent = DSACAgent(obs_dim=192, n_actions=17, use_attention=True)
-        act = agent.select_action(obs, mask)
-        losses = agent.update(batch)
+        agent = DSACAgent(obs_dim=192, n_actions=17, risk_mode="cvar", risk_beta=0.25)
+        a = agent.select_action(obs, mask)
+        info = agent.update(batch)   # dict incl. td_errors for PER
     """
 
     def __init__(
@@ -249,380 +191,251 @@ class DSACAgent:
         n_actions: int,
         hidden: Sequence[int] = (256, 256),
         lr_q: float = 3e-4,
+        lr_pi: float = 3e-4,
         lr_alpha: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
         init_alpha: float = 0.1,
         target_entropy_ratio: float = 0.1,
-        fixed_alpha: bool = True,
+        fixed_alpha: bool = False,
         layer_norm: bool = True,
         use_attention: bool = False,
-        attn_d_model: int = 64,
-        attn_n_heads: int = 4,
-        attn_n_layers: int = 2,
-        use_iqn: bool = False,        # Implicit Quantile Network critic
-        risk_mode: str = "mean",      # mean or cvar when use_iqn=True
-        risk_alpha: float = 0.25,     # lower-tail mass for CVaR
-        cql_alpha: float = 0.1,       # Conservative Q-Learning penalty weight
+        risk_mode: str = "mean",
+        risk_beta: float = 0.25,
+        risk_alpha: float | None = None,   # deprecated alias for risk_beta
         device: str = "cpu",
     ) -> None:
-        self.obs_dim      = obs_dim
-        self.n_actions    = n_actions
-        self.gamma        = gamma
-        self.tau          = tau
+        if risk_mode not in RISK_MODES:
+            raise ValueError(f"risk_mode must be one of {RISK_MODES}")
+        if risk_alpha is not None:          # back-compat: old CVaR tail-mass arg
+            risk_beta = risk_alpha
+
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.hidden = tuple(hidden)
+        self.gamma = gamma
+        self.tau = tau
         self.use_attention = use_attention
-        self.use_iqn      = use_iqn
-        self.risk_mode    = risk_mode
-        self.risk_alpha   = risk_alpha
-        self.cql_alpha    = cql_alpha
-        self.device       = torch.device(device)
+        self.risk_mode = risk_mode
+        self.risk_beta = float(risk_beta)
+        self.target_entropy_ratio = target_entropy_ratio
+        self.fixed_alpha = fixed_alpha
+        self.device = torch.device(device)
 
-        if use_iqn and use_attention:
-            raise ValueError("use_iqn and use_attention are mutually exclusive")
-        if risk_mode not in {"mean", "cvar"}:
-            raise ValueError("risk_mode must be 'mean' or 'cvar'")
-        if not (0.0 < risk_alpha <= 1.0):
-            raise ValueError("risk_alpha must be in (0, 1]")
+        def _critic():
+            return _DualIQNCritic(obs_dim, n_actions, self.hidden, layer_norm,
+                                  use_attention).to(self.device)
 
-        def _make_q():
-            if use_iqn:
-                return _IQNQNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
-            if use_attention:
-                return _AttentionQNet(obs_dim, n_actions,
-                                      d_model=attn_d_model,
-                                      n_heads=attn_n_heads,
-                                      n_layers=attn_n_layers,
-                                      layer_norm=layer_norm).to(self.device)
-            return _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
-
-        self.q1 = _make_q()
-        self.q2 = _make_q()
-        self.q1_target = _make_q()
-        self.q2_target = _make_q()
+        self.q1, self.q2 = _critic(), _critic()
+        self.q1_target, self.q2_target = _critic(), _critic()
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
-        self.fixed_alpha = fixed_alpha
+        self.actor = _CategoricalActor(obs_dim, n_actions, self.hidden,
+                                       layer_norm).to(self.device)
+        self.actor_target = _CategoricalActor(obs_dim, n_actions, self.hidden,
+                                              layer_norm).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
         self.log_alpha = torch.tensor(
             math.log(init_alpha), dtype=torch.float32,
-            requires_grad=not fixed_alpha, device=self.device,
-        )
-        self.target_entropy_ratio = target_entropy_ratio
-        self.target_entropy = target_entropy_ratio * math.log(n_actions)
+            requires_grad=not fixed_alpha, device=self.device)
 
         self.opt_q = torch.optim.Adam(
             list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr_q)
-        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr_alpha) \
-            if not fixed_alpha else None
-
+        self.opt_pi = torch.optim.Adam(self.actor.parameters(), lr=lr_pi)
+        self.opt_alpha = (None if fixed_alpha
+                          else torch.optim.Adam([self.log_alpha], lr=lr_alpha))
         self._update_count = 0
 
-    # ------------------------------------------------------------------
     @property
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    def _masked_policy(
-        self, q_vals: torch.Tensor, mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Masked softmax → (probs, log_probs), shape (B, n_actions)."""
-        logits = q_vals / self.alpha.detach().clamp(min=1e-8)
-        logits = logits.masked_fill(~mask, -1e9)
-        probs = F.softmax(logits, dim=-1)
-        log_probs = F.log_softmax(logits, dim=-1)
-        # Zero out log-probs for masked actions (avoid -inf in entropy)
-        log_probs = log_probs.masked_fill(~mask, 0.0)
-        return probs, log_probs
-
-    def _q_values(
-        self,
-        qnet: nn.Module,
-        obs: torch.Tensor,
-        risk_mode: str | None = None,
-    ) -> torch.Tensor:
-        if self.use_iqn:
-            assert isinstance(qnet, _IQNQNet)
-            return qnet.risk_q(
-                obs,
-                risk_mode=risk_mode or self.risk_mode,
-                risk_alpha=self.risk_alpha,
-            )
-        return qnet(obs)
-
-    def _soft_value(
-        self,
-        obs: torch.Tensor,
-        mask: torch.Tensor,
-        use_target: bool = True,
-    ) -> torch.Tensor:
-        """V_soft(s) = Σ_a π(a|s) [min_Q(s,a) − α log π(a|s)]."""
-        if use_target:
-            q = torch.min(
-                self._q_values(self.q1_target, obs),
-                self._q_values(self.q2_target, obs),
-            )
-        else:
-            q = torch.min(
-                self._q_values(self.q1, obs),
-                self._q_values(self.q2, obs),
-            )
-        probs, log_probs = self._masked_policy(q, mask)
-        return (probs * (q - self.alpha.detach() * log_probs)).sum(dim=-1)
-
     # ------------------------------------------------------------------
-    def update(self, batch: Dict[str, np.ndarray]) -> dict:
-        """One gradient step. Returns dict of scalar losses + td_errors array.
+    def _risk_value(self, z_r: torch.Tensor, z_h: torch.Tensor,
+                    taus: torch.Tensor) -> torch.Tensor:
+        """Combined action value ρ[Z_R] + α·E[Z_H]. z_* (B,N,A), taus (B,N) → (B,A)."""
+        a = z_r.shape[-1]
+        taus_a = taus.unsqueeze(1).expand(-1, a, -1)                   # (B, A, N)
+        rho_r = distorted_values(z_r.permute(0, 2, 1), taus_a,
+                                 self.risk_mode, self.risk_beta)       # (B, A)
+        e_h = z_h.mean(dim=1)                                          # (B, A)
+        return rho_r + self.alpha.detach() * e_h
 
-        Supports optional batch keys:
-          'weights'  : IS correction weights from PrioritizedReplayBuffer
-          'indices'  : buffer indices (unused here; caller uses for PER update)
-          'gammas'   : per-transition γ^n for n-step returns
-        """
+    def _soft_update(self, src: nn.Module, tgt: nn.Module) -> None:
+        for p, pt in zip(src.parameters(), tgt.parameters()):
+            pt.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
+
+    def update(self, batch: Dict[str, np.ndarray]) -> dict:
         def _t(k, dtype=torch.float32):
             return torch.as_tensor(batch[k], dtype=dtype, device=self.device)
 
-        obs        = _t("obs")
-        acts       = _t("acts", torch.long)
-        rews       = _t("rews")
-        next_obs   = _t("next_obs")
-        dones      = _t("dones", torch.float32)
-        masks      = _t("masks", torch.bool)
+        obs = _t("obs")
+        acts = _t("acts", torch.long)
+        rews = _t("rews")
+        next_obs = _t("next_obs")
+        dones = _t("dones")
+        masks = _t("masks", torch.bool)
         next_masks = _t("next_masks", torch.bool)
-        gammas     = _t("gammas") if "gammas" in batch else \
-            torch.full_like(rews, self.gamma)
-        # IS weights from PER (all-ones = uniform sampling)
-        is_weights = _t("weights") if "weights" in batch else \
-            torch.ones(len(obs), device=self.device)
+        gammas = _t("gammas") if "gammas" in batch else torch.full_like(rews, self.gamma)
+        is_weights = _t("weights") if "weights" in batch else torch.ones_like(rews)
+        b = obs.shape[0]
+        n = self.q1.N_QUANT
 
-        # ---- Critic update -------------------------------------------
-        if self.use_iqn:
-            with torch.no_grad():
-                target_z = self._distributional_soft_target(
-                    rews, gammas, dones, next_obs, next_masks
-                )
-            loss_q, td_errors = self._iqn_critic_loss(
-                obs, acts, target_z, is_weights
-            )
-        else:
-            with torch.no_grad():
-                v_next   = self._soft_value(next_obs, next_masks, use_target=True)
-                target_q = rews + gammas * (1.0 - dones) * v_next
-            q1_all = self.q1(obs)
-            q2_all = self.q2(obs)
-            q1_a   = q1_all.gather(1, acts.unsqueeze(1)).squeeze(1)
-            q2_a   = q2_all.gather(1, acts.unsqueeze(1)).squeeze(1)
-            err1   = q1_a - target_q
-            err2   = q2_a - target_q
-            loss_q = (is_weights * (err1 ** 2 + err2 ** 2)).mean()
-            # CQL penalty: logsumexp over all actions − Q(s,a_taken)
-            if self.cql_alpha > 0.0:
-                cql = (torch.logsumexp(q1_all, dim=-1) - q1_a
-                     + torch.logsumexp(q2_all, dim=-1) - q2_a).mean()
-                loss_q = loss_q + self.cql_alpha * cql
-            td_errors = ((err1.abs() + err2.abs()) * 0.5).detach().cpu().numpy()
+        # ---- Critic: distributional soft targets (a' ~ target policy) ----
+        with torch.no_grad():
+            probs_n, logp_n = self.actor_target.policy(next_obs, next_masks)
+            next_acts = torch.distributions.Categorical(probs=probs_n).sample()
+            logp_next = logp_n.gather(1, next_acts.unsqueeze(1)).squeeze(1)
+            taus_t = torch.rand(b, n, device=self.device)
+            zr1, zh1 = self.q1_target.quantile_q(next_obs, taus_t)
+            zr2, zh2 = self.q2_target.quantile_q(next_obs, taus_t)
+            idx = next_acts.view(b, 1, 1).expand(-1, n, 1)
+            zr_next = torch.minimum(zr1.gather(2, idx), zr2.gather(2, idx)).squeeze(2)
+            zh_next = torch.minimum(zh1.gather(2, idx), zh2.gather(2, idx)).squeeze(2)
+            g = (gammas * (1.0 - dones)).unsqueeze(1)                  # (B,1)
+            target_r = rews.unsqueeze(1) + g * zr_next                 # (B,N)
+            target_h = g * (zh_next - logp_next.unsqueeze(1))          # (B,N)
+
+        loss_critic = obs.new_zeros(())
+        td_accum = obs.new_zeros(b)
+        aidx = acts.view(b, 1, 1).expand(-1, n, 1)
+        for q in (self.q1, self.q2):
+            taus = torch.rand(b, n, device=self.device)
+            zr, zh = q.quantile_q(obs, taus)
+            zr_a = zr.gather(2, aidx).squeeze(2)                       # (B,N)
+            zh_a = zh.gather(2, aidx).squeeze(2)
+            per_sample = (_quantile_huber(zr_a, target_r, taus)
+                          + _quantile_huber(zh_a, target_h, taus))    # (B,)
+            loss_critic = loss_critic + (is_weights * per_sample).mean()
+            td_accum = td_accum + per_sample.detach()
+        td_errors = (td_accum / 2.0).cpu().numpy()
 
         self.opt_q.zero_grad()
-        loss_q.backward()
+        loss_critic.backward()
         nn.utils.clip_grad_norm_(
             list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
         self.opt_q.step()
 
-        # Soft-update targets
         self._update_count += 1
-        for src, tgt in [(self.q1, self.q1_target), (self.q2, self.q2_target)]:
-            for p, pt in zip(src.parameters(), tgt.parameters()):
-                pt.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
 
-        # ---- Temperature update (skipped when fixed_alpha=True) --------
+        # ---- Actor: risk-sensitive policy objective (masked categorical sum) ----
+        probs, log_probs = self.actor.policy(obs, masks)              # (B,A) grad
+        with torch.no_grad():
+            taus_a = torch.rand(b, n, device=self.device)
+            zr1a, zh1a = self.q1.quantile_q(obs, taus_a)
+            zr2a, zh2a = self.q2.quantile_q(obs, taus_a)
+            zr_a = torch.minimum(zr1a, zr2a)
+            zh_a = torch.minimum(zh1a, zh2a)
+            q_action = self._risk_value(zr_a, zh_a, taus_a)           # (B,A)
+        loss_actor = (probs * (self.alpha.detach() * log_probs - q_action)).sum(-1).mean()
+
+        self.opt_pi.zero_grad()
+        loss_actor.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        self.opt_pi.step()
+        self._soft_update(self.actor, self.actor_target)
+
+        # ---- Temperature α (auto-tune unless fixed) ----
+        with torch.no_grad():
+            entropy = -(probs * log_probs).sum(-1)                    # (B,)
+        entropy_val = float(entropy.mean().item())
         loss_alpha_val = 0.0
-        entropy_val = float("nan")
-        target_entropy_val = float("nan")
-        n_valid_val = float("nan")
-
         if not self.fixed_alpha:
-            with torch.no_grad():
-                q_avg = (
-                    self._q_values(self.q1, obs)
-                    + self._q_values(self.q2, obs)
-                ) * 0.5
-                probs, log_probs = self._masked_policy(q_avg, masks)
-            entropy = -(probs * log_probs).sum(dim=-1).mean()
-
-            n_valid = masks.float().sum(dim=-1).clamp(min=1.0).mean()
+            n_valid = masks.float().sum(-1).clamp(min=1.0)
             target_entropy = self.target_entropy_ratio * torch.log(n_valid)
-
-            loss_alpha = self.log_alpha * (entropy - target_entropy).detach()
+            loss_alpha = (self.log_alpha * (entropy - target_entropy).detach()).mean()
             self.opt_alpha.zero_grad()
             loss_alpha.backward()
             self.opt_alpha.step()
-
             with torch.no_grad():
-                prev = self.log_alpha.item()
-                self.log_alpha.clamp_(-5.0, 0.5)
-                if abs(self.log_alpha.item() - prev) > 1e-6:
-                    self.opt_alpha.state[self.log_alpha] = {}
-
-            loss_alpha_val = loss_alpha.item()
-            entropy_val = entropy.item()
-            target_entropy_val = target_entropy.item()
-            n_valid_val = n_valid.item()
+                self.log_alpha.clamp_(-5.0, 1.0)
+            loss_alpha_val = float(loss_alpha.item())
 
         return {
-            "loss_q":          loss_q.item(),
-            "loss_alpha":      loss_alpha_val,
-            "alpha":           self.alpha.item(),
-            "entropy":         entropy_val,
-            "target_entropy":  target_entropy_val,
-            "n_valid_actions": n_valid_val,
-            "td_errors":       td_errors,   # np.ndarray — used by PER update
+            "loss_critic": float(loss_critic.item()),
+            "loss_actor": float(loss_actor.item()),
+            "loss_alpha": loss_alpha_val,
+            "alpha": float(self.alpha.item()),
+            "entropy": entropy_val,
+            "td_errors": td_errors,
         }
 
-    # ------------------------------------------------------------------
-    def _distributional_soft_target(
-        self,
-        rews: torch.Tensor,
-        gammas: torch.Tensor,
-        dones: torch.Tensor,
-        next_obs: torch.Tensor,
-        next_masks: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build a distributional SAC target, shape (B, N_QUANT).
-
-        We sample the next action from the masked soft policy and bootstrap the
-        next return quantiles with the entropy bonus. This keeps the IQN critic
-        distributional instead of regressing every quantile to a scalar mean.
-        """
-        assert isinstance(self.q1_target, _IQNQNet)
-        assert isinstance(self.q2_target, _IQNQNet)
-        B = next_obs.shape[0]
-        N = self.q1_target.N_QUANT
-
-        q_next = torch.min(
-            self._q_values(self.q1_target, next_obs, risk_mode="mean"),
-            self._q_values(self.q2_target, next_obs, risk_mode="mean"),
-        )
-        probs, log_probs = self._masked_policy(q_next, next_masks)
-        next_acts = torch.multinomial(probs.clamp(min=0.0), num_samples=1).squeeze(1)
-        next_logp = log_probs.gather(1, next_acts.unsqueeze(1)).squeeze(1)
-
-        taus = torch.rand(B, N, device=next_obs.device)
-        z1 = self.q1_target.quantile_q(next_obs, taus)
-        z2 = self.q2_target.quantile_q(next_obs, taus)
-        z_next = torch.minimum(z1, z2).gather(
-            2, next_acts.view(B, 1, 1).expand(-1, N, 1)
-        ).squeeze(2)
-        z_next = z_next - self.alpha.detach() * next_logp.unsqueeze(1)
-        return rews.unsqueeze(1) + gammas.unsqueeze(1) * (1.0 - dones.unsqueeze(1)) * z_next
+    @torch.no_grad()
+    def action_values(self, obs: torch.Tensor) -> torch.Tensor:
+        """Risk-adjusted action value ρ[Z_R] + α·E[Z_H] per action. (B,obs)→(B,A)."""
+        b = obs.shape[0]
+        taus = torch.rand(b, self.q1.N_QUANT, device=self.device)
+        zr1, zh1 = self.q1.quantile_q(obs, taus)
+        zr2, zh2 = self.q2.quantile_q(obs, taus)
+        return self._risk_value(torch.minimum(zr1, zr2),
+                                torch.minimum(zh1, zh2), taus)
 
     # ------------------------------------------------------------------
-    def _iqn_critic_loss(
-        self,
-        obs: torch.Tensor,
-        acts: torch.Tensor,
-        target_z: torch.Tensor,
-        is_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, np.ndarray]:
-        """Quantile Huber loss for IQN critic. Returns (loss, td_errors)."""
-        assert isinstance(self.q1, _IQNQNet)
-        B      = obs.shape[0]
-        N      = self.q1.N_QUANT
-        taus   = torch.rand(B, N, device=self.device)
-
-        def _get_qa(qnet, taus):
-            zq = qnet.quantile_q(obs, taus)               # (B, N, n_actions)
-            return zq.gather(
-                2, acts.view(B, 1, 1).expand(-1, N, 1)
-            ).squeeze(2)                                   # (B, N)
-
-        z1 = _get_qa(self.q1, taus)
-        z2 = _get_qa(self.q2, taus)
-
-        def _qhuber(pred, target, taus_):
-            u      = target.unsqueeze(1) - pred.unsqueeze(2) # (B, N, N)
-            kappa  = 1.0
-            huber  = torch.where(
-                u.abs() < kappa,
-                0.5 * u ** 2,
-                kappa * (u.abs() - 0.5 * kappa),
-            )
-            tau_w  = (
-                taus_.unsqueeze(2) - (u.detach() < 0).float()
-            ).abs()
-            return (tau_w * huber).mean(dim=(1, 2))          # (B,)
-
-        per_sample = _qhuber(z1, target_z, taus) + _qhuber(z2, target_z, taus)
-        loss = (is_weights * per_sample).mean()
-        with torch.no_grad():
-            td_errors = per_sample.detach().cpu().numpy()
-        return loss, td_errors
-
-    # ------------------------------------------------------------------
-    def select_action(
-        self, obs: np.ndarray, mask: np.ndarray, greedy: bool = False
-    ) -> int:
+    def select_action(self, obs: np.ndarray, mask: np.ndarray,
+                      greedy: bool = False) -> int:
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32,
                                     device=self.device).unsqueeze(0)
             mask_t = torch.as_tensor(mask, dtype=torch.bool,
                                      device=self.device).unsqueeze(0)
-            q = torch.min(
-                self._q_values(self.q1, obs_t),
-                self._q_values(self.q2, obs_t),
-            )
-            probs, _ = self._masked_policy(q, mask_t)
-            probs_np = probs.squeeze(0).cpu().numpy()
-        probs_np = probs_np * mask.astype(np.float32)
-        total = probs_np.sum()
+            probs, _ = self.actor.policy(obs_t, mask_t)
+            p = probs.squeeze(0).cpu().numpy()
+        p = p * mask.astype(np.float32)
+        total = p.sum()
         if total < 1e-9:
             return int(np.flatnonzero(mask)[0])
-        probs_np /= total
+        p /= total
         if greedy:
-            return int(probs_np.argmax())
-        return int(np.random.choice(len(probs_np), p=probs_np))
+            return int(p.argmax())
+        return int(np.random.choice(len(p), p=p))
 
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
         torch.save({
-            "q1":           self.q1.state_dict(),
-            "q2":           self.q2.state_dict(),
-            "q1_target":    self.q1_target.state_dict(),
-            "q2_target":    self.q2_target.state_dict(),
-            "opt_q":        self.opt_q.state_dict(),
-            "log_alpha":    self.log_alpha.item(),
-            "opt_alpha":    self.opt_alpha.state_dict() if self.opt_alpha else None,
-            "fixed_alpha":  self.fixed_alpha,
+            "actor": self.actor.state_dict(),
+            "actor_target": self.actor_target.state_dict(),
+            "q1": self.q1.state_dict(), "q2": self.q2.state_dict(),
+            "q1_target": self.q1_target.state_dict(),
+            "q2_target": self.q2_target.state_dict(),
+            "opt_q": self.opt_q.state_dict(), "opt_pi": self.opt_pi.state_dict(),
+            "opt_alpha": self.opt_alpha.state_dict() if self.opt_alpha else None,
+            "log_alpha": self.log_alpha.item(),
+            "fixed_alpha": self.fixed_alpha,
             "use_attention": self.use_attention,
-            "use_iqn":      self.use_iqn,
-            "risk_mode":    self.risk_mode,
-            "risk_alpha":   self.risk_alpha,
-            "cql_alpha":    self.cql_alpha,
-            "obs_dim":      self.obs_dim,
-            "n_actions":    self.n_actions,
+            "risk_mode": self.risk_mode, "risk_beta": self.risk_beta,
+            "target_entropy_ratio": self.target_entropy_ratio,
+            "hidden": list(self.hidden),
+            "obs_dim": self.obs_dim, "n_actions": self.n_actions,
             "update_count": self._update_count,
         }, str(path))
 
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "DSACAgent":
         data = torch.load(str(path), map_location="cpu", weights_only=False)
-        fixed_alpha   = data.get("fixed_alpha", False)
-        use_attention = data.get("use_attention", False)
-        use_iqn       = data.get("use_iqn", False)
-        risk_mode     = kwargs.pop("risk_mode", data.get("risk_mode", "mean"))
-        risk_alpha    = kwargs.pop("risk_alpha", data.get("risk_alpha", 0.25))
-        cql_alpha     = data.get("cql_alpha", 0.0)
-        agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"],
-                    fixed_alpha=fixed_alpha, use_attention=use_attention,
-                    use_iqn=use_iqn, risk_mode=risk_mode,
-                    risk_alpha=risk_alpha, cql_alpha=cql_alpha,
-                    **kwargs)
+        agent = cls(
+            obs_dim=data["obs_dim"], n_actions=data["n_actions"],
+            hidden=tuple(data.get("hidden", (256, 256))),
+            fixed_alpha=data.get("fixed_alpha", False),
+            use_attention=data.get("use_attention", False),
+            risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
+            risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),
+            target_entropy_ratio=data.get("target_entropy_ratio", 0.1),
+            **kwargs)
+        agent.actor.load_state_dict(data["actor"])
+        agent.actor_target.load_state_dict(data["actor_target"])
         agent.q1.load_state_dict(data["q1"])
         agent.q2.load_state_dict(data["q2"])
         agent.q1_target.load_state_dict(data["q1_target"])
         agent.q2_target.load_state_dict(data["q2_target"])
         agent.opt_q.load_state_dict(data["opt_q"])
+        agent.opt_pi.load_state_dict(data["opt_pi"])
         with torch.no_grad():
             agent.log_alpha.fill_(float(data["log_alpha"]))
         if agent.opt_alpha and data.get("opt_alpha"):
             agent.opt_alpha.load_state_dict(data["opt_alpha"])
-        agent._update_count = data["update_count"]
+        agent._update_count = data.get("update_count", 0)
         return agent

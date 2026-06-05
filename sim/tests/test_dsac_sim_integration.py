@@ -120,9 +120,10 @@ def test_update_produces_finite_losses():
             obs, _ = env.reset()
 
     losses = agent.update(buf.sample(64, rng))
-    assert np.isfinite(losses["loss_q"]),    f"loss_q not finite: {losses}"
-    assert np.isfinite(losses["loss_alpha"]), f"loss_alpha not finite: {losses}"
-    assert np.isfinite(losses["alpha"]),      f"alpha not finite: {losses}"
+    assert np.isfinite(losses["loss_critic"]), f"loss_critic not finite: {losses}"
+    assert np.isfinite(losses["loss_actor"]),  f"loss_actor not finite: {losses}"
+    assert np.isfinite(losses["loss_alpha"]),  f"loss_alpha not finite: {losses}"
+    assert np.isfinite(losses["alpha"]),       f"alpha not finite: {losses}"
     assert losses["alpha"] > 0
     env.close()
 
@@ -166,8 +167,8 @@ def test_200_gradient_steps_loss_finite():
     for step in range(200):
         batch = buf.sample(64, rng)
         info = agent.update(batch)
-        assert np.isfinite(info["loss_q"]), f"NaN at step {step}: {info}"
-        losses_q.append(info["loss_q"])
+        assert np.isfinite(info["loss_critic"]), f"NaN at step {step}: {info}"
+        losses_q.append(info["loss_critic"])
 
     # Loss should not explode (rough sanity: last-50 mean < first-50 mean × 10)
     first50 = float(np.mean(losses_q[:50]))
