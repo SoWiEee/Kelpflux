@@ -35,25 +35,6 @@ Kelpflux 的排程 action 是離散且有 mask 的：每一步只能從 pending 
 
 DSAC 是 Discrete SAC。它把 SAC 的 maximum-entropy actor-critic 形式改成離散 action space，並支援 action masking。Kelpflux 目前使用 DSAC 作為 DRL scheduler/placement 的主要研究實作。
 
-目前 DSAC 的 live path 是：
-
-1. `rl-snapshot-agent` 定期把 Slurm pending/running/node/GPU/MPS 狀態送到 `rl-scheduler`。
-2. `rl-scheduler` 用 DSAC checkpoint 對 masked action space 做推論。
-3. policy 若選中 job，live scheduler 回傳 priority boost 與 placement hints。
-4. hard placement controller 會把可安全介入的 placement 寫回 Slurm，使指定 job 傾向落到指定 worker/GPU/MPS slot。
-5. 若 snapshot stale、模型不可用、action confidence 不足或 placement 不安全，系統 abstain，回到 heuristic/Slurm fallback。
-
-相關實作：
-
-| 層級 | 檔案 |
-|---|---|
-| DSAC agent | `services/rl_scheduler/dsac.py` |
-| masked scheduling env | `sim/gym_env.py` |
-| simulator training | `services/rl_scheduler/sim_train.py` |
-| live inference API | `services/rl_scheduler/serve.py` |
-| live daemon / placement path | `services/rl_scheduler/live_daemon.py`、`services/rl_scheduler/placement_controller.py` |
-| replay buffer / RLPD support | `services/rl_scheduler/replay_buffer.py`、`scripts/collect-live-trace.py` |
-
 ## 2. Benchmark 方法
 
 ### 2.1 Simulator paired benchmark
@@ -200,17 +181,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 3. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
 4. benchmark 顯示目前 DSAC checkpoint 尚未優於 heuristic score，這讓後續研究方向更清楚：不是只宣稱「用了 DRL」，而是要改善訓練資料、reward fidelity 與 live latency/worker lifecycle model。
 
-## 6. 後續改進方向
-
-| 優先級 | 改進 | 原因 |
-|---|---|---|
-| P0 | 已改進並部署：operator scale-down 會將被移除的 Slurm nodes 標成 `DOWN`，下一次 scale-up 會先 `RESUME` 目標 ordinals；chart 也已移除 k3s pod 內會造成 invalid GRES 的 `Cores=` | live smoke job `149` 已完成，證明 scale-to-zero 後下一批 GPU/MPS job 可重新 scale-up、run、complete；仍需用更大樣本 A/B 驗證長時間穩定性。 |
-| P1 | 已改進：`scripts/collect-live-trace.py` 的 normalized trace 可直接餵給 `rlpd_finetune.py --online-trace` | live `sacct` 的 arrival/runtime/MPS/node/wait data 現在能變成 score demonstration replay，不再只停在報表資料。 |
-| P1 | 下一步：長期收集 shadow-mode JSONL transition logs，和 `--online-trace` demonstration replay 混合 | normalized trace 可提供真實 workload 分佈；完整 shadow log 才能補上 DSAC 當下 obs/action/confidence。 |
-| P2 | latency model 納入 warm/cold worker、hard placement、pod startup、Slurm completing/not responding | simulator 若沒模擬這些 live failure mode，模型會學不到真正的部署成本。 |
-| P2 | residual DSAC：DSAC 學 score baseline 的修正量，而不是完全取代 score | 可以保留強 baseline，降低 DRL policy 早期不穩定造成的風險。 |
-
-## 7. 本次驗證指令
+## 6. 本次驗證指令
 
 Simulator：
 
