@@ -129,7 +129,7 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 
 ## 4. Live cluster 結果
 
-> 以下 live 結果是 RDSAC 改寫前、用舊 discrete-SAC checkpoint 跑的。它們驗證的是 serving / Slurm placement / worker lifecycle / MPS allocation 等基礎設施路徑能否運作，與演算法版本無關，因此保留。換上 RDSAC checkpoint 的 live A/B 尚未重跑。
+> §4.1–4.3 的 live 結果是 RDSAC 改寫前、用舊 discrete-SAC checkpoint 跑的。它們驗證的是 serving / Slurm placement / worker lifecycle / MPS allocation 等基礎設施路徑能否運作，與演算法版本無關，因此保留。**§4.4 是換上 RDSAC cvar-v2 checkpoint、warm-pool 穩定化後重跑的配對 A/B。**
 
 ### 4.1 DSAC live scheduler enabled
 
@@ -197,18 +197,39 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 測試後 queue 為空；GPU worker StatefulSet 回到 scale-to-zero 狀態，Slurm GPU nodes 保持 `DOWN` / `DRAIN`，等待下一批 GPU workload 由 operator scale-up 並 resume。
 
+### 4.4 RDSAC checkpoint live A/B（重跑，cvar-v2）
+
+把 §3 的 **cvar-v2 RDSAC checkpoint** 烘進 `slurm-rl-scheduler:m11` 部署到 live，與 score-only 啟發式做配對 A/B。要做到「RDSAC 真的有作用」的公平比較，先排除兩個讓比較失真的問題：
+
+1. **拓樸不匹配 → `/decide` 靜默 abstain**：1×1 checkpoint（`n_actions=17`）遇到 2 個 healthy GPU worker 時，snapshot 回報 `nodes=2`、serve 以 33 個 action 建 mask → shape mismatch → 每次決策都早期 abstain、`priority_boost_total` 不動，RL 看似在跑實際完全不影響排程（詳見 `docs/note.md` #17.2）。
+2. **worker lifecycle / 冷啟動 race**：GPU pool `scale-to-0` 後冷啟動喚醒會與 job dispatch 競爭而 `NODE_FAIL`（即 §4.2 暴露、`docs/note.md` #16 的死結）。
+
+**穩定化做法**：把 `gpu-rtx4070` pool 設成 `min_replicas=1`（warm pool）。一顆常駐 GPU 節點同時解掉兩件事 —— 沒有冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 匹配、`/decide` 正常 boost。Operator 另補兩個 hardening：scale-up in-flight gate（避免 0→1→2 overshoot 打死剛落地的 job）與 provisioning-complete 後 `scontrol reconfigure`（清掉換 pod IP 造成的 `NOT_RESPONDING`）。詳見 `docs/cluster.md §4`。
+
+**A/B 設定**：兩臂各 3 輪 × 14 個 MPS sleep job（`mps∈{20,34,50}`、runtime∈{8,16,26,40}s），逐 (round, idx) 工作負載完全相同。RDSAC 臂 `shadowMode=false`（RL boost 生效）、score 臂 `shadowMode=true`（boost 強制 0、純啟發式）。指標由 controller pod 的 `sacct` 收。
+
+| 指標 | RDSAC (priority-boost) | score-only | Δ |
+|---|---:|---:|---:|
+| JCT mean | 86.1s | 86.2s | **−0.1s (−0.2%)** |
+| JCT median | 90.5s | 90.0s | +0.5s |
+| JCT p95 | 153.0s | 153.6s | −0.6s |
+| WAIT mean | 64.1s | 64.2s | −0.1s |
+| 配對 ΔJCT (n=42) | **−0.1s**（sd 27.2） | better 20 / tie 11 / worse 11 | — |
+
+**解讀**：1×1 live 下 RDSAC 與 score **統計上無法區分**（ΔJCT −0.2%，遠小於 ±27s 逐對雜訊）。原因與 §3 一致 —— 在 1×1、強啟發式 baseline 下，RDSAC 幾乎對每個到達的 job 都均勻 boost（每輪 `selected=14/14`），佇列排序等同 score 的排序，沒有重排效果。這證明 **RDSAC 能在 production 正確上線並與啟發式持平**，但真正的增益要等「拓樸匹配的多節點 checkpoint、placement 選擇有意義」時才會出現；單純把 1×1 checkpoint 丟到 live 不會贏。
+
 ## 5. 結論
 
 目前可誠實下的結論：
 
 | 問題 | 結論 |
 |---|---|
-| DRL path 是否能在 live 上跑？ | 可以。job `136-141` 全部完成，MPS allocation 與 worker placement 有實際生效（舊 checkpoint；RDSAC live A/B 待重跑）。 |
+| DRL path 是否能在 live 上跑？ | 可以。舊 checkpoint job `136-141` 全部完成；**RDSAC cvar-v2 live A/B 已重跑**（§4.4），warm-pool 穩定化後 84 個 job 全乾淨完成、RL boost 確實生效。 |
 | 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
 | RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。修復後 mean 三個 family 都**顯著較差**且訓練不穩；cvar 把 philly 拉到統計**打平**、burst 不顯著、ali 仍顯著差——但沒有任何 family 真正贏過 score。 |
 | risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。同配置下 cvar 的 mean JCT 與 p95 尾部都大幅勝過 mean（philly p95 9.4h vs 27h），支持採用 risk distortion 的設計選擇；唯 burst p99 與 ali 仍是弱點。 |
-| live A/B 是否已能公平比較 DRL vs score？ | 還不能。score-only phase 暴露 worker lifecycle / Slurm completion acknowledgement 問題。 |
-| 目前最穩定的上線策略 | DRL live scheduler 保持 enabled，但保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
+| live A/B 是否已能公平比較 DRL vs score？ | **可以了**。把 GPU pool 設成 `min_replicas=1`（warm pool）後消除冷啟動 race，並讓 1×1 checkpoint 拓樸匹配；§4.4 配對 A/B 顯示 RDSAC 與 score 在 1×1 統計上打平（ΔJCT −0.2%）。 |
+| 目前最穩定的上線策略 | DRL live scheduler 保持 enabled + GPU warm pool（`min_replicas=1`），並保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
 
 工程貢獻目前比較明確的是：
 
@@ -216,7 +237,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 2. DRL 實作已對齊 Ma et al. RDSAC（雙分布 critic + categorical actor + risk distortion），並有單元/行為測試覆蓋；risk 機制是相對舊 discrete-SAC 的主要新能力。
 3. 已定位並修好 temperature auto-tune 的 reward-scale 根因，並在 `sim_train.jsonl` 加上 alpha/entropy instrumentation，後續訓練可直接觀測收斂品質。
 4. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
-5. benchmark 給出乾淨的 risk-mode 受控對照：RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 顯著優於 risk-neutral mean**。後續方向：穩定 mean 變體訓練（步數 / target_entropy_ratio）、改善 ali 與 burst 最尾端、提升 reward fidelity，並重跑 RDSAC live A/B。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
+5. benchmark 給出乾淨的 risk-mode 受控對照：RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 顯著優於 risk-neutral mean**。RDSAC live A/B 也已重跑（§4.4）：warm-pool 穩定化後 RDSAC 能在 production 正確運作、與 score 在 1×1 打平。後續方向：穩定 mean 變體訓練（步數 / target_entropy_ratio）、改善 ali 與 burst 最尾端、提升 reward fidelity，並訓練拓樸匹配的多節點 checkpoint 讓 placement 選擇真正有意義。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
 
 ## 6. 本次驗證指令
 

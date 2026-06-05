@@ -496,6 +496,39 @@ E7 兩次撞死結之後，我認為 operator 有一個值得加的功能：**in
 
 這不在當前 Phase 6 scope，但留作 future operator hardening 的方向。
 
+## 問題 17：RDSAC live A/B —— 一連串「看起來像」的錯誤假設 + 拓樸不匹配導致 /decide 靜默 abstain
+
+把 cvar-v2 RDSAC checkpoint 部署到 live、要跟 score 啟發式做 A/B 時踩到的兩類坑。記錄重點是**錯誤的觀察**：避免下次又花時間追同樣的假象。
+
+### 17.1 GPU node 卡 `NOT_RESPONDING`：五個都被推翻的假設
+
+slurmd log 出現 `Zero Bytes were transmitted or received`，直覺往認證/網路追，結果全錯。實際根因跟 [16.2](#162-controller-restart--workers-not_responding--in-flight-jobs-卡-completing) / [16.4](#164-alloctres-zombie示mps-slot-沒被釋放) 同源：pod 換 IP 後 slurmctld 內部 per-node 連線/位址 state 變 stale，`scontrol reconfigure` 刷新即恢復（reconfigure 自己會 `Socket timed out` 但有生效，同 16.4）。
+
+| # | 錯誤假設 | 為何看起來合理 | 驗證方式 | 結果 |
+|---|---------|--------------|---------|------|
+| 1 | munge key 不一致 | `Zero Bytes` 是典型 auth drop | 三節點 `md5sum /etc/munge/munge.key` + 跨節點 `munge -n \| unmunge` | ❌ key 完全相同、decode `Success` |
+| 2 | overlay MTU 分片丟包 | GPU 註冊訊息含 GRES(gpu+mps)較大、CPU node 正常 | 比對雙方 `eth0` MTU | ❌ 對稱 1450 |
+| 3 | NetworkPolicy 擋 6818 | GPU sts 可能有不同 policy | controller→slurmd `/dev/tcp/.../6818` ×5 | ❌ 5/5 PORT_OPEN |
+| 4 | GPU GRES/nvml plugin 卡住 slurmd 主執行緒 | GPU 專屬、CPU worker 正常 | pod 內 `nvidia-smi -L`、slurmd log | ❌ nvidia-smi exit 0、log 無 hang |
+| 5 | pod 重建後 DNS 指向舊 IP | 我剛 delete/recreate GPU pod 換了 IP | controller `getent hosts <fqdn>` | ❌ 解析到當前 IP（DNS 是對的，stale 在 slurmctld 內部） |
+
+**教訓**：看到 `Zero Bytes` 先確認是不是 controller 端 stale node state（一個 `scontrol reconfigure` 或 16.2 修法 B），不要一頭栽進 munge/MTU/NetworkPolicy。CPU worker 正常、GPU 不正常的**不對稱**，真正原因不是「GPU 有 GRES」，而是「GPU pod 剛被我重建換了 IP，CPU pod 沒動」。
+
+### 17.2 拓樸不匹配 → `/decide` 每次靜默 abstain（新）
+
+- **觸發**：1×1 訓練的 checkpoint（`obs_dim=192, n_actions=17`）部署到有 **2 個 healthy GPU worker** 的 live 叢集。
+- **表象**：`/healthz` 一切正常（`ready:true, shadow_mode:false`），但每次決策都是 `rl_scheduler_decisions_total{result="abstain"}` +1，且 `policy_value=0`、`policy_entropy=0`、`priority_boost_total=0`。RL 看起來在跑，實際上**每個 decision 都 abstain、完全不影響排程**，靜默 fallback 回 score。
+- **根因**：`snapshot_agent.node_view` 只跳過 DOWN/DRAIN/NOT_RESPONDING/FAIL 的節點，兩個 healthy GPU node 都算 → 回報 `nodes=2` → serve.py `build_obs_and_mask` 以 2 節點建 mask（`n_actions = TOP_K*2*1+1 = 33`）→ 與 model 的 17 不符 → `decide()` 走 `shape_mismatch_actions` 早期 return，value/entropy 都填 0。這正是 [`README` 的 1×1 caveat](../README.md) 在 runtime 的具體後果。
+- **修法（實驗用）**：operator 暫停下把 GPU sts 縮成 1（`kubectl scale sts slurm-worker-gpu-rtx4070 --replicas=1`），snapshot 變 `nodes=1` → `n_actions=17` 匹配 → RL 正常 boost（`selected` / `priority_boost_total` 開始累加、`policy_entropy≈0.08`、`value≈-11`）。
+- **責任層**：serve / 部署。這是個 **silent failure**：shape-mismatch 的 value=0 早退，跟正常 `no_boost` 在 metric 上幾乎分不出來，維運完全看不出 RL 沒在作用。
+
+### 17.3 改進建議
+
+1. **serve.py 把 shape_mismatch 變成大聲的失敗**：目前 mismatch 跟正常 abstain 都記成 `result="abstain"`。建議 (a) 拆出 `result="shape_mismatch"` label + 專屬 metric `rl_scheduler_topology_mismatch_total`；(b) 啟動時把 model 的 `(n_nodes, gpus_per_node)` 跟首個 snapshot 比對，不符就 log ERROR 並 set `rl_topology_ok=0` gauge 供 alert。
+2. **operator wake/scale 後自動 resume + reconcile**：scale up 或偵測到「node responding 但 `state=DRAIN(reason=operator-scale-down/k8s-eviction)`」時自動 `scontrol update state=resume`；pod IP 變更後觸發一次 `scontrol reconfigure`（接受其 timeout）。可省掉 16.2 / 17.1 的人手介入。
+3. **為「需要穩定 testbed」提供 warm-pool 選項**：gpu-rtx4070 目前 `min_replicas=0`，佇列一空就 drain→縮 0，下次冷啟動 race 出 `NODE_FAIL`。提供 `min_replicas=1` / `warmReplicas` 模式給需要連續送 job 的實驗場景。
+4. **deploy script 加 topology assert**：部署 1×1 checkpoint 時，若當前 healthy GPU node 數 > checkpoint 的 `n_nodes`，應 warn/abort，避免上線後靜默 abstain。
+
 ---
 
 > **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 Phase 7。

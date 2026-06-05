@@ -358,6 +358,26 @@ flowchart TD
 **Circuit breaker**：連續 poll 失敗時指數退避（最長 60s），`/tmp/operator-alive`
 持續更新維持 livenessProbe；首次成功 poll 後寫 `/tmp/operator-ready`。
 
+**GPU warm pool 與 cold-start 穩定化**：在單張實體 GPU 上，GPU pool 的 `scale-to-0`
+冷啟動喚醒（drain → 0 → 有 job 才 wake → slurmd 重新註冊）會與 job dispatch 競爭，
+短 job 因節點還沒就緒而 `NODE_FAIL`，並可能讓節點卡在 `drain*` / `down*`
+（詳見 `docs/note.md` #16 / #17）。為此 GPU pool 改採 **warm pool**：
+
+- `values.pools[gpu-rtx4070].minReplicas: 1`（原本 0）。永遠保留 ≥1 顆 GPU 節點，
+  徹底消除冷啟動 race。額外好處：恰好 1 顆 healthy GPU node 讓 live snapshot 回報
+  `n_nodes=1`，與 1×1 DSAC checkpoint 匹配，`/decide` 才不會因 shape mismatch 靜默
+  abstain。Burst 仍可彈性 scale-up 到 `maxReplicas`。
+
+operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operator/k8s.py`）：
+
+| 機制 | 問題 | 修法 |
+|------|------|------|
+| **in-flight provisioning gate** | 冷啟動空窗 job 還 pending 時，operator 每個 loop 都 scale-up → 0→1→2 overshoot，第二顆 pod 的 StatefulSet churn 打死剛落地的 job | scale-up 前若 `key in self._provisioning`（上一次 scale-up 的 pods 尚未 Ready）就改成 `keep`，把多節點 scale-up 序列化（一次一顆、等 Ready 再評估） |
+| **reconfigure-on-provisioning-complete** | 新 pod 換了 IP，slurmctld 持有 stale per-node 連線狀態並標 `NOT_RESPONDING`，第一個派上去的 job `NODE_FAIL` | pods 變 Ready（provisioning 完成）時，對該批節點 `resume` 並 `scontrol reconfigure` 強制 slurmctld 重新解析/重 ping（reconfigure RPC 常 `Socket timed out` 但有生效，吞掉錯誤） |
+
+> 控制流程圖中 `scale_up` 分支實際會先過 in-flight gate；`scale_down` 仍依 cooldown
+> drain，但因 `minReplicas=1`，GPU pool 不會再縮到 0。
+
 **RBAC**（chart `templates/operator.yaml`）：
 
 | 物件 | Scope | 權限 |
