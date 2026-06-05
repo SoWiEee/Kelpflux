@@ -107,6 +107,19 @@ class K8sClient:
             f"scontrol update NodeName={node_name} State=RESUME || true"
         )
 
+    def reconfigure_slurm(self) -> None:
+        """Force slurmctld to re-read config and re-resolve/re-ping all nodes.
+
+        After a scale-up the freshly-recreated worker pods come up with NEW pod
+        IPs, but slurmctld keeps stale per-node connection state and marks them
+        ``NOT_RESPONDING`` (``*`` in sinfo) — newly woken nodes then fail to take
+        jobs (NODE_FAIL) until the address state is refreshed. A reconfigure
+        clears that. The RPC itself frequently returns
+        ``Socket timed out on send/recv`` yet still takes effect, so we swallow
+        the error (``|| true``). See docs/note.md #16.4 / #17.1.
+        """
+        self.exec_in_controller("scontrol reconfigure || true")
+
     def cancel_jobs_on_node(self, node_name: str) -> None:
         """Force-cancel every job currently running on `node_name`.
 

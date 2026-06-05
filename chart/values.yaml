@@ -67,9 +67,16 @@ pools:
     appLabel: slurm-worker-gpu-rtx4070
     workerClass: gpu-rtx4070
     partition: gpu-rtx4070
-    minReplicas: 0
+    # Warm pool: keep >=1 GPU node always up. On a single physical GPU the
+    # scale-to-0 cold-start wake (drain -> 0 -> wake -> register) races with
+    # job dispatch and NODE_FAILs short jobs (see docs/note.md #16/#17). A warm
+    # node removes that race. Bonus: with exactly 1 healthy GPU node the live
+    # snapshot reports n_nodes=1, matching the 1x1 DSAC checkpoint so /decide
+    # stays topology-valid instead of silently abstaining. Burst still scales
+    # up to maxReplicas elastically.
+    minReplicas: 1
     maxReplicas: 2
-    replicas: 0
+    replicas: 1
     scaleCooldownSeconds: 60
     cpus: 4
     realMemory: 3500

@@ -63,6 +63,23 @@ class ReconcilerMixin:
                     else:
                         _PROVISIONING_LATENCY.labels(pool=key).observe(latency)
                     del self._provisioning[key]
+                    # Post-wake hardening: the freshly-recreated worker pods
+                    # came up with NEW pod IPs. slurmctld holds stale per-node
+                    # connection state and marks them NOT_RESPONDING, so the
+                    # first job dispatched onto a just-woken node NODE_FAILs.
+                    # Re-resume each provisioned node (it may still carry the
+                    # DRAIN from the prior scale-down) and reconfigure to force
+                    # slurmctld to re-resolve/re-ping. Best-effort; see
+                    # docs/note.md #16.4 / #17. Without this the cold-start
+                    # wake races and the pool flaps drain*/down*/NODE_FAIL.
+                    try:
+                        for i in range(prov_target):
+                            self.client.resume_slurm_node(
+                                f"{partition_cfg.worker_statefulset}-{i}"
+                            )
+                        self.client.reconfigure_slurm()
+                    except Exception:  # noqa: BLE001
+                        pass
 
             # E7 hardening — ghost-job detector. If slurmrestd reports
             # running jobs but the StatefulSet has scaled to zero AND no
@@ -210,7 +227,26 @@ class ReconcilerMixin:
                 cooldown_remaining_seconds=cooldown_remaining,
             )
 
-            if decision.action == "scale_up":
+            # In-flight provisioning gate: if a previous scale-up's pods are not
+            # yet Ready (key still in self._provisioning), do NOT issue another
+            # scale-up. Without this the operator scales 0→1→2 in consecutive
+            # ~1s loops because the pending job hasn't started yet (slurmd on the
+            # first node is still registering). The second pod's StatefulSet
+            # churn + node registration then disrupts the node where the job
+            # just landed and NODE_FAILs it. Serializing scale-ups (one node,
+            # wait for Ready, then re-evaluate) removes the cold-start race.
+            # See docs/note.md #17.
+            if decision.action == "scale_up" and key in self._provisioning:
+                self.logger.emit(
+                    "scale_deferred",
+                    policy=self.cfg.policy_name,
+                    partition=partition_cfg.partition,
+                    statefulset=key,
+                    reason="provisioning_in_flight",
+                    pending_jobs=state.pending_jobs,
+                )
+                self._do_keep(partition_cfg, state, decision, key, checkpoint_age)
+            elif decision.action == "scale_up":
                 self._do_scale_up(partition_cfg, state, decision, key, now)
             elif decision.action == "scale_down":
                 self._do_scale_down(partition_cfg, state, decision, key, cooldown_elapsed, cooldown_remaining)
