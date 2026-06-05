@@ -1,6 +1,8 @@
 # Kelpflux Scheduler Evaluation
 
-本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是清楚比較三種做法在同一套 simulator 與 live Slurm/k3s/GPU 環境中的行為：heuristic score、SAC、DSAC。
+本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是清楚比較三種做法在同一套 simulator 與 live Slurm/k3s/GPU 環境中的行為：heuristic score、SAC、RDSAC。
+
+> 註：DRL 實作已從早期的 discrete SAC 改寫為 Ma et al. 的 risk-sensitive distributional SAC（RDSAC）。本文 §3 為改寫後的新結果；§4 live cluster 結果是 RDSAC 改寫前用舊 checkpoint 跑的，保留作為基礎設施驗證紀錄。
 
 ## 1. 評估對象
 
@@ -31,40 +33,48 @@ SAC 是 Soft Actor-Critic。它的目標不是只最大化 reward，而是同時
 
 Kelpflux 的排程 action 是離散且有 mask 的：每一步只能從 pending queue 中可行的 job、node、GPU/MPS placement 組合裡選一個，不能選資源不足的 action。因此目前沒有把「連續 SAC」直接作為 live scheduler；SAC 在本專案中主要作為 DSAC 的概念來源與比較基準。
 
-### 1.3 DSAC
+### 1.3 RDSAC
 
-DSAC 是 Discrete SAC。它把 SAC 的 maximum-entropy actor-critic 形式改成離散 action space，並支援 action masking。Kelpflux 目前使用 DSAC 作為 DRL scheduler/placement 的主要研究實作。
+RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning〉(arXiv:2004.14547) 的**離散動作忠實轉寫**，取代早期的 discrete SAC。它把連續控制的 reparameterised Gaussian actor 換成**顯式 categorical actor**（placement 是離散動作），critic 與 risk 機制依論文 §4.1：
+
+- **雙分布 critic**：把 soft return 拆成 reward 分布 `Z_R` 與 entropy 分布 `Z_H`，各以 IQN 的 quantile 表示、共用 trunk，quantile Huber 回歸 + twin double learning。
+- **risk 進策略目標**：actor 目標對 reward 分布套用 distortion `ρ`，`risk_mode ∈ {mean, cvar, wang, cpw, msd}`。`mean` 是 risk-neutral，等同穩定性導向的 distributional SAC；`cvar` 偏好下尾較不嚴重的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。
+
+實作在 `services/rl_scheduler/dsac.py` 與 `services/rl_scheduler/distortion.py`，演算法與單元/行為測試見 commit `fe899ec`。本文 §3 報告 `risk_mode=mean`（risk-neutral baseline）的結果；`cvar` 的尾部對照仍待補（見 §3 末）。
 
 ## 2. Benchmark 方法
 
 ### 2.1 Simulator paired benchmark
 
-標準 simulator benchmark 使用相同 seed 對 DSAC 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。
+標準 simulator benchmark 使用相同 seed 對 RDSAC 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。
 
 本次設定：
 
 | 項目 | 值 |
 |---|---|
-| checkpoint | `runs/eval_mlp_20260514-210824/train/dsac.pt` |
-| mode | eval only, no training |
+| agent | RDSAC，`risk_mode=mean`（risk-neutral） |
+| critic trunk | MLP（`--no-attention`） |
+| training | 從頭訓練 150k 步，curriculum n_jobs 10→30→50 |
+| checkpoint | `runs/rdsac_eval_mean/train/dsac.pt` |
 | cluster | 1 node × 1 GPU |
 | jobs per trace | 50 |
 | trace families | `philly`, `burst`, `ali` |
 | seeds | 42, 43, 44, 45, 46 |
-| metric | mean job completion time, lower is better |
+| metric | mean JCT（主），p95 / p99 JCT（尾部） |
 
 重現指令：
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-  --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
-  --no-train \
+  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
   --n-nodes 1 --gpus-per-node 1 \
-  --n-jobs 50 \
   --trace-families philly burst ali \
   --seeds 42 43 44 45 46 \
-  --out-dir /tmp/kelpflux-dsac-score-bench-standard
+  --no-attention --curriculum --risk-mode mean --device cuda \
+  --out-dir runs/rdsac_eval_mean
 ```
+
+> 與舊版差異：早期 §3 數字來自一個 500k 步的 discrete-SAC checkpoint；本次是 RDSAC 從頭訓練 **150k 步**。步數較少，因此**不應**把兩組數字當作同條件直接比較。
 
 ### 2.2 Live cluster smoke A/B
 
@@ -85,17 +95,36 @@ live workload：6 個短 GPU/MPS sleep jobs，依序要求 `mps=25,25,100,25,50,
 
 ## 3. Simulator 結果
 
-| Family | DSAC mean JCT | Score mean JCT | Score − DSAC | 95% CI | p-value | 結論 |
-|---|---:|---:|---:|---:|---:|---|
-| philly | 4.815 h | 2.621 h | -83.7% | [-118.1%, -49.4%] | 0.002 | DSAC 顯著較差 |
-| burst | 5.025 h | 3.541 h | -41.9% | [-75.0%, -8.8%] | 0.025 | DSAC 顯著較差 |
-| ali | 1.991 h | 1.383 h | -44.0% | [-113.4%, +25.4%] | 0.153 | DSAC 較差但未達顯著 |
+RDSAC `risk_mode=mean`，150k 步，5 seeds（`Δ` 為 `(score − dsac)/score`，負值代表 RDSAC 的 JCT 較高、較差）：
 
-解讀：目前這個 MLP DSAC checkpoint 在 1×1 simulator 上沒有打贏 heuristic score。philly 與 burst 的差距達統計顯著；ali 因 seed 間變異較大，方向仍是 DSAC 較差，但 p-value 未達 0.05。
+| Family | RDSAC mean JCT | Score mean JCT | Δ | 95% CI | p-value | p95 JCT | p99 JCT | 結論 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| philly | 4.475 h | 2.621 h | -70.8% | [-178.4%, +36.8%] | 0.142 | 21.24 h | 44.73 h | RDSAC 較差，未顯著 |
+| burst | 3.541 h | 3.541 h | -0.0% | [-118.2%, +118.2%] | 1.000 | 10.50 h | 23.04 h | 打平 |
+| ali | 1.986 h | 1.383 h | -43.6% | [-141.5%, +54.3%] | 0.284 | 5.50 h | 29.68 h | RDSAC 較差，未顯著 |
 
-這個結果符合目前系統狀態：1×1 action space 的可學習結構有限，而 score baseline 已經把 MPS fit、短工作偏好與碎片化懲罰寫得很強。DSAC 的價值目前主要在於提供可上線的 DRL decision path 與後續 RLPD/live trace 訓練基礎，而不是目前 checkpoint 已經優於啟發式。
+解讀：
+
+- **RDSAC(mean) 在 1×1 simulator 上仍未打贏 heuristic score**。philly、ali 方向是較差但**都未達統計顯著**（p=0.142、0.284，seed 間變異大）；burst 與 score 打平。
+- 這與舊 discrete-SAC checkpoint 的結論一致：1×1 action space 的可學結構有限，而 score baseline 已把 MPS fit、短工作偏好與碎片化懲罰寫得很強。換演算法本身不會憑空在 1×1 上贏過一個已調好的啟發式。
+- **訓練品質警訊**：本次 run 的 `alpha` 自動調到 clamp 上限 2.718（=e¹），代表 policy entropy 持續低於 target、temperature 一路被推到頂。這通常是 `target_entropy_ratio` / alpha clamp 需要調，或 150k 步尚未充分收斂；下一輪應先處理這點再下效能結論。
+- RDSAC 相對舊版的價值在 **risk-sensitive（cvar）對尾部的處理**，而上表是 `risk_mode=mean`（risk-neutral），尚未動用 risk 機制。p95/p99 欄位先記錄下來，作為之後 cvar 對照的 baseline。
+
+### 待補：cvar 尾部對照
+
+本輪只完成 `risk_mode=mean`。RDSAC 的核心主張——CVaR 用犧牲一點平均換取較好的尾部——需要再跑一個同配置的 `--risk-mode cvar` run，比較 p95/p99 JCT 與 tail slowdown 是否優於上表的 mean。演算法層面已用單元 + 行為測試確認 CVaR 會把策略推向低變異動作（commit `fe899ec`），但 simulator trace 上的尾部效益尚未量測。重現：
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
+  --trace-families philly burst ali --seeds 42 43 44 45 46 \
+  --no-attention --curriculum --risk-mode cvar --risk-beta 0.25 --device cuda \
+  --out-dir runs/rdsac_eval_cvar
+```
 
 ## 4. Live cluster 結果
+
+> 以下 live 結果是 RDSAC 改寫前、用舊 discrete-SAC checkpoint 跑的。它們驗證的是 serving / Slurm placement / worker lifecycle / MPS allocation 等基礎設施路徑能否運作，與演算法版本無關，因此保留。換上 RDSAC checkpoint 的 live A/B 尚未重跑。
 
 ### 4.1 DSAC live scheduler enabled
 
@@ -169,31 +198,31 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 | 問題 | 結論 |
 |---|---|
-| DSAC 是否能在 live 上跑？ | 可以。job `136-141` 全部完成，MPS allocation 與 worker placement 有實際生效。 |
-| DSAC checkpoint 是否在標準 simulator benchmark 打贏 score？ | 還沒有。`philly`、`burst` 顯著輸給 heuristic score，`ali` 方向也是輸但不顯著。 |
-| live A/B 是否已能公平比較 DSAC vs score？ | 還不能。score-only phase 暴露 worker lifecycle / Slurm completion acknowledgement 問題。 |
-| 目前最穩定的上線策略 | DSAC live scheduler 保持 enabled，但保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
+| DRL path 是否能在 live 上跑？ | 可以。job `136-141` 全部完成，MPS allocation 與 worker placement 有實際生效（舊 checkpoint；RDSAC live A/B 待重跑）。 |
+| RDSAC(mean) 是否在標準 simulator benchmark 打贏 score？ | 還沒有。philly、ali 方向較差但**未達顯著**，burst 打平；且本次 `alpha` 觸頂，訓練尚未調好。 |
+| RDSAC 的 risk-sensitive(cvar) 在尾部是否有效？ | simulator 上尚未量測。演算法已用單元 + 行為測試確認 CVaR 會把策略推向低變異動作，但 trace 上的 p95/p99 / tail slowdown 對照待補。 |
+| live A/B 是否已能公平比較 DRL vs score？ | 還不能。score-only phase 暴露 worker lifecycle / Slurm completion acknowledgement 問題。 |
+| 目前最穩定的上線策略 | DRL live scheduler 保持 enabled，但保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
 
 工程貢獻目前比較明確的是：
 
-1. 已有可上線的 DSAC inference path，而不是只停在 notebook/simulator。
-2. live path 能把 queue、node、GPU/MPS 狀態轉成模型輸入，並把決策回接到 Slurm submit/placement 流程。
+1. 已有可上線的 DRL inference path，而不是只停在 notebook/simulator。
+2. DRL 實作已對齊 Ma et al. RDSAC（雙分布 critic + categorical actor + risk distortion），並有單元/行為測試覆蓋；risk 機制是相對舊 discrete-SAC 的主要新能力。
 3. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
-4. benchmark 顯示目前 DSAC checkpoint 尚未優於 heuristic score，這讓後續研究方向更清楚：不是只宣稱「用了 DRL」，而是要改善訓練資料、reward fidelity 與 live latency/worker lifecycle model。
+4. benchmark 顯示 RDSAC(mean) 尚未優於 heuristic score，這讓後續方向更清楚：先修 alpha 自動調 / 收斂問題，再跑 cvar 尾部對照，並改善訓練資料、reward fidelity 與 live latency/worker lifecycle model。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
 
 ## 6. 本次驗證指令
 
-Simulator：
+Simulator（RDSAC mean，本次 §3 結果）：
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-  --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
-  --no-train \
+  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
   --n-nodes 1 --gpus-per-node 1 \
-  --n-jobs 50 \
   --trace-families philly burst ali \
   --seeds 42 43 44 45 46 \
-  --out-dir /tmp/kelpflux-dsac-score-bench-standard
+  --no-attention --curriculum --risk-mode mean --device cuda \
+  --out-dir runs/rdsac_eval_mean
 ```
 
 Live DSAC phase：
