@@ -84,6 +84,7 @@ def sim_train(
     seed: int = 42,
     out_dir: Optional[Path] = None,
     reward_mode: str = "jct_aligned",
+    reward_scale: float = 20_000.0,
     device: str = "cpu",
     log_every: int = 5_000,
     use_attention: bool = False,
@@ -121,6 +122,7 @@ def sim_train(
         n_nodes=n_nodes, gpus_per_node=gpus_per_node,
         max_steps=active_n_jobs * 200,
         reward_mode=reward_mode,
+        reward_scale=reward_scale,
         potential_shaping=potential_shaping,
     )
     agent = DSACAgent(
@@ -151,6 +153,7 @@ def sim_train(
     obs, _ = env.reset(seed=seed)
     ep_steps = ep_reward = 0.0
     ep_count = 0
+    last_losses: dict = {}
     t0 = time.time()
 
     for step in range(total_steps):
@@ -224,6 +227,10 @@ def sim_train(
                     "avg_jct": info.get("avg_jct", float("nan")),
                     "completed": info.get("completed", 0),
                     "n_jobs": active_n_jobs,
+                    "alpha": last_losses.get("alpha"),
+                    "entropy": last_losses.get("entropy"),
+                    "loss_critic": last_losses.get("loss_critic"),
+                    "loss_actor": last_losses.get("loss_actor"),
                 }) + "\n")
             ep_steps = ep_reward = 0.0
             obs, _ = env.reset()
@@ -233,6 +240,7 @@ def sim_train(
             for _ in range(utd_ratio):
                 batch = buf.sample(min(batch_size, len(buf)), rng)
                 losses = agent.update(batch)
+                last_losses = losses
                 # PER: update priorities with new TD errors
                 if use_per and "indices" in batch and "td_errors" in losses:
                     buf.update_priorities(batch["indices"], losses["td_errors"])
@@ -271,6 +279,9 @@ def main(argv=None) -> int:
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--reward-mode",   default="jct_aligned",
                    choices=["jct_aligned", "shaped"])
+    p.add_argument("--reward-scale",  type=float, default=20_000.0,
+                   help="divisor on -JCT; larger → smaller returns "
+                        "(keeps entropy term competitive with Q, default 20000)")
     p.add_argument("--device",        default="cpu")
     p.add_argument("--out-dir",
                    default=f"runs/dsac_sim_{time.strftime('%Y%m%d-%H%M%S')}")
@@ -312,6 +323,7 @@ def main(argv=None) -> int:
         total_steps=args.total_steps, warmup_steps=args.warmup_steps,
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
         seed=args.seed, reward_mode=args.reward_mode,
+        reward_scale=args.reward_scale,
         out_dir=Path(args.out_dir), device=device,
         use_attention=use_attention,
         potential_shaping=not args.no_potential_shaping,

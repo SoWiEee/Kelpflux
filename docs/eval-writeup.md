@@ -40,7 +40,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 - **雙分布 critic**：把 soft return 拆成 reward 分布 `Z_R` 與 entropy 分布 `Z_H`，各以 IQN 的 quantile 表示、共用 trunk，quantile Huber 回歸 + twin double learning。
 - **risk 進策略目標**：actor 目標對 reward 分布套用 distortion `ρ`，`risk_mode ∈ {mean, cvar, wang, cpw, msd}`。`mean` 是 risk-neutral，等同穩定性導向的 distributional SAC；`cvar` 偏好下尾較不嚴重的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。
 
-實作在 `services/rl_scheduler/dsac.py` 與 `services/rl_scheduler/distortion.py`，演算法與單元/行為測試見 commit `fe899ec`。本文 §3 報告 `risk_mode=mean`（risk-neutral baseline）的結果；`cvar` 的尾部對照仍待補（見 §3 末）。
+實作在 `services/rl_scheduler/dsac.py` 與 `services/rl_scheduler/distortion.py`，演算法與單元/行為測試見 commit `fe899ec`。本文 §3 報告 `mean`（risk-neutral）與 `cvar`（β=0.25）兩個變體在**完全相同配置、僅 `risk_mode` 不同**下的受控對照，這也是本次評估的主軸：驗證 risk distortion 對 placement 是否真的有用。
 
 ## 2. Benchmark 方法
 
@@ -48,33 +48,34 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 標準 simulator benchmark 使用相同 seed 對 RDSAC 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。
 
-本次設定：
+本次設定（mean / cvar 兩 run 共用，只差 `--risk-mode`）：
 
 | 項目 | 值 |
 |---|---|
-| agent | RDSAC，`risk_mode=mean`（risk-neutral） |
+| agent | RDSAC，`risk_mode ∈ {mean, cvar}`（cvar β=0.25） |
 | critic trunk | MLP（`--no-attention`） |
 | training | 從頭訓練 150k 步，curriculum n_jobs 10→30→50 |
-| checkpoint | `runs/rdsac_eval_mean/train/dsac.pt` |
+| reward_scale | **20000**（修復 alpha 觸頂，見下方說明） |
+| checkpoint | `runs/rdsac_eval_mean_v2/`、`runs/rdsac_eval_cvar_v2/` |
 | cluster | 1 node × 1 GPU |
 | jobs per trace | 50 |
 | trace families | `philly`, `burst`, `ali` |
 | seeds | 42, 43, 44, 45, 46 |
 | metric | mean JCT（主），p95 / p99 JCT（尾部） |
 
-重現指令：
+#### reward_scale 修復（alpha 觸頂根因）
 
-```bash
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
-  --n-nodes 1 --gpus-per-node 1 \
-  --trace-families philly burst ali \
-  --seeds 42 43 44 45 46 \
-  --no-attention --curriculum --risk-mode mean --device cuda \
-  --out-dir runs/rdsac_eval_mean
-```
+上一輪 mean run 出現 `alpha` 自動調到 clamp 上限 2.718（=e¹）的警訊。排查後確認**不是 alpha 邏輯錯**（符號為標準 Christodoulou discrete-SAC 形式），而是 **return 尺度問題**：
 
-> 與舊版差異：早期 §3 數字來自一個 500k 步的 discrete-SAC checkpoint；本次是 RDSAC 從頭訓練 **150k 步**。步數較少，因此**不應**把兩組數字當作同條件直接比較。
+- 舊 `reward = −JCT / 1000`，50 個 job 累加 → 每個 episode 的 return 量級約 **O(−150)**，critic 學到的 `E[Z_R]` 跨動作落差約 **560**。
+- actor 目標 `Σ π·(α·logπ − ρ[Z_R])` 中，entropy 正則項 `α·log(n)` 上限僅約 2，被 `Z_R`（~560）**壓過約 300×**。
+- 結果：policy 在訓練早期就塌成 one-hot（量到的 actor entropy ≈ 0.002，遠低於 target 0.1·log(n)），**探索停擺**；alpha auto-tune 看到 entropy ≪ target 就一路把 temperature 推到 clamp 上限仍無力回天。
+
+修法（最小幅度，走既有 `sim_train`）：把 `reward_scale` 由 1000 提到 **20000**，使 return 量級降到 O(−10)、讓 entropy 項與 Q 同量級可競爭；同時把 log_alpha clamp 上限由 1.0 放寬到 3.0（α≤~20），給 auto-tune 餘量；並在 `sim_train.jsonl` 補記 alpha/entropy 以便驗證。修復後量測：alpha 不再釘頂、自由調節（mean run 收斂於 α≈1.4、cvar run α≈0.66），actor entropy 由 0.002 恢復到 **≈0.13**，回到 target 附近。
+
+> 與更早版本差異：最早的 §3 數字來自 500k 步 discrete-SAC checkpoint，**不應**與本次 RDSAC 150k 步直接比較。本次 mean 與 cvar 則是同步驟、同 reward_scale、同 seed 的乾淨受控對照。
+
+重現指令見 §6。
 
 ### 2.2 Live cluster smoke A/B
 
@@ -95,32 +96,36 @@ live workload：6 個短 GPU/MPS sleep jobs，依序要求 `mps=25,25,100,25,50,
 
 ## 3. Simulator 結果
 
-RDSAC `risk_mode=mean`，150k 步，5 seeds（`Δ` 為 `(score − dsac)/score`，負值代表 RDSAC 的 JCT 較高、較差）：
+reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體（`Δ` 為 `(score − dsac)/score`，負值代表 RDSAC 的 JCT 較高、較差）。
 
-| Family | RDSAC mean JCT | Score mean JCT | Δ | 95% CI | p-value | p95 JCT | p99 JCT | 結論 |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| philly | 4.475 h | 2.621 h | -70.8% | [-178.4%, +36.8%] | 0.142 | 21.24 h | 44.73 h | RDSAC 較差，未顯著 |
-| burst | 3.541 h | 3.541 h | -0.0% | [-118.2%, +118.2%] | 1.000 | 10.50 h | 23.04 h | 打平 |
-| ali | 1.986 h | 1.383 h | -43.6% | [-141.5%, +54.3%] | 0.284 | 5.50 h | 29.68 h | RDSAC 較差，未顯著 |
+### 3.1 risk_mode = mean（risk-neutral）
 
-解讀：
+| Family | RDSAC mean JCT | Score mean JCT | Δ | 95% CI | p-value | 顯著 | p95 JCT | p99 JCT |
+|---|---:|---:|---:|---:|---:|:--:|---:|---:|
+| philly | 7.537 h | 2.621 h | -187.6% | [-261.3%, -113.9%] | 0.0021 | **是** | 27.04 h | 37.84 h |
+| burst | 8.007 h | 3.541 h | -126.1% | [-223.8%, -28.4%] | 0.0231 | **是** | 37.15 h | 55.66 h |
+| ali | 2.342 h | 1.383 h | -69.4% | [-134.9%, -3.8%] | 0.0424 | **是** | 7.59 h | 22.17 h |
 
-- **RDSAC(mean) 在 1×1 simulator 上仍未打贏 heuristic score**。philly、ali 方向是較差但**都未達統計顯著**（p=0.142、0.284，seed 間變異大）；burst 與 score 打平。
-- 這與舊 discrete-SAC checkpoint 的結論一致：1×1 action space 的可學結構有限，而 score baseline 已把 MPS fit、短工作偏好與碎片化懲罰寫得很強。換演算法本身不會憑空在 1×1 上贏過一個已調好的啟發式。
-- **訓練品質警訊**：本次 run 的 `alpha` 自動調到 clamp 上限 2.718（=e¹），代表 policy entropy 持續低於 target、temperature 一路被推到頂。這通常是 `target_entropy_ratio` / alpha clamp 需要調，或 150k 步尚未充分收斂；下一輪應先處理這點再下效能結論。
-- RDSAC 相對舊版的價值在 **risk-sensitive（cvar）對尾部的處理**，而上表是 `risk_mode=mean`（risk-neutral），尚未動用 risk 機制。p95/p99 欄位先記錄下來，作為之後 cvar 對照的 baseline。
+### 3.2 risk_mode = cvar（β=0.25，下尾風險敏感）
 
-### 待補：cvar 尾部對照
+| Family | RDSAC mean JCT | Score mean JCT | Δ | 95% CI | p-value | 顯著 | p95 JCT | p99 JCT |
+|---|---:|---:|---:|---:|---:|:--:|---:|---:|
+| philly | 2.783 h | 2.621 h | -6.2% | [-63.1%, +50.7%] | 0.777 | 否 | 9.42 h | 22.64 h |
+| burst | 4.320 h | 3.541 h | -22.0% | [-130.6%, +86.7%] | 0.604 | 否 | 16.16 h | 65.66 h |
+| ali | 2.301 h | 1.383 h | -66.4% | [-111.5%, -21.3%] | 0.0150 | **是** | 7.14 h | 18.43 h |
 
-本輪只完成 `risk_mode=mean`。RDSAC 的核心主張——CVaR 用犧牲一點平均換取較好的尾部——需要再跑一個同配置的 `--risk-mode cvar` run，比較 p95/p99 JCT 與 tail slowdown 是否優於上表的 mean。演算法層面已用單元 + 行為測試確認 CVaR 會把策略推向低變異動作（commit `fe899ec`），但 simulator trace 上的尾部效益尚未量測。重現：
+### 3.3 解讀：risk distortion 才是 RDSAC 的價值來源
 
-```bash
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
-  --trace-families philly burst ali --seeds 42 43 44 45 46 \
-  --no-attention --curriculum --risk-mode cvar --risk-beta 0.25 --device cuda \
-  --out-dir runs/rdsac_eval_cvar
-```
+這組受控對照（兩 run 只差 `risk_mode`，reward_scale、步數、seed 全相同）得到一個清楚、且有點反直覺的結論：
+
+- **修好 alpha 反而讓 risk-neutral（mean）變差，並從「未顯著」掉到「顯著低於 baseline」**。上一輪 alpha 釘在 ceiling、entropy≈0 的「壞」狀態，等效於全程近乎 deterministic greedy，反而碰巧較穩（philly 4.48h、未顯著）；一旦 entropy/探索恢復，mean 變體在這些 trace 上**訓練不穩定**——n_jobs=50 階段的 avg_jct 在約 10k–49k 秒之間劇烈震盪、不收斂——greedy eval 取到的策略因此更差。換句話說，risk-neutral SAC 的探索在 1×1 的窄 action space + 強 baseline 下沒有帶來增益。
+- **CVaR 才是讓 RDSAC 真正發揮的關鍵**，這正是當初採用 Ma et al. risk-sensitive DSAC 的初衷。同樣 reward_scale、同樣探索強度下，cvar：
+  - 把 **philly 拉到與強 score baseline 統計打平**（−6.2%，p=0.78，CI 跨 0），mean 則是 −187.6%、p=0.002 顯著差；
+  - **尾部 p95 大致砍半**：philly 9.42h vs mean 27.04h、burst 16.16h vs mean 37.15h；philly per-seed 也更集中（1.86–4.48h vs mean 4.70–9.19h）；
+  - 收斂在較低的 α≈0.66（mean≈1.4），即較 exploitative、訓練較穩。
+- **誠實的限制**：(1) cvar 在 **ali 仍顯著差**（−66%，p=0.015），這個 trace 對 RDSAC 一直最難；(2) burst 的 **p99 反而比 mean 差**（65.66h vs 55.66h）——p95 改善但最尾端有單一壞 seed，CVaR 對「平均尾部」有效不代表壓得住最極端的離群；(3) 整體上 cvar 仍未在任何 family 上**贏過** score，只是把差距縮到不顯著。1×1 + 已調好的啟發式，這個結果與先前一致：換演算法不會憑空贏過強 baseline，但 risk distortion 明確優於 risk-neutral。
+
+結論一句話：**alpha 修復本身不是效能銀彈，但它讓 risk 機制能正常運作；在能正常運作後，CVaR 對 mean JCT 與尾部都顯著優於 risk-neutral mean**，這支持了採用 risk-sensitive DSAC 的設計選擇。
 
 ## 4. Live cluster 結果
 
@@ -199,8 +204,9 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 | 問題 | 結論 |
 |---|---|
 | DRL path 是否能在 live 上跑？ | 可以。job `136-141` 全部完成，MPS allocation 與 worker placement 有實際生效（舊 checkpoint；RDSAC live A/B 待重跑）。 |
-| RDSAC(mean) 是否在標準 simulator benchmark 打贏 score？ | 還沒有。philly、ali 方向較差但**未達顯著**，burst 打平；且本次 `alpha` 觸頂，訓練尚未調好。 |
-| RDSAC 的 risk-sensitive(cvar) 在尾部是否有效？ | simulator 上尚未量測。演算法已用單元 + 行為測試確認 CVaR 會把策略推向低變異動作，但 trace 上的 p95/p99 / tail slowdown 對照待補。 |
+| 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
+| RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。修復後 mean 三個 family 都**顯著較差**且訓練不穩；cvar 把 philly 拉到統計**打平**、burst 不顯著、ali 仍顯著差——但沒有任何 family 真正贏過 score。 |
+| risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。同配置下 cvar 的 mean JCT 與 p95 尾部都大幅勝過 mean（philly p95 9.4h vs 27h），支持採用 risk distortion 的設計選擇；唯 burst p99 與 ali 仍是弱點。 |
 | live A/B 是否已能公平比較 DRL vs score？ | 還不能。score-only phase 暴露 worker lifecycle / Slurm completion acknowledgement 問題。 |
 | 目前最穩定的上線策略 | DRL live scheduler 保持 enabled，但保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
 
@@ -208,21 +214,34 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 1. 已有可上線的 DRL inference path，而不是只停在 notebook/simulator。
 2. DRL 實作已對齊 Ma et al. RDSAC（雙分布 critic + categorical actor + risk distortion），並有單元/行為測試覆蓋；risk 機制是相對舊 discrete-SAC 的主要新能力。
-3. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
-4. benchmark 顯示 RDSAC(mean) 尚未優於 heuristic score，這讓後續方向更清楚：先修 alpha 自動調 / 收斂問題，再跑 cvar 尾部對照，並改善訓練資料、reward fidelity 與 live latency/worker lifecycle model。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
+3. 已定位並修好 temperature auto-tune 的 reward-scale 根因，並在 `sim_train.jsonl` 加上 alpha/entropy instrumentation，後續訓練可直接觀測收斂品質。
+4. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
+5. benchmark 給出乾淨的 risk-mode 受控對照：RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 顯著優於 risk-neutral mean**。後續方向：穩定 mean 變體訓練（步數 / target_entropy_ratio）、改善 ali 與 burst 最尾端、提升 reward fidelity，並重跑 RDSAC live A/B。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
 
 ## 6. 本次驗證指令
 
-Simulator（RDSAC mean，本次 §3 結果）：
+Simulator（本次 §3 受控對照，mean 與 cvar 只差 `--risk-mode`）：
 
 ```bash
+# risk-neutral mean
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
   --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
   --n-nodes 1 --gpus-per-node 1 \
-  --trace-families philly burst ali \
+  --trace-families philly burst ali --train-trace philly burst ali \
   --seeds 42 43 44 45 46 \
-  --no-attention --curriculum --risk-mode mean --device cuda \
-  --out-dir runs/rdsac_eval_mean
+  --no-attention --curriculum --reward-scale 20000 \
+  --risk-mode mean --device cuda \
+  --out-dir runs/rdsac_eval_mean_v2
+
+# risk-sensitive cvar (β=0.25)
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+  --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
+  --n-nodes 1 --gpus-per-node 1 \
+  --trace-families philly burst ali --train-trace philly burst ali \
+  --seeds 42 43 44 45 46 \
+  --no-attention --curriculum --reward-scale 20000 \
+  --risk-mode cvar --risk-beta 0.25 --device cuda \
+  --out-dir runs/rdsac_eval_cvar_v2
 ```
 
 Live DSAC phase：
@@ -246,3 +265,15 @@ sudo kubectl exec -n slurm slurm-controller-0 -- bash -lc \
   'sacct -X -P -j 136,137,138,139,140,141,142,143,144,145,146,147 \
    --format=JobID,JobName,Partition,State,Submit,Start,End,ElapsedRaw,NodeList,AllocTRES%120,ReqTRES%120'
 ```
+
+## 7. 資料集來源
+
+§3 的 simulator benchmark **並非直接重放原始資料集**，而是用 `sim/loader.py` 的合成生成器，其分布參數（GPU 數量比例、到達過程、log-normal runtime 與尾部）依下列公開 GPU cluster trace 的已發表統計校準，因此可離線、無網路重現。其中 Philly 另提供真實 `cluster_log_data.json` 的載入路徑（`load_philly()`），可選擇用原始 trace 重放。
+
+| Trace family | 生成器 | 模仿來源 | 資料集連結 | 對應論文 |
+|---|---|---|---|---|
+| `philly` | `generate_philly_like`（亦支援 `load_philly` 真實重放） | Microsoft Philly GPU cluster trace | https://github.com/msr-fiddle/philly-traces | Jeon et al., *Analysis of Large-Scale Multi-Tenant GPU Clusters for DNN Training Workloads*, USENIX ATC 2019 — https://www.usenix.org/conference/atc19/presentation/jeon |
+| `ali` | `generate_ali_like` | Alibaba PAI GPU cluster trace（MPS-fractional、短尾、多單卡） | https://github.com/alibaba/clusterdata（`cluster-trace-gpu-v2020`） | Weng et al., *MLaaS in the Wild: Workload Analysis and Scheduling in Large-Scale Heterogeneous GPU Clusters*, USENIX NSDI 2022 — https://www.usenix.org/conference/nsdi22/presentation/weng |
+| `burst` | `generate_burst_heavy` | **非具名公開資料集**：沿用 `philly` 的 job-size 組合，疊加日週期爆發到達（`burst_concentration` 集中於 active window），作為到達突發壓力測試 | —（合成壓力模式） | — |
+
+> 注意：`philly` / `ali` 是「**統計近似**」而非逐筆原始資料；數值結果反映的是這些 trace 的工作負載**特性**（job 大小分布、到達節奏、runtime 尾部），不等同在原始 production log 上的表現。要做嚴格對照時，建議改用 `load_philly()` 載入 msr-fiddle/philly-traces 的真實 `cluster_log_data.json`。

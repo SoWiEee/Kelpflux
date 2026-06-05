@@ -352,7 +352,12 @@ class DSACAgent:
             loss_alpha.backward()
             self.opt_alpha.step()
             with torch.no_grad():
-                self.log_alpha.clamp_(-5.0, 1.0)
+                # Upper bound generous (α≤~20): auto-tune needs head-room to
+                # balance the entropy term against the return scale. A tight
+                # ceiling (old 1.0 → α≤2.72) pins α and silently disables
+                # temperature control when returns are O(10). Lower bound keeps
+                # α from collapsing to zero (entropy term vanishes → no explore).
+                self.log_alpha.clamp_(-5.0, 3.0)
             loss_alpha_val = float(loss_alpha.item())
 
         return {

@@ -167,6 +167,8 @@ def main(argv=None) -> int:
                    help="risk distortion in the RDSAC actor objective")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
+    p.add_argument("--reward-scale",         type=float, default=20_000.0,
+                   help="training reward divisor on -JCT (default 20000)")
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable per-step potential shaping")
     p.add_argument("--no-per",               action="store_true",
@@ -216,6 +218,7 @@ def main(argv=None) -> int:
             use_attention=use_attention,
             risk_mode=args.risk_mode,
             risk_beta=args.risk_beta,
+            reward_scale=args.reward_scale,
             potential_shaping=not args.no_potential_shaping,
             use_per=not args.no_per,
             curriculum=args.curriculum,
