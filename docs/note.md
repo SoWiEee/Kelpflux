@@ -531,6 +531,33 @@ slurmd log 出現 `Zero Bytes were transmitted or received`，直覺往認證/�
 
 ---
 
+## 問題 18：live A/B 用 block 設計（先全跑 A 臂再全跑 B 臂）在共用單 GPU 上被「一次性暖機」帶風向，aggregate 會隨 arm 順序翻號
+
+**情境**：把 §17 的 RDSAC live A/B 從 42 job/arm 擴大到 128 job/arm（8 輪 × 16 job、6×6 mps×runtime 網格）重評，想用更多資料把 §4.4 的 ΔJCT −0.2% 坐實。第一次跑（rdsac 臂先、score 臂後）配對結果是 **ΔJCT −26.9%、p=0.0001、win/tie/loss 19/29/79**，看起來「RDSAC 顯著比 score 差」。
+
+**錯誤觀察 / 差點下錯結論**：
+
+| # | 看起來像 | 實際 |
+|---|---|---|
+| 18.1 | 「128 job 大樣本 + p=0.0001 → RDSAC 真的較差」 | ❌ 假象。逐輪拆開後 Δ **全部集中在 round 1–2**（+96s、+44s），round 3–8 幾乎為 0（+7/+1/+0.4/+1/+0.7/−0.8 s）。 |
+| 18.2 | 「round 1 慢是 RDSAC boost 把佇列排爛了」 | ❌ round-1 是 **wait time** 爆掉（rdsac wait 106.8s vs score 14.4s），不是執行變慢；且 RDSAC 該臂 abstain 112/128，根本很少真的 boost。 |
+| 18.3 | 「那就取 warm-subset (3–8) 報 −2.3%」 | ⚠️ 部分對，但 warm-subset 仍是 rdsac-先-score-後，殘留時間趨勢。**決定性檢驗是交換 arm 順序**。 |
+
+**根因**：共用單一物理 GPU 的 block A/B，**先跑的那一臂**會獨吃一次性的 GPU/MPS context 暖機懲罰（第一批 job 落地時 MPS server 冷、placement 初始化），這筆成本全記在 A 臂頭上、與排程器無關。
+
+**決定性驗證（交換 arm 順序）**：改成 score 臂先、rdsac 臂後、並各丟 1 個 discarded warmup round 重跑 → aggregate **翻成 ΔJCT +8.6%（RDSAC 較好）**。同一個系統，只因換順序，符號就反轉 ⇒ 那個 ±20%+ 的 aggregate 是 **order/warmup 假象**。兩次 warm-subset 平均 ≈ **−0.7%**，逐輪 Δ 在 0 附近抖動 ⇒ 1×1 live 下 **RDSAC 與 score 真正打平**（坐實 §4.4）。
+
+**改進方式**：
+
+1. **每臂丟棄 ≥1 個 warmup round**（`ab_driver_v2.sh` 的 `WARMUP=1`）：measured rounds 全部在暖機後。
+2. **交換 arm 順序或逐輪 interleave**：單次 block 跑的 aggregate 不可信；至少跑兩次相反順序、看 warm-subset 是否一致（符號不該翻）。理想做法是逐輪交替 A/B，讓任何時間趨勢在配對中相消（代價：每輪要 toggle `SHADOW_MODE` → rollout restart，會再引入小暖機，需權衡）。
+3. **報 warm-subset、不要報含 round-1 的 aggregate**；或在分析時自動偵測並剔除頭部離群輪。
+4. （延續 17.3）serve.py 應把 abstain 原因拆細（snapshot stale vs shape mismatch），這次也才看得出 rdsac 臂 88–100% abstain 主要是 snapshot 時效性、不是拓樸問題。
+
+原始檔：`runs/live_ab/SUMMARY_v2.md`、`runs/live_ab/analyze_ab.py`、`runs/live_ab/v2_*`、`runs/live_ab/v2swap_*`。
+
+---
+
 > **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 Phase 7。
 >
 > 本節以下保留 5-A 的設計與決策記錄，作為 chart 結構的歷史脈絡；活躍的下一階段請看 [`# Phase 6 Plan`](#phase-6-plan) 與 [`# Phase 7 Plan`](#phase-7-plan)。

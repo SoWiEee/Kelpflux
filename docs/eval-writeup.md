@@ -218,6 +218,30 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 **解讀**：1×1 live 下 RDSAC 與 score **統計上無法區分**（ΔJCT −0.2%，遠小於 ±27s 逐對雜訊）。原因與 §3 一致 —— 在 1×1、強啟發式 baseline 下，RDSAC 幾乎對每個到達的 job 都均勻 boost（每輪 `selected=14/14`），佇列排序等同 score 的排序，沒有重排效果。這證明 **RDSAC 能在 production 正確上線並與啟發式持平**，但真正的增益要等「拓樸匹配的多節點 checkpoint、placement 選擇有意義」時才會出現；單純把 1×1 checkpoint 丟到 live 不會贏。
 
+### 4.5 RDSAC 擴大評估：更多資料、受控 order（2026-06-11）
+
+§4.4 的 42-job 單一 block 樣本太少、CI 太寬，不足以下定論。本節用**更多資料**重評，並補上一個 §4.4 沒控到的混淆因子。原始檔：`runs/live_ab/SUMMARY_v2.md`、`runs/rdsac_eval30_*/SUMMARY.md`。
+
+**(a) Live：擴大到 128 job/arm、6×6 參數網格，並交換 arm 順序。** 兩次跑各 8 輪 × 16 job（`mps∈{20,25,34,50,67,75}`、runtime∈{8,14,20,28,36,45}s，掃滿 36 種組合），operator 全程暫停把拓樸釘在 1 個 GPU node。**aggregate ΔJCT 會隨 arm 順序翻號**：
+
+| 跑次 | arm 順序 | aggregate ΔJCT | warm-subset ΔJCT |
+|---|---|---:|---:|
+| v2_123417 | rdsac → score | **−26.9%**（RDSAC 較差） | −2.3%（r3–8） |
+| v2swap | score → rdsac（+warmup） | **+8.6%**（RDSAC 較好） | +0.9%（r2–8） |
+
+先跑的那一臂吃到一次性的 GPU/MPS 暖機懲罰（run #1 rdsac round-1 wait = 106.8s vs score 14.4s），所以那個看似顯著的 ±20%+ aggregate **是 order/warmup 假象、不是排程效果**。暖機後逐輪 Δ 在 0 附近抖動（run #2 r3–8：+0.8/+0.5/−1.2/−0.9/+1.1/−0.4 s，工作 60–100s），兩次 warm 估計平均 ≈ **−0.7%**。**結論：1×1 live 下 RDSAC 與 score 真正打平**，比 §4.4 −0.2% 多 3× 資料、且控掉了 block 設計的暖機混淆後依然成立。另外 RDSAC 臂的 RL 在 88–100% 的提交上 abstain（受 snapshot 時效性 + 單 GPU placement 太瑣碎主導，逐跑高變異），更印證「as-deployed RDSAC 大多回退成 score、無可測差異」。
+
+**(b) Sim：30 seed 重評（取代舊的 5 seed）。** 用兩個 v2 checkpoint 以 as-deployed risk 模式（cvar→cvar、mean→mean）在 1×1、`n_jobs=50` 跑配對 eval。5 seed 的 CI 寬到無意義（舊 cvar philly −6.2%，CI[−63%,+51%]，p=0.78），30 seed 後 CI 收斂、符號穩定：
+
+| checkpoint | philly | burst | ali |
+|---|---:|---:|---:|
+| **cvar_v2**（live） | −24.6%（不顯著，p≈0.12） | −31.1%（顯著） | −120.9%（顯著） |
+| **mean_v2** | −117.3%（顯著） | −159.2%（顯著） | −128.4%（顯著） |
+
+兩個 finding：**(i)** 在 1×1 sim 全 rollout 下**兩個 checkpoint 都贏不了 score**——舊 5-seed 的「接近持平」是雜訊；**(ii)** **cvar 的泛化遠勝 mean**（−24.6% vs −117%，約 5×），這正是把 cvar 而非 mean 烘進 live image 的經驗依據。
+
+**(a)(b) 一致的故事**：1×1 太小，placement 策略端到端**無法表現出優勢、也無法表現出明顯劣勢**。sim 全 rollout 會放大 checkpoint 的不足（略輸 score）；live 端因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。**方法論教訓**：共用單 GPU 的 block A/B 必須丟棄每臂 ≥1 個 warmup round 並交換 arm 順序（或逐輪 interleave），否則 aggregate 會被一次性暖機帶風向（→ `docs/note.md` #18）。
+
 ## 5. 結論
 
 目前可誠實下的結論：
@@ -226,9 +250,9 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 |---|---|
 | DRL path 是否能在 live 上跑？ | 可以。舊 checkpoint job `136-141` 全部完成；**RDSAC cvar-v2 live A/B 已重跑**（§4.4），warm-pool 穩定化後 84 個 job 全乾淨完成、RL boost 確實生效。 |
 | 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
-| RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。修復後 mean 三個 family 都**顯著較差**且訓練不穩；cvar 把 philly 拉到統計**打平**、burst 不顯著、ali 仍顯著差——但沒有任何 family 真正贏過 score。 |
-| risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。同配置下 cvar 的 mean JCT 與 p95 尾部都大幅勝過 mean（philly p95 9.4h vs 27h），支持採用 risk distortion 的設計選擇；唯 burst p99 與 ali 仍是弱點。 |
-| live A/B 是否已能公平比較 DRL vs score？ | **可以了**。把 GPU pool 設成 `min_replicas=1`（warm pool）後消除冷啟動 race，並讓 1×1 checkpoint 拓樸匹配；§4.4 配對 A/B 顯示 RDSAC 與 score 在 1×1 統計上打平（ΔJCT −0.2%）。 |
+| RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。**30-seed 重評**（§4.5b，取代舊 5-seed 雜訊）下 cvar 三個 family 都不優於 score（philly −24.6% 不顯著、burst/ali 顯著較差），mean 更全面顯著較差。1×1 sim 全 rollout 下沒有任何 family 贏過 score。 |
+| risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。30-seed 下 cvar 的泛化遠勝 mean（philly −24.6% vs −117%，約 5×），支持把 cvar 而非 mean 烘進 live image 的設計選擇；唯絕對值仍未過 score baseline。 |
+| live A/B 是否已能公平比較 DRL vs score？ | **可以了，且已用更多資料驗證**。warm-pool（`min_replicas=1`）消除冷啟動 race 並讓 1×1 checkpoint 拓樸匹配。§4.5a 擴大到 128 job/arm 並**交換 arm 順序**：aggregate 會隨順序翻號（−27% ↔ +8.6%），證明那是一次性暖機假象；warm-subset 平均 ≈ −0.7%，**RDSAC 與 score 在 1×1 真正打平**（confirms §4.4 −0.2%）。 |
 | 目前最穩定的上線策略 | DRL live scheduler 保持 enabled + GPU warm pool（`min_replicas=1`），並保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
 
 工程貢獻目前比較明確的是：
@@ -237,7 +261,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 2. DRL 實作已對齊 Ma et al. RDSAC（雙分布 critic + categorical actor + risk distortion），並有單元/行為測試覆蓋；risk 機制是相對舊 discrete-SAC 的主要新能力。
 3. 已定位並修好 temperature auto-tune 的 reward-scale 根因，並在 `sim_train.jsonl` 加上 alpha/entropy instrumentation，後續訓練可直接觀測收斂品質。
 4. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
-5. benchmark 給出乾淨的 risk-mode 受控對照：RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 顯著優於 risk-neutral mean**。RDSAC live A/B 也已重跑（§4.4）：warm-pool 穩定化後 RDSAC 能在 production 正確運作、與 score 在 1×1 打平。後續方向：穩定 mean 變體訓練（步數 / target_entropy_ratio）、改善 ali 與 burst 最尾端、提升 reward fidelity，並訓練拓樸匹配的多節點 checkpoint 讓 placement 選擇真正有意義。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
+5. benchmark 給出乾淨的 risk-mode 受控對照：30-seed 重評（§4.5b）下 RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 泛化遠勝 risk-neutral mean**（約 5×），這是把 cvar 烘進 live image 的依據。RDSAC live A/B 也已用**更多資料 + 受控 arm 順序**重跑（§4.5a）：warm-pool 穩定化後 RDSAC 能在 production 正確運作、與 score 在 1×1 真正打平（aggregate 隨順序翻號證明為暖機假象，warm Δ≈−0.7%）。後續方向：穩定 mean 變體訓練、改善 ali 與 burst 最尾端、提升 reward fidelity，並訓練拓樸匹配的多節點 checkpoint 讓 placement 選擇真正有意義。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
 
 ## 6. 本次驗證指令
 
