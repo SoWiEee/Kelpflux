@@ -242,6 +242,24 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 **(a)(b) 一致的故事**：1×1 太小，placement 策略端到端**無法表現出優勢、也無法表現出明顯劣勢**。sim 全 rollout 會放大 checkpoint 的不足（略輸 score）；live 端因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。**方法論教訓**：共用單 GPU 的 block A/B 必須丟棄每臂 ≥1 個 warmup round 並交換 arm 順序（或逐輪 interleave），否則 aggregate 會被一次性暖機帶風向（→ `docs/note.md` #18）。
 
+### 4.6 三方對照：加入 vanilla SAC（2026-06-11）
+
+為了回答「RDSAC 的分布式 / 風險機制到底有沒有用」，加入第三個模型 **vanilla 離散 SAC**（`DSACAgent(use_iqn=False)`：scalar twin-Q critic、MSE soft-Bellman、無 IQN Z_R/Z_H 分解、無 risk distortion）。用一個 `use_iqn` flag 切換 SAC↔RDSAC，貫穿訓練 / eval / live serving（serve `/healthz` 回報 `variant`）。SAC 用**與 RDSAC v2 完全相同的配方**訓練（150k 步、mixed traces、curriculum、PER、shaping、MLP、1×1），唯一差別就是 critic 型別與沒有 risk。原始檔：`runs/sac_eval_v2/SUMMARY.md`、`runs/live_ab/SUMMARY_sac.md`。
+
+**(a) Sim（30-seed）能分出高下**：
+
+| family | score | **SAC** | RDSAC-cvar | RDSAC-mean |
+|---|---:|---:|---:|---:|
+| philly | 0% | −106.4% | **−24.6%** | −117.3% |
+| burst  | 0% | −157.5% | **−31.1%** | −159.2% |
+| ali    | 0% | −311.6% | **−120.9%** | −128.4% |
+
+排名（好→差）：**score > RDSAC-cvar > RDSAC-mean ≳ SAC**。vanilla SAC 是**最差**的學習策略，全面落後且比 RDSAC-cvar 差 3–4×——**分布式 IQN critic + risk distortion 確實有用**。SAC 變差的機制看訓練 log 很清楚：auto-tune 的 `alpha` 一路爬到 ~4.0（entropy 項壓過 scalar critic → greedy policy 近乎隨機）；分布式 critic 把 value scale 維持得更適合共用的 auto-α 控制器，scalar critic 沒有。
+
+**(b) Live（1×1）分不出高下**：把 SAC 烘成臨時 image `slurm-rl-scheduler:sac-m11` 部署（`variant:"SAC"`），跑同樣受控的雙序 A/B 後復原 `:m11`。兩個順序都**打平**（warm-subset −0.5% / +1.6%，~73s job 上不到 2s，符號隨序翻）。關鍵在 decision counters：SAC 臂 **abstain 132–144/144、實際 boost 0 次**——它根本沒機會展現（爛的）策略。和 RDSAC 一樣，1×1 live 的 serving 路徑在 snapshot 過期時回退 score、單 GPU placement 又瑣碎，把模型品質差異完全洗掉。
+
+**三方結論**：**sim 全 rollout 能分（score > RDSAC-cvar > RDSAC-mean ≳ SAC，分布式/風險機制有用）；live 1×1 分不出（score ≈ RDSAC ≈ SAC 全部打平，因為每個學習模型都 abstain ~90–100% 而 fail-safe 回 score）**。live 的 takeaway 是穩健性而非品質：在 1×1 部署一個訓練很差的 checkpoint 也不會讓 live JCT 變差，因為 fallback 保護了 production。要對品質下定論，得有 placement 真正起作用的拓樸匹配多節點 checkpoint。
+
 ## 5. 結論
 
 目前可誠實下的結論：
@@ -250,9 +268,10 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 |---|---|
 | DRL path 是否能在 live 上跑？ | 可以。舊 checkpoint job `136-141` 全部完成；**RDSAC cvar-v2 live A/B 已重跑**（§4.4），warm-pool 穩定化後 84 個 job 全乾淨完成、RL boost 確實生效。 |
 | 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
-| RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。**30-seed 重評**（§4.5b，取代舊 5-seed 雜訊）下 cvar 三個 family 都不優於 score（philly −24.6% 不顯著、burst/ali 顯著較差），mean 更全面顯著較差。1×1 sim 全 rollout 下沒有任何 family 贏過 score。 |
+| RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。**30-seed 重評**（§4.5b，取代舊 5-seed 雜訊）下 cvar 三個 family 都不優於 score（philly −24.6% 不顯著、burst/ali 顯著較差），mean 更全面顯著較差。1×1 sim 全 rollout 下沒有任何 learned model 贏過 score。 |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC 三方) | **有用**。30-seed sim 排名 **score > RDSAC-cvar > RDSAC-mean ≳ SAC**（§4.6a）。vanilla SAC（`use_iqn=False`，scalar critic、無 risk）是最差的學習策略（−106/−157/−312%），比 RDSAC-cvar 差 3–4×——拿掉 IQN 分布式 critic + risk distortion 會明顯變壞。 |
 | risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。30-seed 下 cvar 的泛化遠勝 mean（philly −24.6% vs −117%，約 5×），支持把 cvar 而非 mean 烘進 live image 的設計選擇；唯絕對值仍未過 score baseline。 |
-| live A/B 是否已能公平比較 DRL vs score？ | **可以了，且已用更多資料驗證**。warm-pool（`min_replicas=1`）消除冷啟動 race 並讓 1×1 checkpoint 拓樸匹配。§4.5a 擴大到 128 job/arm 並**交換 arm 順序**：aggregate 會隨順序翻號（−27% ↔ +8.6%），證明那是一次性暖機假象；warm-subset 平均 ≈ −0.7%，**RDSAC 與 score 在 1×1 真正打平**（confirms §4.4 −0.2%）。 |
+| live A/B 是否已能公平比較 DRL vs score？ | **可以了，且已用更多資料 + 三方驗證**。warm-pool（`min_replicas=1`）消除冷啟動 race 並讓 1×1 checkpoint 拓樸匹配。§4.5a 擴大到 128 job/arm 並**交換 arm 順序**：aggregate 隨順序翻號（−27% ↔ +8.6%）證明為暖機假象，warm Δ≈−0.7%。§4.6b 把 vanilla SAC 也部署上 live（`variant:"SAC"`）：同樣**打平**。但 1×1 live 其實**分不出模型**——每個 learned model 都 abstain ~90–100% 而 fail-safe 回 score，所以 score ≈ RDSAC ≈ SAC。 |
 | 目前最穩定的上線策略 | DRL live scheduler 保持 enabled + GPU warm pool（`min_replicas=1`），並保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
 
 工程貢獻目前比較明確的是：
@@ -261,7 +280,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 2. DRL 實作已對齊 Ma et al. RDSAC（雙分布 critic + categorical actor + risk distortion），並有單元/行為測試覆蓋；risk 機制是相對舊 discrete-SAC 的主要新能力。
 3. 已定位並修好 temperature auto-tune 的 reward-scale 根因，並在 `sim_train.jsonl` 加上 alpha/entropy instrumentation，後續訓練可直接觀測收斂品質。
 4. simulator 與 live trace collector 已能支援後續 RLPD：先用 live `sacct` / normalized trace 蒐集真實 transition，再混合 simulator replay 做 fine-tuning。
-5. benchmark 給出乾淨的 risk-mode 受控對照：30-seed 重評（§4.5b）下 RDSAC 在 1×1 + 強 baseline 下仍未取勝，但 **CVaR 泛化遠勝 risk-neutral mean**（約 5×），這是把 cvar 烘進 live image 的依據。RDSAC live A/B 也已用**更多資料 + 受控 arm 順序**重跑（§4.5a）：warm-pool 穩定化後 RDSAC 能在 production 正確運作、與 score 在 1×1 真正打平（aggregate 隨順序翻號證明為暖機假象，warm Δ≈−0.7%）。後續方向：穩定 mean 變體訓練、改善 ali 與 burst 最尾端、提升 reward fidelity，並訓練拓樸匹配的多節點 checkpoint 讓 placement 選擇真正有意義。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
+5. benchmark 給出乾淨的三方受控對照（score / SAC / RDSAC，靠一個 `use_iqn` flag 切換）：30-seed sim 排名 **score > RDSAC-cvar > RDSAC-mean ≳ SAC**（§4.6）——RDSAC 在 1×1 + 強 baseline 下雖未贏 score，但**分布式 IQN critic + risk distortion 確實有用**（vanilla SAC 差 3–4×），且 **CVaR 泛化遠勝 mean**（約 5×），這是把 cvar 烘進 live image 的依據。live 端三個模型都已實測（RDSAC §4.5a、SAC §4.6b，皆用更多資料 + 受控 arm 順序）：1×1 下全部與 score 打平，因為 learned model 都 abstain ~90–100% fail-safe 回 score——live testbed 太小、分不出模型優劣。後續方向：穩定 mean/SAC 變體訓練、改善 ali 與 burst 最尾端、提升 reward fidelity，並訓練拓樸匹配的多節點 checkpoint 讓 placement 選擇真正有意義（也才能在 live 分出高下）。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
 
 ## 6. 本次驗證指令
 

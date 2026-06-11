@@ -1,0 +1,35 @@
+# TEMPORARY build for the live three-way A/B: vanilla SAC checkpoint.
+# Identical to Dockerfile except it bakes the SAC (use_iqn=False) checkpoint
+# instead of rdsac_eval_cvar_v2. Build tag: slurm-rl-scheduler:sac-m11.
+# Production stays on :m11 (cvar); restore after the experiment.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY services/rl_scheduler/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY sim /app/sim
+COPY services/rl_scheduler /app/services/rl_scheduler
+COPY services/__init__.py /app/services/__init__.py
+
+# Vanilla SAC checkpoint (scalar twin-Q, use_iqn=False).
+COPY runs/sac_eval_v2/train/dsac.pt /models/dsac.pt
+
+ENV PYTHONPATH=/app \
+    LOG_LEVEL=INFO \
+    SHADOW_MODE=true \
+    SNAPSHOT_TTL_S=30 \
+    PRIORITY_BOOST=1000
+
+EXPOSE 8002
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8002/healthz || exit 1
+
+CMD ["python", "-m", "services.rl_scheduler.serve", \
+     "--policy-dir", "/models", "--port", "8002", "--host", "0.0.0.0"]

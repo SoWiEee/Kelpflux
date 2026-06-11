@@ -88,6 +88,7 @@ def sim_train(
     device: str = "cpu",
     log_every: int = 5_000,
     use_attention: bool = False,
+    use_iqn: bool = True,
     # New improvements
     potential_shaping: bool = True,
     use_per: bool = True,
@@ -127,7 +128,7 @@ def sim_train(
     )
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
-        use_attention=use_attention,
+        use_attention=use_attention, use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
     )
 
@@ -287,6 +288,9 @@ def main(argv=None) -> int:
                    default=f"runs/dsac_sim_{time.strftime('%Y%m%d-%H%M%S')}")
     # Architecture flags
     p.add_argument("--no-attention",         action="store_true")
+    p.add_argument("--no-iqn",               action="store_true",
+                   help="vanilla scalar-critic SAC instead of the IQN "
+                        "distributional critic (disables risk distortion)")
     p.add_argument("--risk-mode",            choices=list(RISK_MODES),
                    default="mean",
                    help="risk distortion in the RDSAC actor objective")
@@ -309,12 +313,16 @@ def main(argv=None) -> int:
 
     traces = args.trace if len(args.trace) > 1 else args.trace[0]
     use_attention = not args.no_attention
-    arch = "IQN+Attention" if use_attention else "IQN+MLP"
+    use_iqn = not args.no_iqn
+    family = "RDSAC" if use_iqn else "SAC"
+    trunk = "Attention" if use_attention else "MLP"
+    arch = f"{family}+{trunk}"
+    risk_str = f"risk={args.risk_mode}:{args.risk_beta}  " if use_iqn else ""
     print(f"[sim_train] arch={arch}  n={args.n_nodes}×{args.gpus_per_node}  "
           f"trace={traces}  steps={args.total_steps:,}  "
           f"n_jobs={args.n_jobs}  nstep={args.nstep_n}  "
           f"PER={not args.no_per}  shaping={not args.no_potential_shaping}  "
-          f"risk={args.risk_mode}:{args.risk_beta}  "
+          f"{risk_str}"
           f"curriculum={args.curriculum}  device={device}")
     sim_train(
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
@@ -325,7 +333,7 @@ def main(argv=None) -> int:
         seed=args.seed, reward_mode=args.reward_mode,
         reward_scale=args.reward_scale,
         out_dir=Path(args.out_dir), device=device,
-        use_attention=use_attention,
+        use_attention=use_attention, use_iqn=use_iqn,
         potential_shaping=not args.no_potential_shaping,
         use_per=not args.no_per,
         risk_mode=args.risk_mode,

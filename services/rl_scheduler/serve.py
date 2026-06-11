@@ -410,8 +410,16 @@ def healthz():
     RL_READY.set(1.0 if _holder is not None else 0.0)
     if snap_age is not None:
         RL_SNAPSHOT_AGE.set(snap_age)
+    variant = None
+    if _holder is not None:
+        agent = _holder.agent
+        if getattr(agent, "use_iqn", True):
+            variant = f"RDSAC:{getattr(agent, 'risk_mode', 'mean')}"
+        else:
+            variant = "SAC"
     return {
         "ready": _holder is not None,
+        "variant": variant,
         "obs_dim": _holder.agent.obs_dim if _holder else None,
         "n_actions": _holder.agent.n_actions if _holder else None,
         "snapshot_age_s": snap_age,

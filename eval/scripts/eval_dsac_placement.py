@@ -162,6 +162,9 @@ def main(argv=None) -> int:
                    help="torch device for DSAC: 'cpu' or 'cuda'")
     p.add_argument("--no-attention",         action="store_true",
                    help="MLP critic trunk instead of attention")
+    p.add_argument("--no-iqn",               action="store_true",
+                   help="vanilla scalar-critic SAC instead of IQN distributional "
+                        "critic (no risk distortion)")
     p.add_argument("--risk-mode",            choices=list(RISK_MODES),
                    default="mean",
                    help="risk distortion in the RDSAC actor objective")
@@ -197,7 +200,8 @@ def main(argv=None) -> int:
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
         use_attention = not args.no_attention
-        arch_parts = [f"IQN-{args.risk_mode}:{args.risk_beta}"]
+        use_iqn = not args.no_iqn
+        arch_parts = [f"IQN-{args.risk_mode}:{args.risk_beta}" if use_iqn else "SAC"]
         arch_parts.append("Attn" if use_attention else "MLP")
         if not args.no_per:               arch_parts.append("PER")
         if not args.no_potential_shaping: arch_parts.append("Shaping")
@@ -215,7 +219,7 @@ def main(argv=None) -> int:
             out_dir=out_dir / "train",
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
-            use_attention=use_attention,
+            use_attention=use_attention, use_iqn=use_iqn,
             risk_mode=args.risk_mode,
             risk_beta=args.risk_beta,
             reward_scale=args.reward_scale,

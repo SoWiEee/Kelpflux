@@ -148,6 +148,36 @@ class _DualIQNCritic(nn.Module):
         return self.head_r(combined), self.head_h(combined)
 
 
+class _ScalarCritic(nn.Module):
+    """Scalar action-value critic Q(s,·) for vanilla discrete SAC (no quantiles).
+
+    Christodoulou 2019: a single Q head per action over the shared trunk (MLP or
+    attention). Used when ``use_iqn=False``; the distributional Z_R/Z_H decomposition
+    and risk distortion are dropped, isolating the value of the IQN machinery.
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int,
+                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True,
+                 use_attention: bool = False) -> None:
+        super().__init__()
+        if use_attention:
+            d = hidden[-1]
+            self.encoder = _AttentionEncoder(obs_dim, d)
+            self.head = nn.Linear(d, n_actions)
+            nn.init.orthogonal_(self.head.weight, gain=1.0)
+            nn.init.zeros_(self.head.bias)
+        else:
+            self.encoder = _build_mlp(obs_dim, hidden, n_actions, layer_norm)
+            self.head = nn.Identity()
+
+    def q_values(self, obs: torch.Tensor) -> torch.Tensor:
+        """Returns Q(s,·) of shape (B, n_actions)."""
+        h = self.encoder(obs)
+        if isinstance(self.head, nn.Identity):
+            return h
+        return self.head(F.relu(h))
+
+
 class _CategoricalActor(nn.Module):
     """Explicit masked categorical policy π(a|s;φ)."""
 
@@ -200,6 +230,7 @@ class DSACAgent:
         fixed_alpha: bool = False,
         layer_norm: bool = True,
         use_attention: bool = False,
+        use_iqn: bool = True,
         risk_mode: str = "mean",
         risk_beta: float = 0.25,
         risk_alpha: float | None = None,   # deprecated alias for risk_beta
@@ -216,6 +247,7 @@ class DSACAgent:
         self.gamma = gamma
         self.tau = tau
         self.use_attention = use_attention
+        self.use_iqn = use_iqn
         self.risk_mode = risk_mode
         self.risk_beta = float(risk_beta)
         self.target_entropy_ratio = target_entropy_ratio
@@ -223,8 +255,9 @@ class DSACAgent:
         self.device = torch.device(device)
 
         def _critic():
-            return _DualIQNCritic(obs_dim, n_actions, self.hidden, layer_norm,
-                                  use_attention).to(self.device)
+            cls = _DualIQNCritic if use_iqn else _ScalarCritic
+            return cls(obs_dim, n_actions, self.hidden, layer_norm,
+                       use_attention).to(self.device)
 
         self.q1, self.q2 = _critic(), _critic()
         self.q1_target, self.q2_target = _critic(), _critic()
@@ -280,6 +313,9 @@ class DSACAgent:
         next_masks = _t("next_masks", torch.bool)
         gammas = _t("gammas") if "gammas" in batch else torch.full_like(rews, self.gamma)
         is_weights = _t("weights") if "weights" in batch else torch.ones_like(rews)
+        if not self.use_iqn:
+            return self._update_scalar(obs, acts, rews, next_obs, dones,
+                                       masks, next_masks, gammas, is_weights)
         b = obs.shape[0]
         n = self.q1.N_QUANT
 
@@ -369,9 +405,78 @@ class DSACAgent:
             "td_errors": td_errors,
         }
 
+    def _update_scalar(self, obs, acts, rews, next_obs, dones,
+                       masks, next_masks, gammas, is_weights) -> dict:
+        """Vanilla discrete SAC update (scalar twin-Q, entropy folded into target)."""
+        b = obs.shape[0]
+        # ---- Critic: soft Bellman target V(s') = Σ π(a'|s')[minQ − α logπ] ----
+        with torch.no_grad():
+            probs_n, logp_n = self.actor_target.policy(next_obs, next_masks)
+            min_qn = torch.minimum(self.q1_target.q_values(next_obs),
+                                   self.q2_target.q_values(next_obs))
+            v_next = (probs_n * (min_qn - self.alpha.detach() * logp_n)).sum(-1)
+            target = rews + gammas * (1.0 - dones) * v_next               # (B,)
+
+        aidx = acts.view(b, 1)
+        loss_critic = obs.new_zeros(())
+        td_accum = obs.new_zeros(b)
+        for q in (self.q1, self.q2):
+            q_sa = q.q_values(obs).gather(1, aidx).squeeze(1)             # (B,)
+            per_sample = F.mse_loss(q_sa, target, reduction="none")       # (B,)
+            loss_critic = loss_critic + (is_weights * per_sample).mean()
+            td_accum = td_accum + (q_sa - target).detach().abs()
+        td_errors = (td_accum / 2.0).cpu().numpy()
+
+        self.opt_q.zero_grad()
+        loss_critic.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
+        self.opt_q.step()
+        self._update_count += 1
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
+
+        # ---- Actor: J = Σ π(a|s)[α logπ − minQ] ----
+        probs, log_probs = self.actor.policy(obs, masks)
+        with torch.no_grad():
+            min_q = torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs))
+        loss_actor = (probs * (self.alpha.detach() * log_probs - min_q)).sum(-1).mean()
+        self.opt_pi.zero_grad()
+        loss_actor.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        self.opt_pi.step()
+        self._soft_update(self.actor, self.actor_target)
+
+        # ---- Temperature α (shared auto-tune) ----
+        with torch.no_grad():
+            entropy = -(probs * log_probs).sum(-1)
+        entropy_val = float(entropy.mean().item())
+        loss_alpha_val = 0.0
+        if not self.fixed_alpha:
+            n_valid = masks.float().sum(-1).clamp(min=1.0)
+            target_entropy = self.target_entropy_ratio * torch.log(n_valid)
+            loss_alpha = (self.log_alpha * (entropy - target_entropy).detach()).mean()
+            self.opt_alpha.zero_grad()
+            loss_alpha.backward()
+            self.opt_alpha.step()
+            with torch.no_grad():
+                self.log_alpha.clamp_(-5.0, 3.0)
+            loss_alpha_val = float(loss_alpha.item())
+
+        return {
+            "loss_critic": float(loss_critic.item()),
+            "loss_actor": float(loss_actor.item()),
+            "loss_alpha": loss_alpha_val,
+            "alpha": float(self.alpha.item()),
+            "entropy": entropy_val,
+            "td_errors": td_errors,
+        }
+
     @torch.no_grad()
     def action_values(self, obs: torch.Tensor) -> torch.Tensor:
-        """Risk-adjusted action value ρ[Z_R] + α·E[Z_H] per action. (B,obs)→(B,A)."""
+        """Per-action value. IQN: ρ[Z_R]+α·E[Z_H]; SAC: min(Q1,Q2). (B,obs)→(B,A)."""
+        if not self.use_iqn:
+            return torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs))
         b = obs.shape[0]
         taus = torch.rand(b, self.q1.N_QUANT, device=self.device)
         zr1, zh1 = self.q1.quantile_q(obs, taus)
@@ -411,6 +516,7 @@ class DSACAgent:
             "log_alpha": self.log_alpha.item(),
             "fixed_alpha": self.fixed_alpha,
             "use_attention": self.use_attention,
+            "use_iqn": self.use_iqn,
             "risk_mode": self.risk_mode, "risk_beta": self.risk_beta,
             "target_entropy_ratio": self.target_entropy_ratio,
             "hidden": list(self.hidden),
@@ -426,6 +532,7 @@ class DSACAgent:
             hidden=tuple(data.get("hidden", (256, 256))),
             fixed_alpha=data.get("fixed_alpha", False),
             use_attention=data.get("use_attention", False),
+            use_iqn=kwargs.pop("use_iqn", data.get("use_iqn", True)),
             risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
             risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),
             target_entropy_ratio=data.get("target_entropy_ratio", 0.1),
