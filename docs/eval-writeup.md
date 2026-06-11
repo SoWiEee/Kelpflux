@@ -2,8 +2,6 @@
 
 本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是清楚比較三種做法在同一套 simulator 與 live Slurm/k3s/GPU 環境中的行為：heuristic score、SAC、RDSAC。
 
-> 註：DRL 實作已從早期的 discrete SAC 改寫為 Ma et al. 的 risk-sensitive distributional SAC（RDSAC）。本文 §3 為改寫後的新結果；§4 live cluster 結果是 RDSAC 改寫前用舊 checkpoint 跑的，保留作為基礎設施驗證紀錄。
-
 ## 1. 評估對象
 
 ### 1.1 Heuristic score scheduler
@@ -131,73 +129,7 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 
 > §4.1–4.3 的 live 結果是 RDSAC 改寫前、用舊 discrete-SAC checkpoint 跑的。它們驗證的是 serving / Slurm placement / worker lifecycle / MPS allocation 等基礎設施路徑能否運作，與演算法版本無關，因此保留。**§4.4 是換上 RDSAC cvar-v2 checkpoint、warm-pool 穩定化後重跑的配對 A/B。**
 
-### 4.1 DSAC live scheduler enabled
-
-提交 job：`136-141`。結果全部 `COMPLETED`。
-
-| Job | Name | Req MPS | State | Submit | Start | End | Wait | Runtime | JCT | Node |
-|---:|---|---:|---|---|---|---|---:|---:|---:|---|
-| 136 | bench-dsaclive-smallA | 25 | COMPLETED | 07:28:10 | 07:28:13 | 07:28:18 | 3s | 5s | 8s | gpu-rtx4070-0 |
-| 137 | bench-dsaclive-smallB | 25 | COMPLETED | 07:28:10 | 07:28:13 | 07:28:18 | 3s | 5s | 8s | gpu-rtx4070-0 |
-| 138 | bench-dsaclive-fullA | 100 | COMPLETED | 07:28:10 | 07:28:18 | 07:28:30 | 8s | 12s | 20s | gpu-rtx4070-0 |
-| 139 | bench-dsaclive-smallC | 25 | COMPLETED | 07:28:10 | 07:28:25 | 07:28:29 | 15s | 4s | 19s | gpu-rtx4070-1 |
-| 140 | bench-dsaclive-halfA | 50 | COMPLETED | 07:28:10 | 07:28:25 | 07:28:31 | 15s | 6s | 21s | gpu-rtx4070-1 |
-| 141 | bench-dsaclive-smallD | 25 | COMPLETED | 07:28:11 | 07:28:29 | 07:28:33 | 18s | 4s | 22s | gpu-rtx4070-1 |
-
-Summary：
-
-| Metric | Value |
-|---|---:|
-| completed jobs | 6 / 6 |
-| mean wait | 9.83s |
-| mean runtime | 6.33s |
-| mean JCT | 14.67s |
-| observed placement | first two 25-MPS jobs co-located on worker 0; 100-MPS job isolated during execution; later 25/50/25-MPS jobs co-located on worker 1 |
-
-這次 live run 證明 DSAC scheduler enabled 時，job submit、priority decision、Slurm placement、MPS GRES allocation 與 worker pod 都能完成一輪實際運作。
-
-### 4.2 Score-only fallback run
-
-為了比較 fallback 行為，測試中暫時把 `rl-scheduler` scale 到 0，提交相同 workload。提交 job：`142-147`。
-
-結果：score-only fallback run 沒有形成可比較的完成樣本。前三個 job 進入 worker 後變成 `NODE_FAIL` / `COMPLETING`，後三個 job 因 GPU worker unavailable/resource busy 留在 pending，之後已用 `scancel` 清掉 pending jobs，並用 Slurm `DOWN` / `RESUME` 流程清空 queue。`rl-scheduler` 已恢復為 1 replica。由於 elastic operator 在沒有 GPU job 時會把 GPU worker StatefulSet 縮到 0，Slurm 端後續會看到 GPU nodes 為 `idle*` / not responding，直到下一次 GPU workload 觸發 worker scale-up。
-
-`sacct` 摘要：
-
-| Job | Name | Req MPS | State | Start/End 狀態 | Node |
-|---:|---|---:|---|---|---|
-| 142 | bench-scoreonly-smallA | 25 | NODE_FAIL / COMPLETING | Start 曾在 07:30:21；End 07:30:32 | gpu-rtx4070-0 |
-| 143 | bench-scoreonly-smallB | 25 | NODE_FAIL / COMPLETING | Start 曾在 07:30:21；End 07:30:33 | gpu-rtx4070-0 |
-| 144 | bench-scoreonly-fullA | 100 | NODE_FAIL / COMPLETING | End 07:30:31；Slurm show job StartTime 為 Unknown | gpu-rtx4070-1 |
-| 145 | bench-scoreonly-smallC | 25 | PENDING, then cancelled | no node assigned | none |
-| 146 | bench-scoreonly-halfA | 50 | PENDING, then cancelled | no node assigned | none |
-| 147 | bench-scoreonly-smallD | 25 | PENDING, then cancelled | no node assigned | none |
-
-當時 node 狀態：
-
-```text
-slurm-worker-gpu-rtx4070-0  IDLE+COMPLETING+NOT_RESPONDING
-slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
-```
-
-這表示 live 對照組遇到 worker lifecycle / Slurm completion acknowledgement 問題。GPU worker pod 在測試期間被重新建立，導致 Slurm 將 node 視為 not responding，job 完成回報不乾淨。測試後已將 queue 清空；GPU worker StatefulSet 依目前 scale-to-zero 策略回到 0 replica。這個結果不能用來主張 score 比 DSAC 差；它只能說明目前 live benchmark 若要做嚴格 A/B，需要先固定 worker lifecycle 或在每個 phase 前重置成相同 warm/cold 狀態。
-
-### 4.3 P0 fix follow-up smoke
-
-後續修正兩個 live worker lifecycle 問題：
-
-1. operator 在 scale-down 成功 patch replicas 後，會把被移除的 Slurm worker nodes 標成 `DOWN`；下一次 scale-up 會先 `RESUME` 目標 StatefulSet ordinals。
-2. chart 不再於 k3s pod 的 GPU `gres.conf` 條目渲染 `Cores=`。live worker 曾因 `Cores=0-3` 和容器可見 CPU topology 不一致而在 slurmd log 出現 `Invalid GRES data for gpu, Cores=0-3`，導致 job stuck `COMPLETING`。
-
-部署後重新提交 GPU/MPS smoke job `149`：
-
-| Job | Name | Req MPS | State | Submit | Start | End | Runtime | Node |
-|---:|---|---:|---|---|---|---|---:|---|
-| 149 | p0-gres-smoke | 25 | COMPLETED | 07:56:55 | 07:56:59 | 07:57:15 | 16s | gpu-rtx4070-0 |
-
-測試後 queue 為空；GPU worker StatefulSet 回到 scale-to-zero 狀態，Slurm GPU nodes 保持 `DOWN` / `DRAIN`，等待下一批 GPU workload 由 operator scale-up 並 resume。
-
-### 4.4 RDSAC checkpoint live A/B（重跑，cvar-v2）
+### 4.1 RDSAC checkpoint live A/B（cvar-v2）
 
 把 §3 的 **cvar-v2 RDSAC checkpoint** 烘進 `slurm-rl-scheduler:m11` 部署到 live，與 score-only 啟發式做配對 A/B。要做到「RDSAC 真的有作用」的公平比較，先排除兩個讓比較失真的問題：
 
@@ -218,7 +150,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 **解讀**：1×1 live 下 RDSAC 與 score **統計上無法區分**（ΔJCT −0.2%，遠小於 ±27s 逐對雜訊）。原因與 §3 一致 —— 在 1×1、強啟發式 baseline 下，RDSAC 幾乎對每個到達的 job 都均勻 boost（每輪 `selected=14/14`），佇列排序等同 score 的排序，沒有重排效果。這證明 **RDSAC 能在 production 正確上線並與啟發式持平**，但真正的增益要等「拓樸匹配的多節點 checkpoint、placement 選擇有意義」時才會出現；單純把 1×1 checkpoint 丟到 live 不會贏。
 
-### 4.5 RDSAC 擴大評估：更多資料、受控 order（2026-06-11）
+### 4.2 RDSAC 擴大評估：更多資料、受控 order（2026-06-11）
 
 §4.4 的 42-job 單一 block 樣本太少、CI 太寬，不足以下定論。本節用**更多資料**重評，並補上一個 §4.4 沒控到的混淆因子。原始檔：`runs/live_ab/SUMMARY_v2.md`、`runs/rdsac_eval30_*/SUMMARY.md`。
 
@@ -242,7 +174,7 @@ slurm-worker-gpu-rtx4070-1  IDLE+COMPLETING+NOT_RESPONDING
 
 **(a)(b) 一致的故事**：1×1 太小，placement 策略端到端**無法表現出優勢、也無法表現出明顯劣勢**。sim 全 rollout 會放大 checkpoint 的不足（略輸 score）；live 端因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。**方法論教訓**：共用單 GPU 的 block A/B 必須丟棄每臂 ≥1 個 warmup round 並交換 arm 順序（或逐輪 interleave），否則 aggregate 會被一次性暖機帶風向（→ `docs/note.md` #18）。
 
-### 4.6 三方對照：加入 vanilla SAC（2026-06-11）
+### 4.3 三方對照：加入 vanilla SAC（2026-06-11）
 
 為了回答「RDSAC 的分布式 / 風險機制到底有沒有用」，加入第三個模型 **vanilla 離散 SAC**（`DSACAgent(use_iqn=False)`：scalar twin-Q critic、MSE soft-Bellman、無 IQN Z_R/Z_H 分解、無 risk distortion）。用一個 `use_iqn` flag 切換 SAC↔RDSAC，貫穿訓練 / eval / live serving（serve `/healthz` 回報 `variant`）。SAC 用**與 RDSAC v2 完全相同的配方**訓練（150k 步、mixed traces、curriculum、PER、shaping、MLP、1×1），唯一差別就是 critic 型別與沒有 risk。原始檔：`runs/sac_eval_v2/SUMMARY.md`、`runs/live_ab/SUMMARY_sac.md`。
 
