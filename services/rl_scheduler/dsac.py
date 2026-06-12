@@ -410,8 +410,12 @@ class DSACAgent:
         """Vanilla discrete SAC update (scalar twin-Q, entropy folded into target)."""
         b = obs.shape[0]
         # ---- Critic: soft Bellman target V(s') = Σ π(a'|s')[minQ − α logπ] ----
+        # Canonical discrete SAC (Christodoulou 2019; toshikwa/sac-discrete)
+        # bootstraps the soft target from the ONLINE policy — vanilla SAC
+        # stabilises with target *critics* only and has no target actor. (The
+        # IQN path keeps a target actor; that is an RDSAC choice, not SAC.)
         with torch.no_grad():
-            probs_n, logp_n = self.actor_target.policy(next_obs, next_masks)
+            probs_n, logp_n = self.actor.policy(next_obs, next_masks)
             min_qn = torch.minimum(self.q1_target.q_values(next_obs),
                                    self.q2_target.q_values(next_obs))
             v_next = (probs_n * (min_qn - self.alpha.detach() * logp_n)).sum(-1)
@@ -445,7 +449,7 @@ class DSACAgent:
         loss_actor.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
         self.opt_pi.step()
-        self._soft_update(self.actor, self.actor_target)
+        # No actor_target soft-update: vanilla SAC has target critics only.
 
         # ---- Temperature α (shared auto-tune) ----
         with torch.no_grad():

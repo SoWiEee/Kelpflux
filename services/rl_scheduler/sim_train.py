@@ -89,6 +89,10 @@ def sim_train(
     log_every: int = 5_000,
     use_attention: bool = False,
     use_iqn: bool = True,
+    # Temperature (entropy) controls
+    fixed_alpha: bool = False,
+    init_alpha: float = 0.1,
+    target_entropy_ratio: float = 0.1,
     # New improvements
     potential_shaping: bool = True,
     use_per: bool = True,
@@ -130,6 +134,8 @@ def sim_train(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
         use_attention=use_attention, use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
+        fixed_alpha=fixed_alpha, init_alpha=init_alpha,
+        target_entropy_ratio=target_entropy_ratio,
     )
 
     if use_per:
@@ -296,6 +302,13 @@ def main(argv=None) -> int:
                    help="risk distortion in the RDSAC actor objective")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
+    # Temperature (entropy) controls
+    p.add_argument("--fixed-alpha",          action="store_true",
+                   help="pin the entropy temperature α (disables auto-tuning)")
+    p.add_argument("--init-alpha",           type=float, default=0.1,
+                   help="initial α; with --fixed-alpha this is the constant value")
+    p.add_argument("--target-entropy-ratio", type=float, default=0.1,
+                   help="auto-α target entropy as a fraction of log(n_actions)")
     # Improvement flags
     p.add_argument("--no-potential-shaping", action="store_true",
                    help="disable potential-based reward shaping")
@@ -334,6 +347,8 @@ def main(argv=None) -> int:
         reward_scale=args.reward_scale,
         out_dir=Path(args.out_dir), device=device,
         use_attention=use_attention, use_iqn=use_iqn,
+        fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
+        target_entropy_ratio=args.target_entropy_ratio,
         potential_shaping=not args.no_potential_shaping,
         use_per=not args.no_per,
         risk_mode=args.risk_mode,

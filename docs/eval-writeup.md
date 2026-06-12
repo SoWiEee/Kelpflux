@@ -127,7 +127,7 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 
 ## 4. Live cluster 結果
 
-> §4.1–4.3 的 live 結果是 RDSAC 改寫前、用舊 discrete-SAC checkpoint 跑的。它們驗證的是 serving / Slurm placement / worker lifecycle / MPS allocation 等基礎設施路徑能否運作，與演算法版本無關，因此保留。**§4.4 是換上 RDSAC cvar-v2 checkpoint、warm-pool 穩定化後重跑的配對 A/B。**
+> §4.4 是換上 RDSAC cvar-v2 checkpoint、warm-pool 穩定化後重跑的配對 A/B。
 
 ### 4.1 RDSAC checkpoint live A/B（cvar-v2）
 
@@ -186,11 +186,29 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 | burst  | 0% | −157.5% | **−31.1%** | −159.2% |
 | ali    | 0% | −311.6% | **−120.9%** | −128.4% |
 
-排名（好→差）：**score > RDSAC-cvar > RDSAC-mean ≳ SAC**。vanilla SAC 是**最差**的學習策略，全面落後且比 RDSAC-cvar 差 3–4×——**分布式 IQN critic + risk distortion 確實有用**。SAC 變差的機制看訓練 log 很清楚：auto-tune 的 `alpha` 一路爬到 ~4.0（entropy 項壓過 scalar critic → greedy policy 近乎隨機）；分布式 critic 把 value scale 維持得更適合共用的 auto-α 控制器，scalar critic 沒有。
+這版的原始排名（好→差）是 **score > RDSAC-cvar > RDSAC-mean ≳ SAC**，vanilla SAC 全面墊底、比 RDSAC-cvar 差 3–4×。**但這個排名有誤導性**——後續的 fixed-α 受控對照（§4.3.1）顯示 SAC 的崩潰**幾乎全是共用 auto-α 控制器的假象，不是 scalar critic 本身的問題**。SAC 變差的機制是：auto-tune 的 `alpha` 一路爬到 ~3.4，但 entropy 卻只有 ~0.12 nats——`alpha` 推不動 entropy（各 action 的 Q 落差太大），於是 `alpha` 一邊 railing、一邊把 actor 目標扭成一個被熵項硬拉、卻仍接近確定性的次優策略（**不是隨機**，先前寫的「近乎隨機」不準）。這個 auto-α 控制器是按 RDSAC-cvar 的 return 尺度（O(10)）調的，直接共用到 SAC 身上就翻車。
 
 **(b) Live（1×1）分不出高下**：把 SAC 烘成臨時 image `slurm-rl-scheduler:sac-m11` 部署（`variant:"SAC"`），跑同樣受控的雙序 A/B 後復原 `:m11`。兩個順序都**打平**（warm-subset −0.5% / +1.6%，~73s job 上不到 2s，符號隨序翻）。關鍵在 decision counters：SAC 臂 **abstain 132–144/144、實際 boost 0 次**——它根本沒機會展現（爛的）策略。和 RDSAC 一樣，1×1 live 的 serving 路徑在 snapshot 過期時回退 score、單 GPU placement 又瑣碎，把模型品質差異完全洗掉。
 
-**三方結論**：**sim 全 rollout 能分（score > RDSAC-cvar > RDSAC-mean ≳ SAC，分布式/風險機制有用）；live 1×1 分不出（score ≈ RDSAC ≈ SAC 全部打平，因為每個學習模型都 abstain ~90–100% 而 fail-safe 回 score）**。live 的 takeaway 是穩健性而非品質：在 1×1 部署一個訓練很差的 checkpoint 也不會讓 live JCT 變差，因為 fallback 保護了 production。要對品質下定論，得有 placement 真正起作用的拓樸匹配多節點 checkpoint。
+### 4.3.1 SAC fixed-α 受控對照：拆開「critic 型別」與「auto-α 假象」（2026-06-12）
+
+§4.3 的 SAC 慘敗到底是 scalar critic 真的差，還是只是共用 auto-α 控制器在 SAC 上 railing 的副作用？做一組受控對照來分開這兩件事。把 SAC 的 critic target 改成**忠實的公開實作**（Christodoulou 2019 / `toshikwa/sac-discrete`：soft target 由 **online** policy bootstrap，vanilla SAC 只有 target critics、沒有 target actor），其餘配方與 §4.3 完全相同，**唯一掃描的變數是溫度策略**：把 `alpha` 釘死在 {0.01, 0.05, 0.20} vs auto-α。原始檔 `runs/sac_fixedA/SUMMARY.md`。
+
+| family | auto-α SAC（§4.3） | **fixedA 0.01** | fixedA 0.05 | fixedA 0.20 | RDSAC-cvar |
+|---|---:|---:|---:|---:|---:|
+| philly | −106.4% | **−16.8%** | −20.8% | +1.5% | −24.6% |
+| burst  | −157.5% | **+2.2%** | −36.8% | −18.3% | −31.1% |
+| ali    | −311.6% | **−23.8%** | −69.2% | −22.6% | −120.9% |
+
+三個重點：
+
+1. **「SAC 最差」基本上是 auto-α 假象，不是 scalar critic。** *任何一個*釘死的 α 值都把 SAC 從墊底（−106/−157/−312）拉到每個 family 領先原本 80–290 個百分點。給它一個穩定溫度後，vanilla SAC 與 RDSAC-cvar **打平甚至更好**——α=0.01（−16.8 / +2.2 / −23.8）與 α=0.20（+1.5 / −18.3 / −22.6）在三個 family 上都贏過 cvar。
+
+2. **失效點就是 auto-α 控制器本身。** 把忠實版（online-actor）的 auto-α 再跑一次（`autoA_repro`），`alpha` 仍從 0.1 railing 到 **2.58**（entropy 0.081），ΔJCT 停在 **−75.9 / −88.2 / −132.4%**——比 fixed-α 差 50–110 個百分點。**忠實化修正本身救不了它，只有釘死 α 才行**；單一物理成因是熵溫度控制器，不是 bootstrap 寫法。
+
+3. **分布式 / 風險機制的優勢因此大幅縮水。** 一旦 SAC 有了穩定溫度，IQN+CVaR 相對於「調好的 scalar SAC」在 1×1 的優勢小到接近零。§4.3 原本把功勞過度歸給 critic family，**實際上大半差距是溫度穩定性**。誠實的限制：fixed-α 各值之間的細排名（0.05 在中間反而偏弱）是**單一訓練 seed 的雜訊**，方向（任何 fixed α ≫ auto-α）穩健、細排名不穩；要排 0.01 vs 0.20 需多 seed 訓練掃描，超出本輪範圍。
+
+**三方結論（修正版）**：**sim 全 rollout 下，先前「score > RDSAC-cvar > RDSAC-mean ≳ SAC」的排名要打折——SAC 的墊底主要是 auto-α 假象；給定穩定溫度後 score ≈ tuned-SAC ≈ RDSAC-cvar，三者都贏不了 1×1 的強啟發式，分布式/風險機制的淨增益在此拓樸下很小**。live 1×1 仍分不出（score ≈ RDSAC ≈ SAC 全部打平，每個學習模型都 abstain ~90–100% 而 fail-safe 回 score）。live 的 takeaway 是穩健性而非品質：在 1×1 部署一個訓練差的 checkpoint 也不會讓 live JCT 變差，fallback 保護了 production。要對「critic 型別 / 風險機制」的品質下定論，需要 placement 真正起作用的拓樸匹配多節點 checkpoint，以及 per-model 各自調好的溫度。
 
 ## 5. 結論
 
@@ -201,7 +219,7 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 | DRL path 是否能在 live 上跑？ | 可以。舊 checkpoint job `136-141` 全部完成；**RDSAC cvar-v2 live A/B 已重跑**（§4.4），warm-pool 穩定化後 84 個 job 全乾淨完成、RL boost 確實生效。 |
 | 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
 | RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。**30-seed 重評**（§4.5b，取代舊 5-seed 雜訊）下 cvar 三個 family 都不優於 score（philly −24.6% 不顯著、burst/ali 顯著較差），mean 更全面顯著較差。1×1 sim 全 rollout 下沒有任何 learned model 贏過 score。 |
-| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC 三方) | **有用**。30-seed sim 排名 **score > RDSAC-cvar > RDSAC-mean ≳ SAC**（§4.6a）。vanilla SAC（`use_iqn=False`，scalar critic、無 risk）是最差的學習策略（−106/−157/−312%），比 RDSAC-cvar 差 3–4×——拿掉 IQN 分布式 critic + risk distortion 會明顯變壞。 |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC 三方) | **在 1×1 下淨增益很小，先前的「有用」被高估了**。auto-α 下 sim 排名看似 score > RDSAC-cvar > RDSAC-mean ≳ SAC，但 fixed-α 受控對照（§4.3.1）顯示 SAC 的墊底（−106/−157/−312%）**幾乎全是共用 auto-α 控制器 railing 的假象**：把 α 釘死後 vanilla SAC（scalar critic、無 risk）回到 −17/+2/−24%，反而**打平甚至贏過** RDSAC-cvar。給定穩定溫度，IQN 分布式 critic + risk distortion 在此拓樸的淨增益接近零。要判定是否真有用，需拓樸匹配的多節點 checkpoint + per-model 各自調好的溫度。 |
 | risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。30-seed 下 cvar 的泛化遠勝 mean（philly −24.6% vs −117%，約 5×），支持把 cvar 而非 mean 烘進 live image 的設計選擇；唯絕對值仍未過 score baseline。 |
 | live A/B 是否已能公平比較 DRL vs score？ | **可以了，且已用更多資料 + 三方驗證**。warm-pool（`min_replicas=1`）消除冷啟動 race 並讓 1×1 checkpoint 拓樸匹配。§4.5a 擴大到 128 job/arm 並**交換 arm 順序**：aggregate 隨順序翻號（−27% ↔ +8.6%）證明為暖機假象，warm Δ≈−0.7%。§4.6b 把 vanilla SAC 也部署上 live（`variant:"SAC"`）：同樣**打平**。但 1×1 live 其實**分不出模型**——每個 learned model 都 abstain ~90–100% 而 fail-safe 回 score，所以 score ≈ RDSAC ≈ SAC。 |
 | 目前最穩定的上線策略 | DRL live scheduler 保持 enabled + GPU warm pool（`min_replicas=1`），並保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |

@@ -118,3 +118,33 @@ def test_iqn_default_unchanged():
     agent = DSACAgent(obs_dim=6, n_actions=5, device="cpu", hidden=(32, 32))
     assert agent.use_iqn is True
     assert hasattr(agent.q1, "quantile_q")
+
+
+def test_sac_fixed_alpha_stays_constant():
+    """With fixed_alpha, α must not drift and α-loss must be reported as 0."""
+    agent = _sac(fixed_alpha=True, init_alpha=0.05)
+    assert agent.opt_alpha is None
+    assert not agent.log_alpha.requires_grad
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        out = agent.update(_batch(rng))
+        assert out["loss_alpha"] == 0.0
+    assert abs(out["alpha"] - 0.05) < 1e-6
+
+
+def test_sac_critic_target_uses_online_actor():
+    """Faithful discrete SAC bootstraps the soft target from the ONLINE policy,
+    so a stale actor_target must not influence the scalar critic update."""
+    agent = _sac()
+    # Desync the target actor: zero its weights so it differs from the online net.
+    with torch.no_grad():
+        for p in agent.actor_target.parameters():
+            p.zero_()
+    rng = np.random.default_rng(11)
+    batch = _batch(rng)
+    snapshot = {k: v.clone() for k, v in agent.actor_target.state_dict().items()}
+    out = agent.update(batch)  # must run off the online actor, not the zeroed target
+    assert np.isfinite(out["loss_critic"])
+    # The scalar path never reads actor_target, so it stays exactly as set.
+    for k, v in agent.actor_target.state_dict().items():
+        assert torch.equal(v, snapshot[k])

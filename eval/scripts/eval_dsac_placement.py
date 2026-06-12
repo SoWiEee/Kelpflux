@@ -170,6 +170,12 @@ def main(argv=None) -> int:
                    help="risk distortion in the RDSAC actor objective")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
+    p.add_argument("--fixed-alpha",          action="store_true",
+                   help="pin the entropy temperature α (disables auto-tuning)")
+    p.add_argument("--init-alpha",           type=float, default=0.1,
+                   help="initial α; with --fixed-alpha this is the constant value")
+    p.add_argument("--target-entropy-ratio", type=float, default=0.1,
+                   help="auto-α target entropy as a fraction of log(n_actions)")
     p.add_argument("--reward-scale",         type=float, default=20_000.0,
                    help="training reward divisor on -JCT (default 20000)")
     p.add_argument("--no-potential-shaping", action="store_true",
@@ -203,6 +209,8 @@ def main(argv=None) -> int:
         use_iqn = not args.no_iqn
         arch_parts = [f"IQN-{args.risk_mode}:{args.risk_beta}" if use_iqn else "SAC"]
         arch_parts.append("Attn" if use_attention else "MLP")
+        arch_parts.append(f"fixedα={args.init_alpha}" if args.fixed_alpha
+                          else f"autoα(te={args.target_entropy_ratio})")
         if not args.no_per:               arch_parts.append("PER")
         if not args.no_potential_shaping: arch_parts.append("Shaping")
         if args.curriculum:               arch_parts.append("Curr")
@@ -220,6 +228,8 @@ def main(argv=None) -> int:
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
             use_attention=use_attention, use_iqn=use_iqn,
+            fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
+            target_entropy_ratio=args.target_entropy_ratio,
             risk_mode=args.risk_mode,
             risk_beta=args.risk_beta,
             reward_scale=args.reward_scale,
