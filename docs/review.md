@@ -1,336 +1,144 @@
-# Kelpflux 系統審查報告（v6）
+# Kelpflux 系統審查報告（v7）
 
-> **評估時間：** 2026-05-31
-> **評估快照：** main @ `b77f3f3`
-> **評估視角：** HPC 叢集工程師 + K8s SRE + ML systems
-> **評估範圍：** 目前上線規格、DRL/live scheduler、Helm/K8s、CI、可觀測性、論文/研究可交付性。
+> **評估時間：** 2026-06-13
+> **評估快照：** main @ `c26b268`（A/B sim-fidelity 實驗併入後）
+> **評估視角：** IEEE 期刊/會議審稿人 + AI Infra 專家 + ML/Model 專家
+> **評估範圍：** RDSAC 演算法與評估方法學、sim-to-live 保真度、單卡/異質叢集基礎設施、研究可發表性。
+> **與 v6 的關係：** v6（HPC/SRE/ML-systems 視角）對「平台工程完整度」的判斷大致仍成立；v7 不重複那些，改用三個更嚴格的專家視角重審 **研究主張的可辯護性**，並把本輪 sim 隨機性消融（eval §4.4–4.5）的新證據納入。
 
 ---
 
 ## 0. 執行摘要
 
-目前 Kelpflux 已經不是早期 prototype，而是一套可部署、可觀測、可驗證的 Slurm-on-K8s research platform。核心能力已到位：
+**一句話判斷：** Kelpflux 的系統工程已經成熟（v6 已肯定），本輪最大的進展是**把「分布式/風險機制到底有沒有用」這個核心研究問題從「測不出來」推進到「測得出來、且有方向性結論」**——但這個結論目前**只在模擬器內、單一訓練 seed、人工注入的噪音下成立**，距離可發表/可上線還有三道關卡（噪音的真實性、訓練 seed 的統計顯著性、sim-to-live 的動作落差）。
 
-| 面向 | 現況 | 評估 |
+本輪確立的事實（eval §4.3–4.5）：
+
+1. **確定性 1×1 sim 下三者打平**，根因是**兩個一起**：oracle runtime（零不確定性 → CVaR≈mean，風險機制結構性閒置）+ auto-α 控制器 railing 壓垮策略。
+2. **注入 runtime 不確定性後，RDSAC 隨 σ 單調拉開對 SAC 的差距**（−73 → +47 → +196 pts），且 **fixed-α 對照排除 α 假象**（仍 +90～+143 pts），σ=1.0 時甚至**贏過 score** 並把 p99 尾部壓低 5–9×。
+3. **共置動作（PACK/ISOLATE）在 1×1 是負結果**——動作空間加倍在相同預算下 underfit，且單卡隔離=閒置；其價值需 ≥2 GPU。
+
+**三個專家視角的共同結論：** 目前的瓶頸已經**不是工程，而是方法學與測試平台規模**。三個視角各自指出的最高優先改進（詳見 §2）：
+
+| 視角 | 最高優先改進 | 為什麼擋住結論 |
 |---|---|---|
-| Slurm-on-K8s 基礎 | Helm chart、controller/login/worker/operator、multi-pool routing | 穩定可 demo |
-| MPS-aware 排程 | Lua submit score、VRAM/MPS/fragmentation/runtime factors、score parity test | 工程完整 |
-| DRL live scheduler | DSAC checkpoint baked into image，`rlScheduler.shadowMode=false` 可 live boost | 可上線，但效果仍需量化 |
-| 可觀測性 | Prometheus、Grafana、Tempo、OTel、scheduler live dashboard、per-job GPU dashboard | 明顯強項 |
-| CI | 7 個 workflow：lint、chart、Lua、operator、sim、RL unit、score parity | 已覆蓋主要風險 |
-| 失敗降級 | runtime predictor / RL / weight tuner 皆 silent fallback；chaos script 已補 | 設計正確，但仍需跑實機數據 |
-
-**最重要的判斷：** 這個系統目前最強的貢獻不是「DRL 已經打敗 baseline」，而是「把 Slurm、K8s、MPS、DRL、OTel 串成可重現的實驗平台」。若論文或專題敘事仍只押在 DRL 效能優於 score baseline，風險偏高；若主軸改成 **ML-assisted resource allocation platform + observability + safe live rollout**，目前證據更完整。
-
-目前仍值得優先改進的地方剩下五類：
-
-1. **DRL 評估缺口**：DSAC 已能 live，但尚未證明在 2×2 cluster 或真實 workload 下優於 score baseline。
-2. **2×2 cluster 實驗環境**：目前單機 1×GPU 的 action space 太小，無法支撐 DRL 做出真正不同於 heuristic 的決策。
-3. **生產化韌性**：operator 無 leader election；RL/predictor/weight-tuner 仍單副本；runtime predictor 模型 PVC 為 RWO。
-4. **fragmentation requeue**：程式與測試存在，但上線仍應保持 shadow；目前 victim selection 曾在 eval 中造成 JCT regression。
-5. **研究結果包裝**：需要把 evaluation 寫成可重現的實驗矩陣，而不是只展示系統能跑。
+| **IEEE 審稿人** | 把 σ **校準到 runtime predictor 的真實殘差分布**，並補**多訓練 seed**（≥3–5）| 否則「注入噪音 → 抗噪方法贏」近乎套套邏輯；單 seed 的 per-family 數字審稿人不會接受 |
+| **AI Infra** | 修正 **train/serve 動作落差**（sim 學 placement，live 只套 priority boost）| 否則 sim 結論無法外推到 live；live 永遠只能 demo fallback |
+| **ML/Model** | 在 σ-sweep 補 **RDSAC-mean 臂**，拆開「分布式 critic」與「風險扭曲」兩個貢獻 | 目前 SAC vs RDSAC-cvar 把兩件事混在一起，無法歸因 |
 
 ---
 
-## 1. 目前系統狀態
+## 1. 自 v6 以來的狀態變更（delta）
 
-### 1.1 上線路徑
-
-目前 live submit path 是：
-
-```text
-user sbatch
-  -> slurmctld loads job_submit.lua
-  -> submit helper 補齊 mem / partition / qos
-  -> Lua score function 計算 submit-time priority delta
-  -> optional runtime_predictor /predict
-  -> optional rl_scheduler /decide
-  -> Slurm multifactor priority + explicit priority delta 排序
-  -> worker StatefulSet / slurmd 執行 job
-  -> operator 觀察 squeue/sinfo 並 scale up/down
-  -> Prometheus/Grafana/Tempo/OTel 收集 metrics/traces
-```
-
-`rlScheduler.shadowMode=false` 已設定，代表 RL 選中的 job 可以拿到 positive `priorityBoost`。同時 `serve.py` 仍有 `VALUE_ABSTAIN`、`ENTROPY_ABSTAIN`、snapshot TTL 與 no-op action 作為保護。
-
-### 1.2 ML / DRL 管線
-
-目前實際有用於 live 的 DRL 演算法是 **DSAC**，搭配：
-
-| 元件 | 檔案 | 角色 |
+| 項目 | v6（2026-05-31） | v7（2026-06-13） |
 |---|---|---|
-| DSAC policy | `services/rl_scheduler/dsac.py` | 離散 action scheduling policy |
-| Training | `services/rl_scheduler/sim_train.py` | simulator 中訓練 DSAC checkpoint |
-| Live serving | `services/rl_scheduler/serve.py` | `/snapshot`、`/decide`、`/metrics` |
-| Replay / fine-tune | `services/rl_scheduler/rlpd_finetune.py` | ReplayBuffer / PrioritizedReplayBuffer，支援 RLPD 方向 |
-| Live daemon | `services/rl_scheduler/live_daemon.py` | 連接 live cluster snapshot / placement |
+| 演算法命名 | 「DSAC」 | **RDSAC**：雙頭 IQN 分布式 critic（Z_R/Z_H）+ categorical actor + 風險扭曲；`use_iqn` flag 切換 vanilla SAC ↔ RDSAC。**注意命名陷阱**：這不是 Duan et al. 2021 的連續控制 DSAC，是 Christodoulou 2019 + Dabney 2018 + 風險變體的自組版本 |
+| 三方對照 | 缺 | 已有 score / SAC / RDSAC 三方（eval §4.3），靠單一 flag 切換 |
+| auto-α 假象 | 未診斷 | 已定位並用 fixed-α 對照拆解（§4.3.1）——SAC 墊底大半是共用 α 控制器 railing |
+| 評估種子數 | 5-seed | eval 用 30-seed paired；**但訓練仍單 seed**（最大方法學缺口）|
+| 不確定性消融 | 無 | **新增 §4.4**：opt-in runtime σ + 干擾模型，證明風險機制在有尾部時有用 |
+| 共置動作 | 無 | **新增 §4.5**：PACK/ISOLATE，1×1 負結果，待 2-node |
+| 第二節點 | 「待建 2×2」 | RTX 3080（Ubuntu 24.04）即將加入 → 2-node **異質 2×1**；`docs/intergration.md` 已備 runbook（並標出 3080 在 codebase 完全缺席的異質性缺口）|
 
-PPO / SB3 相關 smoke 與 paired-eval 工具已移除；目前 live scheduler 與 benchmark 主線都是 DSAC。若文件提到 PPO，應只作為歷史探索背景。
-
-### 1.3 CI 與測試
-
-目前 CI 已覆蓋：
-
-| Workflow | 覆蓋範圍 |
-|---|---|
-| `python-lint.yml` | ruff check |
-| `chart-ci.yml` | helm lint / template / helm-unittest / negative storage test |
-| `lua-test.yml` | standalone Lua helper tests |
-| `operator-test.yml` | operator / fragmentation / autoscale tests |
-| `sim-unit.yml` | simulator unit tests |
-| `rl-scheduler-test.yml` | RL scheduler serve + replay buffer unit tests |
-| `score-parity-test.yml` | Helm-rendered Lua score vs Python reference parity |
-
-這表示過去 review 中的 C1、S2 都已經補上。S3 也已有 `scripts/chaos/submit-with-services-down.sh`，但那是 live cluster script，不是 CI 內可完全自動化的測試。
-
-### 1.4 可觀測性
-
-目前 Grafana dashboard 包含：
-
-| Dashboard | 用途 |
-|---|---|
-| `scheduler-live.json` | RL scheduler live 決策、snapshot、boost、abstain metrics |
-| `per-job-gpu.json` | per-job / per-GPU drill-down 與 Tempo deep-link |
-| `operator.json` | autoscaling / reconcile / provisioning latency |
-| `gpu.json` | DCGM GPU metrics |
-| `bridge-overview.json` | Slurm/K8s bridge overview |
-| `sla-efficiency.json` | SLA / efficiency overview |
-
-可觀測性已經是系統強項；下一步不是再加 dashboard，而是把 dashboard 截圖與 trace 範例放進 evaluation / thesis，證明系統能解釋每一次資源分配決策。
+v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix）部分由 §4.4 隨機性消融推進；P1-3（score-residual RDSAC）仍未做，且 §4.5 的負結果反而提高了它的優先序。
 
 ---
 
-## 2. 系統強項
+## 2. 三方專家審視
 
-### 2.1 Safe live scheduling path
+### 2.1 IEEE 審稿人視角：這份結果能不能過 peer review？
 
-submit path 上的外掛 service 都設計成 optional：
+審稿人會先肯定**誠實的負結果**（§4.3.1 自我修正、§4.5 負結果）——這在系統論文裡是加分而非減分。但會在以下五點要求 major revision：
 
-| 服務 | 失敗時行為 | 評估 |
+| # | 審稿意見 | 嚴重度 | 改進 |
+|---|---|:---:|---|
+| R1 | **注入噪音的真實性未經校準。** 核心正結果是「在人工 mean-preserving lognormal σ 下，風險敏感法贏」。σ=0.5/1.0 從何而來？若噪音是任意選的，這個結果近乎套套邏輯（加風險 → 抗風險法贏）。 | **Critical** | 你們**已經有 LightGBM runtime predictor**——量它在真實 trace 上的 log-residual 分布，用**那個** σ（與形狀）當作 sim 噪音。把「σ 來自實測預測誤差」寫進方法學，這個結果才站得住。 |
+| R2 | **訓練單 seed。** eval 用 30 種子是評估隨機性，但每個 (algo, σ) 只訓練**一次**。doc 自己承認 §4.3.1 細排名是單訓練 seed 雜訊。per-family 的 +52/+189/+333 不能只報點值。 | **Critical** | 每個 cell 至少 3–5 個訓練 seed，報 mean±std 或 IQR；對「RDSAC−SAC gap 隨 σ 單調」做跨 seed 的顯著性。沒有這個，所有 §4.4/§4.5 的數字都是 anecdote。 |
+| R3 | **baseline 太單薄。** 只比自家 `score` 啟發式 + vanilla SAC。 | High | 補：FCFS、SJF（你有 oracle runtime，SJF 是強 baseline）、Tetris/packing 啟發式；理想上一個已發表的 RL scheduler（Decima / DeepRM 改編）。再加一個近似上界（clairvoyant SJF 或離線排程 LP）讓 ΔJCT% 有尺度感。 |
+| R4 | **外部效度 / sim-to-real gap 未量化。** 全部正結果在 sim；live 1×1 全數打平（模型 abstain ~90–100%）。 | High | 明確分離兩個主張：(a) sim 內的演算法比較（需 R1/R2 才成立）、(b) live 的**韌性**（fail-safe，不是效能）。寫一個 Threats to Validity：單卡天花板、注入噪音、單訓練 seed、僅啟發式 baseline、消費級 GPU 與桌面遊戲共享造成的熱/競爭干擾。 |
+| R5 | **命名與定位。** 「RDSAC/DSAC」與已發表的 Duan 2021 DSAC 撞名，審稿人第一眼就會混淆。 | Medium | 換一個乾淨名稱（如 *discrete risk-sensitive distributional SAC, dRSAC*）或在標題/摘要就重度 caveat。貢獻定位建議照 v6 §6：主軸是 **safe + observable ML-assisted scheduling platform**，RL 超越 baseline 是「在有尾部風險時」的條件式加分，不是無條件主張。 |
+
+**審稿人總評（模擬）：** 系統貢獻（OTel trace bridge、sim-to-live、MPS-aware、誠實的消融）足以撐一篇 systems track。但若標題押「risk-sensitive RL beats heuristic GPU scheduling」，以目前證據會被打回——因為它在**校準噪音 + 多 seed + 多 baseline** 下尚未驗證。R1+R2 是過關門檻。
+
+### 2.2 AI Infra 專家視角：這套東西在真實基礎設施上站得住嗎？
+
+| # | 觀察 | 嚴重度 | 改進 |
+|---|---|:---:|---|
+| I1 | **train/serve 動作落差。** sim 訓練的是 placement policy（job, node, gpu），但 live 的 Lua hook 只把 RL 的選擇轉成 **priority boost**——Slurm 仍做真正的 allocation，`node_j/gpu_k` 在 live 並未被強制執行。等於訓練一個放置策略、上線只用了它的「選哪個 job」那一半。 | **Critical** | 兩條路擇一：(a) 把 live 真正接上 explicit placement（`live_daemon` 已有 `srun` 明確放置的雛形，但預設 SHADOW），讓 serve 的 placement 真的被執行；或 (b) 把 sim 的 action 改成只學 priority/job-selection，與 live 對齊。現在的不一致讓任何 sim 結論都無法宣稱能轉移到 live。 |
+| I2 | **MPS 不是生產級共享原語。** 無記憶體/故障隔離：一個 job OOM 可拖垮共置者。§4.4 的干擾模型是 `1 + k·factor` 線性近似，真實干擾取決於 kernel overlap、記憶體頻寬、L2 競爭，可能是非線性甚至災難式。 | High | 消費卡無 MIG，可接受用 MPS demo，但要在 Threats 寫明；干擾模型至少做一次**實測校準**（在真卡上跑 2 個 compute-bound job 量 slowdown 分布），別只用線性假設。生產敘事需提 MIG/時間片的取捨。 |
+| I3 | **固定拓樸的 obs/action 空間 = 反彈性。** `gym_env` 的 obs_dim / n_actions 綁死 N_NODES×N_GPUS，節點 join/leave 就 checkpoint 不相容、要從零重訓。對「cloud-native 彈性叢集」的宣稱是根本性矛盾——這也是為什麼加一台 3080 就要重訓。 | High | 中期應走 **permutation-invariant / 可變長度** 的 obs（attention trunk 已是 set-based，往「節點數無關」的編碼推進），讓單一 policy 跨拓樸。否則每次擴縮都重訓，無法營運。 |
+| I4 | **submit-path 同步延遲。** Lua 在 `slurm_job_submit` 同步呼叫 `/decide`（150ms timeout）。負載高時這是 submit 關鍵路徑。 | Medium | 量 `/decide` 的 p99 與在 batch submit 風暴下的 slurmctld 影響；serve 確保 CPU 推論 + warm pool（memory 已記 `min_replicas=1`）。把 decision latency、snapshot age、abstain rate 設成有 alert 的 SLO。 |
+| I5 | **測試平台規模 vs 宣稱。** 整個「叢集」是一張與 Steam 遊戲共享的消費級 RTX 4070 上的 k3s 單節點；第二台是異質消費卡 3080。 | Medium | 這不是缺陷、是限制——但要在論文/報告誠實標示，且 live 數字要排除遊戲佔卡造成的熱節流/競爭（本輪訓練就曾因 `wwm.exe` 佔卡使 CUDA 不可用）。理想上把實驗挪到專用機或雲端 spot GPU 做最終數據。 |
+| I6 | **單副本關鍵服務 + operator 無 leader election**（v6 已記，仍未解）。 | Medium | 維持 v6 建議：operator active-passive leader election；rl-scheduler 可 2 replicas + PDB。fail-safe 讓 submit 不壞，但 snapshot pusher / live_daemon 仍是 SPOF。 |
+
+**Infra 總評：** 可觀測性與 fail-safe 設計是真強項（v6 已肯定）。但 **I1（train/serve 動作落差）是把 sim 成果接到 live 的根本障礙**，沒解掉，live 永遠只能展示「壞 checkpoint 也不會讓 JCT 變差」，無法展示「RL 讓 JCT 變好」。I3 則決定這套東西能不能叫「彈性叢集」。
+
+### 2.3 ML / Model 專家視角：建模與方法本身是否扎實？
+
+| # | 觀察 | 嚴重度 | 改進 |
+|---|---|:---:|---|
+| M1 | **歸因未拆乾淨。** σ-sweep 比的是 SAC（scalar）vs RDSAC-**cvar**（分布式 + 風險扭曲），把「分布式 critic」與「風險扭曲」兩個貢獻綁在一起。 | **Critical** | 在 σ-sweep 補 **RDSAC-mean 臂**（分布式但風險中立）。三方 SAC / RDSAC-mean / RDSAC-cvar 才能回答「贏是因為 distributional critic 還是因為 CVaR」。這是最便宜、最高價值的下一個實驗。 |
+| M2 | **score-warmup 可能是 live abstain ~90% 的元兇。** 訓練前期用 score 排程器產生種子 transition，模型可能直接 clone 了 score（1×1 近最優）→ 學不到偏離 score 的放置 → 上線就 no-op。 | High | 做 warmup on/off 的 ablation；或改成「衰減式」warmup（前期高、後期關）。若關掉 warmup 後 live abstain 率下降，這就是 1×1 live 全打平的真正機制（而非「策略本來就該 no-op」）。 |
+| M3 | **auto-α 修法是 band-aid。** 需要 reward_scale=20000 + 放寬 clamp 才不 railing，說明根因是 return 尺度 vs entropy 項失衡；discrete-SAC 的 target-entropy 啟發式本就 finicky。 | High | 用 **return normalization（PopArt / reward 標準化）**讓單一 α 控制器跨 SAC/RDSAC 都穩，不必 per-algorithm 調 reward_scale。這也讓 §4.3.1 必須釘 α 的 caveat 消失。 |
+| M4 | **§4.5 共置負結果是預算混淆。** ON 有 2× 動作但同 100k 步 → underfit。結論其實是「相同預算下大動作空間學不好」，不是「共置沒用」。 | High | 給 ON 臂**配對的訓練資訊量**（按 log|A| 放大步數，或對 ISOLATE 的稀疏 mask 做 action-embedding / factorized policy）。否則 §4.5 應明確標為「budget-confounded」，不能下「共置無用」的強結論（doc 已部分標註，可再強化）。 |
+| M5 | **無 held-out workload。** 在 philly/burst/ali 混合訓練、又在同三族評估。 | Medium | 做 workload split（train philly+burst、test ali）證明泛化而非記住 trace 統計。對「能應付沒見過的 workload」的宣稱是必要的。 |
+| M6 | **機制堆疊缺 ablation。** n-step、PER、potential shaping、score warmup、雙頭 Z_R/Z_H 全開，沒有逐項 ablation。 | Medium | 至少對 PER、potential shaping、雙頭分解各做一次開關。尤其**雙頭 Z_R/Z_H**（RDSAC 特有的熵回報分離）增加複雜度——若單頭分布式 critic（熵折進 V）效果相當，應簡化。 |
+| M7 | **sim 是純 Python 離散事件、~10 steps/s = 多 seed 研究的算力牆。** 本輪一個 σ 區塊就要 ~4.6h。 | High（間接擋住 M1/R2）| 向量化 / 編譯 sim（numba、或重寫熱路徑），把吞吐拉到 10²–10³ steps/s，多訓練 seed（R2）與三方臂（M1）才在算力上可行。**這是解開 R2/M1 的前置條件。** |
+
+**Model 總評：** RDSAC 的實作對齊參考文獻、有測試覆蓋（本輪 +9 測試），σ 消融的方向性結論在理論上合理。但 **M1（拆 distributional vs risk）與 M2（warmup 是否造成 abstain）是兩個最關鍵、最便宜的待答問題**，而 M7（算力牆）是讓 R2/M1 變得可行的前置工程。
+
+---
+
+## 3. 整合改進清單（依「擋住結論的程度」重排）
+
+> 原則：先做能讓**研究結論成立**的事（P0），再做能讓**結論轉移到 live**的事（P1），最後才是工程韌性與清理（P2，多數沿用 v6）。
+
+**已解決，不再列入待辦（自 v6 / 本輪）：** 三方 score/SAC/RDSAC 對照（§4.3）、auto-α 診斷 + fixed-α 受控對照（§4.3.1）、30-seed paired eval、隨機性消融能力與 σ-sweep（§4.4）、共置動作能力與其 1×1 負結果（§4.5）、2-node 加入 runbook（`docs/intergration.md`）、`chart/values-2x2.yaml`、runtime predictor 測試（`services/runtime_predictor/tests/` 已含 feature/cold-start/retrain 三項，對應 v6 P2-2）、7 個 CI workflow（v6 C1/S2）。
+
+### P0 — 沒做就無法下結論（方法學門檻）
+
+| ID | 項目 | 對應視角 | 產出 |
+|---|---|---|---|
+| P0-1 | **σ 校準到真實 predictor 殘差** | R1 | 量 LightGBM 的 log-residual 分布，σ 用實測值；方法學寫明 |
+| P0-2 | **多訓練 seed（≥3–5）重跑 §4.4/§4.5 關鍵點** | R2, M4 | 每 cell mean±std；gap 單調性的跨 seed 顯著性 |
+| P0-3 | **σ-sweep 補 RDSAC-mean 臂** | M1 | 三方拆解 distributional vs risk 貢獻 |
+| P0-4 | **向量化 / 加速 sim**（前置工程）| M7 | steps/s ↑ 一個數量級，讓 P0-2/P0-3 可行 |
+
+### P1 — 讓 sim 結論能轉移到 live / 更強的對照
+
+| ID | 項目 | 對應視角 | 備註 |
+|---|---|---|---|
+| P1-1 | **修 train/serve 動作落差** | I1 | 二選一：live 真接 explicit placement，或 sim 改學 priority/selection |
+| P1-2 | **score-residual RDSAC**（`final = score + RL_delta`，bounded）| v6 P1-3, R5 | §4.5 負結果後優先序升高；學「何時修正啟發式」而非從零學 |
+| P1-3 | **warmup on/off ablation**（驗證 live abstain 成因）| M2 | 可能直接解釋 1×1 live 全打平 |
+| P1-4 | **補強 baseline**：FCFS / SJF / packing / 近似上界 | R3 | ΔJCT% 才有尺度感 |
+| P1-5 | **2-node（4070+3080）異質實驗** | I3, §4.5 | 補 `rtx3080` 進 `GPU_TYPES` / `_gpu_type_to_vram`（10GB）；共置動作在真 2-GPU 重評 |
+| P1-6 | **干擾模型實測校準** | I2 | 真卡量 2-job slowdown 分布，取代線性假設 |
+
+### P2 — 工程韌性與清理（多沿用 v6，仍有效）
+
+| ID | 項目 | 來源 |
 |---|---|---|
-| runtime predictor | predictor factor 回中性值 / 不覆蓋 time limit | 合理 |
-| RL scheduler | Lua hook skip RL，回到 score baseline | 合理 |
-| weight tuner | plugin load 失敗時用 chart default weights | 合理 |
-| OTel | tracing disabled / unavailable 不影響 submit | 合理 |
-
-這是 HPC submit path 應該有的保守設計。即使 RL 已經 live，系統仍能在 model 不確定、snapshot stale、service down 時回到 baseline。
-
-### 2.2 Observability is a real differentiator
-
-`traceparent` 寫入 `job_desc.admin_comment`，再由 operator 還原 OTel context，是這個系統最有辨識度的工程設計。它解決了 Slurm submit hook 是同步、operator reconcile 是非同步的 trace 斷裂問題，而且不需要改 Slurm core。
-
-這個特色比「又一個 RL scheduler」更容易說服 reviewer：它能展示每個 job 從 submit、queue wait、scale up、running 到完成的全鏈路，並能把 scheduler decision、GPU metrics、K8s provisioning latency 放在同一個觀察面。
-
-### 2.3 Simulator-to-live pipeline is coherent
-
-目前已具備：
-
-```text
-sim workload -> DSAC training -> dsac.pt -> Docker image -> Helm deploy -> live /decide -> metrics/traces
-```
-
-再加上 score parity test，至少可以保證 live Lua score 與 Python reference 不會悄悄漂移。這對後續實驗非常重要，因為你們要比較 score baseline、DSAC、DSAC residual 或 2×2 cluster 時，需要能信任 baseline 一致。
+| P2-1 | return normalization（PopArt）取代 reward_scale 手調 | M3 |
+| P2-2 | 機制 ablation（PER / shaping / 雙頭 Z_R/Z_H）| M6 |
+| P2-3 | held-out workload split | M5 |
+| P2-4 | operator leader election；rl-scheduler 2 replicas + PDB | v6 P1-5/P2-1, I6 |
+| P2-5 | permutation-invariant obs（往跨拓樸 policy）| I3 |
+| P2-6 | fragmentation 維持 shadow + 加 progress penalty；NFS mount tuning | v6 P2-3/P2-5 |
+| P2-7 | submit-path chaos 實機數據；decision-latency/abstain SLO + alert | v6 P1-4, I4 |
 
 ---
 
-## 3. 主要風險與改進方向
-
-### P1-1. 建立 2×2 cluster 實驗環境，否則 DRL 很難有表現空間
-
-目前 1 台電腦 / 1×GPU 或近似 1×1 的 live setup，action space 太小。對 DRL 來說，很多情境其實只有「排或不排」而不是「資源分配」。這會讓 DSAC 很容易退化成 score baseline 的弱版本。
-
-**建議目標：** 至少做 2 nodes × 2 GPUs 的實驗 profile，即使第二台機器先用 CPU-only 或 mock GPU 也可以先把 Slurm/K8s topology 與 action mask 跑通。真正有 GPU 的第二台再接上 DCGM/MPS。
-
-**要補的內容：**
-
-| 工作 | 目的 |
-|---|---|
-| `values-2x2.yaml` | 固定 2×2 cluster 實驗設定，避免手動 overlay 漂移 |
-| `docs/cluster.md` 增補 join node 流程 | 第二台機器加入 k3s、label、NVIDIA runtime、MPS setup |
-| simulator 2×2 eval matrix | DSAC 才有 placement / packing / fragmentation 決策空間 |
-| live smoke test | submit 多個 mps:25/mps:50 job，確認 allocation / metrics / traces |
-
-**驗收標準：** 不是「job 能跑」而已，而是 dashboard 能看到 queue、GPU allocation、MPS slot、CPU/memory、RL selected action，並且 Slurm allocation 與 RL `/decide` 回傳 placement 不矛盾。
-
-### P1-2. 補 DRL vs baseline 的正式 evaluation matrix
-
-目前 DSAC live 已接上，但還缺能支持結論的實驗表。建議最小矩陣如下：
-
-| Dimension | Values |
-|---|---|
-| Cluster | 1×1、2×2 |
-| Workload | philly_subsample、burst、mixed short/long、MPS-heavy |
-| Scheduler | FCFS、Slurm multifactor、Lua score、DSAC live、DSAC shadow |
-| Metrics | mean JCT、p95 JCT、GPU utilization、MPS utilization、queue wait、submit latency、abstain rate |
-| Seeds | 至少 5 |
-
-**關鍵點：** 若 DSAC 仍輸 score baseline，不要硬凹。可以把 DSAC 定位成「live-safe exploration layer」，主貢獻改成平台與可觀測性。若要追求演算法收益，下一步應做 score-residual learning，而不是讓 DSAC 從零學完整 policy。
-
-### P1-3. 做 score-residual DSAC，而不是純 DSAC 從零學
-
-純 DSAC 在小 cluster 會很難超過手工 score。更務實的做法：
-
-```text
-final_priority = score_priority + RL_delta
-```
-
-讓 RL 學「何時修正 heuristic」，而不是重學整個 scheduler。這也比較符合目前 live 架構，因為 Lua score 已經是穩定 fallback。
-
-**建議設計：**
-
-| 項目 | 建議 |
-|---|---|
-| Action | keep current placement/no-op，或改成 boost bucket |
-| Reward | score baseline improvement：JCT delta / queue wait delta |
-| Safety | RL_delta bounded，例如 `[-250, +250]` 或只允許 positive boost |
-| Evaluation | 和 pure DSAC、score baseline 做 ablation |
-
-這條路徑比「加大訓練步數」更有機會產生可解釋的改善。
-
-### P1-4. 實機執行 submit-path chaos script 並把數字寫入 monitoring/eval
-
-S3 的 script 已存在，但目前報告仍需要實際數據。建議在 live k3s 跑：
-
-```bash
-SAMPLES=50 bash scripts/chaos/submit-with-services-down.sh
-```
-
-至少記錄：
-
-| Phase | 要看什麼 |
-|---|---|
-| baseline | 正常 submit latency p50/p95/p99 |
-| rl-scheduler down | sbatch 是否仍成功、latency 是否受 150ms timeout 影響 |
-| runtime-predictor down | predictor timeout 是否符合設定 |
-| weight-tuner down | plugin load fallback 是否正常 |
-| all optional down | 最壞情況 submit 是否仍成功 |
-
-這會直接支撐「safe live ML scheduling」的主張。
-
-### P1-5. Operator leader election / failover policy
-
-operator 目前單副本，雖然有 PDB 和 liveness，但沒有 leader election。單機 thesis demo 可以接受；如果文件宣稱 production-grade，就會被問。
-
-**最低成本改法：** 不一定要立刻 active-active。先做 active-passive leader election，只有 leader 執行 reconcile/scale；follower 保持 ready 但不操作 StatefulSet。
-
-**驗收標準：** kill operator pod 後，新 pod 在一個 reconcile period 內恢復，且不重複 scale 或誤 drain。
-
----
-
-## 4. P2 改進項
-
-### P2-1. 外掛服務副本數與持久化
-
-`rl-scheduler`、`runtime-predictor`、`weight-tuner` template 目前皆 `replicas: 1`。silent fallback 讓 submit 不會壞，但重啟期間會降級。
-
-| 服務 | 現況 | 建議 |
-|---|---|---|
-| rl-scheduler | stateless，policy baked in image | 暴露 `replicaCount`，加 PDB |
-| runtime-predictor | RWO model PVC，Deployment Recreate | 若要多副本，模型改 ReadOnlyMany 或 baked artifact |
-| weight-tuner | state 在 `emptyDir` | 改 PVC 或 ConfigMap/SQLite state；多副本前需 leader election |
-
-對目前單機環境，這不是立即阻擋；對 2×2 或長時間實驗，建議至少讓 rl-scheduler 可 2 replicas。
-
-### P2-2. Runtime predictor CI coverage
-
-目前 runtime predictor 是上線功能的一部分，但 CI 重點在 operator/sim/RL scheduler。建議新增輕量測試：
-
-| Test | 目的 |
-|---|---|
-| feature extraction unit test | 避免欄位改名或 default drift |
-| cold-start `/predict` test | 無模型時回 bootstrap floor |
-| retrain smoke test | 小 trace 可產生 model artifact |
-
-這能避免 predictor 在未來 refactor 時 silent break。
-
-### P2-3. Fragmentation reconciler 繼續 shadow，不建議現在開 live
-
-fragmentation decider 已有測試，但過去 eval 顯示 victim requeue 可能讓 mean JCT 變差。原因不是 checkpoint reload cost，而是 victim lost progress。
-
-**建議：**
-
-1. 繼續 `shadowMode=true`。
-2. 加 elapsed-progress penalty：已跑很久的 job 不應被輕易 requeue。
-3. 補 live shadow dashboard：每次 shadow victim decision 要能看到 target/victim/priority gap/estimated lost work。
-4. 若要 live，先限制在低風險 partition 或測試帳號。
-
-### P2-4. Checkpoint guard 支援多 pattern
-
-目前 checkpoint guard 仍偏向單一路徑 / 單檔模型。實際 ML workload 常見：
-
-```text
-checkpoints/epoch_*.pt
-last.ckpt
-rank*/checkpoint.pt
-```
-
-建議把 `CHECKPOINT_PATH` 升級成 pattern list，並記錄最近 matched file 的 mtime/size 到 metrics。這能讓 scale-down guard 更符合真實訓練工作。
-
-### P2-5. NFS / shared storage tuning
-
-NFS 對 demo 足夠，但對 checkpoint-heavy workload 會成為瓶頸。短期至少補：
-
-```text
-rsize=1M,wsize=1M,hard,timeo=600,retrans=2
-```
-
-中期若論文要談 production，可把 shared FS 升級列為 future work：Lustre、CephFS、FSx for Lustre 或 local NVMe cache。
-
----
-
-## 5. P3 清理與文件改進
-
-| 項目 | 建議 |
-|---|---|
-| `docs/note.md` | 拆成 archive / experiment log，避免主要文件入口太雜 |
-| Dashboard screenshots | 把 scheduler-live / per-job-gpu 截圖放進 docs 或 thesis figures |
-| `values-k3s.yaml` drift check | 加 script 比對關鍵欄位：MPS slots、GPU type、shadowMode、image tags |
-| `serve_otel.py` | 可以維持獨立；若要簡化，再 inline 成 optional import |
-
----
-
-## 6. 建議後續路線圖
-
-### 最近 1 週
-
-1. 跑一次 `scripts/chaos/submit-with-services-down.sh`，把 p50/p95/p99 latency 寫進 `docs/eval-writeup.md` 或 `docs/monitoring.md`。
-2. 補 `values-2x2.yaml` 草稿與 `docs/cluster.md` 第二台機器 join 流程。
-3. 確認 README / evaluation 指令皆指向 DSAC benchmark，避免口試時被問「到底用 PPO 還是 DSAC」。
-
-### 接下來 2-3 週
-
-1. 建 2×2 實驗環境。
-2. 跑 evaluation matrix：score baseline vs DSAC live/shadow。
-3. 做 score-residual DSAC prototype。
-4. 補 runtime predictor CI。
-
-### 論文 / 報告主軸
-
-建議主軸改成：
-
-```text
-A safe and observable ML-assisted resource allocation platform for Slurm-on-Kubernetes
-```
-
-三個主貢獻：
-
-1. **MPS-aware scheduling baseline + DSAC live extension**：不是只賣 DRL，而是賣 safe ML-assisted scheduling。
-2. **Sim-to-live reproducibility**：sim、training、checkpoint、live service、score parity、CI 全管線。
-3. **End-to-end observability**：OTel trace bridge + Grafana dashboard 能解釋 job queue / GPU allocation / MPS slot / CPU resource。
-
-DRL 結果如果超 baseline，就是加分；如果沒有，也能作為 honest negative result，說明在小 cluster 上 heuristic 仍強，未來需 2×2 / residual RL / richer workloads。
-
----
-
-## 7. 最終評估
-
-| 面向 | 評分 | 說明 |
-|---|:---:|---|
-| 工程完整度 | 4/5 | Helm、CI、docs、metrics 都已成熟 |
-| Live 安全性 | 4/5 | silent fallback + abstain + chaos script；仍缺實機 chaos 數據 |
-| DRL 研究完成度 | 2.5/5 | DSAC 能 live，但尚未證明效能優勢 |
-| 可觀測性 | 5/5 | 這是目前最強項 |
-| 生產化韌性 | 3/5 | 單副本與 leader election 是主要缺口 |
-| 論文敘事一致性 | 3/5 | 若從「DRL scheduler」改成「ML-assisted observable platform」會更穩 |
-
-**結論：** 已完成的改善應從 backlog 刪掉；目前真正該投資的是 2×2 cluster、DRL/score baseline evaluation、chaos 實測數據，以及 operator/service 韌性。不要再把時間花在已完成的測試與 dashboard 上；接下來要產出的是能支撐研究結論的數據。
+## 4. 更新後評分卡
+
+| 面向 | v6 | v7 | 變動說明 |
+|---|:---:|:---:|---|
+| 工程完整度 | 4/5 | 4/5 | 維持；A/B 工具 + 測試再增 |
+| Live 安全性 | 4/5 | 4/5 | fail-safe 已多次實證；仍缺實機 chaos 數據 |
+| 可觀測性 | 5/5 | 5/5 | 最強項，未變 |
+| 生產化韌性 | 3/5 | 3/5 | leader election / 單副本仍未解 |
+| **DRL 研究方法學** | 2.5/5 | **3/5** | 隨機性消融 + fixed-α 對照是實質方法學進步；但單訓練 seed、未校準噪音、未拆 distributional/risk 仍壓住分數 |
+| **可發表性（IEEE）** | — | **2.5/5** | 系統貢獻夠；演算法主張需 P0-1/P0-2/P0-3 才過門檻 |
+| **sim-to-live 保真度** | — | **2/5** | I1 動作落差是最大未解項 |
+
+**結論：** 本輪把核心研究問題從「測不出」推進到「有方向性答案」，是真進展。但三個專家視角一致指向同一個瓶頸——**結論目前活在「模擬器 + 單訓練 seed + 人工噪音」的三重溫室裡**。接下來最該投資的不是更多功能，而是 **P0 四項**（校準噪音、多 seed、拆 distributional/risk、加速 sim）把溫室拆掉；其次是 **P1-1** 把 sim 與 live 的動作對齊。把這些做掉，這份研究才從「我們做了一個能跑的平台」升級成「我們有一個站得住的結論」。
