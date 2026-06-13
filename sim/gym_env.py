@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import heapq
 import math
+import zlib
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -69,10 +70,23 @@ OBS_DIM      = (TOP_K * JOB_FEAT_DIM
                 + GLOBAL_FEAT_DIM)
 
 
-def env_dims(n_nodes: int, gpus_per_node: int, top_k: int = TOP_K) -> tuple[int, int]:
+# ── Co-location modes (B: MPS co-location as an action dimension) ───────────
+# Each (job, placement) action carries a mode when colocation_actions=True:
+#   PACK    — accept MPS sharing: place even on an occupied GPU (pays the A
+#             interference slowdown if co-residents are present).
+#   ISOLATE — require an empty GPU: legal only when the target GPU is idle, so
+#             the job never shares and never pays interference, at the cost of
+#             waiting for the GPU to drain.
+MODE_PACK    = 0
+MODE_ISOLATE = 1
+
+
+def env_dims(n_nodes: int, gpus_per_node: int, top_k: int = TOP_K,
+             colocation: bool = False) -> tuple[int, int]:
     """Return (obs_dim, n_actions) for a given cluster shape.
 
-    Use this to construct a matching DSACAgent before creating the env::
+    With ``colocation=True`` each (job, placement) gains a PACK/ISOLATE mode, so
+    the action count doubles. Use this to construct a matching DSACAgent::
 
         obs_dim, n_actions = env_dims(n_nodes=1, gpus_per_node=1)
         agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions)
@@ -82,12 +96,17 @@ def env_dims(n_nodes: int, gpus_per_node: int, top_k: int = TOP_K) -> tuple[int,
            + n_nodes * gpus_per_node * GPU_FEAT_DIM
            + TOPO_FEAT_DIM
            + GLOBAL_FEAT_DIM)
-    n_act = top_k * n_nodes * gpus_per_node + 1
+    n_modes = 2 if colocation else 1
+    n_act = top_k * n_nodes * gpus_per_node * n_modes + 1
     return obs, n_act
 
 # Bandwidth placeholders (sim has no real network model; feats are 1.0 = full)
 _INTRA_BW_TOTAL = 1.0
 _INTER_BW_TOTAL = 1.0
+
+# Floor on a realized (post-noise) runtime so stochastic draws can't produce
+# zero/negative durations.
+MIN_RUNTIME_S = 1.0
 
 
 # ── Feature extractors ────────────────────────────────────────────────────
@@ -235,6 +254,9 @@ class KubefluxSchedEnv:
         reward_scale: float = 1000.0,
         placement_reward_scale: float = 0.01,
         potential_shaping: bool = False,
+        runtime_sigma: float = 0.0,
+        interference: float = 0.0,
+        colocation_actions: bool = False,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
@@ -252,11 +274,26 @@ class KubefluxSchedEnv:
         self.placement_reward_scale = float(placement_reward_scale)
         self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
         self.potential_shaping      = potential_shaping
+        # ── Stochastic execution (opt-in; 0/0 = legacy deterministic env) ──
+        # runtime_sigma : multiplicative mean-preserving lognormal noise on the
+        #                 *realized* runtime. The obs still shows the nominal
+        #                 runtime, so this is genuine outcome uncertainty — it
+        #                 gives Z_R real spread for the distributional critic.
+        # interference  : per-co-resident slowdown on the realized runtime when
+        #                 a job shares its GPU(s) via MPS. Crowded placements
+        #                 run slower → placement quality + tail risk to manage.
+        self.runtime_sigma          = float(runtime_sigma)
+        self.interference           = float(interference)
+        # ── Co-location action mode (opt-in; 1 mode = legacy action space) ──
+        self.colocation_actions     = bool(colocation_actions)
+        self._n_modes               = 2 if colocation_actions else 1
 
         self._step_count = 0
         self._state: Optional[_RunState] = None
+        self._rng = np.random.default_rng(None)
+        self._episode_seed: Optional[int] = None
 
-        n_act = top_k * n_nodes * gpus_per_node + 1
+        n_act = top_k * n_nodes * gpus_per_node * self._n_modes + 1
         obs_d = (top_k * JOB_FEAT_DIM
                  + n_nodes * gpus_per_node * GPU_FEAT_DIM
                  + TOPO_FEAT_DIM
@@ -273,6 +310,13 @@ class KubefluxSchedEnv:
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
+        # Dedicated stream for runtime-noise draws — reproducible per seed and
+        # independent of any global np.random state. When a seed is given the
+        # idiosyncratic per-job noise becomes common-random (keyed on the job
+        # id), so a paired eval sees the same multiplier for the same job under
+        # every policy. Seedless (training) resets fall back to this stream.
+        self._episode_seed = seed
+        self._rng = np.random.default_rng(seed)
         jobs    = self.jobs_factory()
         cluster = Cluster(
             n_nodes=self.n_nodes,
@@ -306,13 +350,14 @@ class KubefluxSchedEnv:
         phi_prev   = self._potential()
 
         if action != self._no_op:
-            job_i, node_j, gpu_k = self._decode(action)
+            job_i, node_j, gpu_k, _mode = self._decode(action)
             if job_i < len(top):
                 chosen = top[job_i]
                 plan   = st.cluster.try_allocate_on(chosen, node_j, gpu_k)
                 if plan is not None:
                     st.pending.remove(chosen)
-                    end_ts = st.now + chosen.runtime
+                    realized = self._realized_runtime(chosen, plan, st.cluster)
+                    end_ts   = st.now + realized
                     heapq.heappush(st.events, (end_ts, st.seq, "end", chosen.job_id))
                     st.seq += 1
                     scheduled = True
@@ -359,27 +404,48 @@ class KubefluxSchedEnv:
         return self.action_mask()
 
     def action_mask(self) -> np.ndarray:
-        """Bool mask over Discrete(N_ACTIONS). True = legal."""
+        """Bool mask over Discrete(N_ACTIONS). True = legal.
+
+        With colocation modes on, ISOLATE is legal only when the target GPU is
+        idle (free_mps == capacity); PACK is legal whenever the job fits.
+        """
         st   = self._state
         assert st is not None
         top  = self._top_k_jobs()
         mask = np.zeros(self.action_space.n, dtype=bool)
+        cap  = st.cluster.mps_per_gpu
         for i, job in enumerate(top):
             for nj in range(self.n_nodes):
                 for gk in range(self.gpus_per_node):
-                    if st.cluster.can_allocate_on(job, nj, gk):
-                        mask[encode_action(i, nj, gk)] = True
+                    if not st.cluster.can_allocate_on(job, nj, gk):
+                        continue
+                    placement = nj * self.gpus_per_node + gk
+                    gpu_idle  = st.cluster.nodes[nj].gpus[gk].free_mps == cap
+                    for mode in range(self._n_modes):
+                        if mode == MODE_ISOLATE and not gpu_idle:
+                            continue
+                        mask[self._encode(i, placement, mode)] = True
         mask[self._no_op] = True
         return mask
 
     # ── Internals ────────────────────────────────────────────────────────
 
-    def _decode(self, a: int) -> Tuple[int, int, int]:
-        job_i  = a // self._n_placements
-        rem    = a %  self._n_placements
+    def _encode(self, job_i: int, placement: int, mode: int) -> int:
+        """(job, placement_flat, mode) → flat action index. Mirrors _decode.
+
+        With ``_n_modes == 1`` this is identical to the legacy
+        ``job_i * n_placements + placement`` index.
+        """
+        return (job_i * self._n_placements + placement) * self._n_modes + mode
+
+    def _decode(self, a: int) -> Tuple[int, int, int, int]:
+        mode   = a %  self._n_modes
+        pj     = a // self._n_modes
+        job_i  = pj // self._n_placements
+        rem    = pj %  self._n_placements
         node_j = rem // self.gpus_per_node
         gpu_k  = rem %  self.gpus_per_node
-        return job_i, node_j, gpu_k
+        return job_i, node_j, gpu_k, mode
 
     def _top_k_jobs(self) -> List[Job]:
         st = self._state
@@ -400,6 +466,53 @@ class KubefluxSchedEnv:
                 st.pending.append(st.by_id[payload])
             elif kind == "end":
                 self._on_job_end(payload)
+
+    def _realized_runtime(self, job: Job, plan, cluster: Cluster) -> float:
+        """Realized (executed) runtime = nominal × interference × lognormal noise.
+
+        With ``runtime_sigma == 0`` and ``interference == 0`` this returns the
+        nominal runtime *exactly* (no RNG draw), keeping the legacy env
+        bit-for-bit deterministic. ``plan`` is the just-applied allocation, so
+        the chosen job already appears in ``cluster.active``.
+        """
+        base = job.runtime
+        if self.runtime_sigma <= 0.0 and self.interference <= 0.0:
+            return base
+        mult = 1.0
+        if self.interference > 0.0:
+            k = self._co_residents(cluster, plan, job.job_id)
+            mult *= 1.0 + self.interference * k          # crowded GPU runs slower
+        if self.runtime_sigma > 0.0:
+            z = self._job_noise(job.job_id)
+            # mean-preserving lognormal: E[exp(σZ − σ²/2)] = 1, so only the
+            # variance grows with σ — the mean JCT stays comparable across σ.
+            mult *= math.exp(self.runtime_sigma * z - 0.5 * self.runtime_sigma ** 2)
+        return max(MIN_RUNTIME_S, base * mult)
+
+    def _job_noise(self, job_id: str) -> float:
+        """Standard-normal draw for a job's idiosyncratic runtime noise.
+
+        Common-random per (episode_seed, job_id) so a paired eval gives the
+        same multiplier to the same job under every policy — isolating the
+        policy effect from noise luck. Seedless (training) resets draw from the
+        sequential stream instead.
+        """
+        if self._episode_seed is None:
+            return float(self._rng.standard_normal())
+        key = (int(self._episode_seed), int(zlib.crc32(job_id.encode())))
+        return float(np.random.default_rng(key).standard_normal())
+
+    @staticmethod
+    def _co_residents(cluster: Cluster, plan, job_id: str) -> int:
+        """Count other active jobs sharing any GPU in ``plan`` (MPS neighbours)."""
+        gpus = {(a.node_id, gi) for a in plan for gi in a.gpu_indices}
+        others: set = set()
+        for jid, p in cluster.active.items():
+            if jid == job_id:
+                continue
+            if any((a.node_id, gi) in gpus for a in p for gi in a.gpu_indices):
+                others.add(jid)
+        return len(others)
 
     def _on_job_end(self, jid: str) -> None:
         st = self._state

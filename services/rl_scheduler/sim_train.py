@@ -100,9 +100,14 @@ def sim_train(
     risk_beta: float = 0.25,
     curriculum: bool = False,
     curriculum_stages: Optional[list] = None,
+    # Stochastic execution (opt-in; gives Z_R spread for the distributional critic)
+    runtime_sigma: float = 0.0,
+    interference: float = 0.0,
+    # Co-location action mode (B; opt-in, doubles the action space)
+    colocation: bool = False,
 ) -> DSACAgent:
     """Run online DSAC training in sim. Returns the trained agent."""
-    obs_dim, n_actions = env_dims(n_nodes, gpus_per_node)
+    obs_dim, n_actions = env_dims(n_nodes, gpus_per_node, colocation=colocation)
     rng = np.random.default_rng(seed)
 
     total_gpus = n_nodes * gpus_per_node
@@ -129,6 +134,9 @@ def sim_train(
         reward_mode=reward_mode,
         reward_scale=reward_scale,
         potential_shaping=potential_shaping,
+        runtime_sigma=runtime_sigma,
+        interference=interference,
+        colocation_actions=colocation,
     )
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
@@ -197,7 +205,9 @@ def sim_train(
                         None,
                     )
                     if job_idx is not None:
-                        candidate = job_idx * env._n_placements
+                        # PACK action on the first placement; with _n_modes==1
+                        # this is the legacy job_idx * _n_placements index.
+                        candidate = job_idx * env._n_placements * env._n_modes
                         if candidate < len(mask) and mask[candidate]:
                             act = int(candidate)
                             break
@@ -316,6 +326,17 @@ def main(argv=None) -> int:
                    help="disable Prioritized Experience Replay")
     p.add_argument("--curriculum",           action="store_true",
                    help="ramp n_jobs: 10→30→50 over training")
+    # Stochastic execution (opt-in)
+    p.add_argument("--runtime-sigma",        type=float, default=0.0,
+                   help="lognormal (mean-preserving) noise on realized runtime; "
+                        "0 = deterministic. Gives the distributional critic real "
+                        "return spread to model.")
+    p.add_argument("--interference",         type=float, default=0.0,
+                   help="per-co-resident MPS slowdown on realized runtime; "
+                        "0 = off")
+    p.add_argument("--colocation",           action="store_true",
+                   help="add PACK/ISOLATE co-location mode per placement "
+                        "(doubles the action space; checkpoint-incompatible)")
     args = p.parse_args(argv)
 
     import torch
@@ -354,6 +375,9 @@ def main(argv=None) -> int:
         risk_mode=args.risk_mode,
         risk_beta=args.risk_beta,
         curriculum=args.curriculum,
+        runtime_sigma=args.runtime_sigma,
+        interference=args.interference,
+        colocation=args.colocation,
     )
     return 0
 
