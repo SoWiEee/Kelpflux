@@ -9,6 +9,9 @@ Default (colocation off) must stay byte-identical to the legacy 17-action env.
 from __future__ import annotations
 
 import numpy as np
+import pytest
+
+pytest.importorskip("gymnasium")
 
 from sim.gym_env import (
     KubefluxSchedEnv, env_dims, MODE_PACK, MODE_ISOLATE, TOP_K,

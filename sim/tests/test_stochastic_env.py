@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+pytest.importorskip("gymnasium")
+
 from sim.gym_env import KubefluxSchedEnv
 from sim.loader import Job, MPS_PER_GPU
 
