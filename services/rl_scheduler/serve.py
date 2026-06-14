@@ -264,6 +264,17 @@ class _AgentHolder:
         print(f"[serve] loaded DSACAgent obs_dim={self.agent.obs_dim} "
               f"n_actions={self.agent.n_actions} from {ckpt}")
 
+    @classmethod
+    def from_checkpoint(cls, ckpt: Path) -> "_AgentHolder":
+        """Build a holder from an explicit .pt file (used by POST /reload to swap
+        arms in the heavy-tail live A/B without restarting the pod)."""
+        self = cls.__new__(cls)
+        self.agent = DSACAgent.load(str(ckpt))
+        self.policy_dir = ckpt.parent
+        print(f"[serve] reloaded DSACAgent obs_dim={self.agent.obs_dim} "
+              f"n_actions={self.agent.n_actions} from {ckpt}")
+        return self
+
     def select(
         self, obs: np.ndarray, mask: np.ndarray
     ) -> tuple[int, float, float]:
@@ -424,6 +435,58 @@ def healthz():
         "n_actions": _holder.agent.n_actions if _holder else None,
         "snapshot_age_s": snap_age,
         "shadow_mode": SHADOW_MODE,
+    }
+
+
+class ReloadRequest(BaseModel):
+    checkpoint: str
+
+
+def _variant_of(agent) -> str:
+    if getattr(agent, "use_iqn", True):
+        return f"RDSAC:{getattr(agent, 'risk_mode', 'mean')}"
+    return "SAC"
+
+
+@app.post("/reload")
+def reload_checkpoint(req: ReloadRequest):
+    """Hot-swap the served DSAC checkpoint (heavy-tail live A/B arm switch, §4.4).
+
+    Loads the new checkpoint into a fresh holder FIRST; only on success and matching
+    obs/action dims is the global atomically swapped. Any failure keeps the current
+    model and returns 4xx — the service never goes un-served by a bad reload.
+    """
+    global _holder
+    ckpt = Path(req.checkpoint)
+    if not ckpt.exists():
+        raise HTTPException(status_code=404, detail=f"checkpoint not found: {ckpt}")
+    try:
+        new_holder = _AgentHolder.from_checkpoint(ckpt)
+    except Exception as exc:  # bad file / torch load error — keep current model
+        raise HTTPException(status_code=400, detail=f"failed to load checkpoint: {exc}")
+
+    if _holder is not None and (
+        new_holder.agent.obs_dim != _holder.agent.obs_dim
+        or new_holder.agent.n_actions != _holder.agent.n_actions
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"dim mismatch: new obs/actions "
+                    f"{new_holder.agent.obs_dim}/{new_holder.agent.n_actions} != current "
+                    f"{_holder.agent.obs_dim}/{_holder.agent.n_actions}; kept current model"),
+        )
+
+    _holder = new_holder  # atomic swap
+    agent = _holder.agent
+    RL_READY.set(1.0)
+    return {
+        "ok": True,
+        "variant": _variant_of(agent),
+        "obs_dim": agent.obs_dim,
+        "n_actions": agent.n_actions,
+        "use_iqn": bool(getattr(agent, "use_iqn", True)),
+        "risk_mode": getattr(agent, "risk_mode", None),
+        "checkpoint": str(ckpt),
     }
 
 

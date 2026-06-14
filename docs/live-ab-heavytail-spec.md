@@ -1,6 +1,6 @@
 # 規格：重尾 + 高競爭 Live A/B Workload 產生器 + 尾部量測
 
-**狀態**：設計中（未實作）。目標是在**現有 1×1 cluster**（單 RTX 4070、k3s + Slurm + MPS）上，用一條重尾、高競爭、估計不確定的 workload，評估 `score / SAC / RDSAC` 在 live 的真實差異。**不碰 sim、不等多節點硬體。**
+**狀態**：harness **已實作並通過單元測試**；**尚未在 cluster 上實跑**（需 GPU + 關遊戲）。三元件：產生器 `eval/scripts/live_ab_heavytail.py`、尾部量測 `eval/scripts/tail_metrics.py`、serve `/reload` 熱載（`services/rl_scheduler/serve.py`）。測試：`eval/tests/`、`services/rl_scheduler/tests/test_serve_reload.py`。目標是在**現有 1×1 cluster**（單 RTX 4070、k3s + Slurm + MPS）上，用一條重尾、高競爭、估計不確定的 workload，評估 `score / SAC / RDSAC` 在 live 的真實差異。**不碰 sim、不等多節點硬體。**
 
 設計理由與科學動機見 `docs/eval-writeup.md` §4.4；本文件只談**工程規格**。
 
@@ -156,4 +156,9 @@ POST /reload  {"checkpoint": "<path>", "variant": "RDSAC-cvar"}
 - **不動 production checkpoint**（`slurm-rl-scheduler:m11`）；arm 切換用 `/reload` 載指定檔。
 - **不字面重放**：trace 經 gpu≤1 過濾 + 時間壓縮（已聲明範圍，見 §4.4）。
 - **只用 philly / ali**；不含 burst。
-- 新增檔：`eval/scripts/live_ab_heavytail.py`（產生器 + 提交 + 收集）、`serve.py` 加 `/reload`、尾部量測可重用/擴充 `sim/metrics.py` 的 summary。
+- 新增檔（**已實作**）：`eval/scripts/live_ab_heavytail.py`（產生器 + dry-run 提交）、`eval/scripts/tail_metrics.py`（尾部量測 + 配對統計）、`serve.py` 加 `/reload`。
+- **仍待做（live-only，需 cluster）**：`submit_stream` 的真實提交（目前 dry-run 可印 plan）、`collect_sacct`（從 controller pod 收 `sacct`）、A/B runner 把「兩 σ × 四 arm × 多 round」串起來。
+
+## 7. 實作備註：時間壓縮錨點
+
+時間壓縮**以 p95 為錨**（非 max）：philly 的 runtime range ~2000×，若用 `target_max/max(runtime)` 線性壓縮，單一離群 max 會把 ~43% 的 job 壓到地板、毀掉重尾形狀。改錨 p95（`compress_pct=95`）後只 ~5% 在地板、~5% 在 cap，p99/p50 ≈ 8（尾部保留）。少數 > p95 的 job soft-cap 在 `target_max_s`，形成尾部叢集。見 `gen_workload` 與 `eval/tests/test_live_ab_heavytail.py::test_sigma_injects_variance_and_keeps_heavy_tail`。
