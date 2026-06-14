@@ -162,15 +162,93 @@ DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被
 
 Submit-time path 仍是低風險預設；hard placement controller 是正式可用的 Slurm-safe placement path，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗與受控上線。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
 
-#### 演算法：risk-sensitive distributional SAC（RDSAC）
+#### 演算法：SAC 與 RDSAC 的公式與運作
 
-底層 agent（`services/rl_scheduler/dsac.py`）是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning〉(arXiv:2004.14547) 的**離散動作忠實轉寫**。連續控制的 reparameterised Gaussian actor 因為 placement 是離散動作而換成**顯式 categorical actor** `π(a|s;φ)`；分布式 critic 與 risk 機制依論文 §4.1（RDSAC）：
+底層 agent（`services/rl_scheduler/dsac.py`）以一個 `use_iqn` flag 在 **vanilla 離散 SAC**（`use_iqn=False`）與 **risk-sensitive distributional SAC / RDSAC**（`use_iqn=True`，預設）之間切換。flag 存在 checkpoint 裡，train / eval / serve 自動偵測。兩者共用同一套**離散最大熵 RL** 設定，只差 critic 家族與有無 risk distortion。
 
-- **雙分布 critic**：把 soft return 拆成 reward 分布 `Z_R` 與 entropy 分布 `Z_H`，各以 IQN(Dabney et al. 2018)的 quantile 表示、共用 trunk 只差最後一層；quantile Huber 回歸 + twin critic double learning。慣例採 α-external：`Z_H` 回歸純 entropy return，組合值為 `Q = E[Z_R] + α·E[Z_H]`。
-- **Risk 進策略目標**：actor 目標 `J_π = Σ_a π(a|s)·[α·logπ(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)]]`，distortion `ρ` 只作用在 reward 分布 `Z_R`，entropy 保持期望。
-- **Risk 旋鈕** `risk_mode ∈ {mean, cvar, wang, cpw, msd}`（`risk_beta` 為風險參數，見 `services/rl_scheduler/distortion.py`）：`mean` 為 risk-neutral，退化成穩定性導向的 distributional SAC；`cvar` 偏好下尾較不嚴重的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。temperature α 依 SAC 自動調（離散 target entropy = `ratio·log(n_valid)`）。
+**共用設定（兩者相同）**
 
-`risk_mode=mean` 是預設;要尾部感知(p95/p99 JCT、tail slowdown,見 `sim/metrics.py`)時改用 `cvar`。
+placement 是離散動作，故 actor 是**顯式 masked categorical** `π(a|s;φ)`（非法動作 logits 設 −1e9）。狀態 `s` 為 192 維 obs，動作 `a` 從 `valid(s)` 中取。最大熵目標：最大化
+
+```
+J = Σ_t E[ r_t + α·H(π(·|s_t)) ]，  H = −Σ_a π(a|s)·log π(a|s)
+```
+
+temperature `α` 由 SAC 自動調（離散 target entropy `H̄ = ratio·log(n_valid)`）：
+
+```
+L_α = E_s Σ_a π(a|s)·[ −α·( log π(a|s) + H̄ ) ]
+```
+
+target network 用 soft update（τ=0.005）。差別從這裡開始：
+
+**(A) vanilla SAC（`use_iqn=False`）— scalar twin-Q**
+
+critic 是一對 scalar Q `Q_θ1, Q_θ2`（twin，取 min 抑制高估）。soft 狀態值與 MSE soft-Bellman target：
+
+```
+V(s') = Σ_a' π(a'|s')·[ min_i Q_θi(s',a') − α·log π(a'|s') ]
+y     = r + γ·(1−d)·V(s')                      # 用 target net
+L_Q   = Σ_i E[ ( Q_θi(s,a) − y )² ]            # MSE soft-Bellman
+```
+
+actor 目標（最小化）：
+
+```
+L_π = E_s Σ_a π(a|s)·[ α·log π(a|s) − min_i Q_θi(s,a) ]
+```
+
+回報只是**點估計**，沒有分布、沒有風險概念 — 對應 Christodoulou 2019 的離散 SAC。
+
+**(B) RDSAC（`use_iqn=True`，預設）— 雙分布 IQN critic + risk distortion**
+
+依 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-Sensitive RL〉(arXiv:2004.14547) §4.1 的離散動作轉寫。把 scalar Q 換成 **IQN**(Dabney et al. 2018) 的**分位數分布**，並把 soft return 拆成兩個 head：reward 回報分布 `Z_R` 與 entropy 回報分布 `Z_H`（共用 trunk、cosine 嵌入分位數 `τ~U(0,1)`）：
+
+```
+θ_τ(s,a) = critic(s, a, φ_cos(τ))             # 第 τ 分位數
+Q(s,a)   = E_τ[Z_R(s,a)] + α·E_τ[Z_H(s,a)]    # α-external 組合值
+```
+
+分布式 soft-Bellman target（`a' ~ π(·|s')`，twin 取 min）：
+
+```
+T Z_R(s,a) = r + γ·(1−d)·Z_R(s',a')                       # reward 回報
+T Z_H(s,a) = −log π(a'|s') + γ·(1−d)·Z_H(s',a')           # 純 entropy 回報
+```
+
+critic 用 **quantile Huber loss**（κ=1）回歸 `Tθ` 對 `θ`，對分位數對 `(τ_i, τ_j)` 做不對稱加權 `|τ_i − 1{δ<0}|`，`δ = Tθ_τj − θ_τi`。
+
+**risk distortion `ρ` 只作用在 reward 分布 `Z_R`**（entropy 保持期望），由 `risk_mode` 選：
+
+```
+mean    : ρ[Z_R] = E[Z_R]                                  # risk-neutral
+cvar_β  : ρ[Z_R] = (1/β)∫₀^β F⁻¹_{Z_R}(u) du               # 下尾 β 比例分位數平均
+          ≈ 取最低 β 比例的分位數取平均  （β = risk_beta，預設 0.25）
+```
+
+（`wang / cpw / msd` 為另三種 distortion，見 `services/rl_scheduler/distortion.py`。）distortion 同時進 **actor 目標**與 serve 回傳的 `value`：
+
+```
+L_π   = E_s Σ_a π(a|s)·[ α·log π(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)] ]   # actor loss
+value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       # /decide 回傳、餵 §8.3 guardrail
+```
+
+`mean` 退化成穩定性導向的 distributional SAC（有分布、不規避風險）；`cvar` 偏好**下尾較不嚴重**的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。
+
+**SAC vs RDSAC 一覽**
+
+| 面向 | vanilla SAC | RDSAC |
+|---|---|---|
+| critic 家族 | scalar twin-Q | 雙 head IQN（`Z_R` + `Z_H`）|
+| 回報表示 | 點估計 `Q(s,a)` | 分位數分布 |
+| Bellman loss | MSE soft-Bellman | quantile Huber（κ=1）|
+| risk 機制 | 無 | distortion `ρ[Z_R]`（cvar/wang/cpw/msd）|
+| actor 目標 | `α logπ − min_i Q_i` | `α logπ − ρ[Z_R] − α E[Z_H]` |
+| flag | `use_iqn=False` | `use_iqn=True`（預設）|
+
+兩條路徑都帶 twin-Q（取 min）與 soft target update。`risk_mode=mean` 是 RDSAC 預設；要尾部感知（p95/p99 JCT、tail slowdown，見 `sim/metrics.py`）時改 `cvar`。
+
+> **命名注意**：此處「DSAC」指**院內組裝的 distributional + 離散 SAC**（Christodoulou 離散 SAC + Dabney IQN critic + CVaR distortion 的組合），**不是** Duan et al. 2021 把回報建模成單一 Gaussian 的連續控制 DSAC，勿假設與該論文對等。`use_attention=True` 可把 MLP trunk 換成對 16 個 job token 的 TransformerEncoder（permutation-invariant），與兩種 critic 家族都相容。
 
 ### 3.3 Submit 到硬體分配的時序
 
@@ -224,6 +302,36 @@ scontrol release <job_id>
 Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131` 被更新為 `ReqNodeList=slurm-worker-gpu-rtx4070-1`，Slurm 隨後配置 `NodeList=slurm-worker-gpu-rtx4070-1`、`BatchHost=slurm-worker-gpu-rtx4070-1`、`TRES=gres/mps=10`。後續已修正 elastic operator worker lifecycle guard：只要 pool 內 `running_jobs > 0`，policy 會回 `running_jobs_block_scale_down`，scale action 層也會阻止 drain / replica patch，因此 hard placement job 不會再因 `pending_jobs=0` 被 operator scale-down eviction。
 
 `services/rl_scheduler/live_daemon.py` 保留為研究 / legacy 原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，適合離線比較與 RLPD transition 蒐集。正式 hard placement path 是 `services/rl_scheduler/placement_controller.py`，因為它使用 Slurm 原生 hold-release 與 `ReqNodeList`，可被 Slurm priority、backfill、GRES/MPS accounting 和 operator lifecycle guard 正常約束。
+
+### 3.5 訓練管線：sim 訓練 → RLPD 微調至真實環境
+
+上面的 SAC / RDSAC **不是、也無法直接在 live cluster 上從頭訓練**。RL 要數十萬～數百萬個 transition，而真實 cluster 一個 placement 決策對應一個跑數分鐘～小時的 job，湊滿樣本要等數月；且訓練初期的隨機策略會直接破壞系統，真實環境又無法 `reset()` 重放同一條 trace 做配對比較。因此採 **sim-to-real 兩段式**：
+
+```
+① sim 大量訓練（便宜 / 安全 / 可 reset / 可配對評估）  →  checkpoint（warm start）
+② live shadow-mode 部署，記錄真實 (obs, act, rew, …) 到 JSONL
+③ RLPD 用真實資料把 sim checkpoint 微調成真實環境策略
+```
+
+| 階段 | 環境 | 做什麼 | 為何不能在 live 直接做 | 產出 | 程式 |
+|---|---|---|---|---|---|
+| **① sim 訓練** | `KubefluxSchedEnv`（gym） | 從頭訓練 100k–150k 步，curriculum + PER + n-step + shaping | live 一個 step = 一個跑數分鐘～小時的 job，湊樣本要數月 | checkpoint | `services/rl_scheduler/sim_train.py` |
+| **② live 蒐集** | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，`/act` 記錄真實 `(obs, act, rew, next_obs)` | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 transition JSONL | `services/rl_scheduler/live_daemon.py` |
+| **③ RLPD 微調** | 用 ② 的真實 JSONL + sim transition | 以 sim checkpoint 為 prior，混真實資料 fine-tune | 從零 RLPD = 退回 ① 的 sample-complexity 與破壞性探索 | 真實環境策略 | `services/rl_scheduler/rlpd_finetune.py` |
+
+sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它的產出是**「機制性洞察 + 一個可用的 warm start」**。對應有**兩種可轉移性差很多的主張**：sim 的**絕對 JCT/勝幅不轉移**（live 1×1 三方打平已印證），只有**機制性結論轉移**（如「auto-α 是壓垮 SAC 的 artifact」「分布式 critic 才是主因、CVaR 是尾部加成」）。完整模擬與實機數據見 `docs/eval-writeup.md`。
+
+#### RLPD 是什麼、怎麼運作
+
+**RLPD = Reinforcement Learning with Prior Data**（Ball et al. 2023, arXiv:2302.02948）。它要解的問題：sim 訓練好的 checkpoint 是個 warm start，但 sim≠real（train-serve skew），需要用真實資料**適應**，同時避免兩個失敗模式——(a) 真實資料太少時災難性遺忘 sim prior、(b) 純離線（只靠舊資料）無法超越資料本身。RLPD 的核心機制：
+
+- **對稱取樣（symmetric sampling）**：維持兩個 buffer——**prior buffer**（sim transition）與 **online buffer**（live_daemon 收的真實 transition）。每個 gradient step **各取一半**組 batch。這讓 sim transition 留在**每個** batch 裡 → 防遺忘，又讓小量真實資料有槓桿。
+- **高 UTD（update-to-data ratio）**：每收一筆真實 transition 做多次更新，把稀少的真實資料榨乾，因為真實樣本昂貴。
+- **Critic LayerNorm**：論文最強調的一項——critic 加 LayerNorm 防止對 OOD 動作的值外推發散。本專案 critic 預設 `layer_norm=True`（`dsac.py`），符合論文。沿用 §3.2 的分布式 RDSAC critic（論文用 scalar SAC，此為專案擴充，與 RLPD 正交）。
+
+> 關鍵理解：RLPD **不是丟掉 sim、重練一個**——sim prior 是每個 batch 的一半（對稱取樣），讓小量真實資料有槓桿又不遺忘。live trace collector 管線（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒，等拓樸匹配的多節點 checkpoint 後啟動。
+
+**與原論文的符合度（已對程式碼核對）**：**每步更新的配方忠實照論文**——對稱取樣 50/50（`mixed_batch`，`online_ratio=0.5`）、critic LayerNorm（`layer_norm=True`）、高 UTD（預設 20）、**不加 CQL/顯式 pessimism**（論文明確主張不需要，程式也確實沒有）。但**訓練機制偏離**：論文 RLPD 是**真正線上**（更新迴圈持續用當前 policy 在真環境互動、新 transition 進 online buffer），本實作的 `rlpd_train` 迴圈**只有 `agent.update`、無 `env.step`**，兩個 buffer 在訓練前就凍結 → 實際上是「sim+real 混合 buffer 的**離線**微調」；且 online 資料目前是預收 shadow log 或用 score baseline 示範動作回放的 live trace（非學習 policy 自己跑的 on-policy 資料），critic 是 twin（2）而非論文的大 ensemble，並從 `dsac.pt` warm-start（論文從零訓練、prior 全靠 buffer）。會這樣是因為「真線上微調」需要多節點 live 部署讓 policy 實際互動，尚未上線。詳見 `services/rl_scheduler/rlpd_finetune.py`。
 
 ## 4. Slurm 基礎排程設定
 

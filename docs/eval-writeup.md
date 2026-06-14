@@ -2,7 +2,22 @@
 
 本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是在同一套 simulator 與 live Slurm/k3s/GPU 環境中，清楚比較三種排程方式的行為：**heuristic score**、**SAC**、**RDSAC**。
 
-文件結構：§0 摘要與結果總覽 → §1 評估對象 → §2 實驗與 benchmark 方法 → §3 模擬結果 → §4 實機執行結果 → §5 結論 → §6 重現指令 → §7 資料集來源。
+**訓練與評估管線（先讀這段）：** 本系統的策略**不是、也無法直接在 live cluster 上從頭訓練**——RL 要數十萬～數百萬個 transition，而真實 cluster 一個 placement 決策對應一個跑數分鐘～數小時的 job，湊滿樣本要等數月；且訓練初期的隨機策略會直接破壞系統，真實環境又無法 `reset()` 重放同一條 trace 做配對比較。因此採 **sim-to-real 兩段式**：
+
+```
+① sim 大量訓練（便宜 / 安全 / 可 reset / 可配對評估）  →  checkpoint
+② live shadow-mode 部署，記錄真實 (obs, act, rew) 到 JSONL
+③ RLPD 用真實資料把 sim checkpoint 微調成真實環境策略
+```
+
+sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它的產出是**「機制性洞察 + 一個可用的 warm start」**，RLPD 微調的對象正是這個 warm start。對應地，本文有**兩種可轉移性差很多的主張**要分清楚：
+
+- **絕對績效數字（sim → real 轉移差）**：sim 的 JCT/勝幅不會原樣搬到真實系統（§4 的 live 1×1 三方打平已當場印證），故只當定性/序數參考。
+- **機制性結論（sim → real 轉移好）**：「auto-α 是壓垮 SAC 的 artifact」「oracle runtime → CVaR≈mean → 風險機制空轉」「分布式 critic 才是主因、CVaR 是尾部加成」「共置要 ≥2 GPU 才有意義」——這些是**演算法本身**的性質，跟 sim 擬真度無關，會跟著 checkpoint 進真實系統，是 §3 真正值錢的產出。
+
+**閱讀順序對應管線：** §3（模擬結果）先講 **sim 訓練產出了哪些洞察**；§4（實機結果）再講 **這些洞察與真實環境的關聯/發現**；§5.1 列出 RLPD 微調與多節點驗證的 future work。
+
+文件結構：§0 摘要與結果總覽 → §1 評估對象 → §2 實驗與 benchmark 方法（含 §2.0 管線總覽）→ §3 模擬結果（sim 洞察）→ §4 實機執行結果（與真實環境的關聯）→ §5 結論 + future work → §6 重現指令 → §7 資料集來源。
 
 ---
 
@@ -65,6 +80,19 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 ## 2. 實驗與 Benchmark 方法
 
+### 2.0 訓練與評估管線（sim 訓練 → RLPD 微調至真實環境）
+
+整體方法是 **sim-to-real 兩段式**，原因與各段產出如下表。理解這條管線是讀懂後面所有實驗的前提：**§3 的所有數字都是「在 sim 裡訓練 + 在 sim 裡評估」，目的是篩架構與抽洞察，不是預測真實績效**；真實績效由 §4 的 live A/B 量，最終策略由 RLPD 微調產出。
+
+| 階段 | 環境 | 做什麼 | 為什麼不能在 live 直接做 | 產出 |
+|---|---|---|---|---|
+| **① sim 訓練** | `KubefluxSchedEnv`（gym） | 從頭訓練 100k–150k 步，curriculum，PER + shaping | live 一個 step = 一個跑數分鐘～小時的 job，湊滿樣本要數月 | checkpoint（warm start） |
+| **② sim 評估** | 同 sim，配對 + 受控消融 | paired t-test、SAC/RDSAC/cvar/fixed-α 消融 | live 無法 `reset()` 重放同一 trace → 拿不到 counterfactual | **機制性洞察**（§3） |
+| **③ live 部署** | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，記錄真實 (obs, act, rew) | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 A/B（§4）+ 微調語料 |
+| **④ RLPD 微調** | 用 ③ 的真實 JSONL | 以 sim checkpoint 為 prior，混真實資料 fine-tune | 從零 RLPD = 退回 ① 的 sample-complexity 與 ② 的破壞性探索 | 真實環境策略（future work，§5.1） |
+
+**兩段式的取捨**：sim 換來「可大量訓練 + 可配對消融」，代價是擬真度——所以 sim 的**絕對數字不轉移**（§4 live 1×1 三方打平已印證），只有**機制性結論轉移**。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；sim checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上——沒有它，連微調的起點都沒有。live trace collector（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒，等拓樸匹配的多節點 checkpoint 後啟動 ④。
+
 ### 2.1 Simulator paired benchmark
 
 相同 seed 對 learned model 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。`Δ = (score − model)/score`，**負值代表 model 的 JCT 較高、較差**。
@@ -108,6 +136,15 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 ---
 
 ## 3. 模擬結果（Simulator）
+
+本節是管線的**階段 ①②**：在 sim 裡訓練、在 sim 裡配對評估。**請把這裡的數字當定性/序數洞察，不是真實績效預測**（真實績效見 §4）。sim 訓練實際產出的、會跟著 checkpoint 進真實系統的**機制性洞察**有四條：
+
+1. **auto-α 是壓垮 SAC 的 artifact，不是 scalar critic 本身爛**（§3.3）——釘死 α 後 SAC 翻身。→ 真實部署要 pin α，不要照搬為 cvar 尺度調的 auto-α 控制器。
+2. **確定性 oracle runtime → 回報塌成點 → CVaR≈mean → 風險機制結構性閒置**（§3.1–3.3 與 live 打平互相印證）。→ RDSAC 只有在環境**有 runtime 不確定性**時才有意義。
+3. **補上校準過的真實不確定性後，贏的主因是「把回報建模成分布」（分布式 critic），CVaR 只是尾部專用加成**（§3.4–3.6）。→ 真實系統若要砍 straggler 尾部才需 cvar，一般情形 distributional critic 已吃下大部分增益。
+4. **共置動作在 1×1 反而拖累，價值需 ≥2 GPU**（§3.7）。→ 共置決策的真正檢驗要等多節點拓樸。
+
+以下 §3.1–3.7 是支撐這四條的受控實驗；§4 再看它們與真實環境的關聯。
 
 ### 3.1 確定性 sim：risk-neutral(mean) vs risk-sensitive(cvar)
 
@@ -222,6 +259,14 @@ fixed-α 下 RDSAC 仍贏 SAC（+90~143 pts，排除 α 假象），σ=1.0 時 R
 ---
 
 ## 4. 實機執行結果（Live cluster）
+
+本節是管線的**階段 ③**：把 §3 的 sim checkpoint 烘進真實 k3s + Slurm + GPU/MPS 跑 paired A/B。重點是檢驗 §3 機制性洞察與真實環境的**關聯**，而非期待 sim 勝幅重現。三條關聯/發現：
+
+- **「絕對數字不轉移」當場成立**：sim 表面排名 `score > RDSAC > SAC`，但 live 1×1 三方統計打平（Δ 全在 ±1% 雜訊內）、學習模型 abstain 88–100% fail-safe 回退 score。這**正面印證** §3 洞察 ②——1×1 是退化 placement，幾乎沒有決策空間，sim 的勝幅本就不該轉移到這裡。
+- **fail-safe 設計在真實環境驗證有效**：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋——這是讓階段 ③ 能安全 shadow 部署的前提，也是 §2.0 不敢在 live 直接訓練的另一面。
+- **真實微調語料已開始累積**：live A/B 期間 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 ④ RLPD 的輸入；live 環境本身已驗證可收 `sacct` 指標、可逐 (round, idx) 配對。
+
+換言之，§4 沒有「DRL 在 live 大勝」的故事——它的價值是**證明 sim 洞察的方向正確（1×1 該打平、就打平了）、且 sim-to-real 的工程管線（shadow + fail-safe + trace collector）真的能跑**，為多節點上線與 RLPD 微調鋪好路。
 
 ### 4.1 RDSAC live A/B（cvar-v2 checkpoint）
 
