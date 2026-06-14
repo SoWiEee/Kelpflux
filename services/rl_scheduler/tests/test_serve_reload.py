@@ -67,6 +67,14 @@ def test_reload_dim_mismatch_keeps_current(sac_ckpt, tmp_path):
     assert serve._holder is before                   # kept current model
 
 
+def test_shadow_toggle_sets_global():
+    serve.SHADOW_MODE = True
+    r1 = serve.set_shadow(serve.ShadowRequest(shadow=False))
+    assert r1["shadow_mode"] is False and serve.SHADOW_MODE is False
+    r2 = serve.set_shadow(serve.ShadowRequest(shadow=True))
+    assert r2["shadow_mode"] is True and serve.SHADOW_MODE is True
+
+
 def test_variant_helper():
     assert serve._variant_of(DSACAgent(obs_dim=8, n_actions=4, device="cpu",
                                        use_iqn=False)) == "SAC"

@@ -156,8 +156,23 @@ POST /reload  {"checkpoint": "<path>", "variant": "RDSAC-cvar"}
 - **不動 production checkpoint**（`slurm-rl-scheduler:m11`）；arm 切換用 `/reload` 載指定檔。
 - **不字面重放**：trace 經 gpu≤1 過濾 + 時間壓縮（已聲明範圍，見 §4.4）。
 - **只用 philly / ali**；不含 burst。
-- 新增檔（**已實作**）：`eval/scripts/live_ab_heavytail.py`（產生器 + dry-run 提交）、`eval/scripts/tail_metrics.py`（尾部量測 + 配對統計）、`serve.py` 加 `/reload`。
-- **仍待做（live-only，需 cluster）**：`submit_stream` 的真實提交（目前 dry-run 可印 plan）、`collect_sacct`（從 controller pod 收 `sacct`）、A/B runner 把「兩 σ × 四 arm × 多 round」串起來。
+- 新增檔（**已實作 + 單元測試**）：
+  - `eval/scripts/live_ab_heavytail.py` — 產生器、`sbatch_cmd`、`parse_sacct_jct`（純）、`join_records`（純）、`collect_sacct` / `submit_stream` / `wait_drain`（live wrapper）。
+  - `eval/scripts/tail_metrics.py` — CVaR / 尾部面板 / 配對統計。
+  - `eval/scripts/run_heavytail_ab.py` — A/B runner，串「σ × arm × round」：每 arm 用 `/reload`+`/shadow` 切換、submit→drain→`sacct`→`join_records`、丟 warmup、`build_report`（純）算配對 Δ、輸出 `SUMMARY.md`/`reports.json`/`records.json`。`--dry-run` 可無 cluster 印 plan。
+  - `serve.py` — `/reload`（熱載 checkpoint）+ `/shadow`（runtime 切 score 臂的 boost）。
+- **執行方式（需 cluster + GPU，關遊戲）**：
+  ```bash
+  # 1. serve 載一個 σ-trained checkpoint、port-forward 8002
+  # 2. 跑 runner（score 自動 shadow；學習臂用既有 σ=1.0 checkpoint）
+  PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
+    --serve-url http://localhost:8002 --family philly --n-jobs 300 \
+    --sigmas 0.0 1.0 --rounds 2 --warmup 1 \
+    --sac-ckpt runs/item1_calib_20260614-100525/ckpt_sac_sigma1.0.pt \
+    --rdsac-mean-ckpt runs/item1_calib_20260614-100525/ckpt_rdsac-mean_sigma1.0.pt \
+    --rdsac-cvar-ckpt runs/item1_calib_20260614-100525/ckpt_rdsac-cvar_sigma1.0.pt
+  ```
+- **仍待做**：實際在 cluster 上跑一輪、把結果填回 eval-writeup §4.4。
 
 ## 7. 實作備註：時間壓縮錨點
 

@@ -158,6 +158,15 @@ def gen_workload(
     ]
 
 
+JOB_NAME_PREFIX = "htab"
+HTAB_SACCT_FORMAT = "JobID,JobName%64,State,Submit,Start,End,ElapsedRaw"
+
+
+def job_name(arm: str, round_idx: int, job_id: str) -> str:
+    """Stable sacct join key shared by submission and collection."""
+    return f"{JOB_NAME_PREFIX}_{arm}_{round_idx}_{job_id}"
+
+
 def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *, partition: str = "gpu-rtx4070") -> list[str]:
     """Build the sbatch argv for one job. --time uses the (noisy) *reported*
     estimate the scheduler sees; the job actually sleeps the *true* runtime."""
@@ -169,13 +178,93 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *, partition: str = "gpu-
     time_min = max(1, int(np.ceil(job.reported_runtime_s / 60.0)))
     return [
         "sbatch",
-        f"--job-name=htab_{arm}_{round_idx}_{job.job_id}",
+        f"--job-name={job_name(arm, round_idx, job.job_id)}",
         f"--partition={partition}",
         f"--gres=mps:{job.mps_req}",
         f"--time={time_min}",
         f"--comment={comment}",
         f"--wrap=sleep {int(round(job.true_runtime_s))}",
     ]
+
+
+def parse_sacct_jct(raw_text: str) -> dict:
+    """Parse `sacct -P --format=HTAB_SACCT_FORMAT` output → {JobName: record}.
+
+    Pure (no cluster). record = {state, submit, start, end, jct, wait, elapsed}.
+    JCT = End − Submit, wait = Start − Submit (None if a timestamp is missing or
+    the job has not finished). Keyed by JobName so the runner joins back to its
+    in-memory LiveJob stream via job_name(arm, round, job_id).
+    """
+    import csv
+    from io import StringIO
+
+    from sim.live_trace import parse_elapsed_seconds, parse_slurm_time
+
+    clean = "\n".join(line for line in raw_text.splitlines() if line.strip())
+    if not clean:
+        return {}
+    out: dict = {}
+    for row in csv.DictReader(StringIO(clean), delimiter="|"):
+        name = (row.get("JobName") or "").strip()
+        if not name.startswith(JOB_NAME_PREFIX + "_"):
+            continue
+        submit = parse_slurm_time(row.get("Submit", ""))
+        start = parse_slurm_time(row.get("Start", ""))
+        end = parse_slurm_time(row.get("End", ""))
+        jct = (end - submit) if (submit is not None and end is not None) else None
+        wait = (start - submit) if (submit is not None and start is not None) else None
+        out[name] = {
+            "state": (row.get("State") or "").strip(),
+            "submit": submit, "start": start, "end": end,
+            "jct": jct, "wait": wait,
+            "elapsed": parse_elapsed_seconds(row.get("ElapsedRaw", "")),
+        }
+    return out
+
+
+def join_records(jobs: List[LiveJob], parsed: dict, arm: str, round_idx: int) -> list[dict]:
+    """Join parsed sacct rows back to the workload stream for one (arm, round).
+
+    Returns one record per job that COMPLETED with a usable JCT, carrying the
+    ground-truth (true/reported/mps) plus measured jct/wait. Pure & testable.
+    """
+    records: list[dict] = []
+    for j in jobs:
+        row = parsed.get(job_name(arm, round_idx, j.job_id))
+        if row is None or row["jct"] is None:
+            continue
+        if not row["state"].upper().startswith("COMPLETED"):
+            continue
+        records.append({
+            "job_id": j.job_id, "arm": arm, "round": round_idx,
+            "true_runtime_s": j.true_runtime_s,
+            "reported_runtime_s": j.reported_runtime_s,
+            "mps_req": j.mps_req,
+            "jct": float(row["jct"]), "wait": float(row["wait"]) if row["wait"] is not None else None,
+            "state": row["state"],
+        })
+    return records
+
+
+def build_sacct_cmd(since: str, *, kubectl: str = "kubectl", namespace: str = "slurm",
+                    controller_pod: str = "slurm-controller-0", until: Optional[str] = None) -> list[str]:
+    import shlex
+    inner = ["sacct", "-X", "-P", "-S", since, "--format", HTAB_SACCT_FORMAT]
+    if until:
+        inner.extend(["-E", until])
+    return [*shlex.split(kubectl), "exec", "-n", namespace, controller_pod, "--", *inner]
+
+
+def collect_sacct(since: str, *, kubectl: str = "kubectl", namespace: str = "slurm",
+                  controller_pod: str = "slurm-controller-0", until: Optional[str] = None) -> dict:
+    """Live wrapper: run sacct on the controller pod and parse. Cluster-only."""
+    cmd = build_sacct_cmd(since, kubectl=kubectl, namespace=namespace,
+                          controller_pod=controller_pod, until=until)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise RuntimeError(f"sacct failed ({proc.returncode})")
+    return parse_sacct_jct(proc.stdout)
 
 
 # ── live-only shell wrappers (not unit-tested against a cluster) ───────────────
@@ -194,6 +283,24 @@ def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
             print(" ".join(cmd))
         else:
             subprocess.run(cmd, check=False)
+
+
+def wait_drain(*, kubectl: str = "kubectl", namespace: str = "slurm",
+               controller_pod: str = "slurm-controller-0", poll_s: float = 10.0,
+               timeout_s: float = 3600.0) -> bool:
+    """Block until no htab_* jobs remain in squeue (cluster-only). Returns False on timeout."""
+    import shlex
+    cmd = [*shlex.split(kubectl), "exec", "-n", namespace, controller_pod, "--",
+           "squeue", "-h", "-o", "%j"]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        remaining = [ln for ln in proc.stdout.splitlines()
+                     if ln.strip().startswith(JOB_NAME_PREFIX + "_")]
+        if not remaining:
+            return True
+        time.sleep(poll_s)
+    return False
 
 
 def main(argv=None) -> int:

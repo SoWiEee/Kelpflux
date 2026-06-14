@@ -490,6 +490,21 @@ def reload_checkpoint(req: ReloadRequest):
     }
 
 
+class ShadowRequest(BaseModel):
+    shadow: bool
+
+
+@app.post("/shadow")
+def set_shadow(req: ShadowRequest):
+    """Toggle shadow mode at runtime — the heavy-tail A/B score arm (§4.4) needs
+    boost OFF (shadow=true) while learned arms run boost ON (shadow=false), without
+    restarting the pod. Mirrors /reload so an A/B runner can switch all four arms live."""
+    global SHADOW_MODE
+    SHADOW_MODE = bool(req.shadow)
+    RL_SHADOW_MODE.set(1.0 if SHADOW_MODE else 0.0)
+    return {"ok": True, "shadow_mode": SHADOW_MODE}
+
+
 @app.get("/metrics")
 def metrics():
     snap_age = (time.time() - _snapshot.ts) if _snapshot else None
