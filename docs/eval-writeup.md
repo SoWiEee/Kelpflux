@@ -2,6 +2,31 @@
 
 本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是清楚比較三種做法在同一套 simulator 與 live Slurm/k3s/GPU 環境中的行為：heuristic score、SAC、RDSAC。
 
+## 0. 結果總覽（三方對照）
+
+三種排程方式：**score**（MPS-aware 啟發式優先序，baseline=0%）、**SAC**（vanilla 離散 SAC，scalar twin-Q critic，無分布式/風險）、**RDSAC**（分布式 IQN critic + 風險扭曲，mean/cvar 變體）。
+
+**核心發現：三方排名隨「環境有沒有 runtime 不確定性」整個翻轉。**
+
+| 實驗條件 | score | SAC | RDSAC-cvar | 判定 |
+|---|---|---|---|---|
+| 確定性 1×1 sim, auto-α（§4.3, 30-seed）| 0% | −106/−158/−312% | −25/−31/−121% | 表面 score > cvar > mean ≳ SAC，**但誤導** |
+| 確定性 1×1 sim, fixed-α（§4.3.1）| 0% | −17/+2/−24% | −25/−31/−121% | **SAC 翻身 ≈/贏 cvar**；淨增益 ≈0 |
+| Live 1×1（§4.1–4.2）| 0% | ≈0% | ≈0%（−0.2~−0.7%）| **三方統計打平**；模型 abstain 88–100% 回退 score |
+| 隨機 sim σ=1.0, fixed-α（§4.4.2 三臂）| 0% | −107/−135/−155% | −4.7/+9.2/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 |
+
+（三個數字 = philly / burst / ali；ΔJCT% vs score，負值=較慢）
+
+**兩個時期、兩個故事：**
+
+1. **沒有不確定性時（確定性 sim + live）→ 三方分不出高下。** 確定性 sim 表面上 SAC 墊底，但 fixed-α 對照（§4.3.1）證明那幾乎全是共用 auto-α 控制器 railing 的**假象**；釘死 α 後 SAC 追平甚至贏過 RDSAC-cvar。Live 1×1 三方都在 ±1% 雜訊內、模型幾乎全 abstain 回退 score。根因：oracle runtime 讓回報塌成點 → CVaR≈mean → 風險機制結構性閒置。
+
+2. **加入真實 runtime 不確定性 → 清楚排名浮現。** 注入的 σ 已**校準到生產預測器的真實 log-殘差**（§4.4.1：σ≈1.2–1.45，故 §4.4 的 σ=1.0 偏保守）。RDSAC−SAC 差距**隨 σ 單調拉開**（−73→+47→+196 pts，§4.4），σ=1.0 下 RDSAC 甚至贏過 score、p99 尾部低 5–9×。三臂拆解（§4.4.2）指出**贏的主因是「把回報建模成分布」（分布式 critic，SAC→mean +108~125 pts），CVaR 風險扭曲只是尾部專用小加成**（burst p99 46→20h）。RDSAC 內部則 cvar > mean（§3.3）。
+
+**一句話：** 在 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式；補上真實不確定性後 RDSAC > SAC，且贏在分布式 critic 本身、CVaR 為尾部加成。
+
+**最重要的 caveats：**(1) **單訓練 seed**——同 cvar config 兩跑擺盪 50–90 pts，故 SAC→mean 大效應穩健、mean-vs-cvar 細排名需 multi-seed；(2) σ 是合成 trace 的最難預測上界（特徵與 runtime 無關），真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]；(3) **全部 1×1**，placement 是退化決策，真正檢驗要等拓樸匹配的多節點 checkpoint。
+
 ## 1. 評估對象
 
 ### 1.1 Heuristic score scheduler
