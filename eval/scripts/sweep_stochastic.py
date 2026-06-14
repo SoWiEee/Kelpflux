@@ -138,6 +138,9 @@ def main(argv=None) -> int:
     p.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46])
     p.add_argument("--trace-families", nargs="+", default=["philly", "burst", "ali"])
     p.add_argument("--risk-mode", default="cvar")
+    p.add_argument("--risk-modes", nargs="+", default=None,
+                   help="train one RDSAC per mode (e.g. mean cvar) for the "
+                        "3-way distributional-vs-risk split; overrides --risk-mode")
     p.add_argument("--risk-beta", type=float, default=0.25)
     p.add_argument("--no-attention", action="store_true")
     p.add_argument("--curriculum", action="store_true")
@@ -164,24 +167,37 @@ def main(argv=None) -> int:
     for sigma in args.sigmas:
         print(f"\n=== σ={sigma}  interference={args.interference} ===", flush=True)
         t0 = time.time()
-        sac = None
+        # Arms: SAC (scalar) + one RDSAC per risk mode. risk-modes=[mean,cvar]
+        # gives the 3-way split that separates "distributional critic" (mean)
+        # from "+ risk distortion" (cvar) — eval R1/M1.
+        risk_modes = args.risk_modes if args.risk_modes else [args.risk_mode]
+        agents: dict = {}
         if not args.no_sac:
             print("[train] SAC ...", flush=True)
-            sac = _train(use_iqn=False, risk_mode="mean", risk_beta=args.risk_beta,
-                         sigma=sigma, interference=args.interference, args=args)
-        print(f"[train] RDSAC-{args.risk_mode} ...", flush=True)
-        rdsac = _train(use_iqn=True, risk_mode=args.risk_mode, risk_beta=args.risk_beta,
-                       sigma=sigma, interference=args.interference, args=args)
+            agents["sac"] = _train(use_iqn=False, risk_mode="mean",
+                                   risk_beta=args.risk_beta, sigma=sigma,
+                                   interference=args.interference, args=args)
+        for m in risk_modes:
+            print(f"[train] RDSAC-{m} ...", flush=True)
+            agents[f"rdsac-{m}"] = _train(use_iqn=True, risk_mode=m,
+                                          risk_beta=args.risk_beta, sigma=sigma,
+                                          interference=args.interference, args=args)
         print(f"[train] done in {time.time()-t0:.0f}s; evaluating ...", flush=True)
 
-        policies = {
-            "score": lambda env: (lambda: _score_action(env, score_sched)),
-            "rdsac": lambda env: (lambda: rdsac.select_action(
-                                    env._build_obs(), env.action_mask(), greedy=True)),
-        }
-        if sac is not None:
-            policies["sac"] = lambda env: (lambda: sac.select_action(
-                                    env._build_obs(), env.action_mask(), greedy=True))
+        # Persist every arm immediately — a degenerate arm or a crash in the
+        # eval/metric stage must not throw away hours of training.
+        for name, ag in agents.items():
+            try:
+                ag.save(out_dir / f"ckpt_{name}_sigma{sigma}.pt")
+            except Exception as e:  # noqa: BLE001
+                print(f"[warn] could not save {name}: {e}", flush=True)
+
+        def _mk(agent):  # bind agent so the closure doesn't capture the loop var
+            return lambda env: (lambda: agent.select_action(
+                env._build_obs(), env.action_mask(), greedy=True))
+        policies = {"score": lambda env: (lambda: _score_action(env, score_sched))}
+        for name, ag in agents.items():
+            policies[name] = _mk(ag)
 
         for family in args.trace_families:
             ev = {}
@@ -196,23 +212,32 @@ def main(argv=None) -> int:
                 ev[name] = {"avg": np.array(avg), "per_job": np.array(per_job)}
 
             score_avg = ev["score"]["avg"]
-            model_names = ["rdsac"] + (["sac"] if sac is not None else [])
-            for name in model_names:
+            for name in agents:
                 m = ev[name]
-                # paired ΔJCT% vs score (negative = worse/slower)
-                delta = (score_avg - m["avg"]) / score_avg * 100.0
+                pj = m["per_job"]
+                # An arm that collapses to no-op completes 0 jobs → nan avg_jct
+                # and empty per_job. Record it (completed_frac, nan metrics)
+                # instead of crashing the whole sweep.
+                both = np.isfinite(score_avg) & np.isfinite(m["avg"])
+                delta = (float(((score_avg[both] - m["avg"][both]) / score_avg[both]).mean() * 100.0)
+                         if both.any() else float("nan"))
                 row = {
                     "sigma": sigma, "family": family, "model": name,
-                    "mean_jct_h": float(m["avg"].mean()) / 3600,
-                    "score_jct_h": float(score_avg.mean()) / 3600,
-                    "delta_pct": float(delta.mean()),
-                    "p95_h": float(np.percentile(m["per_job"], 95)) / 3600,
-                    "p99_h": float(np.percentile(m["per_job"], 99)) / 3600,
+                    "mean_jct_h": (float(np.nanmean(m["avg"])) / 3600
+                                   if np.isfinite(m["avg"]).any() else float("nan")),
+                    "score_jct_h": float(np.nanmean(score_avg)) / 3600,
+                    "delta_pct": delta,
+                    "p95_h": float(np.percentile(pj, 95)) / 3600 if pj.size else float("nan"),
+                    "p99_h": float(np.percentile(pj, 99)) / 3600 if pj.size else float("nan"),
+                    "completed_frac": float(np.isfinite(m["avg"]).mean()),
                 }
                 results.append(row)
-                print(f"  σ={sigma} {family:6s} {name:5s}  "
-                      f"Δ={row['delta_pct']:+6.1f}%  "
-                      f"p95={row['p95_h']:.2f}h p99={row['p99_h']:.2f}h", flush=True)
+                print(f"  σ={sigma} {family:6s} {name:10s}  "
+                      f"Δ={row['delta_pct']:+7.1f}%  "
+                      f"p95={row['p95_h']:.2f}h p99={row['p99_h']:.2f}h "
+                      f"done={row['completed_frac']:.0%}", flush=True)
+            # Incremental save: a late crash keeps everything computed so far.
+            (out_dir / "sweep.json").write_text(json.dumps(results, indent=2))
 
     (out_dir / "sweep.json").write_text(json.dumps(results, indent=2))
     _write_summary(out_dir / "SUMMARY.md", results, args)
@@ -229,13 +254,14 @@ def _write_summary(path: Path, results: list[dict], args) -> None:
         f"α: {'fixed=' + str(args.init_alpha) if args.fixed_alpha else 'auto'}\n",
         "\nΔJCT% vs score (paired, negative = slower than score); "
         "p95/p99 = per-job tail JCT (hours).\n",
-        "\n| σ | family | model | ΔJCT% | p95 (h) | p99 (h) |",
-        "|---|--------|-------|------:|--------:|--------:|",
+        "\n| σ | family | model | ΔJCT% | p95 (h) | p99 (h) | done% |",
+        "|---|--------|-------|------:|--------:|--------:|------:|",
     ]
     for r in results:
         lines.append(
             f"| {r['sigma']} | {r['family']} | {r['model']} | "
-            f"{r['delta_pct']:+.1f} | {r['p95_h']:.2f} | {r['p99_h']:.2f} |"
+            f"{r['delta_pct']:+.1f} | {r['p95_h']:.2f} | {r['p99_h']:.2f} | "
+            f"{r.get('completed_frac', 1.0):.0%} |"
         )
     lines.append(
         "\n**Read:** if the hypothesis holds, RDSAC's p95/p99 advantage over SAC "

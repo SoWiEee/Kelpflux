@@ -242,6 +242,34 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 
 **消融結論**：§4.3 / §4.3.1「1×1 風險機制淨增益≈0」的根因是**兩個一起**——(a) oracle runtime 讓環境零不確定性，(b) auto-α 壓垮策略。把這兩個都修正後，分布式 IQN critic + CVaR distortion 不只贏 SAC（隨 σ 單調拉開、fixed-α 下仍成立），還能贏強啟發式 score 並把尾部風險壓低 5–9×。**風險機制在「有尾部風險可管理」時確實有價值；先前的 1×1 確定性 sim 只是沒有尾部**。仍待補：拓樸匹配的多節點驗證、per-model 各自調好的溫度（本輪只釘單一 α=0.05）、以及共置動作（PACK/ISOLATE）讓 placement 在單卡下也成為真實決策（程式已就緒，實驗待跑）。原始檔 `runs/stoch_sweep_*/SUMMARY.md`、`runs/stoch_fixedA_*/SUMMARY.md`。
 
+### 4.4.1 σ 校準到真實預測誤差：σ=1.0 其實偏保守（2026-06-14）
+
+§4.4 的弱點（審稿視角的第一刀）：σ=0.5/1.0 若是憑空挑的，「注入噪音 → 抗噪法贏」就近乎套套邏輯。注入的 σ 必須來自**真實的 runtime 預測誤差**。sim 的噪音是 `actual = predicted·exp(σZ−σ²/2)`，所以 `σ = std(log(actual/predicted))` —— 正是預測器的 log-runtime 殘差標準差。
+
+**方法**：`eval/scripts/measure_predictor_sigma.py` 用**生產級 LightGBM 預測器**（同 `services/runtime_predictor` 的 features、time-honest 80/20 split、超參）在真實 trace 上量 held-out log-殘差 std。
+
+| workload | σ（殘差 std）| 95% CI | 形狀 |
+|---|---:|---|---|
+| philly | **1.45** | [1.31, 1.58] | near-Gaussian |
+| burst | **1.42** | [1.27, 1.56] | near-Gaussian |
+| ali | **1.24** | [1.11, 1.38] | near-Gaussian |
+
+兩個結論：(1) 真實 σ ≈ **1.2–1.45**，所以 §4.4 用的 **σ=1.0 落在真實下限以下、是保守值**——RDSAC 在 σ=1.0 就大勝，在更真實的噪音下只會更強。(2) 殘差**近高斯**（excess kurtosis −0.1～+0.4），lognormal 噪音模型沒有低估尾部。**誠實 caveat**：這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2–1.45 是「最難預測」的上界；真實結構化資料上好的 predictor 會更低 → 合理 σ 區間 ≈ **[0.5, 1.45]**，而 §4.4 測的 {0.5, 1.0} 都落在其中。
+
+### 4.4.2 拆解：贏的是「分布式 critic」還是「風險扭曲」？（2026-06-14）
+
+§4.4 比的是 SAC（scalar）vs RDSAC-**cvar**（分布式 + 風險扭曲），把兩個貢獻綁死了。加入第三臂 **RDSAC-mean**（分布式但**風險中立**）即可拆開（σ=1.0、fixed-α=0.05、5 seed、3 family；`--risk-modes mean cvar`）。
+
+| family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（**分布式**）| mean→cvar（**風險**）|
+|---|---:|---:|---:|---:|---:|
+| philly | −107.4 | +0.7 | −4.7 | **+108.1** | −5.4 |
+| burst  | −135.2 | −20.0 | +9.2 | **+115.2** | +29.2 |
+| ali    | −154.7 | −29.4 | −14.2 | **+125.2** | +15.2 |
+
+**核心發現：絕大部分增益來自分布式 critic，不是風險扭曲。** SAC→RDSAC-mean（風險中立）就吃掉 **+108～+125 個百分點**，幾乎是整個 SAC↔RDSAC 差距。意義是：**在有噪音時，把回報「建模成分布」本身才是關鍵**——scalar critic 的單點 Q 在高回報變異下是較差的學習目標，quantile critic 穩健得多。CVaR（mean→cvar 僅 −5/+29/+15 pts）是**較小、看 workload 的尾部專用加成**：burst 上 p99 從 46.3h→**20.3h**（砍一半多）、mean +29 pts；ali 小幅正向；philly 反而略負。**CVaR 在「有重尾可砍」處才賺得到，符合其設計**。
+
+**強 caveat（單訓練 seed，有鐵證）**：同一組 config（σ=1.0、fixed-α=0.05、cvar）在 §4.4 fixed-α 對照給 philly **+53.5**/burst −13.4/ali **+73.8**，本輪卻是 −4.7/+9.2/−14.2 —— **同設定兩跑，cvar 擺盪 ~50–90 pts**。因此：SAC→mean 的 +110~125 pts 太大、seed 雜訊吃不掉，「**分布式 critic 是主因**」穩健；但 mean→cvar 這段落在單 seed 雜訊內，**CVaR 的淨增益需 multi-seed（R2）才能定論**（唯一例外是 burst 的 p99 尾部改善夠大夠一致）。原始檔 `runs/item1_calib_*/SUMMARY.md`。
+
 ### 4.5 共置動作消融：PACK/ISOLATE 在 1×1 反而拖累（負結果，2026-06-13）
 
 §4.4 把不確定性補回環境後，下一個問題是：**讓模型自己決定共置策略**能不能在單卡下進一步幫到 RDSAC？做法是給每個放置動作加一個 mode（`gym_env` 的 `colocation_actions`，opt-in，預設關 → 動作空間與舊版逐位元相同）：
@@ -273,7 +301,7 @@ reward_scale 修復後重跑，150k 步、5 seeds，`mean` 與 `cvar` 兩變體�
 | DRL path 是否能在 live 上跑？ | 可以。舊 checkpoint job `136-141` 全部完成；**RDSAC cvar-v2 live A/B 已重跑**（§4.4），warm-pool 穩定化後 84 個 job 全乾淨完成、RL boost 確實生效。 |
 | 先前 `alpha` 觸頂是真 bug 嗎？已修好？ | 是真 bug（return 尺度壓過 entropy 項 ~300×，policy 塌縮、探索停擺）。已用 reward_scale 1000→20000 + 放寬 clamp 修好：alpha 不再釘頂、entropy 由 0.002 恢復到 ≈0.13。 |
 | RDSAC 是否在標準 simulator benchmark 打贏 score？ | 還沒有。**30-seed 重評**（§4.5b，取代舊 5-seed 雜訊）下 cvar 三個 family 都不優於 score（philly −24.6% 不顯著、burst/ali 顯著較差），mean 更全面顯著較差。1×1 sim 全 rollout 下沒有任何 learned model 贏過 score。 |
-| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC 三方) | **看環境有沒有不確定性**。在**確定性** 1×1 sim（oracle runtime）下淨增益確實≈0：fixed-α 對照（§4.3.1）顯示 SAC 的墊底主要是 auto-α 假象，α 釘死後 vanilla SAC ≈ RDSAC-cvar。**但這是因為確定性轉移讓 CVaR≈mean、風險機制結構性閒置**。一旦注入真實 runtime 不確定性（§4.4 隨機性消融），RDSAC−SAC 的差距隨 σ **單調拉開**（σ=0 −73 → σ=1.0 +196 個百分點），且在 **fixed-α 下仍成立**（+90～+143 pts，排除 α 假象），σ=1.0 時 RDSAC 甚至**贏過 score**（philly +54%、ali +74%）並把 **p99 尾部壓低 5–9×**。結論修正：**風險機制在「有尾部風險可管理」時明確有用**；先前「淨增益≈0」是 1×1 確定性 sim 沒有尾部所致，不是演算法的性質。仍待補拓樸匹配多節點 + per-model 溫度 + 共置動作實驗。 |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC 三方) | **看環境有沒有不確定性**。在**確定性** 1×1 sim（oracle runtime）下淨增益確實≈0：fixed-α 對照（§4.3.1）顯示 SAC 的墊底主要是 auto-α 假象，α 釘死後 vanilla SAC ≈ RDSAC-cvar。**但這是因為確定性轉移讓 CVaR≈mean、風險機制結構性閒置**。一旦注入真實 runtime 不確定性（§4.4），RDSAC−SAC 的差距隨 σ **單調拉開**（σ=0 −73 → σ=1.0 +196 pts），fixed-α 下仍成立（排除 α 假象）。注入的 σ 已**校準到真實預測誤差**（§4.4.1：σ≈1.2–1.45，§4.4 的 σ=1.0 偏保守）。三臂拆解（§4.4.2）進一步指出：**增益主要來自「分布式 critic」而非風險扭曲**——SAC→RDSAC-mean（風險中立）就吃掉 +108~125 pts，CVaR 只是較小、看 workload 的尾部專用加成（burst p99 46→20h）。結論修正：**「把回報建模成分布」在有不確定性時明確有用**；CVaR 加成需 multi-seed 才能定論（單訓練 seed 擺盪大）。先前「淨增益≈0」是 1×1 確定性 sim 沒有尾部所致，非演算法性質。仍待補多 seed + 拓樸匹配多節點 + per-model 溫度。 |
 | risk-sensitive(cvar) 是否優於 risk-neutral(mean)？ | **是，明確優於**。30-seed 下 cvar 的泛化遠勝 mean（philly −24.6% vs −117%，約 5×），支持把 cvar 而非 mean 烘進 live image 的設計選擇；唯絕對值仍未過 score baseline。 |
 | live A/B 是否已能公平比較 DRL vs score？ | **可以了，且已用更多資料 + 三方驗證**。warm-pool（`min_replicas=1`）消除冷啟動 race 並讓 1×1 checkpoint 拓樸匹配。§4.5a 擴大到 128 job/arm 並**交換 arm 順序**：aggregate 隨順序翻號（−27% ↔ +8.6%）證明為暖機假象，warm Δ≈−0.7%。§4.6b 把 vanilla SAC 也部署上 live（`variant:"SAC"`）：同樣**打平**。但 1×1 live 其實**分不出模型**——每個 learned model 都 abstain ~90–100% 而 fail-safe 回 score，所以 score ≈ RDSAC ≈ SAC。 |
 | 目前最穩定的上線策略 | DRL live scheduler 保持 enabled + GPU warm pool（`min_replicas=1`），並保留 stale snapshot、low confidence、service down 時的 heuristic/Slurm fallback。 |
