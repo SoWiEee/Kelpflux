@@ -299,6 +299,28 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 > §4 一致的故事：1×1 太小，placement 端到端無法表現出優勢、也無法表現出明顯劣勢。sim 全 rollout 會放大 checkpoint 不足（略輸 score，§3.2）；live 因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。
 
+### 4.4 設計中（未執行）：重尾 + 高競爭 live A/B —— 在 1×1 上拆開三方的條件
+
+§4.1–4.3 在 1×1 全部打平，但**打平的原因不只是「1×1 太小」，也是 workload 本身沒有給出可測的決策**。先前 A/B 用 14 個 `sleep N` job、`runtime∈{8,16,26,40}s`、範圍窄又**確定**——有 slack、沒有尾部風險。在這種 workload 下三方**結構上必然打平**，跟模型好壞無關。
+
+要在**現有 1×1 硬體**上（不碰 sim、不等多節點）評估 score/SAC/RDSAC 的差異，正確的施力點是**改 live A/B 的 workload 與量測，而非改模型或拓樸**。1×1 上 live 只剩兩個真實槓桿：**job 排序**（priority boost）與**單 GPU 的 MPS 打包程度**。設計三根支柱讓這兩個決策產生可測的 JCT 差異：
+
+| 支柱 | 做法 | 拆開誰 | 理由 |
+|---|---|---|---|
+| **(A) 高競爭 / 深佇列 + MPS 超賣** | 一次注入遠多於單 GPU 能舒服容納的 job（peak MPS 需求 ≫ 100），佇列真的堆積 | **score vs SAC/RDSAC** | 沒競爭就沒排序問題，SJF 立刻解完 → 必然打平 |
+| **(B) 重尾 runtime + σ-noisy 估計** | 真實 sleep 時間抽自重尾分布；餵給 `/decide` 與排序的是**加噪的估計**（`reported = true·exp(σZ−σ²/2)`），σ 校準到 §3.5 量到的預測器 log-殘差（≈1.2–1.45）| **SAC vs RDSAC** | RDSAC 的優勢全在「不確定下的尾部風險」。若 runtime 確定（`sleep N` 已知）→ CVaR≈mean → RDSAC 與 SAC **結構上必然打平**，改什麼都沒用。這是 §3.4–3.6「σ 越大 RDSAC 越贏」的 **live 對應物** |
+| **(E) 尾部量測** | 除 mean JCT，加 p95/p99 JCT、tail slowdown、JCT 的 CVaR、最差 straggler、完成率 | 看得見 RDSAC 的尾部優勢 | RDSAC-cvar 直接優化尾部；只看 mean 會把差異洗掉 |
+
+**配對協定**：同一條 job stream（per-job common-random：相同 arrival / true-runtime / reported-runtime / mps）在 score / SAC / RDSAC 各重放一次；沿用 §2.5/§4.2 的方法學教訓——每臂丟棄 ≥1 warmup round 並交換 arm 順序，避免共用單 GPU 的一次性暖機懲罰帶風向。並記錄每臂的 `/decide` abstain 率：若高競爭下模型仍大量 abstain，那本身是發現，後續才考慮放寬 §8.3 的 `valueAbstain`/`entropyAbstain`。
+
+**為什麼只用 philly 和 ali**：兩者都是**由真實叢集 trace 衍生**、runtime **天生重尾**，正好是支柱 (B) 需要的形狀；burst 是合成尖峰壓力 pattern、非 trace 衍生，對「差異是否會轉移到真實 workload」的論證較弱，故略去。
+
+**資料集適用性（誠實說明）**：philly/ali 的**強項**正是重尾 runtime（符合 (B) 的需求）；**落差**在規模——原 trace 是大叢集、job 跑數小時～數天，且含多 GPU job。我們**不做字面重放**，而是 (1) `gpu_count ≤ 1` 過濾（單 GPU 跑不了多卡 job）、(2) **時間壓縮**把 runtime 映到可測的 live 尺度（目標最長 job ~數分鐘）但**保留尾部形狀與相對次序**。因此這個 live A/B 檢驗的是「**philly/ali 形狀的競爭 + 尾部**下三方是否分得開」，**不是**生產級字面重放——這是有界、已聲明的範圍，不是隱藏假設。
+
+**預期與價值**：(a) 高競爭下 score vs DRL 若仍打平 → 證實 1×1 即使加載也觸頂；(b) σ-noisy + 尾部量測下 RDSAC-cvar 若砍低 p99/CVaR → **sim 的 σ-發現轉移到 live**（本論文 thesis 第一次在真環境兌現）；(c) 若加噪加載後 RDSAC 仍 = SAC → **sim σ-結果不轉移 live**，這是同等有價值的負結果。無論結果如何，這比再跑一輪打平的 A/B 有資訊量。
+
+> **天花板 caveat**：即使如此，1×1 上限仍低（單 GPU 上 score 的 SJF-ish 排序已接近最佳，DRL 上行有限），效果量可能小；決定性檢驗仍是 2-node 異質拓樸。但這是 1×1 能做的最佳、最便宜評估。工程規格見 `docs/live-ab-heavytail-spec.md`。
+
 ---
 
 ## 5. 結論
@@ -328,6 +350,8 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 3. **向量化 / 加速 sim。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h），是上面兩項可行的前置工程。
 
 **讓 sim 結論能轉移到 live**
+
+★ **（現有 1×1 即可做、最近期）重尾 + 高競爭 live A/B。** 改 live A/B 的 workload（深佇列 + MPS 超賣 + 重尾 runtime + σ-noisy 估計）與量測（p95/p99/CVaR 尾部），檢驗 §3.4–3.6 的「σ 越大 RDSAC 越贏」是否轉移到 live。不碰 sim、不等硬體。設計理由見 §4.4，工程規格見 `docs/live-ab-heavytail-spec.md`。
 
 4. **修 train/serve 動作落差。** sim 訓練 placement policy（job, node, gpu），live 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation；兩者對齊（live 真接 explicit placement，或 sim 改學 priority/selection）後 sim 結論才能宣稱轉移到 live。
 5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。需先補 `rtx3080` 進 `GPU_TYPES` / `_gpu_type_to_vram`。
