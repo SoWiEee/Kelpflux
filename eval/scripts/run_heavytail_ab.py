@@ -145,10 +145,17 @@ def run(args) -> int:
             for rnd in range(args.warmup + args.rounds):
                 is_warm = rnd < args.warmup
                 tag = "warmup" if is_warm else f"r{rnd - args.warmup + 1}"
-                since = time.strftime("%Y-%m-%dT%H:%M:%S")
+                # sacct -S is read in the cluster's timezone (UTC); use UTC with a
+                # back-margin so host/cluster clock skew can't push it into the future.
+                # round is in the job_name, so an over-wide window is harmless (join
+                # filters by exact name).
+                since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 300))
                 print(f"[ab] σ={sigma} arm={arm} {tag}: submit {len(jobs)} jobs")
+                import shlex as _shlex
+                exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
+                                args.login_pod, "--"] if args.login_pod else None)
                 submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
-                              partition=args.partition)
+                              partition=args.partition, exec_prefix=exec_prefix)
                 if not args.dry_run:
                     wait_drain(kubectl=args.kubectl, namespace=args.namespace,
                                controller_pod=args.controller_pod, timeout_s=args.drain_timeout_s)
@@ -193,6 +200,9 @@ def main(argv=None) -> int:
     p.add_argument("--kubectl", default="kubectl")
     p.add_argument("--namespace", default="slurm")
     p.add_argument("--controller-pod", default="slurm-controller-0")
+    p.add_argument("--login-pod", default=None,
+                   help="pod to run sbatch in via kubectl exec (e.g. pod/slurm-login-xxx); "
+                        "omit to run sbatch locally")
     p.add_argument("--drain-timeout-s", type=float, default=3600.0)
     p.add_argument("--out-dir", default=f"runs/htab_{time.strftime('%Y%m%d-%H%M%S')}")
     p.add_argument("--dry-run", action="store_true", help="print plan, no cluster calls")

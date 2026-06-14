@@ -271,33 +271,58 @@ def collect_sacct(since: str, *, kubectl: str = "kubectl", namespace: str = "slu
 
 def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
                   dry_run: bool = True, partition: str = "gpu-rtx4070",
-                  t0: Optional[float] = None) -> None:
-    """Submit the stream honouring each job's arrival_offset. dry_run prints."""
+                  t0: Optional[float] = None,
+                  exec_prefix: Optional[list[str]] = None) -> None:
+    """Submit the stream honouring each job's arrival_offset. dry_run prints.
+
+    `exec_prefix` (e.g. ["kubectl","exec","-n","slurm","pod/slurm-login-x","--"])
+    is prepended so sbatch runs inside the cluster; each sbatch arg stays a single
+    argv element (no shell), so `--wrap=sleep N` survives unquoted.
+    """
     t0 = t0 if t0 is not None else time.time()
     for job in jobs:
         wait = job.arrival_offset_s - (time.time() - t0)
         if wait > 0 and not dry_run:
             time.sleep(wait)
-        cmd = sbatch_cmd(job, arm, round_idx, partition=partition)
+        cmd = (exec_prefix or []) + sbatch_cmd(job, arm, round_idx, partition=partition)
         if dry_run:
             print(" ".join(cmd))
-        else:
-            subprocess.run(cmd, check=False)
+            continue
+        for attempt in range(3):  # slurmctld can socket-timeout under burst load
+            proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+            if proc.returncode == 0:
+                break
+            if attempt < 2:
+                time.sleep(1.0 + attempt)
+            else:
+                sys.stderr.write(f"[htab] submit failed for {job.job_id}: {proc.stderr.strip()}\n")
 
 
 def wait_drain(*, kubectl: str = "kubectl", namespace: str = "slurm",
                controller_pod: str = "slurm-controller-0", poll_s: float = 10.0,
-               timeout_s: float = 3600.0) -> bool:
-    """Block until no htab_* jobs remain in squeue (cluster-only). Returns False on timeout."""
+               timeout_s: float = 3600.0, confirm: int = 2) -> bool:
+    """Block until no htab_* jobs remain in squeue (cluster-only). Returns False on timeout.
+
+    Hardened against a busy slurmctld: a FAILED squeue (non-zero rc, e.g. socket
+    timeout) returns empty stdout — that must NOT be read as "drained". We only count
+    an empty result when the command SUCCEEDED, and require `confirm` consecutive
+    successful-empty polls before declaring drain.
+    """
     import shlex
     cmd = [*shlex.split(kubectl), "exec", "-n", namespace, controller_pod, "--",
            "squeue", "-h", "-o", "%j"]
     deadline = time.time() + timeout_s
+    empties = 0
     while time.time() < deadline:
         proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        if proc.returncode != 0:
+            empties = 0  # query failed → unknown, do not trust as drained
+            time.sleep(poll_s)
+            continue
         remaining = [ln for ln in proc.stdout.splitlines()
                      if ln.strip().startswith(JOB_NAME_PREFIX + "_")]
-        if not remaining:
+        empties = empties + 1 if not remaining else 0
+        if empties >= confirm:
             return True
         time.sleep(poll_s)
     return False
