@@ -130,42 +130,55 @@ def run(args) -> int:
     all_records: list[dict] = []
     reports: list[dict] = []
 
+    import shlex as _shlex
+    exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
+                    args.login_pod, "--"] if args.login_pod else None)
+
     for si, sigma in enumerate(sigmas):
-        # Same stream for every arm at this σ (CRN: identical generator inputs).
+        # Same stream for every method at this σ (CRN: identical generator inputs).
         jobs = gen_workload(args.family, args.n_jobs, seed=args.seed, sigma=sigma,
                             target_max_s=args.target_max_s, mps_oversub=args.mps_oversub,
                             arrival_mode=args.arrival_mode)
-        records_by_arm: dict = {}
-        # Alternate arm order each σ block to cancel shared-GPU warmup bias (§2.5/§4.2).
-        arm_order = arms if si % 2 == 0 else list(reversed(arms))
-        for arm in arm_order:
-            print(f"[ab] σ={sigma} arm={arm}: configure")
+        records_by_arm: dict = {a: [] for a in arms}
+
+        def _do(arm: str, rnd: int, is_warm: bool) -> None:
+            tag = "warmup" if is_warm else f"r{rnd - args.warmup + 1}"
+            print(f"[ab] σ={sigma} {arm} {tag}: configure + submit {len(jobs)} jobs", flush=True)
             _configure_arm(args.serve_url, arm, ckpts, dry_run=args.dry_run)
-            recs: list[dict] = []
-            for rnd in range(args.warmup + args.rounds):
+            # sacct -S is read in the cluster timezone (UTC); use UTC with a back-margin
+            # so host/cluster clock skew can't push it into the future. round is in the
+            # job_name, so an over-wide window is harmless (join filters by exact name).
+            since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 300))
+            submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
+                          partition=args.partition, exec_prefix=exec_prefix)
+            if args.dry_run:
+                return
+            wait_drain(kubectl=args.kubectl, namespace=args.namespace,
+                       controller_pod=args.controller_pod, timeout_s=args.drain_timeout_s)
+            parsed = collect_sacct(since, kubectl=args.kubectl, namespace=args.namespace,
+                                   controller_pod=args.controller_pod)
+            rr = join_records(jobs, parsed, arm, rnd)
+            if not is_warm:               # discard warmup round(s)
+                records_by_arm[arm].extend(rr)
+                all_records.extend(rr)
+
+        total = args.warmup + args.rounds
+        if args.interleave:
+            # round-robin: each round runs every method once, rotating who goes first
+            # so drift over the run averages out equally across methods (§4.4.1).
+            for rnd in range(total):
                 is_warm = rnd < args.warmup
-                tag = "warmup" if is_warm else f"r{rnd - args.warmup + 1}"
-                # sacct -S is read in the cluster's timezone (UTC); use UTC with a
-                # back-margin so host/cluster clock skew can't push it into the future.
-                # round is in the job_name, so an over-wide window is harmless (join
-                # filters by exact name).
-                since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 300))
-                print(f"[ab] σ={sigma} arm={arm} {tag}: submit {len(jobs)} jobs")
-                import shlex as _shlex
-                exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
-                                args.login_pod, "--"] if args.login_pod else None)
-                submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
-                              partition=args.partition, exec_prefix=exec_prefix)
-                if not args.dry_run:
-                    wait_drain(kubectl=args.kubectl, namespace=args.namespace,
-                               controller_pod=args.controller_pod, timeout_s=args.drain_timeout_s)
-                    parsed = collect_sacct(since, kubectl=args.kubectl, namespace=args.namespace,
-                                           controller_pod=args.controller_pod)
-                    rr = join_records(jobs, parsed, arm, rnd)
-                    if not is_warm:           # discard warmup round
-                        recs.extend(rr)
-                        all_records.extend(rr)
-            records_by_arm[arm] = recs
+                k = rnd % len(arms)
+                order = arms[k:] + arms[:k]
+                for arm in order:
+                    _do(arm, rnd, is_warm)
+        else:
+            # block design: all rounds of one method, then the next (drift-prone).
+            arm_order = arms if si % 2 == 0 else list(reversed(arms))
+            for arm in arm_order:
+                for rnd in range(total):
+                    _do(arm, rnd, rnd < args.warmup)
+
         if not args.dry_run:
             reports.append(build_report(records_by_arm, sigma=sigma, family=args.family,
                                         beta=args.beta))
@@ -205,6 +218,9 @@ def main(argv=None) -> int:
                         "omit to run sbatch locally")
     p.add_argument("--drain-timeout-s", type=float, default=3600.0)
     p.add_argument("--out-dir", default=f"runs/htab_{time.strftime('%Y%m%d-%H%M%S')}")
+    p.add_argument("--interleave", action="store_true",
+                   help="round-robin method order each round (averages out cluster drift, §4.4.1); "
+                        "default is block design")
     p.add_argument("--dry-run", action="store_true", help="print plan, no cluster calls")
     args = p.parse_args(argv)
     return run(args)

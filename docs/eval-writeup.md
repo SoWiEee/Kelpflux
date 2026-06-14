@@ -321,11 +321,11 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 > **天花板 caveat**：即使如此，1×1 上限仍低（單 GPU 上 score 的 SJF-ish 排序已接近最佳，DRL 上行有限），效果量可能小；決定性檢驗仍是 2-node 異質拓樸。但這是 1×1 能做的最佳、最便宜評估。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
-#### 4.4.1 首輪結果（philly, n=30, σ∈{0,1}, 4 臂, warmup+1 round）
+#### 4.4.1 首輪結果（philly, n=30, σ∈{0,1}, 4 種排程方法, block 設計）
 
 2026-06-15 在實機 1×1（k3s + Slurm + RTX 4070）跑完一輪。harness 端到端可用（過程中修掉 4 個只在實機現形的 bug：sacct 時區、`wait_drain` 把 slurmctld socket-timeout 的空查詢誤判為排空、sbatch 偶發 timeout 掉 job、serve 映像的 `dsac.py` 載不了 scalar-critic 的 SAC checkpoint）。原始檔 `runs/htab_live_20260615-003638/`。
 
-| σ | arm | mean | p99 | CVaR(0.25) | ΔJCT% vs score | Δp99% | t-test p |
+| σ | 排程方法 | mean | p99 | CVaR(0.25) | ΔJCT% vs score | Δp99% | t-test p |
 |---|---|--:|--:|--:|--:|--:|--:|
 | 0 | score | 49.2 | 153.5 | 91.0 | — | — | — |
 | 0 | SAC | 49.2 | 153.5 | 91.1 | −0.2 | +0.0 | 0.60 |
@@ -338,15 +338,34 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 **判定：null 結果，且被 cluster drift 汙染——不可解讀為「RDSAC 贏」。** 三條鐵證：
 
-1. **同一個 score policy、同一條 true workload，跨 σ 區塊漂移 ~5%。** σ 只擾動「估計」不改 job 實際 sleep → score 在 σ=0 與 σ=1 跑的是**完全相同的真實工作**，但 mean JCT 49.2（σ=0 區塊，先跑）→ 46.8（σ=1 區塊，後跑）、**p99 153.5 → 124.5**。這個漂移**和所謂「RDSAC 優勢」一樣大**。
-2. **σ=0 區塊的 RDSAC「+18.9% p99」其實是跑序位置效應。** 該區塊 forward 順序 score→SAC→RDSAC-mean→RDSAC-cvar，後跑的 RDSAC 落在較快的時段，拿到的 p99=124.5 **正好等於 score 自己後跑（σ=1）時的 p99**。σ=1 區塊（reversed 順序）四臂全部收斂到 ~46.7 / p99 124.5。
-3. **SAC ≡ score 到小數點**（48.0 / 153.0 pooled）→ SAC 全程 abstain、fail-safe 回退 score，scheduling 決策對 JCT **零影響**。
+1. **同一個 score 方法、同一條真實工作，只因執行時段不同就漂移 ~5%。** σ 只擾動餵給排程器的「估計值」、不改 job 實際 sleep 的時間 → score 在 σ=0 與 σ=1 排的是**完全相同的真實工作**，但 mean JCT 49.2（σ=0 區塊，先跑）→ 46.8（σ=1 區塊，後跑）、**p99 153.5 → 124.5**。這個漂移**和所謂「RDSAC 優勢」一樣大**。
+2. **σ=0 區塊 RDSAC 的「+18.9% p99」其實是執行順序的位置效應。** 該區塊順序為 score→SAC→RDSAC-mean→RDSAC-cvar，後跑的 RDSAC 落在較快的時段，拿到的 p99=124.5 **正好等於 score 自己後跑（σ=1）時的 p99**。σ=1 區塊（反序）四種方法全部收斂到 ~46.7 / p99 124.5。
+3. **SAC ≡ score 到小數點**（48.0 / 153.0 pooled）→ SAC 全程 abstain、fail-safe 回退 score，排程決策對 JCT **零影響**。
 
-**所以對應 §4.4 預期的 (c)**：加噪加載後仍分不出——但**主因不是「σ 不轉移」，而是 1×1 的 JCT 被 makespan/排隊綁死**（單 GPU 下整批 job 的尾部 JCT≈makespan，與排序幾乎無關），而 ~50 分鐘跑程的 cluster drift（mean ~5%、p99 ~19%）就**蓋過任何 policy 效果**。
+**所以對應 §4.4 預期的 (c)**：加噪加載後仍分不出——但**主因不是「σ 不轉移」，而是 1×1 的 JCT 被 makespan/排隊綁死**（單 GPU 下整批 job 的尾部 JCT≈makespan，與排序幾乎無關），而 ~50 分鐘跑程的 cluster drift（mean ~5%、p99 ~19%）就**蓋過任何排程方法的效果**。
 
-**方法學教訓**：單一 warmup-round 丟棄**不足以**消除這種**緩慢跨臂漂移**（它消的是一次性冷啟動，不是整個跑程的趨勢）。要在 1×1 得到可解讀的 policy 差異，需要 **per-round 交錯臂序（round-robin arms）或大量重複 + 隨機臂序**把漂移平均掉——但即便如此，1×1 makespan-bound 的天花板仍在。**決定性檢驗仍是 2-node 異質拓樸**（§5.1），那裡 placement 才有真實決策面。
+##### 為什麼會這樣：drift × 執行順序的混淆（confounding）
 
-> 一句話：harness 在實機跑通了，但首輪是**被 drift 汙染的 null**——SAC 全程退回 score、RDSAC 的表面尾部優勢無法與 ~19% 的 p99 漂移分離。這如實支持 §4 的結論（1×1 排序動不了 JCT），而非 σ-發現的 live 兌現。
+- **drift（漂移）**：GPU/叢集的速度不是整段時間都固定的；跑了 ~50 分鐘，同樣的工作後來會變快（MPS 狀態穩定、快取暖、背景負載變動）。我們**直接量到**這件事——同一個 score、排同一批工作，早跑 p99=153.5、晚跑 p99=124.5。
+- **執行順序的問題**：1×1 只有一張 GPU，四種排程方法**不能同時跑、只能一個接一個**。本輪用的是 **block 設計**——把一種方法的所有輪次跑完才換下一種。於是某個方法被綁在「慢時段」、另一個被綁在「快時段」。
+- **混淆**：晚跑的方法看起來比較好，但**分不清是它真的比較好、還是只是跑在比較快的時段**——drift 和方法**糾纏在一起**。本輪 RDSAC 剛好排在較後（較快）位置，就揹上了那 ~19% 的假優勢。單一 warmup-round 丟棄消的是**一次性冷啟動**，**消不掉整個跑程的緩慢趨勢**。
+
+##### 解法：round-robin 交錯排程方法的執行順序（接下來要做）
+
+不要「一種方法跑到底再換下一種」，改成**每一輪讓四種方法各跑一次，而且每輪輪換誰先跑**：
+
+```
+第1輪: score  SAC    mean   cvar
+第2輪: SAC    mean   cvar   score
+第3輪: mean   cvar   score  SAC
+第4輪: cvar   score  SAC    mean
+```
+
+這樣**每種方法都會分到一些早期（慢）輪次和一些晚期（快）輪次**，drift 對四者的影響被**平均掉、互相抵消**。跑夠多輪後若仍有差異，才是**真實**差異而非位置造成。實作為 runner 的 `--interleave` 模式（每輪 `/reload` 切方法 + 每輪輪轉順序）。
+
+> **誠實前提**：即使 round-robin 把 drift 修掉，1×1 的 **makespan 天花板**仍在（單 GPU 上排序動不了整批的完成時間），所以很可能得到一個**乾淨的三方打平**而非「RDSAC 贏」。但**乾淨的 null 勝過被 drift 汙染的假象**——決定性檢驗仍需 2-node（§5.1）。
+
+> 一句話：harness 在實機跑通了，但首輪（block 設計）是**被 drift 汙染的 null**——SAC 全程退回 score、RDSAC 的表面尾部優勢無法與 ~19% 的 p99 漂移分離。下一步用 round-robin 交錯順序把 drift 平均掉，取得乾淨可解讀的三方比較。
 
 ---
 
