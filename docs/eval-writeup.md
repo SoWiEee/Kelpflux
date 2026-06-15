@@ -350,7 +350,7 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 - **執行順序的問題**：1×1 只有一張 GPU，四種排程方法**不能同時跑、只能一個接一個**。本輪用的是 **block 設計**——把一種方法的所有輪次跑完才換下一種。於是某個方法被綁在「慢時段」、另一個被綁在「快時段」。
 - **混淆**：晚跑的方法看起來比較好，但**分不清是它真的比較好、還是只是跑在比較快的時段**——drift 和方法**糾纏在一起**。本輪 RDSAC 剛好排在較後（較快）位置，就揹上了那 ~19% 的假優勢。單一 warmup-round 丟棄消的是**一次性冷啟動**，**消不掉整個跑程的緩慢趨勢**。
 
-##### 解法：round-robin 交錯排程方法的執行順序（接下來要做）
+##### 解法：round-robin 交錯排程方法的執行順序（已執行，結果見 §4.4.2）
 
 不要「一種方法跑到底再換下一種」，改成**每一輪讓四種方法各跑一次，而且每輪輪換誰先跑**：
 
@@ -363,9 +363,33 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 這樣**每種方法都會分到一些早期（慢）輪次和一些晚期（快）輪次**，drift 對四者的影響被**平均掉、互相抵消**。跑夠多輪後若仍有差異，才是**真實**差異而非位置造成。實作為 runner 的 `--interleave` 模式（每輪 `/reload` 切方法 + 每輪輪轉順序）。
 
-> **誠實前提**：即使 round-robin 把 drift 修掉，1×1 的 **makespan 天花板**仍在（單 GPU 上排序動不了整批的完成時間），所以很可能得到一個**乾淨的三方打平**而非「RDSAC 贏」。但**乾淨的 null 勝過被 drift 汙染的假象**——決定性檢驗仍需 2-node（§5.1）。
+#### 4.4.2 drift-robust 結果（round-robin, philly, n=30, σ∈{0,1}, 每方法 4 輪×4 位置）
 
-> 一句話：harness 在實機跑通了，但首輪（block 設計）是**被 drift 汙染的 null**——SAC 全程退回 score、RDSAC 的表面尾部優勢無法與 ~19% 的 p99 漂移分離。下一步用 round-robin 交錯順序把 drift 平均掉，取得乾淨可解讀的三方比較。
+2026-06-15 用 `--interleave` 重跑（每方法跨 4 輪各輪過一次先後位置），原始檔 `runs/htab_live_rr_20260615-024419/`。**drift 確實被消掉**——關鍵驗證：同一個 score 方法跨 σ 區塊現在**穩定**了：
+
+| | block 設計（首輪）| round-robin（本輪）|
+|---|---|---|
+| score mean JCT 跨 σ | 49.2 → 46.8（漂移 5%）| 43.5 → 43.7（**穩 0.5%**）|
+| score p99 跨 σ | 153.5 → 124.5（漂移 19%）| 125.0 → 127.0（**穩 1.6%**）|
+
+drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
+
+| 排程方法 | mean | p95 | p99 | CVaR(0.25) |
+|---|--:|--:|--:|--:|
+| **score** | 43.6 | 124.0 | 126.0 | **79.0** |
+| SAC | 44.0 | 124.0 | 152.0 | 81.2 |
+| RDSAC-mean | 43.9 | 125.0 | 132.9 | 80.7 |
+| RDSAC-cvar | 44.0 | 124.0 | 151.0 | 81.1 |
+
+**判定：乾淨的 null——四種方法在 1×1 上打平，沒有任何學習方法贏過 score。**
+
+1. **mean、p95 全部打平**（mean 43.6–44.0，差 <1%；p95 124–125）。
+2. **在穩定的尾部指標 CVaR 上，score 反而（微幅）最好**（79.0 vs 學習方法 80.7–81.2，學習方法差 ~2–3%，但都 **non-significant**，paired p 0.34–0.91）。
+3. **首輪那個「RDSAC −19% p99」確實是 drift 假象**——drift 消掉後方向甚至反轉（RDSAC 尾部若有差異是**略差**）。p99 本身在 n=208 下只是最差 1–2 個 job，噪音主導（同方法跨 σ 在 126–153 間跳），不可細讀。
+
+**意涵（誠實）**：這**不是**「sim 的 σ-發現被推翻」，而是**1×1 makespan-bound 讓排序根本動不了 JCT**——score 與 RDSAC 的決策都無從表現（不論好壞）。sim §3.4–3.6 的機制要在 live 兌現，需要**有真實決策面的拓樸**（2-node，§5.1）。本輪的價值是：**用正確的實驗設計（round-robin 去 drift）拿到一個站得住腳的 1×1 三方打平**，而不是被位置效應誤導成「RDSAC 贏」。
+
+> 一句話：drift-robust 重跑後，**1×1 三方乾淨打平、score 甚至在 CVaR 微幅最好**；首輪的 RDSAC 尾部優勢證實是 drift 假象。1×1 排序動不了 makespan-bound 的 JCT——決定性檢驗仍需 2-node。
 
 ---
 
@@ -378,7 +402,7 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 | RDSAC 在標準 sim benchmark 打贏 score？ | **確定性 1×1 下還沒有**（§3.2，30-seed 三族都不優於 score）。但加入真實不確定性後 σ=1.0 fixed-α 可贏過 score（§3.4）。 |
 | 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **看環境有沒有不確定性**。確定性 1×1（含 live）淨增益≈0，且「SAC 最差」是 auto-α 假象（§3.3）。一旦注入**校準過的**真實不確定性（§3.5 σ≈1.2–1.45），RDSAC−SAC 差距隨 σ **單調拉開**（−73→+196 pts，§3.4），fixed-α 下仍成立。三臂拆解（§3.6）指出**增益主要來自「分布式 critic」**（SAC→mean +108~125 pts），CVaR 是尾部專用小加成。CVaR 淨增益需 multi-seed 才能定論（單 seed 擺盪大）。 |
 | risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **是**。30-seed 下 cvar 泛化遠勝 mean（−24.6% vs −117%，約 5×，§3.2），支持把 cvar 烘進 live image。 |
-| live A/B 已能公平比較 DRL vs score？ | 可以（warm-pool + 三方驗證 + 受控 arm 順序）。但 **1×1 live 分不出模型**——learned model 都 abstain ~90–100% fail-safe 回 score（§4）。重尾 + 高競爭加載版（§4.4.1）也一樣：null 結果，且被 ~50 分鐘跑程的 cluster drift 汙染（score 自身 p99 漂移 153→125），SAC 全程 abstain ≡ score；1×1 JCT 被 makespan 綁死，排序動不了它。 |
+| live A/B 已能公平比較 DRL vs score？ | 可以。重尾 + 高競爭 + **round-robin 去 drift** 後（§4.4.2）拿到**乾淨的 1×1 三方打平**：mean/p95 全平，CVaR 上 score 甚至微幅最好，沒有學習方法贏過 score（全 non-significant）。首輪 block 設計的「RDSAC −19% p99」證實是執行順序 × cluster drift 的假象（score 自身 p99 漂移 153→125）。根因：1×1 JCT 被 makespan 綁死、排序動不了它——非 σ-發現被推翻，而是缺真實決策面。 |
 | 最穩定上線策略 | DRL live scheduler 保持 enabled + GPU warm pool，並保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。 |
 
 **工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的三方受控對照（score/SAC/RDSAC，一個 flag 切換）+ 隨機性消融把「分布式/風險機制何時有用」的條件講清楚。
@@ -397,7 +421,7 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 **讓 sim 結論能轉移到 live**
 
-★ **重尾 + 高競爭 live A/B 的 drift-robust 重跑。** 首輪已執行（§4.4.1），但被 ~50 分鐘跑程的 cluster drift 汙染（同一 score policy 自身 p99 漂移 153→125，蓋過 policy 效果）；單一 warmup-round 丟棄消不掉緩慢漂移。下一步：**per-round 交錯臂序（round-robin arms）或大量重複 + 隨機臂序**把漂移平均掉，並記錄 abstain 率（首輪 SAC 全程 abstain 回退 score）。但 1×1 makespan-bound 的天花板仍在 → 決定性檢驗仍需第 5 項的 2-node。工程規格見 `docs/live-ab-heavytail-spec.md`。
+✓ **重尾 + 高競爭 live A/B（已完成，§4.4.1–4.4.2）。** 首輪 block 設計被 cluster drift 汙染（score 自身 p99 漂移 153→125）；改用 `--interleave`（round-robin 交錯排程方法順序、每方法跨 4 輪輪過 4 位置）後 drift 消掉（score 跨 σ 穩定到 0.5%），得到**乾淨的 1×1 三方打平**——沒有學習方法贏過 score。**剩下的不是再跑一次 1×1**（makespan-bound 天花板已確認），而是第 5 項的 **2-node** 才有真實 placement 決策面。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
 4. **修 train/serve 動作落差。** sim 訓練 placement policy（job, node, gpu），live 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation；兩者對齊（live 真接 explicit placement，或 sim 改學 priority/selection）後 sim 結論才能宣稱轉移到 live。
 5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。需先補 `rtx3080` 進 `GPU_TYPES` / `_gpu_type_to_vram`。
