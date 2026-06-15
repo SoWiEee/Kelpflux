@@ -31,7 +31,7 @@ sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它
 |---|---|---|---|---|
 | 確定性 1×1 sim, auto-α（§3.2, 30-seed）| 0% | −106/−158/−312% | −25/−31/−121% | 表面 score > cvar > mean ≳ SAC，**但誤導** |
 | 確定性 1×1 sim, fixed-α（§3.3）| 0% | −17/+2/−24% | −25/−31/−121% | **SAC 翻身 ≈/贏 cvar**；淨增益 ≈0 |
-| Live 1×1（§4）| 0% | ≈0% | ≈0%（−0.2~−0.7%）| **三方統計打平**；模型 abstain 88–100% 回退 score |
+| Live 1×1（§4）| 0% | ≈0% | ≈0% | **三方統計打平**；drift-robust 重跑（§4.4.2）確認、score 在 CVaR 甚至微幅最好 |
 | 隨機 sim σ=1.0, fixed-α（§3.6 三臂）| 0% | −107/−135/−155% | −4.7/+9.2/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 |
 
 （三個數字 = philly / burst / ali；ΔJCT% vs score，負值=較慢）
@@ -270,19 +270,9 @@ fixed-α 下 RDSAC 仍贏 SAC（+90~143 pts，排除 α 假象），σ=1.0 時 R
 
 ### 4.1 RDSAC live A/B（cvar-v2 checkpoint）
 
-把 §3 的 cvar-v2 RDSAC checkpoint 烘進 `slurm-rl-scheduler:m11` 部署 live，與 score-only 做配對 A/B。設定：兩臂各 3 輪 × 14 個 MPS sleep job（`mps∈{20,34,50}`、runtime∈{8,16,26,40}s），逐 (round, idx) 工作負載完全相同。
+把 §3 的 cvar-v2 RDSAC checkpoint 烘進 `slurm-rl-scheduler:m11` 部署 live，與 score-only 做配對 A/B（14 個 MPS sleep job × 3 輪）。結果：**RDSAC 能在 production 正確上線並與 score 持平**（ΔJCT −0.2%，遠小於逐對雜訊）。原因與 §3.3 一致——1×1 強 baseline 下 RDSAC 對每個到達 job 幾乎均勻 boost（`selected=14/14`），佇列排序等同 score。（細表已併入下方擴大版 §4.2。）
 
-| 指標 | RDSAC (priority-boost) | score-only | Δ |
-|---|---:|---:|---:|
-| JCT mean | 86.1s | 86.2s | **−0.1s (−0.2%)** |
-| JCT median | 90.5s | 90.0s | +0.5s |
-| JCT p95 | 153.0s | 153.6s | −0.6s |
-| WAIT mean | 64.1s | 64.2s | −0.1s |
-| 配對 ΔJCT (n=42) | **−0.1s**（sd 27.2） | better 20 / tie 11 / worse 11 | — |
-
-**解讀**：1×1 live 下 RDSAC 與 score **統計上無法區分**（−0.2%，遠小於 ±27s 逐對雜訊）。原因與 §3.3 一致——1×1 強 baseline 下 RDSAC 幾乎對每個到達 job 都均勻 boost（每輪 `selected=14/14`），佇列排序等同 score。這證明 **RDSAC 能在 production 正確上線並與啟發式持平**。
-
-### 4.2 擴大評估：128 job/arm + 受控 arm 順序
+### 4.2 擴大評估：128 job/arm + 受控 arm 順序（暖機假象的源頭）
 
 §4.1 的 42-job 單 block 太少。擴大到 128 job/arm、6×6 參數網格（`mps∈{20,25,34,50,67,75}`、runtime∈{8,14,20,28,36,45}s），operator 全程暫停把拓樸釘在 1 個 GPU node，並**交換 arm 順序**：
 
@@ -299,7 +289,7 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 
 > §4 一致的故事：1×1 太小，placement 端到端無法表現出優勢、也無法表現出明顯劣勢。sim 全 rollout 會放大 checkpoint 不足（略輸 score，§3.2）；live 因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。
 
-### 4.4 重尾 + 高競爭 live A/B —— 在 1×1 上拆開三方的條件（首輪已執行）
+### 4.4 重尾 + 高競爭 live A/B —— 在 1×1 上拆開三方的條件（已執行）
 
 §4.1–4.3 在 1×1 全部打平，但**打平的原因不只是「1×1 太小」，也是 workload 本身沒有給出可測的決策**。先前 A/B 用 14 個 `sleep N` job、`runtime∈{8,16,26,40}s`、範圍窄又**確定**——有 slack、沒有尾部風險。在這種 workload 下三方**結構上必然打平**，跟模型好壞無關。
 
@@ -311,38 +301,11 @@ aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 
 | **(B) 重尾 runtime + σ-noisy 估計** | 真實 sleep 時間抽自重尾分布；餵給 `/decide` 與排序的是**加噪的估計**（`reported = true·exp(σZ−σ²/2)`），σ 校準到 §3.5 量到的預測器 log-殘差（≈1.2–1.45）| **SAC vs RDSAC** | RDSAC 的優勢全在「不確定下的尾部風險」。若 runtime 確定（`sleep N` 已知）→ CVaR≈mean → RDSAC 與 SAC **結構上必然打平**，改什麼都沒用。這是 §3.4–3.6「σ 越大 RDSAC 越贏」的 **live 對應物** |
 | **(E) 尾部量測** | 除 mean JCT，加 p95/p99 JCT、tail slowdown、JCT 的 CVaR、最差 straggler、完成率 | 看得見 RDSAC 的尾部優勢 | RDSAC-cvar 直接優化尾部；只看 mean 會把差異洗掉 |
 
-**配對協定**：同一條 job stream（per-job common-random：相同 arrival / true-runtime / reported-runtime / mps）在 score / SAC / RDSAC 各重放一次；沿用 §2.5/§4.2 的方法學教訓——每臂丟棄 ≥1 warmup round 並交換 arm 順序，避免共用單 GPU 的一次性暖機懲罰帶風向。並記錄每臂的 `/decide` abstain 率：若高競爭下模型仍大量 abstain，那本身是發現，後續才考慮放寬 §8.3 的 `valueAbstain`/`entropyAbstain`。
+**配對協定**：同一條 job stream（per-job common-random：相同 arrival / true / reported / mps）在四種方法各重放，丟棄 warmup round；**只用 philly/ali**（trace 衍生、天生重尾，正合支柱 B；burst 是合成尖峰故略）。**資料集適用性（誠實）**：我們**不做字面重放**——`gpu_count≤1` 過濾 + 時間壓縮把 runtime 映到可測尺度但**保留尾部形狀**，所以檢驗的是「philly/ali 形狀的競爭+尾部下三方是否分得開」，是有界、已聲明的範圍。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
-**為什麼只用 philly 和 ali**：兩者都是**由真實叢集 trace 衍生**、runtime **天生重尾**，正好是支柱 (B) 需要的形狀；burst 是合成尖峰壓力 pattern、非 trace 衍生，對「差異是否會轉移到真實 workload」的論證較弱，故略去。
+#### 4.4.1 首輪（block 設計）暴露的 drift × 順序混淆
 
-**資料集適用性（誠實說明）**：philly/ali 的**強項**正是重尾 runtime（符合 (B) 的需求）；**落差**在規模——原 trace 是大叢集、job 跑數小時～數天，且含多 GPU job。我們**不做字面重放**，而是 (1) `gpu_count ≤ 1` 過濾（單 GPU 跑不了多卡 job）、(2) **時間壓縮**把 runtime 映到可測的 live 尺度（目標最長 job ~數分鐘）但**保留尾部形狀與相對次序**。因此這個 live A/B 檢驗的是「**philly/ali 形狀的競爭 + 尾部**下三方是否分得開」，**不是**生產級字面重放——這是有界、已聲明的範圍，不是隱藏假設。
-
-**預期與價值**：(a) 高競爭下 score vs DRL 若仍打平 → 證實 1×1 即使加載也觸頂；(b) σ-noisy + 尾部量測下 RDSAC-cvar 若砍低 p99/CVaR → **sim 的 σ-發現轉移到 live**（本論文 thesis 第一次在真環境兌現）；(c) 若加噪加載後 RDSAC 仍 = SAC → **sim σ-結果不轉移 live**，這是同等有價值的負結果。無論結果如何，這比再跑一輪打平的 A/B 有資訊量。
-
-> **天花板 caveat**：即使如此，1×1 上限仍低（單 GPU 上 score 的 SJF-ish 排序已接近最佳，DRL 上行有限），效果量可能小；決定性檢驗仍是 2-node 異質拓樸。但這是 1×1 能做的最佳、最便宜評估。工程規格見 `docs/live-ab-heavytail-spec.md`。
-
-#### 4.4.1 首輪結果（philly, n=30, σ∈{0,1}, 4 種排程方法, block 設計）
-
-2026-06-15 在實機 1×1（k3s + Slurm + RTX 4070）跑完一輪。harness 端到端可用（過程中修掉 4 個只在實機現形的 bug：sacct 時區、`wait_drain` 把 slurmctld socket-timeout 的空查詢誤判為排空、sbatch 偶發 timeout 掉 job、serve 映像的 `dsac.py` 載不了 scalar-critic 的 SAC checkpoint）。原始檔 `runs/htab_live_20260615-003638/`。
-
-| σ | 排程方法 | mean | p99 | CVaR(0.25) | ΔJCT% vs score | Δp99% | t-test p |
-|---|---|--:|--:|--:|--:|--:|--:|
-| 0 | score | 49.2 | 153.5 | 91.0 | — | — | — |
-| 0 | SAC | 49.2 | 153.5 | 91.1 | −0.2 | +0.0 | 0.60 |
-| 0 | RDSAC-mean | 47.2 | 124.5 | 82.9 | +4.0 | +18.9 | 0.22 |
-| 0 | RDSAC-cvar | 47.2 | 124.5 | 83.0 | +3.9 | +18.9 | 0.23 |
-| 1 | score | 46.8 | 124.5 | 82.7 | — | — | — |
-| 1 | SAC | 46.8 | 124.5 | 82.7 | +0.2 | +0.0 | 0.43 |
-| 1 | RDSAC-mean | 46.6 | 124.5 | 82.4 | +0.5 | +0.0 | 0.14 |
-| 1 | RDSAC-cvar | 46.8 | 124.5 | 83.0 | +0.1 | +0.0 | 0.77 |
-
-**判定：null 結果，且被 cluster drift 汙染——不可解讀為「RDSAC 贏」。** 三條鐵證：
-
-1. **同一個 score 方法、同一條真實工作，只因執行時段不同就漂移 ~5%。** σ 只擾動餵給排程器的「估計值」、不改 job 實際 sleep 的時間 → score 在 σ=0 與 σ=1 排的是**完全相同的真實工作**，但 mean JCT 49.2（σ=0 區塊，先跑）→ 46.8（σ=1 區塊，後跑）、**p99 153.5 → 124.5**。這個漂移**和所謂「RDSAC 優勢」一樣大**。
-2. **σ=0 區塊 RDSAC 的「+18.9% p99」其實是執行順序的位置效應。** 該區塊順序為 score→SAC→RDSAC-mean→RDSAC-cvar，後跑的 RDSAC 落在較快的時段，拿到的 p99=124.5 **正好等於 score 自己後跑（σ=1）時的 p99**。σ=1 區塊（反序）四種方法全部收斂到 ~46.7 / p99 124.5。
-3. **SAC ≡ score 到小數點**（48.0 / 153.0 pooled）→ SAC 全程 abstain、fail-safe 回退 score，排程決策對 JCT **零影響**。
-
-**所以對應 §4.4 預期的 (c)**：加噪加載後仍分不出——但**主因不是「σ 不轉移」，而是 1×1 的 JCT 被 makespan/排隊綁死**（單 GPU 下整批 job 的尾部 JCT≈makespan，與排序幾乎無關），而 ~50 分鐘跑程的 cluster drift（mean ~5%、p99 ~19%）就**蓋過任何排程方法的效果**。
+2026-06-15 首輪用 **block 設計**（一種方法跑完所有輪次才換下一種）。harness 端到端可用（過程中修掉 4 個只在實機現形的 bug：sacct 時區、`wait_drain` 把 slurmctld socket-timeout 的空查詢誤判為排空、sbatch 偶發 timeout 掉 job、serve 映像的 `dsac.py` 載不了 scalar-critic 的 SAC checkpoint）。**首輪表面上 RDSAC 砍 19% p99，但那是假象**——下面解釋為什麼，§4.4.2 用正確設計重跑直接推翻它。原始檔 `runs/htab_live_20260615-003638/`。
 
 ##### 為什麼會這樣：drift × 執行順序的混淆（confounding）
 
