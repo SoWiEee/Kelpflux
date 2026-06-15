@@ -61,7 +61,11 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | fragmentation penalty | 避免接受一個 job 後讓剩餘 MPS slot 過度碎片化。 |
 | runtime shortness | 若 runtime predictor 有可用估計，短 job 會得到額外 priority boost。 |
 
-實作：simulator baseline `sim/scheduler/score.py`；live submit hook `chart/templates/configmap-job-submit.yaml`；Slurm priority path `chart/templates/{slurm-conf,login,workers}.yaml`。
+最終分數 = `clamp01(α·f_mps_fit + β·f_vram_fit + γ·topology − δ·f_frag + ε·f_runtime)`，以 `score_gain=1000` 加在 Slurm multifactor 優先序上（**RL 的 `priority_boost` 加在同一條優先序**，故三方共用同一介入機制）。
+
+> **生產實況（與 sim 有差，2026-06-15 核對叢集 `slurm-config-job-submit` ConfigMap）**：上表是**設計上的**訊號，但**目前 live 部署只開 3 個**——權重 `α=0.4, β=0.2, δ=0.2`，而 **`γ=0`（topology 關）、`ε=0`（runtime/SJF 關）**。連帶 **runtime predictor 與 weight-tuner 都沒部署**（`PRED_ENABLED=false` / `WT_ENABLED=false`，叢集無對應 pod），所以權重是靜態、不被線上調。且 live 的因子是**無狀態 proxy**（`f_mps_fit = mps_req/100`、`f_frag = 4x(1−x)`），與 sim 的 cluster-aware 版（`f_mps_fit = mps_req/該GPU剩餘slot`、ε=0.30 SJF 開）**不同**。即生產 score 實際 = `clamp01(0.4·mps大小 + 0.2·vram_fit − 0.2·碎片)`，**完全不看 runtime**。
+
+實作：simulator baseline `sim/scheduler/score.py`（cluster-aware、ε 預設 0.30）；live submit hook `chart/templates/configmap-job-submit.yaml`（無狀態 proxy、ε=0）；Slurm priority path `chart/templates/{slurm-conf,login,workers}.yaml`。
 
 ### 1.2 SAC
 
@@ -131,7 +135,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 ### 2.5 Live cluster A/B 設定
 
-在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。學習方法 `shadowMode=false`（RL boost 生效）、score 方法 `shadowMode=true`（boost 強制 0），用 serve 的 `/reload`+`/shadow` 切換而不重啟 pod。關鍵穩定化：(1) `gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost；(2) **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。
+在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。學習方法 `shadowMode=false`（RL boost 生效）、score 方法 `shadowMode=true`（boost 強制 0），用 serve 的 `/reload`+`/shadow` 切換而不重啟 pod。關鍵穩定化：(1) `gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost；(2) **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。**生產服務拓樸**：跑 `slurmctld` / `rl-scheduler`(serve) / `rl-snapshot-agent`，但**沒有部署 `runtime-predictor` 也沒有 `weight-tuner`**——故 score 的 `ε`(SJF) 與線上權重調整都是關的（§1.1 生產實況），這是讀 §4 數字時的環境前提。
 
 ---
 
@@ -351,6 +355,8 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 3. **首輪那個「RDSAC −19% p99」確實是 drift 假象**——drift 消掉後方向甚至反轉（RDSAC 尾部若有差異是**略差**）。p99 本身在 n=208 下只是最差 1–2 個 job，噪音主導（同方法跨 σ 在 126–153 間跳），不可細讀。
 
 **意涵（誠實）**：這**不是**「sim 的 σ-發現被推翻」，而是**1×1 makespan-bound 讓排序根本動不了 JCT**——score 與 RDSAC 的決策都無從表現（不論好壞）。sim §3.4–3.6 的機制要在 live 兌現，需要**有真實決策面的拓樸**（2-node，§5.1）。本輪的價值是：**用正確的實驗設計（round-robin 去 drift）拿到一個站得住腳的 1×1 三方打平**，而不是被位置效應誤導成「RDSAC 贏」。
+
+> **環境細節 caveat（σ 對 score 無作用）**：支柱 (B) 假設排程器用加噪的 runtime 估計排序，但**生產 score 的 `ε=0`（§1.1，SJF/predictor 關）→ score 完全不看 runtime**，所以注入的 σ 對 score 這條 baseline **沒有任何作用**（它純按 mps 大小/vram/碎片排）。σ 只進到 RL 的 `/decide` obs。因此「σ=0 vs σ=1 對 score 無差異」是**預期內**的，不是反證；要在 live 真正檢驗 σ 機制，得先把生產 `ε` 開起來 + 部署 predictor，或限定結論在「score 不用 runtime」前提下。
 
 > 一句話：drift-robust 重跑後，**1×1 三方乾淨打平、score 甚至在 CVaR 微幅最好**；首輪的 RDSAC 尾部優勢證實是 drift 假象。1×1 排序動不了 makespan-bound 的 JCT——決定性檢驗仍需 2-node。
 
