@@ -32,7 +32,7 @@ sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它
 | 確定性 1×1 sim, auto-α（§3.2, 30-seed）| 0% | −106/−158/−312% | −25/−31/−121% | 表面 score > cvar > mean ≳ SAC，**但誤導** |
 | 確定性 1×1 sim, fixed-α（§3.3）| 0% | −17/+2/−24% | −25/−31/−121% | **SAC 翻身 ≈/贏 cvar**；淨增益 ≈0 |
 | Live 1×1（§4）| 0% | ≈0% | ≈0% | **三方統計打平**；drift-robust 重跑（§4.4.2）確認、score 在 CVaR 甚至微幅最好 |
-| 隨機 sim σ=1.0, fixed-α（§3.6 三臂）| 0% | −107/−135/−155% | −4.7/+9.2/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 |
+| 隨機 sim σ=1.0, fixed-α（§3.6 三方）| 0% | −107/−135/−155% | −4.7/+9.2/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 |
 
 （三個數字 = philly / burst / ali；ΔJCT% vs score，負值=較慢）
 
@@ -40,7 +40,7 @@ sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它
 
 1. **沒有不確定性時（確定性 sim + live）→ 三方分不出高下。** 確定性 sim 表面上 SAC 墊底，但 fixed-α 對照（§3.3）證明那幾乎全是共用 auto-α 控制器 railing 的**假象**；釘死 α 後 SAC 追平甚至贏過 RDSAC-cvar。Live 1×1 三方都在 ±1% 雜訊內、模型幾乎全 abstain 回退 score。根因：oracle runtime 讓回報塌成點 → CVaR≈mean → 風險機制結構性閒置。
 
-2. **加入真實 runtime 不確定性 → 清楚排名浮現。** 注入的 σ 已**校準到生產預測器的真實 log-殘差**（§3.5：σ≈1.2–1.45，故 §3.4 的 σ=1.0 偏保守）。RDSAC−SAC 差距**隨 σ 單調拉開**（−73→+47→+196 pts，§3.4），σ=1.0 下 RDSAC 甚至贏過 score、p99 尾部低 5–9×。三臂拆解（§3.6）指出**贏的主因是「把回報建模成分布」（分布式 critic，SAC→mean +108~125 pts），CVaR 風險扭曲只是尾部專用小加成**（burst p99 46→20h）。RDSAC 內部則 cvar > mean（§3.1）。
+2. **加入真實 runtime 不確定性 → 清楚排名浮現。** 注入的 σ 已**校準到生產預測器的真實 log-殘差**（§3.5：σ≈1.2–1.45，故 §3.4 的 σ=1.0 偏保守）。RDSAC−SAC 差距**隨 σ 單調拉開**（−73→+47→+196 pts，§3.4），σ=1.0 下 RDSAC 甚至贏過 score、p99 尾部低 5–9×。三方拆解（§3.6）指出**贏的主因是「把回報建模成分布」（分布式 critic，SAC→mean +108~125 pts），CVaR 風險扭曲只是尾部專用小加成**（burst p99 46→20h）。RDSAC 內部則 cvar > mean（§3.1）。
 
 **一句話：** 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式；補上真實不確定性後 RDSAC > SAC，且贏在分布式 critic 本身、CVaR 為尾部加成。
 
@@ -131,7 +131,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 ### 2.5 Live cluster A/B 設定
 
-在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。learned 臂 `shadowMode=false`（RL boost 生效）、score 臂 `shadowMode=true`（boost 強制 0）。兩個關鍵穩定化：(1) `gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost；(2) **方法論教訓**：共用單 GPU 的 block A/B 必須丟棄每臂 ≥1 個 warmup round 並交換 arm 順序（否則 aggregate 會被一次性 GPU/MPS 暖機懲罰帶風向）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。
+在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。學習方法 `shadowMode=false`（RL boost 生效）、score 方法 `shadowMode=true`（boost 強制 0），用 serve 的 `/reload`+`/shadow` 切換而不重啟 pod。關鍵穩定化：(1) `gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost；(2) **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。
 
 ---
 
@@ -170,7 +170,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 ### 3.2 確定性 sim：三方對照 score / SAC / RDSAC（30-seed）
 
-加入 vanilla SAC 第三臂，30-seed 重評（取代 §3.1 的 5-seed 雜訊）：
+加入 vanilla SAC 第三方，30-seed 重評（取代 §3.1 的 5-seed 雜訊）：
 
 | family | score | SAC | RDSAC-cvar | RDSAC-mean |
 |---|---:|---:|---:|---:|
@@ -232,7 +232,7 @@ fixed-α 下 RDSAC 仍贏 SAC（+90~143 pts，排除 α 假象），σ=1.0 時 R
 
 ### 3.6 拆解：贏的是「分布式 critic」還是「風險扭曲」？
 
-§3.4 比的是 SAC（scalar）vs RDSAC-cvar（分布式 + 風險），把兩個貢獻綁死。加入第三臂 **RDSAC-mean**（分布式但**風險中立**）即可拆開（σ=1.0、fixed-α=0.05、5 seed、3 family）：
+§3.4 比的是 SAC（scalar）vs RDSAC-cvar（分布式 + 風險），把兩個貢獻綁死。加入第三方 **RDSAC-mean**（分布式但**風險中立**）即可拆開（σ=1.0、fixed-α=0.05、5 seed、3 family）：
 
 | family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（**分布式**）| mean→cvar（**風險**）|
 |---|---:|---:|---:|---:|---:|
@@ -254,7 +254,7 @@ fixed-α 下 RDSAC 仍贏 SAC（+90~143 pts，排除 α 假象），σ=1.0 時 R
 | burst | −41.9 | **−9.2** | 18.5 h | 20.4 h |
 | ali | **+66.0** | −3.1 | **7.1 h** | 15.0 h |
 
-**負結果，方向相反**：共置動作在 philly/ali 明顯更差（OFF 贏 ~42/~69 pts），只有 burst 上 ON 較好。兩個成因：(1) 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較；(2) 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每臂單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
+**負結果，方向相反**：共置動作在 philly/ali 明顯更差（OFF 贏 ~42/~69 pts），只有 burst 上 ON 較好。兩個成因：(1) 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較；(2) 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每種方法單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
 
 ---
 
@@ -272,20 +272,20 @@ fixed-α 下 RDSAC 仍贏 SAC（+90~143 pts，排除 α 假象），σ=1.0 時 R
 
 把 §3 的 cvar-v2 RDSAC checkpoint 烘進 `slurm-rl-scheduler:m11` 部署 live，與 score-only 做配對 A/B（14 個 MPS sleep job × 3 輪）。結果：**RDSAC 能在 production 正確上線並與 score 持平**（ΔJCT −0.2%，遠小於逐對雜訊）。原因與 §3.3 一致——1×1 強 baseline 下 RDSAC 對每個到達 job 幾乎均勻 boost（`selected=14/14`），佇列排序等同 score。（細表已併入下方擴大版 §4.2。）
 
-### 4.2 擴大評估：128 job/arm + 受控 arm 順序（暖機假象的源頭）
+### 4.2 擴大評估：128 job/方法 + 受控方法順序（暖機假象的源頭）
 
-§4.1 的 42-job 單 block 太少。擴大到 128 job/arm、6×6 參數網格（`mps∈{20,25,34,50,67,75}`、runtime∈{8,14,20,28,36,45}s），operator 全程暫停把拓樸釘在 1 個 GPU node，並**交換 arm 順序**：
+§4.1 的 42-job 單 block 太少。擴大到 128 job/方法、6×6 參數網格（`mps∈{20,25,34,50,67,75}`、runtime∈{8,14,20,28,36,45}s），operator 全程暫停把拓樸釘在 1 個 GPU node，並**交換方法順序**：
 
-| 跑次 | arm 順序 | aggregate ΔJCT | warm-subset ΔJCT |
+| 跑次 | 方法順序 | aggregate ΔJCT | warm-subset ΔJCT |
 |---|---|---:|---:|
 | v2_123417 | rdsac → score | **−26.9%**（RDSAC 較差）| −2.3%（r3–8）|
 | v2swap | score → rdsac（+warmup）| **+8.6%**（RDSAC 較好）| +0.9%（r2–8）|
 
-aggregate ΔJCT 隨 arm 順序翻號 → 先跑的那臂吃到一次性 GPU/MPS 暖機懲罰（rdsac round-1 wait 106.8s vs score 14.4s），所以那 ±20%+ 是**暖機假象、非排程效果**。暖機後逐輪 Δ 在 0 附近抖動，兩次 warm 估計平均 ≈ **−0.7%**。**結論**：1×1 live RDSAC 與 score 真正打平，比 §4.1 多 3× 資料、控掉暖機混淆後依然成立。RDSAC 臂的 RL 在 88–100% 提交上 abstain（snapshot 時效性 + 單 GPU placement 太瑣碎主導）→ as-deployed RDSAC 大多回退成 score。原始檔 `runs/live_ab/SUMMARY_v2.md`。
+aggregate ΔJCT 隨方法順序翻號 → 先跑的那個方法吃到一次性 GPU/MPS 暖機懲罰（rdsac round-1 wait 106.8s vs score 14.4s），所以那 ±20%+ 是**暖機假象、非排程效果**。暖機後逐輪 Δ 在 0 附近抖動，兩次 warm 估計平均 ≈ **−0.7%**。**結論**：1×1 live RDSAC 與 score 真正打平，比 §4.1 多 3× 資料、控掉暖機混淆後依然成立。RDSAC 方法的 RL 在 88–100% 提交上 abstain（snapshot 時效性 + 單 GPU placement 太瑣碎主導）→ as-deployed RDSAC 大多回退成 score。原始檔 `runs/live_ab/SUMMARY_v2.md`。
 
 ### 4.3 三方 live：SAC 也打平
 
-把 vanilla SAC 也部署 live（`variant:"SAC"`，serve `/healthz` 回報），同樣的擴大 + 受控 arm 順序協定。結果與 RDSAC 一致：**1×1 live 下 score ≈ RDSAC ≈ SAC，三方分不出**——每個 learned model 都 abstain ~90–100% 而 fail-safe 回 score。原始檔 `runs/live_ab/SUMMARY_sac.md`。
+把 vanilla SAC 也部署 live（`variant:"SAC"`，serve `/healthz` 回報），同樣的擴大 + 受控方法順序協定。結果與 RDSAC 一致：**1×1 live 下 score ≈ RDSAC ≈ SAC，三方分不出**——每個 learned model 都 abstain ~90–100% 而 fail-safe 回 score。原始檔 `runs/live_ab/SUMMARY_sac.md`。
 
 > §4 一致的故事：1×1 太小，placement 端到端無法表現出優勢、也無法表現出明顯劣勢。sim 全 rollout 會放大 checkpoint 不足（略輸 score，§3.2）；live 因 abstain 回退 + 單 GPU placement 瑣碎而把差異洗掉（持平）。真正的增益／檢驗要等拓樸匹配的多節點 checkpoint。
 
@@ -363,7 +363,7 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 | DRL path 能在 live 上跑？ | 可以。warm-pool 穩定化後 RDSAC cvar-v2 live A/B 全 job 乾淨完成、RL boost 確實生效（§4.1）。 |
 | 先前 `alpha` 觸頂是真 bug？修好了？ | 是真 bug（return 尺度壓過 entropy ~300×）。已用 reward_scale 1000→20000 + 放寬 clamp 修好（§2.2）。 |
 | RDSAC 在標準 sim benchmark 打贏 score？ | **確定性 1×1 下還沒有**（§3.2，30-seed 三族都不優於 score）。但加入真實不確定性後 σ=1.0 fixed-α 可贏過 score（§3.4）。 |
-| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **看環境有沒有不確定性**。確定性 1×1（含 live）淨增益≈0，且「SAC 最差」是 auto-α 假象（§3.3）。一旦注入**校準過的**真實不確定性（§3.5 σ≈1.2–1.45），RDSAC−SAC 差距隨 σ **單調拉開**（−73→+196 pts，§3.4），fixed-α 下仍成立。三臂拆解（§3.6）指出**增益主要來自「分布式 critic」**（SAC→mean +108~125 pts），CVaR 是尾部專用小加成。CVaR 淨增益需 multi-seed 才能定論（單 seed 擺盪大）。 |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **看環境有沒有不確定性**。確定性 1×1（含 live）淨增益≈0，且「SAC 最差」是 auto-α 假象（§3.3）。一旦注入**校準過的**真實不確定性（§3.5 σ≈1.2–1.45），RDSAC−SAC 差距隨 σ **單調拉開**（−73→+196 pts，§3.4），fixed-α 下仍成立。三方拆解（§3.6）指出**增益主要來自「分布式 critic」**（SAC→mean +108~125 pts），CVaR 是尾部專用小加成。CVaR 淨增益需 multi-seed 才能定論（單 seed 擺盪大）。 |
 | risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **是**。30-seed 下 cvar 泛化遠勝 mean（−24.6% vs −117%，約 5×，§3.2），支持把 cvar 烘進 live image。 |
 | live A/B 已能公平比較 DRL vs score？ | 可以。重尾 + 高競爭 + **round-robin 去 drift** 後（§4.4.2）拿到**乾淨的 1×1 三方打平**：mean/p95 全平，CVaR 上 score 甚至微幅最好，沒有學習方法贏過 score（全 non-significant）。首輪 block 設計的「RDSAC −19% p99」證實是執行順序 × cluster drift 的假象（score 自身 p99 漂移 153→125）。根因：1×1 JCT 被 makespan 綁死、排序動不了它——非 σ-發現被推翻，而是缺真實決策面。 |
 | 最穩定上線策略 | DRL live scheduler 保持 enabled + GPU warm pool，並保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。 |
@@ -419,7 +419,7 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/measure_predictor_sigma.py \
   --trace sim/data/philly_subsample.json
 ```
 
-**隨機性消融 + 三臂拆解（§3.4, §3.6）**
+**隨機性消融 + 三方拆解（§3.4, §3.6）**
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
@@ -429,16 +429,23 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
 # 共置消融（§3.7）：加 --colocation --interference 0.3 --no-sac
 ```
 
-**Live A/B（§4）**
+**重尾 + 高競爭 live A/B（§4.4，drift-robust round-robin）**
 
 ```bash
-sudo kubectl exec -n slurm deploy/slurm-login -- bash -lc '
-for spec in smallA:25:4 smallB:25:4 fullA:100:12 smallC:25:4 halfA:50:6 smallD:25:4; do
-  IFS=: read -r name mps secs <<< "$spec"
-  sbatch --parsable -p gpu-rtx4070 --gres=mps:${mps} -c 1 --mem=512M --time=00:03:00 \
-    -J "bench-${name}" --wrap "echo start=\$(date -Is) host=\$(hostname); sleep ${secs}; echo end=\$(date -Is)"
-done'
-# 收集：sudo kubectl exec -n slurm slurm-controller-0 -- sacct -X -P -j <ids> --format=JobID,State,Submit,Start,End,ElapsedRaw,AllocTRES%120
+# 前置：建含當前 serve.py/dsac.py + σ-checkpoints 的映像、部署、port-forward 8002
+#   docker build -f Dockerfile.htab -t slurm-rl-scheduler:htab2 .   # FROM m11 + 覆蓋 serve.py/dsac.py/distortion.py + COPY 3 個 ckpt 到 /models/htab/
+#   docker save slurm-rl-scheduler:htab2 | sudo k3s ctr images import -
+#   kubectl set image deploy/rl-scheduler serve=slurm-rl-scheduler:htab2 -n slurm
+#   kubectl port-forward -n slurm svc/rl-scheduler 8002:8002 &
+KUBECONFIG=~/.kube/config PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
+  --serve-url http://localhost:8002 --login-pod pod/<slurm-login-pod> \
+  --interleave --family philly --n-jobs 30 --target-max-s 30 \
+  --sigmas 0.0 1.0 --rounds 4 --warmup 1 \
+  --sac-ckpt /models/htab/sac.pt \
+  --rdsac-mean-ckpt /models/htab/rdsac_mean.pt \
+  --rdsac-cvar-ckpt /models/htab/rdsac_cvar.pt \
+  --out-dir runs/htab_live_rr_$(date +%Y%m%d-%H%M%S)
+# 跑完 kubectl set image ... serve=slurm-rl-scheduler:m11 還原 production。工程規格見 docs/live-ab-heavytail-spec.md
 ```
 
 ---
