@@ -87,7 +87,6 @@ def sim_train(
     reward_scale: float = 20_000.0,
     device: str = "cpu",
     log_every: int = 5_000,
-    use_attention: bool = False,
     use_iqn: bool = True,
     # Temperature (entropy) controls
     fixed_alpha: bool = False,
@@ -140,7 +139,7 @@ def sim_train(
     )
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
-        use_attention=use_attention, use_iqn=use_iqn,
+        use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
         fixed_alpha=fixed_alpha, init_alpha=init_alpha,
         target_entropy_ratio=target_entropy_ratio,
@@ -303,7 +302,6 @@ def main(argv=None) -> int:
     p.add_argument("--out-dir",
                    default=f"runs/dsac_sim_{time.strftime('%Y%m%d-%H%M%S')}")
     # Architecture flags
-    p.add_argument("--no-attention",         action="store_true")
     p.add_argument("--no-iqn",               action="store_true",
                    help="vanilla scalar-critic SAC instead of the IQN "
                         "distributional critic (disables risk distortion)")
@@ -346,11 +344,9 @@ def main(argv=None) -> int:
         device = "cpu"
 
     traces = args.trace if len(args.trace) > 1 else args.trace[0]
-    use_attention = not args.no_attention
     use_iqn = not args.no_iqn
     family = "RDSAC" if use_iqn else "SAC"
-    trunk = "Attention" if use_attention else "MLP"
-    arch = f"{family}+{trunk}"
+    arch = f"{family}+MLP"
     risk_str = f"risk={args.risk_mode}:{args.risk_beta}  " if use_iqn else ""
     print(f"[sim_train] arch={arch}  n={args.n_nodes}×{args.gpus_per_node}  "
           f"trace={traces}  steps={args.total_steps:,}  "
@@ -367,7 +363,7 @@ def main(argv=None) -> int:
         seed=args.seed, reward_mode=args.reward_mode,
         reward_scale=args.reward_scale,
         out_dir=Path(args.out_dir), device=device,
-        use_attention=use_attention, use_iqn=use_iqn,
+        use_iqn=use_iqn,
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
         target_entropy_ratio=args.target_entropy_ratio,
         potential_shaping=not args.no_potential_shaping,

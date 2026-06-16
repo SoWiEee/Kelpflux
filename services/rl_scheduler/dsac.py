@@ -63,53 +63,10 @@ def _build_mlp(in_dim: int, hidden: Sequence[int], out_dim: int,
     return nn.Sequential(*layers)
 
 
-class _AttentionEncoder(nn.Module):
-    """Permutation-invariant trunk: self-attention over job tokens → (B, d).
-
-    Observation layout (must match gym_env.py _build_obs):
-        obs = [job_0 (JOB_DIM) … job_{K-1} (JOB_DIM), cluster (rest)]
-    Job slots whose features are all zero are treated as padding.
-    """
-
-    TOP_K: int = 16
-    JOB_DIM: int = 11
-
-    def __init__(self, obs_dim: int, d: int, n_heads: int = 4,
-                 n_layers: int = 2) -> None:
-        super().__init__()
-        self.cluster_dim = obs_dim - self.TOP_K * self.JOB_DIM
-        assert self.cluster_dim > 0, f"obs_dim={obs_dim} too small for attention trunk"
-        self.job_embed = nn.Linear(self.JOB_DIM, d)
-        layer = nn.TransformerEncoderLayer(
-            d_model=d, nhead=n_heads, dim_feedforward=d * 2,
-            dropout=0.0, batch_first=True, norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            layer, num_layers=n_layers, enable_nested_tensor=False)
-        self.cluster_embed = nn.Linear(self.cluster_dim, d)
-        self.proj = nn.Linear(d * 2, d)
-        for m in [self.job_embed, self.cluster_embed, self.proj]:
-            nn.init.orthogonal_(m.weight, gain=1.0)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        k, jd = self.TOP_K, self.JOB_DIM
-        jobs = obs[:, :k * jd].view(-1, k, jd)
-        cluster = obs[:, k * jd:]
-        pad = (jobs.abs().sum(dim=-1) == 0)
-        tok = F.relu(self.job_embed(jobs))
-        enc = self.transformer(tok, src_key_padding_mask=pad)
-        non_pad = (~pad).float().unsqueeze(-1)
-        n_valid = non_pad.sum(dim=1).clamp(min=1.0)
-        queue_ctx = (enc * non_pad).sum(dim=1) / n_valid
-        cluster_ctx = F.relu(self.cluster_embed(cluster))
-        return F.relu(self.proj(torch.cat([queue_ctx, cluster_ctx], dim=-1)))
-
-
 class _DualIQNCritic(nn.Module):
     """Dual-head Implicit Quantile Network: reward return Z_R and entropy return Z_H.
 
-    Shared trunk (MLP or attention) → state embedding d; cosine-embedded quantile
+    Shared MLP trunk → state embedding d; cosine-embedded quantile
     fraction τ multiplies it elementwise; two linear heads emit Z_R and Z_H
     quantiles, each (B, N_QUANT, n_actions).
     """
@@ -118,15 +75,11 @@ class _DualIQNCritic(nn.Module):
     N_COS: int = 64     # cosine embedding dimension for τ
 
     def __init__(self, obs_dim: int, n_actions: int,
-                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True,
-                 use_attention: bool = False) -> None:
+                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True) -> None:
         super().__init__()
         d = hidden[-1]
-        if use_attention:
-            self.encoder = _AttentionEncoder(obs_dim, d)
-        else:
-            enc_hidden = hidden[:-1] if len(hidden) > 1 else ()
-            self.encoder = _build_mlp(obs_dim, enc_hidden, d, layer_norm)
+        enc_hidden = hidden[:-1] if len(hidden) > 1 else ()
+        self.encoder = _build_mlp(obs_dim, enc_hidden, d, layer_norm)
         self.phi_embed = nn.Linear(self.N_COS, d)
         self.head_r = nn.Linear(d, n_actions)
         self.head_h = nn.Linear(d, n_actions)
@@ -151,24 +104,16 @@ class _DualIQNCritic(nn.Module):
 class _ScalarCritic(nn.Module):
     """Scalar action-value critic Q(s,·) for vanilla discrete SAC (no quantiles).
 
-    Christodoulou 2019: a single Q head per action over the shared trunk (MLP or
-    attention). Used when ``use_iqn=False``; the distributional Z_R/Z_H decomposition
+    Christodoulou 2019: a single Q head per action over the shared MLP trunk.
+    Used when ``use_iqn=False``; the distributional Z_R/Z_H decomposition
     and risk distortion are dropped, isolating the value of the IQN machinery.
     """
 
     def __init__(self, obs_dim: int, n_actions: int,
-                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True,
-                 use_attention: bool = False) -> None:
+                 hidden: Sequence[int] = (256, 256), layer_norm: bool = True) -> None:
         super().__init__()
-        if use_attention:
-            d = hidden[-1]
-            self.encoder = _AttentionEncoder(obs_dim, d)
-            self.head = nn.Linear(d, n_actions)
-            nn.init.orthogonal_(self.head.weight, gain=1.0)
-            nn.init.zeros_(self.head.bias)
-        else:
-            self.encoder = _build_mlp(obs_dim, hidden, n_actions, layer_norm)
-            self.head = nn.Identity()
+        self.encoder = _build_mlp(obs_dim, hidden, n_actions, layer_norm)
+        self.head = nn.Identity()
 
     def q_values(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns Q(s,·) of shape (B, n_actions)."""
@@ -210,7 +155,7 @@ class DSACAgent:
     """Risk-sensitive distributional SAC for masked scheduling (Ma et al. discrete).
 
     Usage::
-        agent = DSACAgent(obs_dim=192, n_actions=17, risk_mode="cvar", risk_beta=0.25)
+        agent = DSACAgent(obs_dim=160, n_actions=17, risk_mode="cvar", risk_beta=0.25)
         a = agent.select_action(obs, mask)
         info = agent.update(batch)   # dict incl. td_errors for PER
     """
@@ -229,7 +174,6 @@ class DSACAgent:
         target_entropy_ratio: float = 0.1,
         fixed_alpha: bool = False,
         layer_norm: bool = True,
-        use_attention: bool = False,
         use_iqn: bool = True,
         risk_mode: str = "mean",
         risk_beta: float = 0.25,
@@ -246,7 +190,6 @@ class DSACAgent:
         self.hidden = tuple(hidden)
         self.gamma = gamma
         self.tau = tau
-        self.use_attention = use_attention
         self.use_iqn = use_iqn
         self.risk_mode = risk_mode
         self.risk_beta = float(risk_beta)
@@ -256,8 +199,7 @@ class DSACAgent:
 
         def _critic():
             cls = _DualIQNCritic if use_iqn else _ScalarCritic
-            return cls(obs_dim, n_actions, self.hidden, layer_norm,
-                       use_attention).to(self.device)
+            return cls(obs_dim, n_actions, self.hidden, layer_norm).to(self.device)
 
         self.q1, self.q2 = _critic(), _critic()
         self.q1_target, self.q2_target = _critic(), _critic()
@@ -519,7 +461,6 @@ class DSACAgent:
             "opt_alpha": self.opt_alpha.state_dict() if self.opt_alpha else None,
             "log_alpha": self.log_alpha.item(),
             "fixed_alpha": self.fixed_alpha,
-            "use_attention": self.use_attention,
             "use_iqn": self.use_iqn,
             "risk_mode": self.risk_mode, "risk_beta": self.risk_beta,
             "target_entropy_ratio": self.target_entropy_ratio,
@@ -535,7 +476,6 @@ class DSACAgent:
             obs_dim=data["obs_dim"], n_actions=data["n_actions"],
             hidden=tuple(data.get("hidden", (256, 256))),
             fixed_alpha=data.get("fixed_alpha", False),
-            use_attention=data.get("use_attention", False),
             use_iqn=kwargs.pop("use_iqn", data.get("use_iqn", True)),
             risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
             risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),

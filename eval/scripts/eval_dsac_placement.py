@@ -160,8 +160,6 @@ def main(argv=None) -> int:
     p.add_argument("--greedy",         action="store_true", default=True)
     p.add_argument("--device",         default="cpu",
                    help="torch device for DSAC: 'cpu' or 'cuda'")
-    p.add_argument("--no-attention",         action="store_true",
-                   help="MLP critic trunk instead of attention")
     p.add_argument("--no-iqn",               action="store_true",
                    help="vanilla scalar-critic SAC instead of IQN distributional "
                         "critic (no risk distortion)")
@@ -205,10 +203,9 @@ def main(argv=None) -> int:
         )
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
-        use_attention = not args.no_attention
         use_iqn = not args.no_iqn
         arch_parts = [f"IQN-{args.risk_mode}:{args.risk_beta}" if use_iqn else "SAC"]
-        arch_parts.append("Attn" if use_attention else "MLP")
+        arch_parts.append("MLP")
         arch_parts.append(f"fixedα={args.init_alpha}" if args.fixed_alpha
                           else f"autoα(te={args.target_entropy_ratio})")
         if not args.no_per:               arch_parts.append("PER")
@@ -227,7 +224,7 @@ def main(argv=None) -> int:
             out_dir=out_dir / "train",
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
-            use_attention=use_attention, use_iqn=use_iqn,
+            use_iqn=use_iqn,
             fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
             target_entropy_ratio=args.target_entropy_ratio,
             risk_mode=args.risk_mode,

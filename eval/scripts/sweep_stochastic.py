@@ -115,7 +115,7 @@ def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args) -> DSACA
         total_steps=args.total_steps, warmup_steps=args.warmup_steps,
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
         device=args.device, out_dir=None, log_every=max(5000, args.total_steps // 5),
-        use_attention=not args.no_attention, use_iqn=use_iqn,
+        use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
         curriculum=args.curriculum,
         runtime_sigma=sigma, interference=interference,
@@ -142,7 +142,6 @@ def main(argv=None) -> int:
                    help="train one RDSAC per mode (e.g. mean cvar) for the "
                         "3-way distributional-vs-risk split; overrides --risk-mode")
     p.add_argument("--risk-beta", type=float, default=0.25)
-    p.add_argument("--no-attention", action="store_true")
     p.add_argument("--curriculum", action="store_true")
     p.add_argument("--fixed-alpha", action="store_true",
                    help="pin the entropy temperature α for both models "
