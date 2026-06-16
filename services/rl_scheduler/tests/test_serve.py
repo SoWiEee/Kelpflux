@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 
 class _FakeAgent:
-    obs_dim = 192
+    obs_dim = 160
     n_actions = 17
 
 
@@ -103,7 +103,7 @@ def test_build_obs_and_mask_marks_only_feasible_actions(serve):
 
     obs, mask, top_ids = serve.build_obs_and_mask(req)
 
-    assert obs.shape == (192,)
+    assert obs.shape == (160,)
     assert mask.shape == (17,)
     assert top_ids[:2] == ["fits", "too-big"]
     assert mask[0] is True or bool(mask[0]) is True

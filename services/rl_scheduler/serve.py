@@ -133,13 +133,13 @@ def _job_feat(j: JobView, now: float, mps_per_gpu: int) -> np.ndarray:
     return np.array([
         j.mps_req / mps_per_gpu,
         float(j.gpu_count),
-        *gpu_oh,                      # 4 dims
+        *gpu_oh,                      # 2 dims (rtx4070 / rtx3080)
         math.log1p(j.runtime),
         math.log1p(wait),
         math.log1p(wait),             # age (matches gym_env.py placeholder)
         0.0,                          # deadline_remaining placeholder
         0.0,                          # retry_count placeholder
-    ], dtype=np.float32)              # 11 dims total
+    ], dtype=np.float32)              # 9 dims total
 
 
 def _gpu_feat(g: GpuView, mps_per_gpu: int) -> np.ndarray:

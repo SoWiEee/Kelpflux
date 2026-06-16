@@ -20,7 +20,7 @@ import urllib.request
 from typing import Any
 
 LOG = logging.getLogger("rl_snapshot_agent")
-GPU_TYPES = ("rtx4070", "rtx4080", "rtx4090", "generic")
+GPU_TYPES = ("rtx4070", "rtx3080", "generic")
 
 
 def _b64url(data: bytes) -> str:

@@ -1,11 +1,11 @@
 """Gymnasium wrapper around the discrete-event runner for DRL training.
 
 MDP spec (placement-aware):
-- State : top-K=16 pending jobs × 11 feats
+- State : top-K=16 pending jobs × 9 feats
           + 2 nodes × 2 GPUs × 6 feats   (GPU slot state)
           + 4 topology feats
           + 6 global feats
-          = 210 dims
+          = 178 dims
 - Action: Discrete(N_JOBS × N_NODES × N_GPUS + 1)
           = 16 × 2 × 2 + 1 = 65
           action a = job_i * (N_NODES*N_GPUS) + node_j * N_GPUS + gpu_k
@@ -35,25 +35,27 @@ from .loader import Job, MPS_PER_GPU
 
 # ── Layout constants ───────────────────────────────────────────────────────
 TOP_K     = 16
-GPU_TYPES = ("rtx4070", "rtx4080", "a10", "h100")
+# Cluster is rtx4070 today; rtx3080 is the only planned addition (2nd node).
+# This 2-entry tuple is the per-job GPU one-hot alphabet → feeds JOB_FEAT_DIM.
+GPU_TYPES = ("rtx4070", "rtx3080")
 
-JOB_FEAT_DIM    = 11
+JOB_FEAT_DIM    = 9
 GPU_FEAT_DIM    = 6
 TOPO_FEAT_DIM   = 4
 GLOBAL_FEAT_DIM = 6
 
 # ── Cluster size — current deployment vs. target ───────────────────────────
 # LIVE (current): 1 host × 1 GPU (RTX 4070, MPS enabled)
-#   obs_dim  = 16*11 + 1*1*6 + 4 + 6 = 192
+#   obs_dim  = 16*9 + 1*1*6 + 4 + 6 = 160
 #   n_actions = 16*1*1 + 1 = 17
 #
 # SIM training default (2×2): mirrors target 2-host cluster
-#   obs_dim  = 16*11 + 2*2*6 + 4 + 6 = 210
+#   obs_dim  = 16*9 + 2*2*6 + 4 + 6 = 178
 #   n_actions = 16*2*2 + 1 = 65
 #
 # HOW TO ADD A SECOND GPU:
 #   1. Set N_NODES=2, N_GPUS=2 below (or pass n_nodes=2, gpus_per_node=2 to env)
-#   2. Retrain DSAC from scratch (obs_dim 192→210, n_actions 17→65 — checkpoint
+#   2. Retrain DSAC from scratch (obs_dim 160→178, n_actions 17→65 — checkpoint
 #      is NOT compatible; different network input/output shape)
 #   3. Update rlpd_finetune.py / hierarchical.py CLI defaults to match
 #   4. In Slurm: verify two worker nodes are registered and GRES is correct
@@ -112,13 +114,13 @@ MIN_RUNTIME_S = 1.0
 # ── Feature extractors ────────────────────────────────────────────────────
 
 def _job_feat(job: Job, now: float, mps_per_gpu: int) -> np.ndarray:
-    """11-dim per-job feature vector."""
+    """9-dim per-job feature vector."""
     gpu_oh = [1.0 if job.gpu_type == t else 0.0 for t in GPU_TYPES]
     wait = max(0.0, now - job.submit_ts)
     return np.array([
         job.mps_req / mps_per_gpu,
         float(job.gpu_count),
-        *gpu_oh,                        # 4 dims
+        *gpu_oh,                        # 2 dims (rtx4070 / rtx3080)
         math.log1p(job.runtime),
         math.log1p(wait),
         math.log1p(wait),               # age (duplicate until priority age added)

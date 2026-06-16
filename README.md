@@ -224,10 +224,10 @@ SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 ### 快速訓練（本機 CPU）
 
 ```bash
-# 預設：500k steps, n-step=10, PER, potential shaping, CQL=0.1
+# 預設：500k steps, n-step=10, PER, potential shaping, IQN/RDSAC critic
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --n-nodes 1 --gpus-per-node 1 \
-    --trace philly burst ali \
+    --trace philly ali \
     --total-steps 500000 \
     --out-dir runs/dsac_sim_$(date +%Y%m%d)
 
@@ -240,7 +240,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 # 2×2 DRL 實驗：需搭配 chart/values-2x2.yaml 與新的 dsac.pt checkpoint。
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --n-nodes 2 --gpus-per-node 2 \
-    --trace philly burst ali \
+    --trace philly ali \
     --total-steps 500000 \
     --out-dir runs/dsac_2x2_$(date +%Y%m%d)
 ```
@@ -255,7 +255,7 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
     --no-train \
     --n-nodes 1 --gpus-per-node 1 \
     --n-jobs 50 \
-    --trace-families philly burst ali \
+    --trace-families philly ali \
     --seeds 42 43 44 45 46 \
     --out-dir runs/bench_dsac_vs_score_$(date +%Y%m%d-%H%M%S)
 ```
@@ -286,29 +286,29 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
 
 也可以同時混入 shadow-mode JSONL transition logs：加上 `--online-log 'runs/shadow/*.jsonl'`。
 
-### 完整評估（3 families × 5 seeds，對比 score baseline）
+### 完整評估（2 families × 5 seeds，對比 score baseline）
 
 ```bash
 # 完整評估（所有改進開啟，CUDA）
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
     --n-nodes 1 --gpus-per-node 1 \
     --total-steps 500000 \
-    --trace-families philly burst ali \
+    --trace-families philly ali \
     --seeds 42 43 44 45 46 \
     --device cuda \
     --curriculum \
     --out-dir runs/eval_dsac_$(date +%Y%m%d-%H%M%S)
 
-# 僅 MLP（無 attention，停用 shaping/PER 作為 ablation baseline）
+# Ablation baseline（停用 shaping/PER）
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --no-attention --no-per --no-potential-shaping --cql-alpha 0 \
+    --no-per --no-potential-shaping \
     --total-steps 200000 --device cuda \
-    --out-dir runs/eval_mlp_ablation_$(date +%Y%m%d-%H%M%S)
+    --out-dir runs/eval_ablation_$(date +%Y%m%d-%H%M%S)
 
-# IQN critic（quantile Huber loss）
+# Vanilla SAC（scalar twin-Q critic；--no-iqn 關掉預設的 IQN/RDSAC）
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --use-iqn --device cuda \
-    --out-dir runs/eval_iqn_$(date +%Y%m%d-%H%M%S)
+    --no-iqn --device cuda \
+    --out-dir runs/eval_sac_$(date +%Y%m%d-%H%M%S)
 
 # 載入已有 checkpoint，跳過訓練直接評估
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
@@ -322,9 +322,8 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 | `--curriculum` | n_jobs 從 10→30→50 漸進 | 關 |
 | `--no-per` | 停用 Prioritized Experience Replay | PER 開 |
 | `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
-| `--cql-alpha` | CQL 正則化係數（0=停用） | 0.1 |
-| `--use-iqn` | IQN critic（quantile Huber loss） | 關 |
-| `--no-attention` | MLP Q-network（非 attention） | 關 |
+| `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
+| `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
 
 ### 執行單元測試
 

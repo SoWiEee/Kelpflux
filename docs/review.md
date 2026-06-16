@@ -66,7 +66,7 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 |---|---|:---:|---|
 | I1 | **train/serve 動作落差。** sim 訓練的是 placement policy（job, node, gpu），但 live 的 Lua hook 只把 RL 的選擇轉成 **priority boost**——Slurm 仍做真正的 allocation，`node_j/gpu_k` 在 live 並未被強制執行。等於訓練一個放置策略、上線只用了它的「選哪個 job」那一半。 | **Critical** | 兩條路擇一：(a) 把 live 真正接上 explicit placement（`live_daemon` 已有 `srun` 明確放置的雛形，但預設 SHADOW），讓 serve 的 placement 真的被執行；或 (b) 把 sim 的 action 改成只學 priority/job-selection，與 live 對齊。現在的不一致讓任何 sim 結論都無法宣稱能轉移到 live。 |
 | I2 | **MPS 不是生產級共享原語。** 無記憶體/故障隔離：一個 job OOM 可拖垮共置者。§4.4 的干擾模型是 `1 + k·factor` 線性近似，真實干擾取決於 kernel overlap、記憶體頻寬、L2 競爭，可能是非線性甚至災難式。 | High | 消費卡無 MIG，可接受用 MPS demo，但要在 Threats 寫明；干擾模型至少做一次**實測校準**（在真卡上跑 2 個 compute-bound job 量 slowdown 分布），別只用線性假設。生產敘事需提 MIG/時間片的取捨。 |
-| I3 | **固定拓樸的 obs/action 空間 = 反彈性。** `gym_env` 的 obs_dim / n_actions 綁死 N_NODES×N_GPUS，節點 join/leave 就 checkpoint 不相容、要從零重訓。對「cloud-native 彈性叢集」的宣稱是根本性矛盾——這也是為什麼加一台 3080 就要重訓。 | High | 中期應走 **permutation-invariant / 可變長度** 的 obs（attention trunk 已是 set-based，往「節點數無關」的編碼推進），讓單一 policy 跨拓樸。否則每次擴縮都重訓，無法營運。 |
+| I3 | **固定拓樸的 obs/action 空間 = 反彈性。** `gym_env` 的 obs_dim / n_actions 綁死 N_NODES×N_GPUS，節點 join/leave 就 checkpoint 不相容、要從零重訓。對「cloud-native 彈性叢集」的宣稱是根本性矛盾——這也是為什麼加一台 3080 就要重訓。 | High | 中期應走 **permutation-invariant / 可變長度** 的 obs（set-based 編碼，如對節點/GPU token 做 attention pooling，往「節點數無關」推進），讓單一 policy 跨拓樸。否則每次擴縮都重訓，無法營運。 |
 | I4 | **submit-path 同步延遲。** Lua 在 `slurm_job_submit` 同步呼叫 `/decide`（150ms timeout）。負載高時這是 submit 關鍵路徑。 | Medium | 量 `/decide` 的 p99 與在 batch submit 風暴下的 slurmctld 影響；serve 確保 CPU 推論 + warm pool（memory 已記 `min_replicas=1`）。把 decision latency、snapshot age、abstain rate 設成有 alert 的 SLO。 |
 | I5 | **測試平台規模 vs 宣稱。** 整個「叢集」是一張與 Steam 遊戲共享的消費級 RTX 4070 上的 k3s 單節點；第二台是異質消費卡 3080。 | Medium | 這不是缺陷、是限制——但要在論文/報告誠實標示，且 live 數字要排除遊戲佔卡造成的熱節流/競爭（本輪訓練就曾因 `wwm.exe` 佔卡使 CUDA 不可用）。理想上把實驗挪到專用機或雲端 spot GPU 做最終數據。 |
 | I6 | **單副本關鍵服務 + operator 無 leader election**（v6 已記，仍未解）。 | Medium | 維持 v6 建議：operator active-passive leader election；rl-scheduler 可 2 replicas + PDB。fail-safe 讓 submit 不壞，但 snapshot pusher / live_daemon 仍是 SPOF。 |
@@ -112,7 +112,7 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 | P1-2 | **score-residual RDSAC**（`final = score + RL_delta`，bounded）| v6 P1-3, R5 | §4.5 負結果後優先序升高；學「何時修正啟發式」而非從零學 |
 | P1-3 | **warmup on/off ablation**（驗證 live abstain 成因）| M2 | 可能直接解釋 1×1 live 全打平 |
 | P1-4 | **補強 baseline**：FCFS / SJF / packing / 近似上界 | R3 | ΔJCT% 才有尺度感 |
-| P1-5 | **2-node（4070+3080）異質實驗** | I3, §4.5 | 補 `rtx3080` 進 `GPU_TYPES` / `_gpu_type_to_vram`（10GB）；共置動作在真 2-GPU 重評 |
+| P1-5 | **2-node（4070+3080）異質實驗** | I3, §4.5 | `rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`（10GB，字母表收斂為 {4070,3080}）；剩 2×1 拓樸重訓 + 共置動作在真 2-GPU 重評 |
 | P1-6 | **干擾模型實測校準** | I2 | 真卡量 2-job slowdown 分布，取代線性假設 |
 
 ### P2 — 工程韌性與清理（多沿用 v6，仍有效）

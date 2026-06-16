@@ -18,7 +18,7 @@ from typing import Iterable, Sequence
 
 from .loader import MPS_PER_GPU
 
-_GPU_TYPES = ("rtx4070", "rtx4080", "rtx4090", "a10", "h100", "v100", "p100")
+_GPU_TYPES = ("rtx4070", "rtx3080")
 _TERMINAL_OK = ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED")
 
 

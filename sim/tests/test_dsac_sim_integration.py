@@ -61,7 +61,7 @@ def _make_env_and_agent(n_nodes=1, gpus_per_node=1):
 
 def test_agent_dims_match_env():
     obs_dim, n_act = env_dims(1, 1)
-    assert obs_dim == OBS_DIM == 192
+    assert obs_dim == OBS_DIM == 160
     assert n_act == N_ACTIONS == 17
     agent = DSACAgent(obs_dim=obs_dim, n_actions=n_act)
     # Q-nets should accept a random obs

@@ -587,7 +587,7 @@ def main(argv=None) -> int:
     p.add_argument("--trace-family", default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     # Cluster shape — must match the live deployment.
-    # Current: 1 host × 1 GPU → obs_dim=192, n_actions=17.
+    # Current: 1 host × 1 GPU → obs_dim=160, n_actions=17.
     # When second GPU is online: change both to 2 and retrain from scratch.
     p.add_argument("--n-nodes", type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)

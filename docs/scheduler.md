@@ -168,7 +168,7 @@ Submit-time path 仍是低風險預設；hard placement controller 是正式可�
 
 **共用設定（兩者相同）**
 
-placement 是離散動作，故 actor 是**顯式 masked categorical** `π(a|s;φ)`（非法動作 logits 設 −1e9）。狀態 `s` 為 192 維 obs，動作 `a` 從 `valid(s)` 中取。最大熵目標：最大化
+placement 是離散動作，故 actor 是**顯式 masked categorical** `π(a|s;φ)`（非法動作 logits 設 −1e9）。狀態 `s` 為 160 維 obs，動作 `a` 從 `valid(s)` 中取。最大熵目標：最大化
 
 ```
 J = Σ_t E[ r_t + α·H(π(·|s_t)) ]，  H = −Σ_a π(a|s)·log π(a|s)
@@ -248,7 +248,7 @@ value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       #
 
 兩條路徑都帶 twin-Q（取 min）與 soft target update。`risk_mode=mean` 是 RDSAC 預設；要尾部感知（p95/p99 JCT、tail slowdown，見 `sim/metrics.py`）時改 `cvar`。
 
-> **命名注意**：此處「DSAC」指**院內組裝的 distributional + 離散 SAC**（Christodoulou 離散 SAC + Dabney IQN critic + CVaR distortion 的組合），**不是** Duan et al. 2021 把回報建模成單一 Gaussian 的連續控制 DSAC，勿假設與該論文對等。`use_attention=True` 可把 MLP trunk 換成對 16 個 job token 的 TransformerEncoder（permutation-invariant），與兩種 critic 家族都相容。
+> **命名注意**：此處「DSAC」指**院內組裝的 distributional + 離散 SAC**（Christodoulou 離散 SAC + Dabney IQN critic + CVaR distortion 的組合），**不是** Duan et al. 2021 把回報建模成單一 Gaussian 的連續控制 DSAC，勿假設與該論文對等。兩種 critic 家族都使用 MLP trunk。
 
 ### 3.3 Submit 到硬體分配的時序
 

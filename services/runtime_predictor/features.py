@@ -14,7 +14,7 @@ well, and we want the service to fit on a single CPU at low latency):
   - ``hour_of_week``        int    0–167  (from submit_ts; bootstraps fall to 0)
   - ``user_freq``           int    count of prior runs by this user in trace
   - ``user_mean_log_rt``    float  rolling mean of log(rt+1) for prior runs
-  - ``gpu_type_*``          one-hot over a fixed alphabet (rtx4070/v100/p100/a10/h100/other)
+  - ``gpu_type_*``          one-hot over a fixed alphabet (rtx4070/rtx3080/other)
   - ``partition_*``         one-hot over a fixed alphabet (cpu/gpu/debug/other)
 
 The ``user_*`` columns are computed in *trace order* — for offline
@@ -30,7 +30,7 @@ from typing import Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-GPU_TYPES = ("rtx4070", "v100", "p100", "a10", "h100", "other")
+GPU_TYPES = ("rtx4070", "rtx3080", "other")
 PARTITIONS = ("cpu", "gpu", "debug", "other")
 
 NUMERIC_COLS = ["gpu_count", "mps_req", "hour_of_week", "user_freq", "user_mean_log_rt"]

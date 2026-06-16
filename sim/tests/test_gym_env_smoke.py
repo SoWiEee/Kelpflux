@@ -33,17 +33,17 @@ def _factory(n_jobs: int = 50, seed: int = 42, family: str = "philly"):
 # ── obs / action space shape ─────────────────────────────────────────────
 
 def test_obs_dim_constant():
-    # Current deployment: 1 node × 1 GPU → 176 + 6 + 4 + 6 = 192
+    # Current deployment: 1 node × 1 GPU → 144 + 6 + 4 + 6 = 160
     expected = TOP_K * JOB_FEAT_DIM + N_NODES * N_GPUS * GPU_FEAT_DIM + TOPO_FEAT_DIM + GLOBAL_FEAT_DIM
-    assert OBS_DIM == expected == 192
+    assert OBS_DIM == expected == 160
 
 
 def test_env_dims_helper():
     from sim.gym_env import env_dims
     obs, n_act = env_dims(1, 1)
-    assert obs == 192 and n_act == 17
+    assert obs == 160 and n_act == 17
     obs2, n_act2 = env_dims(2, 2)
-    assert obs2 == 210 and n_act2 == 65
+    assert obs2 == 178 and n_act2 == 65
 
 
 def test_reset_returns_correct_shape():

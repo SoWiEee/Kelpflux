@@ -25,12 +25,11 @@ _DEFAULT_TIERS_GB = (12, 24)
 
 
 def _gpu_type_to_vram(gpu_type: str) -> Optional[int]:
+    # Only the two GPUs this cluster models: RTX 4070 (12 GB) and the planned
+    # RTX 4070-class second node RTX 3080 (10 GB). Unknown types → None → neutral.
     return {
         "rtx4070": 12,
-        "v100": 16,
-        "p100": 16,
-        "a10": 24,
-        "h100": 80,
+        "rtx3080": 10,
     }.get(gpu_type.lower())
 
 

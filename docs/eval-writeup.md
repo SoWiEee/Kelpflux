@@ -106,7 +106,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 |---|---|
 | training | 從頭訓練 150k 步（§3.4 起的隨機性實驗為 100k），curriculum n_jobs 10→30→50 |
 | reward_scale | **20000**（修復 alpha 觸頂，見 2.2） |
-| cluster | 1 node × 1 GPU（obs 192 / 17 actions） |
+| cluster | 1 node × 1 GPU（執行當時 obs 192 / 17 actions；**GPU 字母表收斂為 {rtx4070, rtx3080} 後程式現為 obs 160**，§3 數字尚未在新字母表下重跑）|
 | jobs per trace | 50 |
 | trace families | `philly`, `ali`（Alibaba PAI）|
 | seeds（eval） | 確定性實驗 30 seed；隨機性實驗 5 seed |
@@ -413,7 +413,7 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 ✓ **重尾 + 高競爭 live A/B（已完成，§4.4.1–4.4.2）。** 首輪 block 設計被 cluster drift 汙染（score 自身 p99 漂移 153→125）；改用 `--interleave`（round-robin 交錯排程方法順序、每方法跨 4 輪輪過 4 位置）後 drift 消掉（score 跨 σ 穩定到 0.5%），得到**乾淨的 1×1 三方打平**——沒有學習方法贏過 score。**剩下的不是再跑一次 1×1**（makespan-bound 天花板已確認），而是第 5 項的 **2-node** 才有真實 placement 決策面。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
 4. **修 train/serve 動作落差。** sim 訓練 placement policy（job, node, gpu），live 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation；兩者對齊（live 真接 explicit placement，或 sim 改學 priority/selection）後 sim 結論才能宣稱轉移到 live。
-5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。需先補 `rtx3080` 進 `GPU_TYPES` / `_gpu_type_to_vram`。
+5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。（`rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`，obs_dim 已收斂為 160）。
 6. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
 
 **演算法與韌性**
@@ -433,7 +433,7 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
   --total-steps 150000 --warmup-steps 2000 --n-jobs 50 \
   --n-nodes 1 --gpus-per-node 1 \
   --trace-families philly ali --train-trace philly ali \
-  --seeds 42 43 44 45 46 --no-attention --curriculum --reward-scale 20000 \
+  --seeds 42 43 44 45 46 --curriculum --reward-scale 20000 \
   --risk-mode cvar --risk-beta 0.25 --device cuda \
   --out-dir runs/rdsac_eval_cvar_v2     # mean: --risk-mode mean
 ```

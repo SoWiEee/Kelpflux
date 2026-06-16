@@ -177,8 +177,8 @@ def generate_philly_like(
     users = [f"u{i:02d}" for i in range(n_users)]
     gpu_choices = [1, 2, 4, 8]
     gpu_weights = [0.75, 0.12, 0.10, 0.03]
-    gpu_types = ["rtx4070", "v100", "p100"]
-    gpu_type_weights = [0.55, 0.30, 0.15]
+    gpu_types = ["rtx4070", "rtx3080"]
+    gpu_type_weights = [0.6, 0.4]
 
     jobs: List[Job] = []
     t = 0.0
@@ -232,8 +232,8 @@ def generate_burst_heavy(
     users = [f"u{i:02d}" for i in range(n_users)]
     gpu_choices = [1, 2, 4, 8]
     gpu_weights = [0.75, 0.12, 0.10, 0.03]
-    gpu_types = ["rtx4070", "v100", "p100"]
-    gpu_type_weights = [0.55, 0.30, 0.15]
+    gpu_types = ["rtx4070", "rtx3080"]
+    gpu_type_weights = [0.6, 0.4]
 
     n_burst = int(round(n_jobs * burst_concentration))
     n_gap = n_jobs - n_burst
@@ -292,8 +292,8 @@ def generate_ali_like(
     users = [f"u{i:02d}" for i in range(n_users)]
     gpu_choices = [1, 2, 4]
     gpu_weights = [0.90, 0.07, 0.03]
-    gpu_types = ["a10", "v100", "rtx4070"]
-    gpu_type_weights = [0.60, 0.25, 0.15]
+    gpu_types = ["rtx4070", "rtx3080"]
+    gpu_type_weights = [0.6, 0.4]
 
     # Diurnal arrival: thinning a uniform sample through a 1+sin envelope.
     raw_ts = [rng.uniform(0.0, horizon_seconds) for _ in range(n_jobs * 3)]

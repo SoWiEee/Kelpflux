@@ -16,15 +16,17 @@
 - 你現在的硬體是 **兩台機器、每台 1 張 GPU** → 在 sim 的術語是 **`n_nodes=2, gpus_per_node=1`（即 2×1）**。
 - code comment 與 `chart/values-2x2.yaml` 講的 **「2×2」是「2 nodes × 2 GPUs/node」**（每台兩張卡），那是另一種拓樸，**不是你目前的硬體**。
 
-兩者的 obs/action 維度完全不同（`sim/gym_env.py:84` `env_dims()` 計算）：
+兩者的 obs/action 維度完全不同（`sim/gym_env.py:84` `env_dims()` 計算；**注意 `JOB_FEAT_DIM` 已收斂為 9**——GPU one-hot 從 4 種縮到 `{rtx4070, rtx3080}` 2 種，見 §0.1）：
 
 | 拓樸 | 說明 | `obs_dim` | `n_actions` | 出處 |
 |------|------|-----------|-------------|------|
-| 1×1（現況 live） | 1 node × 1 GPU | **192** | **17** | `sim/gym_env.py:46-48`、`/healthz` |
-| **2×1（你要的真實拓樸）** | **2 nodes × 1 GPU** | **198** | **33** | `16*11 + 2*1*6 + 4 + 6 = 198`；`16*2*1 + 1 = 33` |
-| 2×2（code comment 講的） | 2 nodes × 2 GPUs | 210 | 65 | `sim/gym_env.py:50-52`、`chart/values-2x2.yaml` |
+| 1×1（現況 live） | 1 node × 1 GPU | **160** | **17** | `sim/gym_env.py:46-48`、`/healthz` |
+| **2×1（你要的真實拓樸）** | **2 nodes × 1 GPU** | **166** | **33** | `16*9 + 2*1*6 + 4 + 6 = 166`；`16*2*1 + 1 = 33` |
+| 2×2（code comment 講的） | 2 nodes × 2 GPUs | 178 | 65 | `sim/gym_env.py:50-52`、`chart/values-2x2.yaml` |
 
-**結論：你要的是 2×1（198 / 33），不是 repo 預設那個 2×2（210 / 65）。**
+**結論：你要的是 2×1（166 / 33），不是 repo 預設那個 2×2（178 / 65）。**
+
+> ⚠ obs_dim 已從舊的 192/198/210 收斂為 **160/166/178**（GPU 字母表縮成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 11→9）。**現有 1×1 live checkpoint（192-dim）已不相容、`/decide` 會一律 fail-safe 退回 score，直到用新維度重訓。**
 
 > 請先決定你要的是哪一種：
 > - 若每台機器只有 1 張卡 → 用 **2×1**：DSAC 訓練帶 `--n-nodes 2 --gpus-per-node 1`，並自行新增一份 `values-2node-1gpu.yaml`（**不要直接用** `values-2x2.yaml`，它會宣告 `gpu count: 2`、`mps:200`，對不上單卡硬體）。
@@ -32,19 +34,14 @@
 >
 > 後面第 6/7 節以 **2×1** 為主軸撰寫。
 
-## 0.1 GPU 異質性：RTX 3080 目前完全不在 codebase 裡（必讀）
+## 0.1 GPU 異質性：4070 / 3080 已建模（字母表已收斂，必讀）
 
-RTX 3080 在整個 repo 都還沒被建模，加入前要先補。否則 sim 與 score baseline 會把它當成「未知 GPU」：
+GPU 型別字母表已收斂成 **`{rtx4070, rtx3080}`**——sim、score baseline、runtime predictor、snapshot agent 都一致只認這兩種（舊的 `rtx4080`/`a10`/`h100`/`v100`/`p100` 已移除）。剩下要處理的是**拓樸/重訓**，不是建模：
 
-1. **per-job GPU one-hot 不認得它** — `sim/gym_env.py:38` `GPU_TYPES = ("rtx4070", "rtx4080", "a10", "h100")` 沒有 `rtx3080`。`_job_feat()`（`sim/gym_env.py:116`）的 one-hot 是 4 維、綁死這四種；rtx3080 job 會 one-hot 成全 0（被當成「無已知 GPU 型別」）。
-   - **注意連鎖效應**：若你選擇把 `rtx3080` *加進* `GPU_TYPES`，one-hot 變 5 維 → `JOB_FEAT_DIM` 由 11→12 → `obs_dim` 又會再變一次（再一次 checkpoint 不相容）。要嘛在同一次重訓裡一起改，要嘛接受 rtx3080 暫時 one-hot 為全 0。
-2. **VRAM 映射缺項** — `sim/scheduler/score.py:27-34` `_gpu_type_to_vram()` 只有 `rtx4070→12, v100→16, p100→16, a10→24, h100→80`，**沒有 `rtx3080`**（也沒有 `rtx4080`，與 `GPU_TYPES` 本身就不一致）。缺項時 `f_vram_fit` 走 `None → 回 0.5` 的中性分支（`score.py:178-179`），等於 3080 的 VRAM 完全不參與排序。建議補：
-   ```python
-   # sim/scheduler/score.py  _gpu_type_to_vram()
-   "rtx3080": 10,   # 10 GB（3080-12G 變體請改 12）
-   "rtx4070": 12,
-   ```
-3. **異質 VRAM 的語意** — 4070 是 12 GB、3080 是 10 GB。`vramTiers: [12, 24]`（`chart/values.yaml:270`）目前的最小 tier 是 12，3080 的 10 GB job 會被歸到 12 GB tier、視為「略微 over-provision」。若要精確建模 10 GB 上限，需新增一個 10 GB tier，並同步改 `chart/values.yaml:270` 與 sim 的 `_DEFAULT_TIERS_GB`（`score.py:24`）。
+1. **per-job GPU one-hot 已含 3080** — `sim/gym_env.py:38` `GPU_TYPES = ("rtx4070", "rtx3080")`，one-hot 為 **2 維**（不再是 4 維）。`_job_feat()`（`sim/gym_env.py:114`）已對齊，trace 生成器（`sim/loader.py`）也只發 `{rtx4070, rtx3080}` job。連帶 `JOB_FEAT_DIM` 已是 **9**（原 11），`obs_dim` 已收斂為 160（1×1）。
+   - **這也是為什麼現有 192-dim checkpoint 不相容**：字母表收斂直接改了 obs 寬度。任何上線都要用新維度重訓。
+2. **VRAM 映射已補 3080** — `sim/scheduler/score.py` `_gpu_type_to_vram()` 現為 `{rtx4070→12, rtx3080→10}`，3080 的 10 GB 已參與 `f_vram_fit` 排序（不再走 `None → 0.5` 中性分支）。
+3. **異質 VRAM 的 tier 語意** — 4070 是 12 GB、3080 是 10 GB。`vramTiers: [12, 24]`（`chart/values.yaml:270`）與 sim `_DEFAULT_TIERS_GB`（`score.py:24`）目前**仍為 (12, 24)**，未隨字母表收斂；10 GB job 會被歸到 12 GB tier、視為「略微 over-provision」。若要精確建模 10 GB 上限，需新增 10 GB tier 並同步改這兩處（屬選用、影響 score 語意，預設不動）。
 4. **同一個 partition 混卡的風險** — 目前 GPU worker pod 只靠 `nvidia.com/gpu` resource request 排程，**沒有把某個 pool 釘到特定實體機器**（`chart/templates/workers.yaml` 無 `nodeSelector`/affinity）。若把 3080 也標成 `gpu-rtx4070` 並丟進同一個 `gpu-rtx4070` partition，Slurm/k3s 會把 4070 的 job 排到 3080 上（反之亦然），VRAM/型別假設就會錯。**建議**：給 3080 一條獨立的 host-class 與（若要嚴格隔離）獨立 partition，見第 5、6 節。
 
 ## 1. 加入前確認
@@ -194,9 +191,9 @@ kubectl -n slurm exec slurm-controller-0 -- sinfo -Nel
 
 ### 6.2 讓 DRL topology 變成 2 nodes × 1 GPU（2×1，你的真實拓樸）
 
-如果你希望 DRL scheduler 看到兩個 GPU placement nodes、每台一張 GPU，則需要讓 Helm values、snapshot agent、DSAC checkpoint 三者一致對齊 **2×1（obs_dim=198, n_actions=33）**。
+如果你希望 DRL scheduler 看到兩個 GPU placement nodes、每台一張 GPU，則需要讓 Helm values、snapshot agent、DSAC checkpoint 三者一致對齊 **2×1（obs_dim=166, n_actions=33）**。
 
-> **不要直接套 `chart/values-2x2.yaml`。** 它是「每台 2 張卡」的 experiment profile（`gres count: 2`、`mps: 200`、`maxNodes: 2`、`replicas: 0`，見 `chart/values-2x2.yaml:40-63`），對應 210/65 的 2×2，對不上你的單卡硬體。請另建一份 `values-2node-1gpu.yaml`。
+> **不要直接套 `chart/values-2x2.yaml`。** 它是「每台 2 張卡」的 experiment profile（`gres count: 2`、`mps: 200`、`maxNodes: 2`、`replicas: 0`，見 `chart/values-2x2.yaml:40-63`），對應 178/65 的 2×2，對不上你的單卡硬體。請另建一份 `values-2node-1gpu.yaml`。
 
 chart 的 worker 是用 **pools list**（`chart/values.yaml:46-118`），Helm 會整段取代 list 而非 merge，所以 overlay 要把整個 `pools` 重列一次，把 GPU pool 調成「每個 pool replica 1 張卡、可上到 2 個 replica（兩台機器各一）」。重點欄位：
 
@@ -267,36 +264,34 @@ helm upgrade --install slurm-platform ./chart \
 
 ## 7. DSAC checkpoint 必須對齊 topology
 
-目前 live image 內的 checkpoint 是 1 node × 1 GPU topology，`/healthz` 會顯示：
+> **現況（GPU 字母表收斂後）**：live image 內**仍是舊的 192-dim checkpoint**（收斂前訓練），`/healthz` 會回報該 checkpoint 自帶的 `{"obs_dim":192,"n_actions":17}`；但收斂後的程式碼**現在組的是 160-dim obs**（1×1），兩者**維度不符 → `/decide` forward shape mismatch → 一律 fail-safe 退回 score**。要恢復 RL boost，得先用新維度（1×1=160 / 2×1=166）重訓並重新烘進 image。
 
-```json
-{"obs_dim":192,"n_actions":17}
-```
+**checkpoint 與 topology 的對齊邏輯**：`serve.py` 用 `DSACAgent.load()` 從 checkpoint 還原 `obs_dim`/`n_actions`，而 `/decide` handler 依 `req.n_nodes`/`req.gpus_per_node` 即時組 obs 與 mask。一旦 obs 寬度（topology 或 **GPU 字母表**）與 checkpoint 維度不一致，agent forward 會 shape mismatch；`rl_hook.lua` 把整個呼叫包在 `pcall` 裡，任何失敗都 fail-safe 退回 score baseline（`chart/lua/rl_hook.lua:89-102`）。**所以收斂/retopology 後不重訓、不換 checkpoint，RL 層只會一路 abstain。**
 
-**checkpoint 與 topology 的對齊邏輯**：`serve.py` 用 `DSACAgent.load()` 從 checkpoint 還原 `obs_dim`/`n_actions`（`services/rl_scheduler/serve.py:262-265`），而 `/decide` handler 是依 `req.n_nodes`/`req.gpus_per_node` 即時組 obs 與 mask（`serve.py:200-240`）。一旦 snapshot agent 送的 topology 與 checkpoint 的維度不一致，agent forward 會 shape mismatch；`rl_hook.lua` 把整個呼叫包在 `pcall` 裡，任何失敗都 fail-safe 退回 score baseline（`chart/lua/rl_hook.lua:89-102`）。**所以 retopology 後不重訓、不換 checkpoint，RL 層只會一路 abstain。**
-
-若第二台加入後仍用 1×1 checkpoint，`rl-snapshot-agent` 應該維持送 1×1 snapshot，才不會觸發 abstain。若要讓模型真的在 **2 nodes × 1 GPU（2×1，目標 `obs_dim=198, n_actions=33`）** 上做 placement-aware decision，必須**從頭重新訓練** DSAC（既有 checkpoint 不相容，輸入/輸出 shape 不同）：
+若要讓模型真的在 **2 nodes × 1 GPU（2×1，目標 `obs_dim=166, n_actions=33`）** 上做 placement-aware decision，必須**從頭重新訓練** DSAC（既有 checkpoint 不相容，輸入/輸出 shape 不同）：
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
   --n-nodes 2 \
   --gpus-per-node 1 \
-  --trace philly burst ali \
+  --trace philly ali \
   --total-steps 500000 \
   --out-dir runs/dsac_2node_1gpu_$(date +%Y%m%d)
 ```
 
-> **重訓前先處理 sim 端的拓樸與型別常數**（對照 `CLAUDE.md` 的 "Key Constants" 與 "HOW TO ADD A SECOND GPU"，`sim/gym_env.py:54-61`）：
+> **重訓前先處理 sim 端的拓樸與型別常數**（對照 `CLAUDE.md` 的 "Key Constants (sim/gym_env.py)" 一節，`sim/gym_env.py:54-61`）：
 > 1. 若改用 module 預設而非 CLI 旗標，把 `sim/gym_env.py:60-61` 的 `N_NODES`/`N_GPUS` 改成你要的拓樸（2×1 → `N_NODES=2, N_GPUS=1`）。注意 `gym_env.py:54-58` 的 comment 範例寫的是 2×2（`N_NODES=2, N_GPUS=2`），別照抄。
-> 2. RTX 3080 的 GPU 型別建模：見 §0.1。若要讓 one-hot 認得 rtx3080，需在 `sim/gym_env.py:38` 的 `GPU_TYPES` 加 `"rtx3080"`——但這會把 `JOB_FEAT_DIM`（`gym_env.py:40`）由 11→12、`obs_dim` 198→210，**要在同一次重訓一起決定**，否則之後再改又是一次不相容。
-> 3. 補 `sim/scheduler/score.py:27-34` 的 `_gpu_type_to_vram` 加 `"rtx3080": 10`，讓 score baseline 與 sim 對 3080 的 VRAM 一致。
+> 2. **GPU 型別建模已完成**（見 §0.1）：`GPU_TYPES`、`_gpu_type_to_vram`、`sim/loader.py` 生成器、predictor/snapshot 字母表都已收斂成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 已是 9。重訓直接吃這個維度即可，不用再動字母表。
+> 3.（選用）若要精確區分 3080 的 10 GB 上限，補 `_DEFAULT_TIERS_GB`（`score.py:24`）與 `chart/values.yaml:270` 的 10 GB tier；預設維持 (12, 24)。
 > 4. 同步 `rlpd_finetune.py` 與（已封存的）`hierarchical.py` 的 CLI 預設拓樸，避免 fine-tune 時又退回 1×1。
 
-訓練完成後：
+訓練完成後（持久路線，正式上線建議）：
 
 1. 更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指向新 checkpoint。
 2. 重新執行 `bash scripts/deploy-2.sh`，讓 image rebuild/import，並 rollout restart RL deployments。
-3. 確認 `/healthz` 的 `obs_dim` / `n_actions` 顯示 **198 / 33**（2×1），且與 snapshot agent 送的 topology 相符。
+3. 確認 `/healthz` 的 `obs_dim` / `n_actions` 顯示 **166 / 33**（2×1），且與 snapshot agent 送的 topology 相符。
+
+> **快速熱換（不重啟 pod）**：`serve.py` 現有 `POST /reload`（`services/rl_scheduler/serve.py:451`，原子換 agent、維度不符會保留舊的並回錯）與 `POST /shadow`（`:497`，runtime 切 SHADOW_MODE）。把新 checkpoint 放進 pod 後 `curl -X POST .../reload -d '{"ckpt_path":"/models/<new>.pt"}'` 即可即時換模，適合 A/B 或迭代驗證；但 pod 重建後會退回 image 內的 checkpoint，所以**正式上線仍要走上面 Dockerfile 持久路線**。
 
 ## 8. Snapshot agent 設定
 
@@ -370,8 +365,8 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 | 風險 | 現象 | 處理 |
 |------|------|------|
-| 把「2×1」當成「2×2」 | checkpoint(210/65) 與 snapshot(198/33) 永遠對不上，`/decide` 一律 abstain | 用 2×1（198/33）：訓練帶 `--gpus-per-node 1`，**勿**直接套 `values-2x2.yaml`（見 §0） |
-| RTX 3080 未建模 | one-hot 全 0、`f_vram_fit` 走中性 0.5 分支、3080 被當 12 GB | 補 `GPU_TYPES`、`_gpu_type_to_vram`、`vramTiers`（見 §0.1）|
+| 把「2×1」當成「2×2」 | checkpoint(178/65) 與 snapshot(166/33) 永遠對不上，`/decide` 一律 abstain | 用 2×1（166/33）：訓練帶 `--gpus-per-node 1`，**勿**直接套 `values-2x2.yaml`（見 §0） |
+| 拿舊 192-dim checkpoint 配收斂後的 160-dim 程式 | obs 寬度不符 → `/decide` shape mismatch → 一律 abstain 退回 score | 用新維度（1×1=160 / 2×1=166）重訓並重烘 image（§7）；3080 字母表建模本身已完成（§0.1）|
 | 第二台沒有 GPU label | GPU worker pod 不上第二台，或 GPU Operator 不套 MPS config | 補 `gpu-host-class=rtx3080` 與 `nvidia.com/device-plugin.config` label |
 | 4070/3080 混在同一 partition | job 被排到「錯型別」的卡，VRAM 假設失準 | 用獨立 `gpu-rtx3080` pool/partition，或接受同質化處理（見 §6.2）|
 | NFS 不通 | worker pod 卡 `ContainerCreating` 或 `/shared` 讀寫失敗 | `/etc/exports` 的 allowed clients 要含第二台 **LAN subnet**（非只 pod CIDR），見 §4 |
@@ -393,8 +388,8 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 若目標是「DRL policy 真的看到 2-node placement」（2×1）：
 
 1. 先完成上面的最小路線。
-2. 決定 topology = **2×1（198/33）**，並處理 RTX 3080 建模（`GPU_TYPES` / `_gpu_type_to_vram` / `vramTiers`，見 §0.1）。
+2. 決定 topology = **2×1（166/33）**（RTX 3080 的 GPU 型別建模已完成，見 §0.1；只剩拓樸與 vramTiers 選用調整）。
 3. 新增 `values-2node-1gpu.yaml`（GPU pool `count: 1` / `mps: 100` / `replicas: 2`，**非** `values-2x2.yaml`）。
 4. 用 `--n-nodes 2 --gpus-per-node 1` 從頭重訓 DSAC。
 5. 更新 Dockerfile checkpoint 並重新 `deploy-2.sh`。
-6. 確認 `/healthz` 顯示 `obs_dim=198, n_actions=33`，且 snapshot metrics 對齊。
+6. 確認 `/healthz` 顯示 `obs_dim=166, n_actions=33`，且 snapshot metrics 對齊。

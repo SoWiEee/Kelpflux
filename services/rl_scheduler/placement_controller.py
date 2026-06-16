@@ -29,7 +29,7 @@ from typing import Any, Sequence
 
 
 LOG = logging.getLogger("rl_placement_controller")
-GPU_TYPES = ("rtx4070", "rtx4080", "rtx4090", "generic")
+GPU_TYPES = ("rtx4070", "rtx3080", "generic")
 TOP_K = 16
 
 
