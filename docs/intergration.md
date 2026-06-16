@@ -266,6 +266,8 @@ helm upgrade --install slurm-platform ./chart \
 
 > **現況（GPU 字母表收斂後）**：live image 內**仍是舊的 192-dim checkpoint**（收斂前訓練），`/healthz` 會回報該 checkpoint 自帶的 `{"obs_dim":192,"n_actions":17}`；但收斂後的程式碼**現在組的是 160-dim obs**（1×1），兩者**維度不符 → `/decide` forward shape mismatch → 一律 fail-safe 退回 score**。要恢復 RL boost，得先用新維度（1×1=160 / 2×1=166）重訓並重新烘進 image。
 
+> **重訓 / 重評的時機（提醒）**：注意 live 目前**沒有壞**——線上跑的舊映像（舊程式 + 192-dim checkpoint）三者自洽、照常運作；維度不符只在「用收斂後的新程式碼 build 新映像、卻配舊 checkpoint」時才會發生。所以**不急著重 build/部署就不必現在重訓**。又因為 1×1 三方本來就打平（`docs/eval-writeup.md §4.4.2`），1×1 的 RL 即使活著也只是退回 score、不損失可量測的東西。**建議把 160/166-dim 的重訓與重評一次併進即將到來的 2-node + rtx3080 那輪做**（那時 obs_dim 本來就要變、trace 也會重生），而不是現在單獨為 1×1 重跑。eval-writeup §3 的數字是收斂前（192-dim、job 帶 v100/p100）跑的，重評後會位移，但機制結論（A 類打平、B 類待 2-node）不會翻盤。
+
 **checkpoint 與 topology 的對齊邏輯**：`serve.py` 用 `DSACAgent.load()` 從 checkpoint 還原 `obs_dim`/`n_actions`，而 `/decide` handler 依 `req.n_nodes`/`req.gpus_per_node` 即時組 obs 與 mask。一旦 obs 寬度（topology 或 **GPU 字母表**）與 checkpoint 維度不一致，agent forward 會 shape mismatch；`rl_hook.lua` 把整個呼叫包在 `pcall` 裡，任何失敗都 fail-safe 退回 score baseline（`chart/lua/rl_hook.lua:89-102`）。**所以收斂/retopology 後不重訓、不換 checkpoint，RL 層只會一路 abstain。**
 
 若要讓模型真的在 **2 nodes × 1 GPU（2×1，目標 `obs_dim=166, n_actions=33`）** 上做 placement-aware decision，必須**從頭重新訓練** DSAC（既有 checkpoint 不相容，輸入/輸出 shape 不同）：
