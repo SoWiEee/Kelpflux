@@ -1,24 +1,22 @@
 # Kelpflux Scheduler Evaluation
 
-本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是在同一套 simulator 與 live Slurm/k3s/GPU 環境中，清楚比較三種排程方式的行為：**heuristic score**、**SAC**、**RDSAC**。
+本文件整理目前上線規格下的 scheduler evaluation。重點不是證明 DRL 一定優於啟發式，而是在同一套模擬環境與真實 Slurm/k3s/GPU 環境中，清楚比較 3 種排程方式的行為：**heuristic score**、**SAC**、**RDSAC**。
 
-**訓練與評估管線（先讀這段）：** 本系統的策略**不是、也無法直接在 live cluster 上從頭訓練**——RL 要數十萬～數百萬個 transition，而真實 cluster 一個 placement 決策對應一個跑數分鐘～數小時的 job，湊滿樣本要等數月；且訓練初期的隨機策略會直接破壞系統，真實環境又無法 `reset()` 重放同一條 trace 做配對比較。因此採 **sim-to-real 兩段式**：
+在真實叢集中從頭做強化學習訓練需要數十道數百萬個 transition，而真實叢集一個 placement 決策對應一個跑數分鐘～數小時的 job，湊滿樣本要等數月，因此採用**sim-to-real 兩段式**：
 
-```
-① sim 大量訓練（便宜 / 安全 / 可 reset / 可配對評估）  →  checkpoint
-② live shadow-mode 部署，記錄真實 (obs, act, rew) 到 JSONL
-③ RLPD 用真實資料把 sim checkpoint 微調成真實環境策略
-```
+1. 在模擬環境中大量訓練（便宜/安全/可配對評估），產生 checkpoint
+2. 上線部署到實機，記錄真實 $(obs, act, rew)$ 資料到 JSONL
+3. 運用 RLPD 用真實資料把原始 checkpoint 微調成真實環境策略
 
-sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它的產出是**「機制性洞察 + 一個可用的 warm start」**，RLPD 微調的對象正是這個 warm start。**本文的聚焦點是：真實環境到底反映出了哪些 sim 推論。** 據此把 sim 結論分成三類（這也是讀本文的主軸）：
+模擬環境 (sim) 是唯一能做大量學習的地方；用來產出是「機制性洞察與一個可用的暖啟動」，接著用 RLPD 微調這個暖啟動。
+
+**本文的聚焦點是：真實環境到底反映出了哪些 sim 推論。** 據此把 sim 結論分成三類（這也是讀本文的主軸）：
 
 - **絕對績效數字（sim → real 轉移差）**：sim 的 JCT/勝幅不會原樣搬到真實系統，故只當定性/序數參考。
 - **A 類——已被 live 反映的機制結論**：「**確定性 1×1 placement 退化 → 沒有學習法贏過強啟發式 → 應該打平**」（連帶「SAC 最差是 auto-α 假象」）。§4 的 live 1×1 三方乾淨打平**正面印證**了這條——這是本文**唯一已在真實環境兌現**的轉移。
 - **B 類——sim 內成立、但 live 1×1 結構上反映不出來的推論**：「oracle runtime → CVaR≈mean → 風險機制空轉」「注入校準過的不確定性後 RDSAC > SAC、分布式 critic 才是主因、CVaR 是尾部加成」「共置要 ≥2 GPU」。這些原理上跟演算法本身綁定、可轉移，**但本系統的 live 1×1（makespan-bound + 生產 score runtime-blind）沒有可表現的決策面 → §4 量不到 → 本文不宣稱已轉移**，列為**待 2-node 驗證**（§5.1）。
 
-**閱讀順序對應管線：** §3（模擬結果）先講 **sim 訓練產出了哪些洞察**；§4（實機結果）再講 **這些洞察與真實環境的關聯/發現**；§5.1 列出 RLPD 微調與多節點驗證的 future work。
-
-文件結構：§0 摘要與結果總覽 → §1 評估對象 → §2 實驗與 benchmark 方法（含 §2.0 管線總覽）→ §3 模擬結果（sim 洞察）→ §4 實機執行結果（與真實環境的關聯）→ §5 結論 + future work → §6 重現指令 → §7 資料集來源。
+> 閱讀順序對應管線：§3（模擬結果）先講 **sim 訓練產出了哪些洞察**；§4（實機結果）再講 **這些洞察與真實環境的關聯/發現**；§5.1 列出 RLPD 微調與多節點驗證的 future work。
 
 ---
 
@@ -64,48 +62,48 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 最終分數 = `clamp01(α·f_mps_fit + β·f_vram_fit + γ·topology − δ·f_frag + ε·f_runtime)`，以 `score_gain=1000` 加在 Slurm multifactor 優先序上（**RL 的 `priority_boost` 加在同一條優先序**，故三方共用同一介入機制）。
 
-> **生產實況（與 sim 有差，2026-06-15 核對叢集 `slurm-config-job-submit` ConfigMap）**：上表是**設計上的**訊號，但**目前 live 部署只開 3 個**——權重 `α=0.4, β=0.2, δ=0.2`，而 **`γ=0`（topology 關）、`ε=0`（runtime/SJF 關）**。連帶 **runtime predictor 與 weight-tuner 都沒部署**（`PRED_ENABLED=false` / `WT_ENABLED=false`，叢集無對應 pod），所以權重是靜態、不被線上調。且 live 的因子是**無狀態 proxy**（`f_mps_fit = mps_req/100`、`f_frag = 4x(1−x)`），與 sim 的 cluster-aware 版（`f_mps_fit = mps_req/該GPU剩餘slot`、ε=0.30 SJF 開）**不同**。即生產 score 實際 = `clamp01(0.4·mps大小 + 0.2·vram_fit − 0.2·碎片)`，**完全不看 runtime**。
+> 實機設定和模擬環境稍有不同，參考 `slurm-config-job-submit` ConfigMap 發現只有開 3 個權重 $α=0.4, β=0.2, δ=0.2$，而 `γ=0`（topology 關）、`ε=0`（runtime/SJF 關），此外 runtime predictor 與 weight-tuner 都沒部署（`PRED_ENABLED=false` / `WT_ENABLED=false`，叢集無對應 pod），所以權重是靜態、不被線上調。且 live 的因子是**無狀態 proxy**（`f_mps_fit = mps_req/100`、`f_frag = 4x(1−x)`），與 sim 的 cluster-aware 版（`f_mps_fit = mps_req/該GPU剩餘slot`、ε=0.30 SJF 開）**不同**。即實機 score 實際 = `clamp01(0.4·mps大小 + 0.2·vram_fit − 0.2·碎片)`，**完全不看 runtime**。
 
 實作：simulator baseline `sim/scheduler/score.py`（cluster-aware、ε 預設 0.30）；live submit hook `chart/templates/configmap-job-submit.yaml`（無狀態 proxy、ε=0）；Slurm priority path `chart/templates/{slurm-conf,login,workers}.yaml`。
 
 ### 1.2 SAC
 
-vanilla 離散 Soft Actor-Critic（`DSACAgent(use_iqn=False)`）：**scalar twin-Q critic、MSE soft-Bellman、無 IQN 的 Z_R/Z_H 分布式分解、無 risk distortion**。排程 action 是離散且有 mask 的——每一步只能從 pending queue 中可行的 (job, node, GPU/MPS placement) 組合裡選一個。SAC 在本專案作為 RDSAC 的對照基準：用**完全相同的配方**（步數、traces、curriculum、PER、shaping、MLP trunk、1×1）訓練，唯一差別是 critic 型別與沒有 risk，用來回答「分布式/風險機制到底有沒有用」。
+根據 [Soft Actor-Critic](https://arxiv.org/abs/1801.01290) 實作離散版本（`DSACAgent(use_iqn=False)`）：**scalar twin-Q critic、MSE soft-Bellman、無 IQN 的 Z_R/Z_H 分布式分解、無 risk distortion**。排程 action 是離散且有 mask 的——每一步只能從 pending queue 中可行的 (job, node, GPU/MPS placement) 組合裡選一個。SAC 在本專案作為 RDSAC 的對照基準：用**完全相同的配方**（步數、traces、curriculum、PER、shaping、MLP trunk、1×1）訓練，唯一差別是 critic 型別與沒有 risk，用來回答「分布式/風險機制到底有沒有用」。
 
 ### 1.3 RDSAC
 
-RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning〉(arXiv:2004.14547) 的**離散動作忠實轉寫**。把連續控制的 reparameterised Gaussian actor 換成**顯式 categorical actor**，critic 與 risk 機制依論文 §4.1：
+根據 [DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning](https://arxiv.org/abs/2004.14547)的**離散動作忠實轉寫**。把連續控制的 reparameterised Gaussian actor 換成**顯式 categorical actor**，critic 與 risk 機制依論文 §4.1：
 
 - **雙分布 critic**：把 soft return 拆成 reward 分布 `Z_R` 與 entropy 分布 `Z_H`，各以 IQN 的 quantile 表示、共用 trunk，quantile Huber 回歸 + twin double learning。
 - **risk 進策略目標**：actor 目標對 reward 分布套用 distortion `ρ`，`risk_mode ∈ {mean, cvar, wang, cpw, msd}`。`mean` 是 risk-neutral（distributional 但不規避風險）；`cvar`（β=0.25）偏好下尾較不嚴重的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。
 
-實作 `services/rl_scheduler/dsac.py`、`services/rl_scheduler/distortion.py`。
+> 實作位於 `services/rl_scheduler/dsac.py`、`services/rl_scheduler/distortion.py`。
 
 ---
 
 ## 2. 實驗與 Benchmark 方法
 
-### 2.0 訓練與評估管線（sim 訓練 → RLPD 微調至真實環境）
+### 2.0 訓練與評估管線
 
-整體方法是 **sim-to-real 兩段式**，原因與各段產出如下表。理解這條管線是讀懂後面所有實驗的前提：**§3 的所有數字都是「在 sim 裡訓練 + 在 sim 裡評估」，目的是篩架構與抽洞察，不是預測真實績效**；真實績效由 §4 的 live A/B 量，最終策略由 RLPD 微調產出。
+整體方法是 **sim-to-real 兩段式**，原因與各段產出如下表。理解這條管線是讀懂後面所有實驗的前提：**§3 的所有數字都是「在模擬環境裡訓練 + 在模擬環境裡評估」，目的是篩架構與抽洞察，不是預測真實績效**；真實績效由 §4 的實機 A/B 評估，最終策略由 RLPD 微調產出。
 
-| 階段 | 環境 | 做什麼 | 為什麼不能在 live 直接做 | 產出 |
+| 階段 | 環境 | 做什麼 | 為什麼不能在實機直接做 | 產出 |
 |---|---|---|---|---|
-| **① sim 訓練** | `KubefluxSchedEnv`（gym） | 從頭訓練 100k–150k 步，curriculum，PER + shaping | live 一個 step = 一個跑數分鐘～小時的 job，湊滿樣本要數月 | checkpoint（warm start） |
-| **② sim 評估** | 同 sim，配對 + 受控消融 | paired t-test、SAC/RDSAC/cvar/fixed-α 消融 | live 無法 `reset()` 重放同一 trace → 拿不到 counterfactual | **機制性洞察**（§3） |
-| **③ live 部署** | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，記錄真實 (obs, act, rew) | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 A/B（§4）+ 微調語料 |
-| **④ RLPD 微調** | 用 ③ 的真實 JSONL | 以 sim checkpoint 為 prior，混真實資料 fine-tune | 從零 RLPD = 退回 ① 的 sample-complexity 與 ② 的破壞性探索 | 真實環境策略（future work，§5.1） |
+| (1) 模擬訓練 | `KubefluxSchedEnv`（gym） | 從頭訓練 100k–150k 步，curriculum，PER + shaping | 實機一個 step = 一個跑數分鐘～小時的 job，湊滿樣本要數月 | checkpoint（warm start） |
+| (2) 模擬評估 | 同 sim，配對 + 受控消融 | paired t-test、SAC/RDSAC/cvar/fixed-α 消融 | 實機無法 `reset()` 重放同一 trace → 拿不到 counterfactual | **機制性洞察**（§3） |
+| (3) 實機部署 | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，記錄真實 (obs, act, rew) 資料 | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 A/B（§4）+ 微調語料 |
+| (4) RLPD 微調 | 用 (3) 的真實 JSONL | 以模擬產出的 checkpoint 為 prior，混合真實資料做微調 | 從頭 RLPD = 退回 (1) 的 sample-complexity 與 (2) 的破壞性探索 | 真實環境策略（future work，§5.1） |
 
-**兩段式的取捨**：sim 換來「可大量訓練 + 可配對消融」，代價是擬真度——所以 sim 的**絕對數字不轉移**（§4 live 1×1 三方打平已印證）；機制性結論裡，**只有 A 類（1×1 退化 → 打平）已被 live 反映**，B 類（σ → RDSAC、分布式 critic、共置）**原理上可轉移但 live 1×1 量不到，待 2-node 驗證**（見 §0 三分類）。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；sim checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上——沒有它，連微調的起點都沒有。live trace collector（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒，等拓樸匹配的多節點 checkpoint 後啟動 ④。
+在模擬環境中「可大量訓練 + 可配對消融」，代價是模擬環境的絕對數字不轉移；機制性結論裡，**只有 A 類（1×1 退化 → 打平）已在實機反映**，B 類（σ → RDSAC、分布式 critic、共置）**原理上可轉移但實機 1×1 測量不到，待 2-node 驗證**。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；模擬器的 checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上。實機 trace 收集器（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒，等拓樸匹配的多節點 checkpoint 後啟動 (4)。
 
 ### 2.1 Simulator paired benchmark
 
-相同 seed 對 learned model 與 heuristic score 做 paired comparison，降低 trace 隨機性造成的誤差。`Δ = (score − model)/score`，**負值代表 model 的 JCT 較高、較差**。
+相同亂數種子 (seed) 對 DRL 模型與啟發式 score 做配對比較來降低 trace 隨機性造成的誤差。`Δ = (score − model)/score`，負值代表 model 的 JCT 較高、較差。
 
 | 項目 | 值 |
 |---|---|
 | training | 從頭訓練 150k 步（§3.4 起的隨機性實驗為 100k），curriculum n_jobs 10→30→50 |
-| reward_scale | **20000**（修復 alpha 觸頂，見 2.2） |
+| reward_scale | 20000（修復 alpha 觸頂） |
 | cluster | 1 node × 1 GPU（§3.1–§3.7 執行當時 obs 192 / 17 actions；**GPU 字母表收斂為 {rtx4070, rtx3080} 後程式現為 obs 160**——160-dim 重跑見 §3.8）|
 | jobs per trace | 50 |
 | trace families | `philly`, `ali`（Alibaba PAI）|
@@ -114,11 +112,9 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 > **訓練 seed 注意**：除非另註，每個 (model, 條件) 只訓練**一個** seed。eval 的 30/5 seed 是評估隨機性，不是訓練隨機性。這是目前最大的方法學限制（§3.6 有同 config 兩跑擺盪 50–90 pts 的鐵證）。
 
-### 2.2 reward_scale 修復（alpha 觸頂根因）
+> 早期 mean run 出現 `alpha` 自動調到 clamp 上限的警訊。排查後確認**不是 alpha 邏輯錯**，而是 **return 尺度問題**：舊 `reward = −JCT/1000`，50 job 累加 → return 量級 O(−150)，critic 的 `E[Z_R]` 跨動作落差約 560；actor 目標裡 entropy 正則 `α·log(n)`（上限~2）被 `Z_R`（~560）**壓過約 300×** → policy 早期塌成 one-hot（entropy ≈ 0.002）、探索停擺、alpha 一路 railing。修法：`reward_scale` 1000→**20000**（return 降到 O(−10)），log_alpha clamp 上限 1.0→3.0。修後 alpha 自由調節、entropy 由 0.002 恢復到 ≈0.13。
 
-早期 mean run 出現 `alpha` 自動調到 clamp 上限的警訊。排查後確認**不是 alpha 邏輯錯**，而是 **return 尺度問題**：舊 `reward = −JCT/1000`，50 job 累加 → return 量級 O(−150)，critic 的 `E[Z_R]` 跨動作落差約 560；actor 目標裡 entropy 正則 `α·log(n)`（上限~2）被 `Z_R`（~560）**壓過約 300×** → policy 早期塌成 one-hot（entropy ≈ 0.002）、探索停擺、alpha 一路 railing。修法：`reward_scale` 1000→**20000**（return 降到 O(−10)），log_alpha clamp 上限 1.0→3.0。修後 alpha 自由調節、entropy 由 0.002 恢復到 ≈0.13。
-
-### 2.3 受控變數設計（每個實驗只動一個旋鈕）
+### 2.2 受控變數設計（每個實驗只動一個旋鈕）
 
 | 旋鈕 | 隔離什麼 | 出現於 |
 |---|---|---|
@@ -130,17 +126,20 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 **隨機性注入模型**：`actual = predicted · exp(σZ − σ²/2)`（mean-preserving lognormal，E=1，只增變異不偏均值；obs 仍顯示 nominal runtime → 真實的結果不確定性）。idiosyncratic 噪音對每個 job common-random（以 `(seed, job_id)` 鍵）→ 同一 job 在每個 policy 下拿到相同乘子 → 配對比較。Harness：`eval/scripts/sweep_stochastic.py`。
 
-### 2.4 σ 校準方法（讓注入的噪音不是憑空挑的）
+### 2.3 σ 校準方法（讓注入的噪音不是憑空挑的）
 
 由注入模型 `σ = std(log(actual/predicted))` —— 正是 runtime 預測器的 log-殘差標準差。`eval/scripts/measure_predictor_sigma.py` 用**生產級 LightGBM 預測器**（同 `services/runtime_predictor` 的 features、time-honest 80/20 split、超參）在真實 trace 上量 held-out log-殘差 std，當作要注入 sim 的 σ。結果見 §3.5。
 
-### 2.5 Live cluster A/B 設定
+### 2.4 實機 cluster A/B 設定
 
-在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。學習方法 `shadowMode=false`（RL boost 生效）、score 方法 `shadowMode=true`（boost 強制 0），用 serve 的 `/reload`+`/shadow` 切換而不重啟 pod。關鍵穩定化：(1) `gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost；(2) **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。**生產服務拓樸**：跑 `slurmctld` / `rl-scheduler`(serve) / `rl-snapshot-agent`，但**沒有部署 `runtime-predictor` 也沒有 `weight-tuner`**——故 score 的 `ε`(SJF) 與線上權重調整都是關的（§1.1 生產實況），這是讀 §4 數字時的環境前提。
+在實際 k3s + Slurm + GPU/MPS 環境提交 `sbatch` job 做 paired A/B。學習方法 `shadowMode=false`（RL boost 生效）、score 方法 `shadowMode=true`（boost 強制 0），用 serve 的 `/reload`+`/shadow` 切換而不重啟 pod。關鍵穩定化：
 
-### 2.6 為何用 p95 / p99 / CVaR 量尾部（不只看 mean JCT）
+1.`gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost。
+2. **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。**生產服務拓樸**：跑 `slurmctld` / `rl-scheduler`(serve) / `rl-snapshot-agent`，但**沒有部署 `runtime-predictor` 和 `weight-tuner`**，因此 score 的 `ε`(SJF) 與線上權重調整都是關的（§1.1 生產實況），這是讀 §4 數字時的環境前提。
 
-全文每張表都同時報 **mean JCT（主）** 與 **p95 / p99 JCT、CVaR(0.25)（尾部）**。納入尾部指標不是裝飾，而是這套評估能不能看見 RDSAC 效應的**前提**——四個理由：
+### 2.5 為何用 p95 / p99 / CVaR 量尾部（不只看 mean JCT）
+
+全文每張表都同時報 **mean JCT（主）** 與 **p95 / p99 JCT、CVaR(0.25)（尾部）**。納入尾部指標不是裝飾，而是這套評估能不能看見 RDSAC 效應的**前提**的四個理由：
 
 1. **mean 會把排程病態洗掉。** straggler、queue starvation、head-of-line blocking 的典型表現是「多數 job 正常、少數被拖很慢」；這幾個慢 job 攤進整批裡幾乎不動 mean，但主導使用者體感。p95/p99 專抓「最差 5%/1% 有多慢」，正是 mean 結構上看不到的那段。
 2. **尾部是 RDSAC/CVaR 的靶心——不量它就無法檢驗它。** RDSAC-cvar 的設計目標就是優化回報下尾（= JCT 上尾）；只量 mean 等於拿不會動的尺去量專門改尾部的方法，結構上必然測不出差異。鐵證在 §3.4：RDSAC 對 SAC 的 **mean 差距有限，p99 卻差 6–11×**，優勢全在尾部。
@@ -153,7 +152,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 ## 3. 模擬結果（Simulator）
 
-本節是管線的**階段 ①②**：在 sim 裡訓練、在 sim 裡配對評估。**請把這裡的數字當定性/序數洞察，不是真實績效預測**（真實績效見 §4）。sim 訓練產出的機制性洞察分成**兩類，可轉移性差很多**——這是本文聚焦的重點：
+本節是管線的階段 (1)(2)，在模擬環境訓練、在模擬環境裡做配對評估，因此這這裡的數字當定性/序數洞察，並非真實績效預測。模擬訓練產出的機制性洞察分成兩類：
 
 **A. 已被 live 1×1 反映的洞察（sim ↔ live 互相印證）**
 
@@ -252,7 +251,7 @@ fixed-α 下 RDSAC 仍贏 SAC（+110~143 pts，排除 α 假象），σ=1.0 時 
 | philly | **1.45** | [1.31, 1.58] | near-Gaussian |
 | ali | **1.24** | [1.11, 1.38] | near-Gaussian |
 
-兩個結論：(1) 真實 σ ≈ **1.2–1.45**，故 §3.4 用的 **σ=1.0 落在真實下限以下、是保守值**——RDSAC 在 σ=1.0 就大勝，真實噪音下只會更強；(2) 殘差**近高斯**（excess kurtosis −0.1~+0.4），lognormal 噪音模型沒有低估尾部。**誠實 caveat**：這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2–1.45 是「最難預測」上界；真實結構化資料上好 predictor 會更低 → 合理 σ 區間 ≈ **[0.5, 1.45]**，§3.4 測的 {0.5, 1.0} 都落在其中。
+兩個結論：(1) 真實 σ ≈ **1.2–1.45**，故 §3.4 用的 **σ=1.0 落在真實下限以下、是保守值**——RDSAC 在 σ=1.0 就大勝，真實噪音下只會更強；(2) 殘差**近高斯**（excess kurtosis −0.1~+0.4），lognormal 噪音模型沒有低估尾部。**誠實告誡**：這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2–1.45 是「最難預測」上界；真實結構化資料上好 predictor 會更低 → 合理 σ 區間 ≈ **[0.5, 1.45]**，§3.4 測的 {0.5, 1.0} 都落在其中。
 
 ### 3.6 拆解：贏的是「分布式 critic」還是「風險扭曲」？
 
@@ -280,45 +279,53 @@ fixed-α 下 RDSAC 仍贏 SAC（+110~143 pts，排除 α 假象），σ=1.0 時 
 | philly | **+35.8** | −6.0 | **12.2 h** | 23.0 h |
 | ali | **+66.0** | −3.1 | **7.1 h** | 15.0 h |
 
-**負結果**：共置動作在 philly/ali 都明顯更差（OFF 贏 ~42/~69 pts）、尾部 p99 也變糟。兩個成因：(1) 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較；(2) 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每種方法單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
+共置動作在 philly/ali 都明顯更差（OFF 贏 ~42/~69 pts）、尾部 p99 也變糟。兩個推測成因：
+
+1. 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較
+2. 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每種方法單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
 
 ### 3.8 160-dim 字母表重跑 + 決策來源拆分：模型其實「幾乎不下放置指令」
 
-> **A 類（DSAC 在確定性 1×1 輸給強啟發式，與 §4 live 打平方向一致）；但這裡第一次量到崩塌的 *機制*。**
+> **A 類（DSAC 在確定性 1×1 輸給強啟發式，與 §4 live 打平方向一致）；這裡第一次量到崩塌的 *機制*，並用受控對照證明它對訓練配方穩健（recipe-robust）。**
 
-GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，用**預設配方**重跑：RDSAC-mean、auto-α、curriculum（n_jobs 10→30→50）、**向量化訓練 `--num-envs 8`**、500k steps、5 seeds、philly+ali。同時 `eval_dsac_placement.py` 新增**決策來源帳**（report-only，不改行為）：把每個 greedy 決策歸類成 **DRL 放置指令 / no-op / 回退 score**（後者＝若套 live serve guardrail `value<−1.0 或 entropy>2.5` 會 abstain → score baseline 接手）。
+GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，在 160-dim 下跑**兩個配方**（都 curriculum n_jobs 10→30→50、向量化 `--num-envs 8`、500k steps、5 seeds、philly+ali，各約 53 min）：
 
-| family | DSAC | score | ΔJCT% | p | DSAC p95 / p99 |
-|---|---:|---:|---:|---:|---:|
-| philly | 3.36 h | 2.62 h | **−28.1** | 0.033 ✓ | 12.8 h / 19.8 h |
-| ali | 3.10 h | 1.38 h | **−124.3** | 0.134 | 9.2 h / 68.5 h |
+- **配方 A（預設）**：RDSAC-mean、**auto-α**、random-legal 暖機。
+- **配方 B（受控）**：RDSAC-mean、**fixed-α 0.05**（依 §3.3 釘死 α）、**score-warmup**（暖機用 score 啟發式種子）——把 §3.3 建議的兩個修正一次補上。
 
-| family | 決策數 | **DRL 指令** | **no-op** | **回退 score（would-abstain）** |
+同時 `eval_dsac_placement.py` 新增**決策來源帳**（report-only，不改行為）：把每個 greedy 決策歸類成 **DRL 放置指令 / no-op / 回退 score**（後者＝若套 live serve guardrail `value<−1.0 或 entropy>2.5` 會 abstain → score baseline 接手）。
+
+| 配方 | philly ΔJCT% | ali ΔJCT% | philly p99 | ali p99 |
 |---|---:|---:|---:|---:|
-| philly | 10,175 | **0.0%** | **98.1%** | 1.9% |
-| ali | 20,177 | **0.0%** | **98.9%** | 1.1% |
+| A 預設（auto-α / random-warmup）| **−28.1**（p=.03 ✓）| **−124.3**（p=.13）| 19.8 h | 68.5 h |
+| B 受控（fixed-α 0.05 / score-warmup）| **−30.9**（p=.13）| **−59.3**（p=.02 ✓）| 22.2 h | 20.1 h |
 
-**主結論**：訓練後的策略**幾乎不下任何真實放置指令**（DRL 指令 ≈ 0%），而是 **~98% 選 no-op**——主動「等」而非放置。「回退 score」只佔 ~1–2%，**正因為策略自信地選 no-op**（value 高、entropy ~0.13），根本不會觸發 abstain guardrail。三桶因此是「≈0% 主動放置 / ~98% 主動不動 / ~1–2% live 才會退回 score」。模型既不放置也不 abstain，就退化成「放著不管」→ 輸給會主動 bin-pack 的 score，尾部 p99 也爆掉（job 堆積）。
+| 配方 | philly：DRL指令 / no-op / →score | ali：DRL指令 / no-op / →score | 訓練末 entropy |
+|---|---|---|---:|
+| A 預設 | 0.0% / **98.1%** / 1.9% | 0.0% / **98.9%** / 1.1% | ~0.13 |
+| B 受控 | 0.0% / **99.6%** / 0.4% | 0.0% / **99.6%** / 0.4% | ~0.005 |
 
-**兩個誠實 caveat（為何這不是 best-case DSAC）**：(1) **無 score-warmup 汙染**——向量化路徑把 score-warmup 退成 random-legal（§3 舊跑都有 score-warmup），所以這跟 §3 不是同配方，no-op 崩塌很可能被「沒有 score-warmup 暖機」放大；(2) **auto-α 又 railed**——α 收在 ~1.8、entropy ~0.13（近確定性），正是 §3.3 指認的同一個共用 auto-α 控制器病灶。所以這是「**預設配方在 160-dim + 向量化訓練**會發生什麼」的忠實快照，不是 DSAC 的能力上限。
+**主結論（recipe-robust 的 no-op 崩塌）**：兩個配方下，訓練後的策略都**幾乎不下任何真實放置指令**（DRL 指令 ≈ 0%）、而是 **~98–99.6% 選 no-op**——主動「等」而非放置。關鍵：**補上 score-warmup + fixed-α（B）並沒有救回放置行為**——no-op 比例反而更高（98→99.6%）、entropy 收得更低（0.13→0.005）。所以最初「no-op 是無 score-warmup 的暖機假象」的猜想**被對照推翻**：在確定性 1×1，DSAC 收斂到 no-op 是**對訓練配方穩健的退化**，不是某個 recipe bug。（800-step 煙霧測試一度顯示 score-warmup→DRL指令 100%，那只是暖機**當下**由 score 啟發式直接驅動；學習一接手，policy 就退回 no-op。B 的 fixed-α 確實把 ali 差距從 −124% 收到 −59%，但**仍輸、仍 99.6% no-op**。）
 
-**對照（執行中，待補）**：`--num-envs 1`（score-warmup 開）+ `--fixed-alpha --init-alpha 0.05`（依 §3.3 釘死 α）的 §3-忠實重跑，用來分離「DSAC 在 1×1 本來就崩成 no-op」與「是向量化配方（無 score-warmup + auto-α）把它弄崩的」。原始檔 `runs/eval_160dim_20260617-151916/`（對照 `runs/eval_160dim_fixedA_*/`）。
+**為什麼 no-op 會贏？** 確定性 1×1 的 placement 本身退化（單卡單槽、放哪都一樣），reward 對「放置 vs 等」幾乎沒有可學的梯度，policy 就塌到「安全」的 no-op。模型既不放置、也幾乎不 abstain（→score 僅 0.4–1.9%，因為它**自信地** no-op），等於「放著不管」→ 輸給會主動 bin-pack 的 score，尾部 p99 也爆掉（job 堆積）。**這正是 A 類「確定性 1×1 沒有學習法贏得過強啟發式」的具體機制**，並與 §4.4.2 live 1×1（模型 abstain/no-op ~90–100%、三方打平）同構。
+
+**意涵**：1×1 不是調 recipe 能翻盤的——要有真正的 placement 決策面（§3.7、第 5 項的 **≥2 GPU / 2-node**）才談得上 DRL 是否贏。原始檔：A `runs/eval_160dim_20260617-151916/`、B `runs/eval_160dim_fixedA_sw_20260617-170056/`。
 
 ---
 
 ## 4. 實機執行結果（Live cluster）
 
-本節是管線的**階段 ③**：把 §3 的 sim checkpoint 烘進真實 k3s + Slurm + GPU/MPS 跑 paired A/B。重點是檢驗 §3 機制性洞察與真實環境的**關聯**——**哪些 sim 推論被真實環境反映、哪些反映不出來**，而非期待 sim 勝幅重現。三條關聯/發現：
+本節是管線的階段 (3)：把 §3 的模擬產出 checkpoint 烘進真實叢集跑 paired A/B。重點是檢驗 §3 機制性洞察與真實環境的關聯，也就是哪些 sim 推論被真實環境反映、哪些反映不出來：
 
 - **A 類被正面反映、「絕對數字不轉移」當場成立**：sim 表面排名 `score > RDSAC > SAC`，但 live 1×1 三方統計打平（Δ 全在 ±1% 雜訊內）、學習模型 abstain 88–100% fail-safe 回退 score。這**正面印證** §3 的 A 類洞察（**1×1 退化 placement → 沒有學習法贏過強啟發式 → 打平**），sim 的勝幅本就不該轉移到這裡。**至於 B 類（σ → RDSAC、分布式 critic、共置），live 1×1 結構上反映不出來**（makespan-bound + 生產 score runtime-blind，§4.4.2），故本文不列為已轉移、留待 2-node。
 - **fail-safe 設計在真實環境驗證有效**：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋——這是讓階段 ③ 能安全 shadow 部署的前提，也是 §2.0 不敢在 live 直接訓練的另一面。
 - **真實微調語料已開始累積**：live A/B 期間 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 ④ RLPD 的輸入；live 環境本身已驗證可收 `sacct` 指標、可逐 (round, idx) 配對。
 
-換言之，§4 沒有「DRL 在 live 大勝」的故事——它的價值是**證明 sim 洞察的方向正確（1×1 該打平、就打平了）、且 sim-to-real 的工程管線（shadow + fail-safe + trace collector）真的能跑**，為多節點上線與 RLPD 微調鋪好路。
+換言之，§4 沒有「DRL 在 live 大勝」的故事——它的價值是**證明模擬環境洞察的方向正確（1×1 該打平、就打平了）、且 sim-to-real 的工程管線（shadow + fail-safe + trace collector）真的能跑**，為多節點上線與 RLPD 微調鋪好路。
 
-### 4.1 RDSAC live A/B（cvar-v2 checkpoint）
+### 4.1 RDSAC 實機 A/B（cvar-v2 checkpoint）
 
-把 §3 的 cvar-v2 RDSAC checkpoint 烘進 `slurm-rl-scheduler:m11` 部署 live，與 score-only 做配對 A/B（14 個 MPS sleep job × 3 輪）。結果：**RDSAC 能在 production 正確上線並與 score 持平**（ΔJCT −0.2%，遠小於逐對雜訊）。原因與 §3.3 一致——1×1 強 baseline 下 RDSAC 對每個到達 job 幾乎均勻 boost（`selected=14/14`），佇列排序等同 score。（細表已併入下方擴大版 §4.2。）
+把 §3 的 cvar-v2 RDSAC checkpoint 烘進 `slurm-rl-scheduler:m11` 部署到實機，與 score-only 做配對 A/B（14 個 MPS sleep job × 3 輪）。結果：**RDSAC 能在 production 正確上線並與 score 持平**（ΔJCT −0.2%，遠小於逐對雜訊）。原因與 §3.3 一致——1×1 強 baseline 下 RDSAC 對每個到達 job 幾乎均勻 boost（`selected=14/14`），佇列排序等同 score。（細表已併入下方擴大版 §4.2。）
 
 ### 4.2 擴大評估：128 job/方法 + 受控方法順序（暖機假象的源頭）
 
