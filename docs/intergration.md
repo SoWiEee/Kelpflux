@@ -73,38 +73,82 @@ kubectl get nodes -o wide
 
 ## 3. 在第二台安裝 GPU runtime 並加入 k3s
 
-在第二台電腦上：
+> 以下是 **2026-06 實際在 RTX 3080（`192.168.0.104`, Ubuntu 22.04）上驗證通過**的流程。
+> 四個關卡照順序做完才會成功：**(1) server 防火牆 → (2) node-2 前置 → (3) 版本釘選 join → (4) NFS/映像/部署**。
+> 每一關都有對應的踩雷紀錄，照做可一次到位。
+
+### 3.0 node-2 前置（在第二台上）
 
 ```bash
-# 安裝 driver / nvidia-container-toolkit；若這台不作為 k3s server，不加 --k3s。
-# 第二台是 Ubuntu 24.04 + RTX 3080，請確認 driver 支援 Ampere（建議 driver >= 535）。
-bash scripts/setup-linux-gpu.sh
+# 1) NVIDIA driver：RTX 3080 屬 Ampere，建議 >= 535（實測 580.x 可）。確認：
+nvidia-smi
 
-# 加入第一台 k3s server。
-# 重要：gpu-host-class 要反映真實硬體 → RTX 3080 用 rtx3080，不要沿用 rtx4070，
-# 否則 GPU Operator 的 device-plugin MPS config 與 score baseline 的 VRAM 假設都會錯。
+# 2) NFS client 工具（純 client 機器預設沒有 mount.nfs，缺了 PVC 掛載會卡 ContainerCreating）
+sudo apt update && sudo apt install -y nfs-common
+
+# 3) 確認 GPU 的 PCI device id，對照 values-2x1.yaml nfdRules（3080 通常是 2206）
+lspci -nn | grep -i NVIDIA          # 例：... [10de:2206] ...
+```
+
+> 缺 `nfs-common` 是常見地雷：`mount -t nfs` 會回 `bad option ... need a /sbin/mount.<type> helper`，且之後排到這台的 worker pod 會卡在 `ContainerCreating`。
+
+### 3.1 在 server（acane）開放防火牆（**最容易卡、且踩了三次**）
+
+acane 的 ufw 是 `Default: deny (incoming)` 且 `deny (routed)`。單機時無所謂，但第二台從 LAN 連進來會被靜默 DROP（症狀是「卡住逾時」而非 `connection refused`）。一次把 node 互通需要的埠全開（限定 LAN 網段），並放行 cluster 內部轉發：
+
+```bash
+# 在 acane 上：
+LAN=192.168.0.0/24
+sudo ufw allow from $LAN to any port 6443  proto tcp   # k3s apiserver / join
+sudo ufw allow from $LAN to any port 8472  proto udp   # flannel VXLAN（跨 node pod 網路）
+sudo ufw allow from $LAN to any port 10250 proto tcp   # kubelet（logs / exec / metrics）
+sudo ufw allow from $LAN to any port 2049  proto tcp   # NFS（NFSv4；NFSv3 另需 111 tcp/udp）
+
+# 跨 node 的 pod↔pod（含 slurmd↔slurmctld）會經 acane 轉發，必須放行 routed + cluster CIDR：
+sudo ufw allow from 10.42.0.0/16                       # pod CIDR
+sudo ufw allow from 10.43.0.0/16                       # service CIDR
+sudo ufw default allow routed
+sudo ufw reload
+```
+
+> **為什麼 routed + CIDR 不能省**：只開 6443 能讓 node `Ready`、甚至 Slurm node 短暫 `idle`，但 slurmctld（acane）週期性 ping node-2 的 slurmd 走的是「acane 轉發到 node-2 pod」這條路。`deny (routed)` 會把它擋掉 → Slurm node 變 `DOWN / Not responding`。開了 routed + pod/svc CIDR 才會穩。
+
+### 3.2 加入 k3s（**版本必須釘到跟 server 一致**）
+
+```bash
+# 在 acane 上先抓「現在」的 server token 與版本：
+sudo cat /var/lib/rancher/k3s/server/node-token
+kubectl version --short | grep Server      # 例：v1.34.6+k3s1
+```
+
+```bash
+# 在 node-2 上 join。INSTALL_K3S_VERSION 要等於 server 版本，不要用 stable channel。
+# gpu-host-class 必須反映真實硬體（3080 用 rtx3080），device-plugin MPS config 與 score 的
+# VRAM 假設都靠它。
 curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_VERSION=v1.34.6+k3s1 \
   K3S_URL=https://192.168.0.111:6443 \
-  K3S_TOKEN=K10f426aafcfab99a36047cb9ce0b00e29ab28ce22b7414dca085a80f968eeee42e::server:9a5e3e481545eb74945c29fa74b32acf \
+  K3S_TOKEN='<上一步的 node-token>' \
   INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx3080' \
   sh -
 ```
 
-> k3s 在這台硬體上曾踩過數個 GPU enablement bug（driver / nvidia runtime / device-plugin）。若 GPU 沒被認出，先回頭對照第一台驗證通過的設定（見 repo memory `project-k3s-gpu-verified.md` 與 `scripts/setup-linux-gpu.sh`）再排查。
+> **版本 skew 地雷**：`stable` channel 會隨時間漂移。若 server 是 1.34、`stable` 已滾到 1.35，agent 會裝成「比 server 新」→ kubelet 不能比 apiserver 新 → join 時 `Failed to validate connection`。**兩台都釘明確版本**；要升級時先升 server 再升 agent。
+>
+> **「No change detected」地雷**：若這台之前裝過 k3s，重跑 installer 會印 `No change detected so skipping service start`，**只 enable 不 start**。乾淨重裝：
+> ```bash
+> sudo /usr/local/bin/k3s-agent-uninstall.sh
+> # 重裝時加 INSTALL_K3S_FORCE_RESTART=true，避免又被跳過
+> ```
 
-回到第一台驗證：
-
-```bash
-kubectl get nodes -o wide
-kubectl get nodes --show-labels | grep gpu-host-class
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-```
-
-若第二台忘了帶 label，可在第一台補：
+### 3.3 在 server 驗證已加入
 
 ```bash
-kubectl label node <second-node-name> gpu-host-class=rtx3080 --overwrite
+kubectl get nodes -o wide                                   # 兩台都 Ready、VERSION 相同
+kubectl get nodes --show-labels | grep gpu-host-class       # node-2 帶 gpu-host-class=rtx3080
 ```
+
+若忘了帶 label：`kubectl label node <node-2> gpu-host-class=rtx3080 --overwrite`。
 
 ## 4. NFS 與共享資料
 
@@ -227,6 +271,55 @@ helm upgrade --install slurm-platform ./chart \
 
 > 部署後確認兩台各自就位：`kubectl -n slurm get pods -o wide | grep gpu` 應看到 `slurm-worker-gpu-rtx4070-0` 落在 host-1、`slurm-worker-gpu-rtx3080-0` 落在 host-2（靠 `nodeSelector`）。`sinfo -Nel` 應列出兩個 GPU partition。
 
+### 6.3 把本地映像匯入 node-2（**必做，否則 GPU worker `ErrImagePull`**）
+
+本專案的 `slurm-*` 映像是**本地 build、用 `k3s ctr images import` 逐節點塞進去**的（沒有 registry）。k3s 每個 node 的 containerd image store 獨立，`deploy-2.sh` 只 build/import RL scheduler image，其餘只存在 acane。`imagePullPolicy: IfNotPresent` 在 node-2 找不到就會去 registry 拉 → 失敗 → `ErrImagePull`。
+
+把 node-2 可能用到的本地映像**合併匯出成一個 tar**（同 tar 會去重共用的 CUDA layer），傳過去匯入：
+
+```bash
+# 在 acane 匯出（worker 是 CUDA base，整包約 4–5 GB）
+sudo k3s ctr -n k8s.io images export /tmp/slurm-images.tar \
+  docker.io/library/slurm-worker:latest \
+  docker.io/library/slurm-controller:latest \
+  docker.io/library/slurm-exporter:latest \
+  docker.io/library/slurm-elastic-operator:latest \
+  docker.io/library/slurm-rl-scheduler:m11
+sudo chmod 644 /tmp/slurm-images.tar
+
+# 傳到 node-2 並匯入它的 k3s containerd
+scp /tmp/slurm-images.tar <user>@192.168.0.104:/tmp/
+ssh <user>@192.168.0.104 'sudo k3s ctr -n k8s.io images import /tmp/slurm-images.tar'
+
+# 驗證 + 清理
+ssh <user>@192.168.0.104 "sudo k3s ctr -n k8s.io images ls | grep slurm-"
+sudo rm -f /tmp/slurm-images.tar
+ssh <user>@192.168.0.104 'sudo rm -f /tmp/slurm-images.tar'
+```
+
+> 之後每次 rebuild 這些映像都要重做一次 import。長期低維護的解法是架一個兩台都連得到的**本地 registry**，讓 `imagePullPolicy` 正常運作；在那之前，export→import 是最務實的做法。
+
+### 6.4 部署後排錯（實測會遇到的四個狀態）
+
+| 症狀 | 根因 | 修法 |
+|---|---|---|
+| GPU worker `ErrImagePull`（node-2） | 本地映像沒匯入 node-2 | 做 §6.3，然後 `kubectl -n slurm delete pod slurm-worker-gpu-rtx3080-0`（StatefulSet 重建、IfNotPresent 直接用） |
+| Slurm node `INVALID_REG`（`Low socket*core*thread count`） | reconfigure 期間殘留的舊註冊；偵測 CPU 其實 ≥ 設定 | `state=resume` 無效（INVALID_REG 只能靠重新註冊清）→ `kubectl -n slurm delete pod <worker>` 讓 slurmd 重註冊 → 再 `scontrol update nodename=<node> state=resume` 清 DRAIN |
+| Slurm node `DOWN / Not responding` | 跨 node 的 slurmctld→slurmd ping 被 acane ufw `deny routed` 擋（見 §3.1） | 開 routed + pod/svc CIDR 後 `scontrol update nodename=<node> state=resume` →（必要時）`scontrol reconfigure` 清 `*` |
+| srun `can't find address for host <node-2>`（只跨 node job） | slurm 設定檔是 **subPath 掛載 → pod 建立時凍結、不隨 configmap 更新**；比 topology 變更更早建立的 pod 拿到舊設定、缺新 node 的 NodeAddr | 重啟那些舊 pod 讓它重掛當前 configmap：`kubectl -n slurm delete pod <pod>`。controller/worker 部署時通常已重建，**`slurm-login` 常被遺漏** |
+
+> 驗證跨 node 連通（pod 沒有 ping/nc 時用 bash `/dev/tcp`）：
+> ```bash
+> kubectl -n slurm exec slurm-controller-0 -- bash -c \
+>   'timeout 3 bash -c "echo > /dev/tcp/<node-2-pod-ip>/6818" && echo OK || echo FAIL'
+> ```
+>
+> 端到端 smoke（MPS 分配，落到對的卡）：
+> ```bash
+> kubectl -n slurm exec <slurm-login-pod> -- bash -lc \
+>   'srun -p gpu-rtx3080 --gres=mps:25 -t 1 nvidia-smi -L'   # → NVIDIA GeForce RTX 3080
+> ```
+
 ## 7. DSAC checkpoint 必須對齊 topology
 
 > **現況（GPU 字母表收斂後）**：live image 內**仍是舊的 192-dim checkpoint**（收斂前訓練），`/healthz` 會回報該 checkpoint 自帶的 `{"obs_dim":192,"n_actions":17}`；但收斂後的程式碼**現在組的是 160-dim obs**（1×1），兩者**維度不符 → `/decide` forward shape mismatch → 一律 fail-safe 退回 score**。要恢復 RL boost，得先用新維度（1×1=160 / 2×1=166）重訓並重新烘進 image。
@@ -336,7 +429,11 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 | 拿舊 192-dim checkpoint 配收斂後的 160-dim 程式 | obs 寬度不符 → `/decide` shape mismatch → 一律 abstain 退回 score | 用新維度（1×1=160 / 2×1=166）重訓並重烘 image（§7）；3080 字母表建模本身已完成（§0.1）|
 | 3080 沒被切成 4 MPS slot | `nvidia.com/gpu` allocatable 顯示 1 而非 4 → 沒有 share | 多半是 **NFD PCI ID 沒對上**：用 `lspci -nn` 確認 3080 的 id 並更新 `values-2x1.yaml` 的 `nfdRules`（§5）；NFD 沒生效才手動補 `device-plugin.config=rtx3080-mps` label |
 | GPU worker 落錯機器（4070 job 跑到 3080）| 卡別/VRAM 假設失準 | 已由 `values-2x1.yaml` 的獨立 partition + `nodeSelector` 解決（§0.1、§6.2）；確認兩台都有 `gpu-host-class` label |
-| NFS 不通 | worker pod 卡 `ContainerCreating` 或 `/shared` 讀寫失敗 | `/etc/exports` 的 allowed clients 要含第二台 **LAN subnet**（非只 pod CIDR），見 §4 |
+| NFS 不通 | worker pod 卡 `ContainerCreating` 或 `/shared` 讀寫失敗 | `/etc/exports` 含第二台 **LAN subnet**（§4）；node-2 裝 `nfs-common`（§3.0）；acane ufw 開 `2049/tcp`（§3.1）|
+| node 加不進來 / Slurm node `DOWN` | join 時 `Failed to validate connection`；或 node Ready 但 Slurm `Not responding` | acane ufw 缺埠：`6443/8472/10250/2049` + **`default allow routed` + pod/svc CIDR**（§3.1）。`deny routed` 會擋跨 node 轉發 |
+| agent 版本比 server 新 | join `Failed to validate connection`（kubelet 不能比 apiserver 新）| join 時釘 `INSTALL_K3S_VERSION=<server 版本>`，別用 `stable`（§3.2）|
+| GPU worker `ErrImagePull`（node-2）| 本地 `slurm-*` 映像沒匯入 node-2 的 containerd | export→scp→`k3s ctr images import`（§6.3），再 bounce pod |
+| srun `can't find address`（跨 node job）| slurm 設定檔 subPath 掛載凍結，舊 pod（常是 `slurm-login`）缺新 node 設定 | 重啟那些舊 pod 重掛 configmap（§6.4）|
 | checkpoint topology 不一致 | `/decide` shape mismatch → fail-safe 退回 score | 重新訓練 DSAC，或把 snapshotAgent topology 維持在 checkpoint 支援的大小 |
 | GPU share slots 被當 physical GPUs | snapshot free MPS 或 node count 被放大 | 調整 `snapshotAgent.gpusPerNode`，並確認 agent log 的 `nodes/free_mps` |
 | Helm upgrade 被 GPU label hook 擋住 | release 變成 failed | 一般升級用 `deploy-2.sh`，它會設定 `gpu.autoLabel=false`；首次加 node 時手動 label |
