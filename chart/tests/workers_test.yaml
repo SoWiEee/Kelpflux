@@ -221,3 +221,33 @@ tests:
       - matchRegex:
           path: data["20-resume-helper.sh"]
           pattern: "SLURM_RESUME_HELPER"
+
+  - it: GPU pool has no nodeSelector by default (floating, backward-compatible)
+    template: workers.yaml
+    set:
+      cluster.runtime: k3s
+    asserts:
+      - isNull:
+          path: spec.template.spec.nodeSelector
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
+  - it: values-2x1 overlay pins each GPU pool to its physical host
+    template: workers.yaml
+    values:
+      - ../values-k3s.yaml
+      - ../values-2x1.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector["gpu-host-class"]
+          value: rtx4070
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+      - equal:
+          path: spec.template.spec.nodeSelector["gpu-host-class"]
+          value: rtx3080
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx3080

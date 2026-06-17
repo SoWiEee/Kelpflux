@@ -83,6 +83,13 @@ spec:
       {{- if $useNvidiaRuntime }}
       runtimeClassName: nvidia
       {{- end }}
+      {{- with $pool.nodeSelector }}
+      # Pin this pool to a specific physical host class (e.g. a heterogeneous
+      # 2×1 cluster where the rtx4070 / rtx3080 pools must land on their own
+      # GPU). Omit for floating pools (CPU, or single-GPU-type clusters).
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: slurm-worker
           image: {{ $.Values.image.worker }}

@@ -1,0 +1,177 @@
+# =============================================================================
+# slurm-platform — 2×1 heterogeneous DRL overlay (RTX 4070 + RTX 3080)
+# =============================================================================
+# Layer after values-k3s.yaml when the live cluster is TWO machines, each with
+# ONE physical GPU (host-1: RTX 4070 12 GB, host-2: RTX 3080 10 GB):
+#
+#   helm upgrade slurm-platform ./chart \
+#     -f chart/values-k3s.yaml \
+#     -f chart/values-2x1.yaml \
+#     -n slurm
+#
+# This is the topology that matches DSAC training with
+# `--n-nodes 2 --gpus-per-node 1` → obs_dim=166, n_actions=33 (NOT the 2×2
+# profile / 178/65). It gives each GPU its OWN Slurm partition + host class so
+# the RL placement decision (which node) is real and type-correct, and so a
+# job's VRAM/type assumptions can't be served by the wrong card.
+#
+# Requirements before applying (see docs/intergration.md):
+#   - host-1 labelled  gpu-host-class=rtx4070 ; host-2 labelled gpu-host-class=rtx3080
+#   - each GPU node carries nvidia.com/device-plugin.config (auto via nodeAssignments
+#     / nfdRules below, or label it manually) so MPS sharing → 4 slots is applied
+#   - host-2 (RTX 3080) NFD PCI id confirmed (GA102 10 GB is usually 2206 — verify
+#     with `lspci -nn | grep -i NVIDIA` and adjust nfdRules below if different)
+#
+# Helm REPLACES lists (merges maps), so this file re-declares every list it
+# touches in full: partitions, pools, gpu.nodeAssignments, gpu.nfdRules.rules,
+# and slurm.jobSubmit.helper.partition.rules.
+
+# --- Slurm partitions: cpu + one partition per GPU type ----------------------
+partitions:
+  - name: cpu
+    default: true
+    maxTime: INFINITE
+    state: UP
+  - name: gpu-rtx4070
+    default: false
+    maxTime: INFINITE
+    state: UP
+  - name: gpu-rtx3080
+    default: false
+    maxTime: INFINITE
+    state: UP
+
+# --- Worker pools: cpu (floating) + one pinned pool per GPU host --------------
+pools:
+  - id: cpu
+    statefulset: slurm-worker-cpu
+    appLabel: slurm-worker-cpu
+    workerClass: cpu-standard
+    partition: cpu
+    minReplicas: 1
+    maxReplicas: 4
+    replicas: 1
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 4
+    features: [cpu]
+    gres: []
+    matchGres: []
+    fallback: true
+
+  - id: gpu-rtx4070
+    statefulset: slurm-worker-gpu-rtx4070
+    appLabel: slurm-worker-gpu-rtx4070
+    workerClass: gpu-rtx4070
+    partition: gpu-rtx4070
+    # One physical 4070 → exactly one GPU worker pod, pinned to host-1.
+    minReplicas: 1
+    maxReplicas: 1
+    replicas: 1
+    scaleCooldownSeconds: 60
+    cpus: 8
+    realMemory: 7000
+    sockets: 1
+    coresPerSocket: 4
+    threadsPerCore: 2
+    maxNodes: 1
+    features: [gpu, gpu-rtx4070, topology-2x1]
+    # Pin to the physical RTX 4070 host so type/VRAM assumptions hold.
+    nodeSelector:
+      gpu-host-class: rtx4070
+    gres:
+      - name: gpu
+        type: rtx4070
+        count: 1
+      - name: mps
+        count: 100          # 100 MPS units; jobs request mps:25 → 4 slots
+    matchGres: ["gpu:rtx4070", "mps"]
+    devicePluginConfig: rtx4070-mps
+
+  - id: gpu-rtx3080
+    statefulset: slurm-worker-gpu-rtx3080
+    appLabel: slurm-worker-gpu-rtx3080
+    workerClass: gpu-rtx3080
+    partition: gpu-rtx3080
+    # One physical 3080 → exactly one GPU worker pod, pinned to host-2.
+    minReplicas: 1
+    maxReplicas: 1
+    replicas: 1
+    scaleCooldownSeconds: 60
+    cpus: 8
+    realMemory: 7000
+    sockets: 1
+    coresPerSocket: 4
+    threadsPerCore: 2
+    maxNodes: 1
+    features: [gpu, gpu-rtx3080, topology-2x1]
+    # Pin to the physical RTX 3080 host.
+    nodeSelector:
+      gpu-host-class: rtx3080
+    gres:
+      - name: gpu
+        type: rtx3080
+        count: 1
+      - name: mps
+        count: 100          # same 4-slot split as the 4070 (jobs request mps:25)
+    matchGres: ["gpu:rtx3080", "mps"]
+    devicePluginConfig: rtx3080-mps
+
+# --- GPU device-plugin: 4 MPS slots per card, per type -----------------------
+gpu:
+  enabled: true
+  deviceConfigs:
+    # rtx3080 also splits into 4 MPS slots (same as rtx4070-mps). The default
+    # + rtx4070-mps + rtx4080-exclusive entries from values.yaml are kept via
+    # map-merge; this only ADDS the 3080 config.
+    rtx3080-mps:
+      version: v1
+      sharing:
+        mps:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 4
+  # Lists below are REPLACED — re-declare 4070 + 3080 (4080 dropped; not present
+  # in this hardware).
+  nodeAssignments:
+    - selector:
+        gpu-host-class: rtx4070
+      config: rtx4070-mps
+    - selector:
+        gpu-host-class: rtx3080
+      config: rtx3080-mps
+  nfdRules:
+    enabled: true
+    rules:
+      - name: rtx4070-class
+        pciDevices: ["2783", "2786", "2705"]
+        config: rtx4070-mps
+      # RTX 3080 (Ampere GA102). 10 GB FE/AIC is typically 2206; 12 GB=2216,
+      # 3080 Ti=2208. VERIFY on host-2 (`lspci -nn | grep -i NVIDIA`) and edit.
+      - name: rtx3080-class
+        pciDevices: ["2206", "2216"]
+        config: rtx3080-mps
+
+# --- Submit-helper partition routing: add the rtx3080 route ------------------
+slurm:
+  jobSubmit:
+    # Per-GPU MPS capacity (not node total). Each GPU node is mps:100.
+    mpsPerNode: 100
+    helper:
+      partition:
+        enabled: true
+        fallback: "cpu"
+        rules:
+          - gres: "gpu:rtx3080"
+            partition: "gpu-rtx3080"
+          - gres: "gpu:rtx4070"
+            partition: "gpu-rtx4070"
+          - gres: "gpu:"            # generic GPU fallback → 4070
+            partition: "gpu-rtx4070"
+
+rlScheduler:
+  snapshotTtlSeconds: 30

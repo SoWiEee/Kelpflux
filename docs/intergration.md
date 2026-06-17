@@ -9,30 +9,24 @@
 
 > 檔名保留 `intergration.md` 是因為目前文件入口使用這個拼法；若之後要修正拼字，建議另開一次文件 rename，避免連結混在功能變更裡。
 
-## 0. 先決：釐清 topology 到底是「2×2」還是「2 nodes × 1 GPU」（必讀）
+## 0. 先決：你的拓樸是 2×1（2 nodes × 1 GPU），對齊 obs_dim=166（必讀）
 
-口語上常把目標說成 **「2×2」**，但這跟 code 裡的定義不一樣，務必先對齊，否則 checkpoint 與 snapshot 會永遠對不上，`/decide` 一律 abstain。
+你的硬體是 **兩台機器、每台 1 張 GPU**（host-1 = RTX 4070、host-2 = RTX 3080）→ 在 sim 的術語是 **`n_nodes=2, gpus_per_node=1`（2×1）**。三者——Helm values、snapshot agent、DSAC checkpoint——的拓樸必須一致，否則 checkpoint 與 snapshot 永遠對不上，`/decide` 一律 abstain。
 
-- 你現在的硬體是 **兩台機器、每台 1 張 GPU** → 在 sim 的術語是 **`n_nodes=2, gpus_per_node=1`（即 2×1）**。
-- code comment 與 `chart/values-2x2.yaml` 講的 **「2×2」是「2 nodes × 2 GPUs/node」**（每台兩張卡），那是另一種拓樸，**不是你目前的硬體**。
+維度由 `env_dims()`（`sim/gym_env.py`）算出（`JOB_FEAT_DIM=9`，GPU one-hot 已收斂為 `{rtx4070, rtx3080}` 2 維，見 §0.1）：
 
-兩者的 obs/action 維度完全不同（`sim/gym_env.py:84` `env_dims()` 計算；**注意 `JOB_FEAT_DIM` 已收斂為 9**——GPU one-hot 從 4 種縮到 `{rtx4070, rtx3080}` 2 種，見 §0.1）：
+| 拓樸 | 說明 | `obs_dim` | `n_actions` |
+|------|------|-----------|-------------|
+| 1×1（現況 live） | 1 node × 1 GPU | **160** | **17** |
+| **2×1（你要的）** | **2 nodes × 1 GPU** | **166** | **33** |
 
-| 拓樸 | 說明 | `obs_dim` | `n_actions` | 出處 |
-|------|------|-----------|-------------|------|
-| 1×1（現況 live） | 1 node × 1 GPU | **160** | **17** | `sim/gym_env.py:46-48`、`/healthz` |
-| **2×1（你要的真實拓樸）** | **2 nodes × 1 GPU** | **166** | **33** | `16*9 + 2*1*6 + 4 + 6 = 166`；`16*2*1 + 1 = 33` |
-| 2×2（code comment 講的） | 2 nodes × 2 GPUs | 178 | 65 | `sim/gym_env.py:50-52`、`chart/values-2x2.yaml` |
+`16*9 + 2*1*6 + 4 + 6 = 166`、`16*2*1 + 1 = 33`（已對 `env_dims(2,1)` 驗證）。
 
-**結論：你要的是 2×1（166 / 33），不是 repo 預設那個 2×2（178 / 65）。**
+> ⚠ obs_dim 已從舊的 192 收斂為 **160/166**（GPU 字母表縮成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 11→9）。現有 1×1 live checkpoint（192-dim）已不相容、`/decide` fail-safe 退回 score，直到用新維度重訓（§7）。
 
-> ⚠ obs_dim 已從舊的 192/198/210 收斂為 **160/166/178**（GPU 字母表縮成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 11→9）。**現有 1×1 live checkpoint（192-dim）已不相容、`/decide` 會一律 fail-safe 退回 score，直到用新維度重訓。**
-
-> 請先決定你要的是哪一種：
-> - 若每台機器只有 1 張卡 → 用 **2×1**：DSAC 訓練帶 `--n-nodes 2 --gpus-per-node 1`，並自行新增一份 `values-2node-1gpu.yaml`（**不要直接用** `values-2x2.yaml`，它會宣告 `gpu count: 2`、`mps:200`，對不上單卡硬體）。
-> - 若之後第二台會插到兩張卡才談 2×2 → 那才用 `values-2x2.yaml` 與 `--gpus-per-node 2`。
+> **chart 設定走單一 overlay：`chart/values-2x1.yaml`**（已建好）。它把整件事做成**宣告式、低維護**：異質 4070 + 3080、每張卡切 **4 個 MPS slot**、兩種卡**各自獨立 partition** 並用 `nodeSelector` 釘到對應實體機，device-plugin 的 MPS 設定由 **NFD 規則自動套用**（PCI 比對、node 重建也會自動收斂，不靠一次性手動 label）。DSAC 訓練帶 `--n-nodes 2 --gpus-per-node 1`。後面 §5/§6/§7 都以這個 overlay 為主軸。
 >
-> 後面第 6/7 節以 **2×1** 為主軸撰寫。
+> （repo 另有的 `values-2x2.yaml` 是「每台 2 張卡」的另一種拓樸，**與你的硬體無關**，本指南不再使用它。）
 
 ## 0.1 GPU 異質性：4070 / 3080 已建模（字母表已收斂，必讀）
 
@@ -42,7 +36,7 @@ GPU 型別字母表已收斂成 **`{rtx4070, rtx3080}`**——sim、score baseli
    - **這也是為什麼現有 192-dim checkpoint 不相容**：字母表收斂直接改了 obs 寬度。任何上線都要用新維度重訓。
 2. **VRAM 映射已補 3080** — `sim/scheduler/score.py` `_gpu_type_to_vram()` 現為 `{rtx4070→12, rtx3080→10}`，3080 的 10 GB 已參與 `f_vram_fit` 排序（不再走 `None → 0.5` 中性分支）。
 3. **異質 VRAM 的 tier 語意** — 4070 是 12 GB、3080 是 10 GB。`vramTiers: [12, 24]`（`chart/values.yaml:270`）與 sim `_DEFAULT_TIERS_GB`（`score.py:24`）目前**仍為 (12, 24)**，未隨字母表收斂；10 GB job 會被歸到 12 GB tier、視為「略微 over-provision」。若要精確建模 10 GB 上限，需新增 10 GB tier 並同步改這兩處（屬選用、影響 score 語意，預設不動）。
-4. **同一個 partition 混卡的風險** — 目前 GPU worker pod 只靠 `nvidia.com/gpu` resource request 排程，**沒有把某個 pool 釘到特定實體機器**（`chart/templates/workers.yaml` 無 `nodeSelector`/affinity）。若把 3080 也標成 `gpu-rtx4070` 並丟進同一個 `gpu-rtx4070` partition，Slurm/k3s 會把 4070 的 job 排到 3080 上（反之亦然），VRAM/型別假設就會錯。**建議**：給 3080 一條獨立的 host-class 與（若要嚴格隔離）獨立 partition，見第 5、6 節。
+4. **卡別隔離（已由 `values-2x1.yaml` 解決）** — 過去 GPU worker pod 只靠 `nvidia.com/gpu` request 排程、無法釘到特定實體機，混卡會讓 4070 的 job 跑到 3080 上（反之亦然），VRAM/型別假設失準。**現在 `values-2x1.yaml` 用獨立 partition + `nodeSelector`（`gpu-host-class`）把 `gpu-rtx4070` / `gpu-rtx3080` 兩個 pool 各自釘到對應實體機**——chart 端已加上 per-pool `nodeSelector` 支援（`chart/templates/workers.yaml`，opt-in、不影響現有 1×1 部署），卡別不再會錯置。這條路也讓 DRL 看到「兩個型別不同的 placement node」，是 2×1 placement 決策面的前提。
 
 ## 1. 加入前確認
 
@@ -144,33 +138,35 @@ sudo exportfs -v   # 確認第二台 subnet 有列出來
 
 > chart 的 NFS server / path 來自 `chart/values-k3s.yaml:33-34`（`nfsServer: 192.168.0.111`、`nfsPath: /srv/nfs/k8s`），由 `chart/templates/storage.yaml:148-158` 注入 PV/provisioner。NFS server 本身仍在第一台。
 
-## 5. GPU Operator 與 node label
+## 5. GPU Operator 與 3080 的 4-slot MPS 設定（宣告式，低維護）
 
-`deploy-2.sh` 會安裝 GPU Operator，但一般平台升級會設定 `gpu.autoLabel=false`，避免每次升級都重跑一次性 label hook。加入第二台後，需要確保 GPU node label 已存在。
+`deploy-2.sh` 會安裝 GPU Operator。**3080 要切成 4 個 MPS slot 的設定，已經宣告在 `values-2x1.yaml` 裡，不需要每台手動 label**：
 
-**先決定 3080 要用哪個 device-plugin config。** 現有的 MPS sharing config `rtx4070-mps`（`chart/values.yaml:375-381`，`replicas: 4`，對應 `MPS_PER_GPU=4`）是「每張卡切 4 個 MPS slot」。3080 也可以重用這個 MPS 切法，但建議新增一個 `rtx3080-mps` config key 並掛上對應的 `nodeAssignments` / `nfdRules`（`chart/values.yaml:384-412`），讓型別語意清楚、未來好調 replicas：
+- `deviceConfigs.rtx3080-mps`：`sharing.mps … replicas: 4` → 每張 3080 切 4 個 share（對齊 4070 的 `rtx4070-mps`、`MPS_PER_GPU=4`）。
+- `nfdRules`：用 **PCI device ID 自動**把 `rtx3080-mps` 套到 3080 node（Ampere GA102 10 GB 通常是 `2206`）。NFD 會在 node 重建 / k3s 重裝後**自動收斂**，不靠一次性 hook——這就是低維護的關鍵。
+- `nodeAssignments`：保留為非 NFD 叢集的 fallback（與 NFD 並存，衝突時 NFD 優先）。
+
+**唯一的一次性人工步驟：確認 3080 的 PCI ID**（板型不同可能是 `2206`/`2216`/`2208`），對不上就改 `values-2x1.yaml` 的 `nfdRules`：
 
 ```bash
-# 若沿用既有 MPS 切法（最省事，但 host-class 仍標 rtx3080 以利後續區分）：
-kubectl label node <second-node-name> gpu-host-class=rtx3080 --overwrite
-kubectl label node <second-node-name> nvidia.com/device-plugin.config=rtx4070-mps --overwrite
+# 在第二台（host-2, RTX 3080）查實際 PCI device id：
+ssh host-2 'lspci -nn | grep -i NVIDIA'
+# 例：... [10de:2206] ...  → 對應 values-2x1.yaml nfdRules 的 "2206"，相符即可
+```
 
-# 若已在 chart 新增 rtx3080-mps config（建議）：
-# kubectl label node <second-node-name> nvidia.com/device-plugin.config=rtx3080-mps --overwrite
+套用 overlay（§6.2 會一起部署）後，確認 device-plugin 已把 3080 切成 4 share：
 
+```bash
 kubectl -n gpu-operator rollout status daemonset/nvidia-device-plugin-daemonset --timeout=180s
-```
-
-> NFD 規則（`chart/values.yaml:399-412`）是用 PCI device ID 自動套 device-plugin config，目前只列了 Ada（4070/4080）的 ID。RTX 3080（Ampere，PCI device ID `2206`/`2216` 視板型而定）**不在清單裡**，所以 NFD 不會自動幫它套 config，目前只能靠手動 label 或新增一條 `nfdRules` 規則。
-
-確認第二台 GPU 被 Kubernetes 看見：
-
-```bash
-kubectl describe node <second-node-name> | grep -A8 'Allocatable:'
 kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+# 兩個 GPU node 的 allocatable nvidia.com/gpu 應各為 4（= 4 MPS share）
 ```
 
-注意：MPS sharing 會讓 `nvidia.com/gpu` 顯示 replicas / share slots，不一定等於 physical GPU 張數。Slurm GRES 與 DSAC topology 要以你希望建模的資源單位為準。
+> **fallback（只在 NFD 沒生效時用）**：手動把 config label 補上 ——
+> `kubectl label node <host-2> nvidia.com/device-plugin.config=rtx3080-mps --overwrite`。
+> 但正常情況下 NFD 規則會自動處理，**不需要**這一步。
+
+> 注意：MPS sharing 會讓 `nvidia.com/gpu` 顯示 share slots（這裡是 4），不等於 physical GPU 張數（1）。Slurm GRES（`mps:100`，job 要 `mps:25`）與 DSAC topology（2×1）才是「資源單位」的權威來源。
 
 ## 6. Slurm worker pool 調整
 
@@ -189,62 +185,29 @@ kubectl -n slurm get pods -o wide | grep slurm-worker
 kubectl -n slurm exec slurm-controller-0 -- sinfo -Nel
 ```
 
-### 6.2 讓 DRL topology 變成 2 nodes × 1 GPU（2×1，你的真實拓樸）
+### 6.2 讓 DRL topology 變成 2 nodes × 1 GPU（2×1）— 套用 `values-2x1.yaml`
 
-如果你希望 DRL scheduler 看到兩個 GPU placement nodes、每台一張 GPU，則需要讓 Helm values、snapshot agent、DSAC checkpoint 三者一致對齊 **2×1（obs_dim=166, n_actions=33）**。
+要讓 DRL scheduler 看到兩個型別不同的 GPU placement node（4070 + 3080），就把 **`chart/values-2x1.yaml`** 疊在 `values-k3s.yaml` 之上即可。這份 overlay 已經把所有需要的東西做成宣告式（**單一檔、低維護**）：
 
-> **不要直接套 `chart/values-2x2.yaml`。** 它是「每台 2 張卡」的 experiment profile（`gres count: 2`、`mps: 200`、`maxNodes: 2`、`replicas: 0`，見 `chart/values-2x2.yaml:40-63`），對應 178/65 的 2×2，對不上你的單卡硬體。請另建一份 `values-2node-1gpu.yaml`。
+- `partitions`：`cpu` + `gpu-rtx4070` + `gpu-rtx3080`（兩種卡各一個 partition）。
+- `pools`：`gpu-rtx4070` / `gpu-rtx3080` 兩個 GPU pool，各 `count: 1` / `mps: 100` / `replicas: 1`，並用 **`nodeSelector: {gpu-host-class: …}` 釘到對應實體機**（4070→host-1、3080→host-2）。
+- `gpu.deviceConfigs.rtx3080-mps`（`replicas: 4`）+ `nfdRules`（PCI 自動套用）+ `nodeAssignments`（fallback）。
+- `slurm.jobSubmit.helper.partition.rules`：多一條 `gpu:rtx3080 → gpu-rtx3080` 路由。
 
-chart 的 worker 是用 **pools list**（`chart/values.yaml:46-118`），Helm 會整段取代 list 而非 merge，所以 overlay 要把整個 `pools` 重列一次，把 GPU pool 調成「每個 pool replica 1 張卡、可上到 2 個 replica（兩台機器各一）」。重點欄位：
+> **為什麼是這份而不是 `values-2x2.yaml`**：`values-2x2.yaml` 是「每台 2 張卡」（`count: 2`、`mps: 200`、178/65）的另一種拓樸，跟你的單卡硬體無關。`values-2x1.yaml` 才對齊 166/33。
+>
+> **Helm list 取代提醒（維護點）**：overlay 用整段取代 list（非 merge），所以它已重列 `partitions` / `pools` / `gpu.nodeAssignments` / `gpu.nfdRules.rules` / `helper.partition.rules`。日後若 `values.yaml` 改這幾個 list，記得同步 `values-2x1.yaml`（檔頭有列出）。
 
-```yaml
-# chart/values-2node-1gpu.yaml（請以 chart/values.yaml 的 pools schema 為準）
-pools:
-  - id: cpu
-    # ...照抄 values.yaml 的 cpu pool...
-    fallback: true
-
-  - id: gpu-rtx4070            # 仍用同一個 partition，但每個 worker pod 只 1 張卡
-    statefulset: slurm-worker-gpu-rtx4070
-    appLabel: slurm-worker-gpu-rtx4070
-    workerClass: gpu-rtx4070
-    partition: gpu-rtx4070
-    minReplicas: 1
-    maxReplicas: 2             # 兩台機器各一個 GPU worker pod
-    replicas: 2               # ← 關鍵：拉到 2，讓 Slurm 看到兩個 GPU node
-    maxNodes: 2
-    features: [gpu, topology-2x1]
-    gres:
-      - name: gpu
-        type: rtx4070          # 注意：型別異質，見下方警告
-        count: 1               # ← 每個 pod 1 張卡（不是 2）
-      - name: mps
-        count: 100             # ← 每張卡 100（不是 200）
-    matchGres: ["gpu:rtx4070", "mps"]
-    devicePluginConfig: rtx4070-mps
-
-slurm:
-  jobSubmit:
-    mpsPerNode: 100            # 每張卡 100 MPS slot（per-GPU，不是 per-node 總和）
-```
-
-> **型別異質的取捨（重要）**：上面為了簡單沿用單一 `gpu-rtx4070` partition + `type: rtx4070`，但實體上其中一個 worker pod 會落在 RTX 3080。由於 chart 沒有把 pool 釘到特定機器（`workers.yaml` 無 nodeSelector），Slurm 會把這兩個 GPU node 當成同質的 `rtx4070`。
-> - 若你**只在乎 placement 容量、不在乎型別精度** → 沿用上面寫法即可，但要知道 score 的 `f_vram_fit` 會把 3080 也當 12 GB。
-> - 若你**要嚴格區分 4070 / 3080** → 應新增一個獨立 `gpu-rtx3080` pool（`type: rtx3080`、獨立 partition、`devicePluginConfig: rtx3080-mps`），並在 `slurm.jobSubmit.helper.partition.rules`（`chart/values.yaml:325-331`）加一條 `gpu:rtx3080 → gpu-rtx3080` 路由。此路線下兩個 partition 各 1 個 GPU node，DRL 的 2×1 仍成立，但型別語意正確。
-
-render 檢查（確認 NodeName 出現兩個 GPU node、gres.conf 的 mps Count 正確）：
+render 檢查（已驗證：兩個 GPU NodeName、各 `mps Count=100`、兩個 GPU pool 帶 nodeSelector、`gpu-rtx3080` partition 與 `rtx3080-mps` config 都在）：
 
 ```bash
 helm template slurm-platform ./chart \
   -f chart/values-k3s.yaml \
-  -f chart/values-2node-1gpu.yaml \
+  -f chart/values-2x1.yaml \
   --set slurm.jobSubmit.enabled=true \
   --set rlScheduler.enabled=true \
-  --set rlScheduler.lua.enabled=true \
-  --set rlScheduler.shadowMode=false \
-  >/tmp/kelpflux-2node-render.yaml
-# 檢查重點：slurm.nodes.conf 有兩條 GPU NodeName；gres.conf 每個 GPU node 有 mps Count=100
-grep -E 'NodeName=.*gpu|Name=mps' /tmp/kelpflux-2node-render.yaml
+  >/tmp/kelpflux-2x1-render.yaml
+grep -E 'NodeName=.*gpu|Name=mps|gpu-host-class|PartitionName=gpu' /tmp/kelpflux-2x1-render.yaml
 ```
 
 部署：
@@ -253,7 +216,7 @@ grep -E 'NodeName=.*gpu|Name=mps' /tmp/kelpflux-2node-render.yaml
 VALUES_FILE=chart/values-k3s.yaml bash scripts/deploy-2.sh
 helm upgrade --install slurm-platform ./chart \
   -f chart/values-k3s.yaml \
-  -f chart/values-2node-1gpu.yaml \
+  -f chart/values-2x1.yaml \
   -n slurm \
   --set gpu.autoLabel=false \
   --set slurm.jobSubmit.enabled=true \
@@ -261,6 +224,8 @@ helm upgrade --install slurm-platform ./chart \
   --set rlScheduler.lua.enabled=true \
   --set rlScheduler.shadowMode=false
 ```
+
+> 部署後確認兩台各自就位：`kubectl -n slurm get pods -o wide | grep gpu` 應看到 `slurm-worker-gpu-rtx4070-0` 落在 host-1、`slurm-worker-gpu-rtx3080-0` 落在 host-2（靠 `nodeSelector`）。`sinfo -Nel` 應列出兩個 GPU partition。
 
 ## 7. DSAC checkpoint 必須對齊 topology
 
@@ -367,10 +332,10 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 | 風險 | 現象 | 處理 |
 |------|------|------|
-| 把「2×1」當成「2×2」 | checkpoint(178/65) 與 snapshot(166/33) 永遠對不上，`/decide` 一律 abstain | 用 2×1（166/33）：訓練帶 `--gpus-per-node 1`，**勿**直接套 `values-2x2.yaml`（見 §0） |
+| 套錯 overlay（拿 `values-2x2.yaml`）| checkpoint(178/65) 與 snapshot(166/33) 永遠對不上，`/decide` 一律 abstain | 用 `values-2x1.yaml`（166/33）+ 訓練帶 `--gpus-per-node 1`（見 §0、§6.2）|
 | 拿舊 192-dim checkpoint 配收斂後的 160-dim 程式 | obs 寬度不符 → `/decide` shape mismatch → 一律 abstain 退回 score | 用新維度（1×1=160 / 2×1=166）重訓並重烘 image（§7）；3080 字母表建模本身已完成（§0.1）|
-| 第二台沒有 GPU label | GPU worker pod 不上第二台，或 GPU Operator 不套 MPS config | 補 `gpu-host-class=rtx3080` 與 `nvidia.com/device-plugin.config` label |
-| 4070/3080 混在同一 partition | job 被排到「錯型別」的卡，VRAM 假設失準 | 用獨立 `gpu-rtx3080` pool/partition，或接受同質化處理（見 §6.2）|
+| 3080 沒被切成 4 MPS slot | `nvidia.com/gpu` allocatable 顯示 1 而非 4 → 沒有 share | 多半是 **NFD PCI ID 沒對上**：用 `lspci -nn` 確認 3080 的 id 並更新 `values-2x1.yaml` 的 `nfdRules`（§5）；NFD 沒生效才手動補 `device-plugin.config=rtx3080-mps` label |
+| GPU worker 落錯機器（4070 job 跑到 3080）| 卡別/VRAM 假設失準 | 已由 `values-2x1.yaml` 的獨立 partition + `nodeSelector` 解決（§0.1、§6.2）；確認兩台都有 `gpu-host-class` label |
 | NFS 不通 | worker pod 卡 `ContainerCreating` 或 `/shared` 讀寫失敗 | `/etc/exports` 的 allowed clients 要含第二台 **LAN subnet**（非只 pod CIDR），見 §4 |
 | checkpoint topology 不一致 | `/decide` shape mismatch → fail-safe 退回 score | 重新訓練 DSAC，或把 snapshotAgent topology 維持在 checkpoint 支援的大小 |
 | GPU share slots 被當 physical GPUs | snapshot free MPS 或 node count 被放大 | 調整 `snapshotAgent.gpusPerNode`，並確認 agent log 的 `nodes/free_mps` |
@@ -382,16 +347,16 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 1. 第二台（Ubuntu 24.04 + RTX 3080）跑 `setup-linux-gpu.sh`。
 2. 第二台用 k3s agent join 第一台（`--node-label gpu-host-class=rtx3080`）。
-3. 補 `gpu-host-class=rtx3080` 與 `nvidia.com/device-plugin.config=rtx4070-mps`（或新增的 `rtx3080-mps`）labels。
+3. 確認 host-1 也有 `gpu-host-class=rtx4070` label（nodeSelector / nodeAssignments 都靠它）。3080 的 device-plugin config 走 `values-2x1.yaml` 的 NFD 自動套用，不必手動 label。
 4. **回第一台把第二台 LAN subnet 加進 `/etc/exports`**，確認 NFS 可 mount。
 5. 跑 `bash scripts/deploy-2.sh`。
 6. 跑 `bash scripts/verify-live.sh`。
 
-若目標是「DRL policy 真的看到 2-node placement」（2×1）：
+若目標是「DRL policy 真的看到 2-node placement」（2×1，**你要的**）：
 
 1. 先完成上面的最小路線。
-2. 決定 topology = **2×1（166/33）**（RTX 3080 的 GPU 型別建模已完成，見 §0.1；只剩拓樸與 vramTiers 選用調整）。
-3. 新增 `values-2node-1gpu.yaml`（GPU pool `count: 1` / `mps: 100` / `replicas: 2`，**非** `values-2x2.yaml`）。
-4. 用 `--n-nodes 2 --gpus-per-node 1` 從頭重訓 DSAC。
+2. 確認 3080 的 PCI ID 與 `values-2x1.yaml` 的 `nfdRules` 相符（§5）；型別建模已完成（§0.1）。
+3. 套用 **`chart/values-2x1.yaml`**（已含 partition / pool / `nodeSelector` / `rtx3080-mps` / NFD / 路由，§6.2）——`helm upgrade … -f values-k3s.yaml -f values-2x1.yaml`。
+4. 用 `--n-nodes 2 --gpus-per-node 1` 從頭重訓 DSAC（§7）。
 5. 更新 Dockerfile checkpoint 並重新 `deploy-2.sh`。
-6. 確認 `/healthz` 顯示 `obs_dim=166, n_actions=33`，且 snapshot metrics 對齊。
+6. 確認 `/healthz` 顯示 `obs_dim=166, n_actions=33`，且 snapshot metrics（`free_mps≈200`、`nodes=2`）對齊。
