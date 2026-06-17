@@ -1,0 +1,75 @@
+suite: rl placement controller (hard placement via slurmrestd)
+templates:
+  - rl-scheduler/placement-controller.yaml
+tests:
+  - it: omitted when rlScheduler.enabled=false (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omitted when rlScheduler enabled but placementController disabled
+    set:
+      rlScheduler.enabled: true
+      rlScheduler.placementController.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: enabling renders Deployment + egress NetworkPolicy
+    set:
+      rlScheduler.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: slurm-rl-scheduler:m11
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: default command actuates (--no-shadow) and runs the controller module
+    set:
+      rlScheduler.enabled: true
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: services.rl_scheduler.placement_controller
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: --no-shadow
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: --require-held
+
+  - it: shadow=true renders --shadow instead
+    set:
+      rlScheduler.enabled: true
+      rlScheduler.placementController.shadow: true
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: --shadow
+      - notContains:
+          path: spec.template.spec.containers[0].command
+          content: --no-shadow
+
+  - it: networkPolicy egress targets slurmrestd and rl-scheduler
+    set:
+      rlScheduler.enabled: true
+    documentSelector:
+      path: kind
+      value: NetworkPolicy
+    asserts:
+      - equal:
+          path: spec.egress[0].ports[0].port
+          value: 6820
+      - equal:
+          path: spec.egress[1].ports[0].port
+          value: 8002

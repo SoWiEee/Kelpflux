@@ -284,12 +284,13 @@ sequenceDiagram
 
 ### 3.4 Hard Placement Controller
 
-`services/rl_scheduler/placement_controller.py` 是目前的 Slurm-safe hard placement 執行路徑。它輪詢 Slurm held queue 與 GPU worker state，呼叫 DSAC `/act`，把 action 解碼出的 `node_j` 映射到可用 worker，接著執行：
+`services/rl_scheduler/placement_controller.py` 是 Slurm-safe hard placement 執行路徑，且**現在預設常駐啟用**（`rlScheduler.placementController.enabled=true`，由 `deploy-2.sh` 一併部署為 `rl-placement-controller` Deployment）。它透過 **slurmrestd（JWT，與 `snapshot_agent` 同一條認證路徑）** 輪詢 held queue 與 GPU worker state，呼叫 DSAC `/act`，把 action 解碼出的 `node_j` 映射到可用 worker，接著對選中的 held job 送一個 job-update：
 
-```bash
-scontrol update JobId=<job_id> ReqNodeList=<selected_node>
-scontrol release <job_id>
 ```
+POST /slurm/<v>/job/<job_id>   { "required_nodes": "<selected_node>", "priority": <INFINITE> }
+```
+
+`required_nodes` 即 `ReqNodeList`；`priority=INFINITE`（0xFFFFFFFF）等同 `scontrol release`——讓 multifactor plugin 重算優先序、解除 user hold。改走 REST 是為了避免在 service 容器裡塞 `squeue`/`scontrol` CLI、munge socket 或 `kubectl exec` RBAC。`shadow=false`（預設）才真的送 job-update；`shadow=true` 只記 log。
 
 執行規則：
 
@@ -533,7 +534,7 @@ job_submit.lua -> POST /decide
 
 在 submit-time `/decide` 路徑中，DSAC 不直接執行 `srun --nodelist`，也不在 `job_submit.lua` 內覆蓋 Slurm placement；`node_j` 與 `gpu_k` 會回傳並記錄為 placement intent，實際 placement 仍交給 Slurm `select/cons_tres`。
 
-若需要 DSAC 的 placement action 真正生效，使用 `services/rl_scheduler/placement_controller.py`：它對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到可用 GPU worker，寫入 `ReqNodeList=<selected_node>`，再 `scontrol release`。這條路徑已納入正式規格，但目前不由 `deploy-2.sh` 預設常駐啟動；啟用前需要確認 checkpoint topology 與 live node/GPU topology 一致。
+DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller`**（`services/rl_scheduler/placement_controller.py`，§3.4），它**現在預設常駐啟用**：對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到 GPU worker，透過 slurmrestd job-update 寫 `required_nodes` 並以 `priority=INFINITE` release。注意 checkpoint topology 必須與 live node/GPU topology 一致——不一致時 `/act` 會 abstain，controller 隨即 no-op，Slurm 照常 `select/cons_tres` 放置（fail-safe）。目前 live 仍是舊 192-dim checkpoint，與收斂後的程式維度不符 → `/act` abstain → controller 不會動到 job，直到用新維度重訓重烘 image（見 `docs/intergration.md §7`）。
 
 ### 8.1 Snapshot Schema
 
@@ -602,7 +603,7 @@ Service response：
 | invalid / masked action | 不 boost |
 | network / parse / Lua error | Lua hook no-op，submission 繼續 |
 
-目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。hard placement controller 另以 `/act` 執行 held job placement，不受 Lua `shadowMode` 控制；controller 自身以 `--shadow / --no-shadow` 控制是否真的更新 Slurm job。
+目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。hard placement controller（預設常駐）另以 `/act` 執行 held job placement，**不受 Lua `shadowMode` 控制**；它自己用 `rlScheduler.placementController.shadow`（→ `--shadow / --no-shadow`，預設 `false`）決定是否真的送 slurmrestd job-update。兩條路徑互補：`/decide` 影響 priority 排序，controller 決定 held job 落在哪個 node。
 
 ## 9. Boundary Policy
 

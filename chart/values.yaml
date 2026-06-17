@@ -528,6 +528,32 @@ rlScheduler:
       limits:   { cpu: 250m, memory: 256Mi }
     networkPolicy:
       enabled: true
+  # Hard placement controller — turns the DSAC /act intent into a slurmrestd
+  # hold/release (ReqNodeList + recompute priority). This is the path that makes
+  # the learned placement action *actually* take effect; the /decide+lua path
+  # only nudges priority. It polls held PENDING jobs (sbatch -H ...), asks /act,
+  # and pins the chosen node. Fails safe: when /act abstains (e.g. checkpoint
+  # topology ≠ live), it no-ops and Slurm places normally.
+  placementController:
+    enabled: true
+    shadow: false          # false = actually POST job updates; true = log only
+    intervalSeconds: 5
+    slurmRestUrl: ""       # defaults to slurm-restapi.<namespace>.svc:6820
+    slurmRestApiVersion: v0.0.37
+    rlSchedulerUrl: "http://rl-scheduler:8002"
+    mpsPerGpu: 100
+    defaultMps: 100
+    defaultRuntimeSeconds: 600
+    nodeNamePrefix: ""     # restrict to GPU worker nodes by name prefix; "" = auto-discover
+    jobNamePrefix: ""      # only act on held jobs whose name starts with this; "" = all held
+    requireHeld: true      # only touch jobs submitted held (sbatch -H)
+    autoTrimModelTopology: true  # cap node list to checkpoint n_actions
+    releasePriority: 4294967295  # Slurm INFINITE → recompute priority, lift hold
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 250m, memory: 256Mi }
+    networkPolicy:
+      enabled: true
   lua:
     enabled: false        # job_submit.lua does NOT call /decide unless true
     url: "http://rl-scheduler:8002/decide"

@@ -118,7 +118,7 @@ deploy_platform() {
 
   if [[ "$SKIP_BUILD" != "1" || "$SKIP_IMPORT" != "1" ]]; then
     log "restarting RL deployments to pick up mutable image tag $RL_IMAGE"
-    run kubectl -n "$NAMESPACE" rollout restart deployment/rl-scheduler deployment/rl-snapshot-agent
+    run kubectl -n "$NAMESPACE" rollout restart deployment/rl-scheduler deployment/rl-snapshot-agent deployment/rl-placement-controller
   fi
 }
 
@@ -155,6 +155,7 @@ wait_for_final_state() {
     log "waiting for slurm-platform workloads"
     run kubectl -n "$NAMESPACE" rollout status deployment/rl-scheduler --timeout=180s
     run kubectl -n "$NAMESPACE" rollout status deployment/rl-snapshot-agent --timeout=180s
+    run kubectl -n "$NAMESPACE" rollout status deployment/rl-placement-controller --timeout=180s
     run kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout=180s
   fi
 

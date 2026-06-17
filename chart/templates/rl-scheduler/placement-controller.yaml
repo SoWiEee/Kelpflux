@@ -1,0 +1,113 @@
+{{- if and .Values.rlScheduler.enabled .Values.rlScheduler.placementController.enabled }}
+{{- $rl := .Values.rlScheduler -}}
+{{- $pc := .Values.rlScheduler.placementController -}}
+{{- $ns := .Values.cluster.namespace -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-placement-controller
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: rl-placement-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rl-placement-controller
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: rl-placement-controller
+    spec:
+      containers:
+        - name: placement-controller
+          image: "{{ $rl.image.repository }}:{{ $rl.image.tag }}"
+          imagePullPolicy: {{ $rl.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - services.rl_scheduler.placement_controller
+            - --rest-url
+            - {{ default (printf "http://slurm-restapi.%s.svc.cluster.local:6820" $ns) $pc.slurmRestUrl | quote }}
+            - --api-version
+            - {{ $pc.slurmRestApiVersion | quote }}
+            - --scheduler-url
+            - {{ default "http://rl-scheduler:8002" $pc.rlSchedulerUrl | quote }}
+            - --jwt-key-path
+            - /slurm-jwt/jwt_hs256.key
+            - --mps-per-gpu
+            - {{ $pc.mpsPerGpu | quote }}
+            - --default-mps
+            - {{ $pc.defaultMps | quote }}
+            - --default-runtime
+            - {{ $pc.defaultRuntimeSeconds | quote }}
+            - --interval
+            - {{ $pc.intervalSeconds | quote }}
+            - --release-priority
+            - {{ $pc.releasePriority | quote }}
+            - {{ if $pc.shadow }}--shadow{{ else }}--no-shadow{{ end }}
+            - {{ if $pc.requireHeld }}--require-held{{ else }}--no-require-held{{ end }}
+            - {{ if $pc.autoTrimModelTopology }}--auto-trim-model-topology{{ else }}--no-auto-trim-model-topology{{ end }}
+            {{- if $pc.nodeNamePrefix }}
+            - --node-name-prefix
+            - {{ $pc.nodeNamePrefix | quote }}
+            {{- end }}
+            {{- if $pc.jobNamePrefix }}
+            - --job-name-prefix
+            - {{ $pc.jobNamePrefix | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml $pc.resources | nindent 12 }}
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: {{ .Values.secrets.jwt }}
+            defaultMode: 0400
+{{- if and .Values.networkPolicy.enabled $pc.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rl-placement-controller-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-placement-controller
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6820
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rl-scheduler
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}
