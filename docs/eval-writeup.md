@@ -212,6 +212,8 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 
 三個重點：(1) **「SAC 最差」基本上是 auto-α 假象**——*任何一個*釘死的 α 都把 SAC 從墊底拉到領先 ~90–290 pts，並**追平甚至贏過** RDSAC-cvar；(2) **失效點是控制器本身**：忠實版的 auto-α 仍從 0.1 railing 到 **2.58**（entropy 0.081），ΔJCT 停在 −75.9/−132.4%——忠實化救不了它，只有釘死 α 才行；(3) **分布式/風險的優勢因此大幅縮水**——給定穩定溫度，IQN+CVaR 相對「調好的 scalar SAC」在**確定性** 1×1 的淨增益接近零（**此「確定性 1×1 淨增益≈0」屬 A 類，與 §4 live 打平一致**）。誠實限制：fixed-α 各值的細排名是單訓練 seed 雜訊，方向（任何 fixed α ≫ auto-α）穩健。
 
+> **「fixed-α 還是 auto-α 才是正規 SAC？」——澄清**：兩者是**同一份實作**的一個開關（`DSACAgent(fixed_alpha=...)`，`dsac.py:175`／溫度自動調在 `dsac.py:401-410`），不是兩種互斥的演算法。**auto-α（最大熵溫度自動調，Haarnoja 2018b）才是 SAC 的 canonical 預設**，本文與生產預設都走它；fixed-α（SAC-v1 把 α 當超參）同樣合法，但這裡的用途是**受控對照（control group）**：SAC 與 RDSAC **共用同一個 auto-α 控制器**，而該控制器的 `target_entropy_ratio`／clamp 是照 RDSAC-cvar 的 O(10) 回報尺度調的，套到 scalar SAC 上會把 α railing 到 2.58、entropy 壓到 0.08。所以本節釘死 α 不是「換一種實作」，而是把溫度從混淆變數裡隔離出來，證明 §3.2 的「SAC 墊底」來自 mis-tuned 的共用控制器、而非 scalar critic 本身。**對生產的含意**：live 要嘛 pin α、要嘛為 SAC 的回報尺度單獨重調控制器，別把為 cvar 調的 auto-α 直接套到 SAC。
+
 > §3.1–§3.3 的共同結論：**在確定性 1×1 sim，分布式/風險機制的淨增益 ≈0**。但這有一個被忽略的前提——sim 的 runtime 是 oracle（`gym_env.step`：`end_ts = now + runtime`），轉移確定性 → 回報分布 `Z_R` 塌成 point mass → **CVaR ≈ mean → 風險機制結構性閒置**。§3.4 起把這個前提拿掉。
 
 ### 3.4 隨機性消融：注入 runtime 不確定性
@@ -406,13 +408,13 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 
 1. **多訓練 seed（≥3–5）重跑 §3.4 / §3.6 關鍵點。** 目前每 cell 單一訓練 seed，§3.6 已有同 config 兩跑擺盪 50–90 pts 的鐵證；per-family 數字要 mean±std 才能下定論，尤其 mean-vs-cvar 的細排名。
 2. **σ 校準的外部效度。** §3.5 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重量，並把 σ-sweep 落在實測區間。
-3. **向量化 / 加速 sim。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h），是上面兩項可行的前置工程。
+3. **向量化 / 加速 sim（已實作）。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h）。已加入 `sim/vec_env.py`（`SyncVectorSchedEnv` 參考實作 + `AsyncVectorSchedEnv` 多進程，autoreset 語義一致、async≡sync 經測試），並把 `sim_train(--num-envs N)` 接成 N 個 env 並行 rollout、共用同一 learner——多核近線性提升 rollout 吞吐，讓上面兩項（multi-seed、σ-sweep）在算力上可行。注意：vec path 的 score-warmup 退回 random-legal（score-warmup 需 in-process `env._state`），且每 iteration 仍 `utd_ratio` 次更新，所以 UTD 隨 N 稀釋——要維持樣本效率就同步調高 `--utd-ratio`。
 
 **讓 sim 結論能轉移到 live**
 
 ✓ **重尾 + 高競爭 live A/B（已完成，§4.4.1–4.4.2）。** 首輪 block 設計被 cluster drift 汙染（score 自身 p99 漂移 153→125）；改用 `--interleave`（round-robin 交錯排程方法順序、每方法跨 4 輪輪過 4 位置）後 drift 消掉（score 跨 σ 穩定到 0.5%），得到**乾淨的 1×1 三方打平**——沒有學習方法贏過 score。**剩下的不是再跑一次 1×1**（makespan-bound 天花板已確認），而是第 5 項的 **2-node** 才有真實 placement 決策面。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
-4. **修 train/serve 動作落差。** sim 訓練 placement policy（job, node, gpu），live 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation；兩者對齊（live 真接 explicit placement，或 sim 改學 priority/selection）後 sim 結論才能宣稱轉移到 live。
+4. **修 train/serve 動作落差（path 已補上，待對齊驗證）。** sim 訓練的是 placement policy（job, node, gpu），而 submit-time `/decide` 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation——這是落差來源。**現在 `rl-placement-controller` 已預設常駐**（透過 slurmrestd 對 held job 寫 `required_nodes`＋release，§3.4），所以「live 真接 explicit placement」這條路已經接上、不再是 sim 獨有。但落差**在 1×1 是退化的**（單 node 只有一個合法目標，explicit placement ≡ priority），要到第 5 項的 **2-node** 才看得出差異；且需先用相符維度的 checkpoint 重訓，否則 `/act` abstain → controller no-op。對齊驗證併入 2-node 那輪做。
 5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。（`rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`，obs_dim 已收斂為 160）。
 6. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
 
