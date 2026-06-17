@@ -1,6 +1,11 @@
 """Integration test: the vectorized sim_train path trains and saves a checkpoint."""
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("torch")       # DSAC agent + training need torch
+pytest.importorskip("gymnasium")   # env construction needs gymnasium
+
 from services.rl_scheduler.dsac import DSACAgent
 from services.rl_scheduler.sim_train import sim_train
 from sim.gym_env import env_dims

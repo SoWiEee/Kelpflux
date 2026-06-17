@@ -2,6 +2,8 @@
 import numpy as np
 import pytest
 
+pytest.importorskip("gymnasium")  # env construction needs gymnasium
+
 from sim.gym_env import KubefluxSchedEnv, env_dims
 from sim.vec_env import (
     AsyncVectorSchedEnv,
