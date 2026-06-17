@@ -106,7 +106,7 @@ RDSAC 是 Ma et al. 2020/2025〈DSAC: Distributional Soft Actor-Critic for Risk-
 |---|---|
 | training | 從頭訓練 150k 步（§3.4 起的隨機性實驗為 100k），curriculum n_jobs 10→30→50 |
 | reward_scale | **20000**（修復 alpha 觸頂，見 2.2） |
-| cluster | 1 node × 1 GPU（執行當時 obs 192 / 17 actions；**GPU 字母表收斂為 {rtx4070, rtx3080} 後程式現為 obs 160**，§3 數字尚未在新字母表下重跑）|
+| cluster | 1 node × 1 GPU（§3.1–§3.7 執行當時 obs 192 / 17 actions；**GPU 字母表收斂為 {rtx4070, rtx3080} 後程式現為 obs 160**——160-dim 重跑見 §3.8）|
 | jobs per trace | 50 |
 | trace families | `philly`, `ali`（Alibaba PAI）|
 | seeds（eval） | 確定性實驗 30 seed；隨機性實驗 5 seed |
@@ -281,6 +281,28 @@ fixed-α 下 RDSAC 仍贏 SAC（+110~143 pts，排除 α 假象），σ=1.0 時 
 | ali | **+66.0** | −3.1 | **7.1 h** | 15.0 h |
 
 **負結果**：共置動作在 philly/ali 都明顯更差（OFF 贏 ~42/~69 pts）、尾部 p99 也變糟。兩個成因：(1) 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較；(2) 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每種方法單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
+
+### 3.8 160-dim 字母表重跑 + 決策來源拆分：模型其實「幾乎不下放置指令」
+
+> **A 類（DSAC 在確定性 1×1 輸給強啟發式，與 §4 live 打平方向一致）；但這裡第一次量到崩塌的 *機制*。**
+
+GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，用**預設配方**重跑：RDSAC-mean、auto-α、curriculum（n_jobs 10→30→50）、**向量化訓練 `--num-envs 8`**、500k steps、5 seeds、philly+ali。同時 `eval_dsac_placement.py` 新增**決策來源帳**（report-only，不改行為）：把每個 greedy 決策歸類成 **DRL 放置指令 / no-op / 回退 score**（後者＝若套 live serve guardrail `value<−1.0 或 entropy>2.5` 會 abstain → score baseline 接手）。
+
+| family | DSAC | score | ΔJCT% | p | DSAC p95 / p99 |
+|---|---:|---:|---:|---:|---:|
+| philly | 3.36 h | 2.62 h | **−28.1** | 0.033 ✓ | 12.8 h / 19.8 h |
+| ali | 3.10 h | 1.38 h | **−124.3** | 0.134 | 9.2 h / 68.5 h |
+
+| family | 決策數 | **DRL 指令** | **no-op** | **回退 score（would-abstain）** |
+|---|---:|---:|---:|---:|
+| philly | 10,175 | **0.0%** | **98.1%** | 1.9% |
+| ali | 20,177 | **0.0%** | **98.9%** | 1.1% |
+
+**主結論**：訓練後的策略**幾乎不下任何真實放置指令**（DRL 指令 ≈ 0%），而是 **~98% 選 no-op**——主動「等」而非放置。「回退 score」只佔 ~1–2%，**正因為策略自信地選 no-op**（value 高、entropy ~0.13），根本不會觸發 abstain guardrail。三桶因此是「≈0% 主動放置 / ~98% 主動不動 / ~1–2% live 才會退回 score」。模型既不放置也不 abstain，就退化成「放著不管」→ 輸給會主動 bin-pack 的 score，尾部 p99 也爆掉（job 堆積）。
+
+**兩個誠實 caveat（為何這不是 best-case DSAC）**：(1) **無 score-warmup 汙染**——向量化路徑把 score-warmup 退成 random-legal（§3 舊跑都有 score-warmup），所以這跟 §3 不是同配方，no-op 崩塌很可能被「沒有 score-warmup 暖機」放大；(2) **auto-α 又 railed**——α 收在 ~1.8、entropy ~0.13（近確定性），正是 §3.3 指認的同一個共用 auto-α 控制器病灶。所以這是「**預設配方在 160-dim + 向量化訓練**會發生什麼」的忠實快照，不是 DSAC 的能力上限。
+
+**對照（執行中，待補）**：`--num-envs 1`（score-warmup 開）+ `--fixed-alpha --init-alpha 0.05`（依 §3.3 釘死 α）的 §3-忠實重跑，用來分離「DSAC 在 1×1 本來就崩成 no-op」與「是向量化配方（無 score-warmup + auto-α）把它弄崩的」。原始檔 `runs/eval_160dim_20260617-151916/`（對照 `runs/eval_160dim_fixedA_*/`）。
 
 ---
 
