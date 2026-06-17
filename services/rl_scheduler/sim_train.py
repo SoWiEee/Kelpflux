@@ -10,8 +10,8 @@ Improvements:
   short episodes      : default n_jobs=50 → ~3× more distinct episodes
   potential shaping   : per-step reward φ(s) = −Σwait/scale, Ng et al. 1999
   PER                 : prioritized replay, sample by TD-error magnitude
-  CQL                 : conservative Q-Learning penalty, reduces overestimation
   IQN                 : Implicit Quantile Network critic (opt-in)
+  vectorized rollout  : N parallel envs (--num-envs) for multi-core throughput
   Curriculum          : n_jobs ramps from easy to hard over training
 
 Usage::
@@ -67,6 +67,125 @@ def _flush_nstep(nstep_buf: deque, buf, gamma: float) -> None:
     )
 
 
+def _collect_and_train_vec(
+    *, agent, buf, rng, log_fh, num_envs, async_envs,
+    families, active_n_jobs, total_gpus, n_nodes, gpus_per_node,
+    reward_mode, reward_scale, potential_shaping, runtime_sigma,
+    interference, colocation, nstep_n, total_steps, warmup_steps,
+    update_every, utd_ratio, batch_size, use_per, seed, log_every,
+    curriculum_stages,
+) -> None:
+    """Vectorized rollout: N parallel envs feed the shared agent/buffer.
+
+    Throughput path for multi-seed/arm studies — the pure-Python sim is the wall.
+    Async (multiprocess) envs step in parallel across cores; the learner stays in
+    the main process. Score-warmup is single-env-only (it needs in-process
+    ``env._state``), so the vec path warms up with random legal actions instead.
+    """
+    from sim.vec_env import EnvSpec, make_vector_env
+
+    def _build_vec(nj: int):
+        spec = EnvSpec(
+            families=tuple(families), n_jobs=nj, total_gpus=total_gpus,
+            n_nodes=n_nodes, gpus_per_node=gpus_per_node, max_steps=nj * 200,
+            reward_mode=reward_mode, reward_scale=reward_scale,
+            potential_shaping=potential_shaping, runtime_sigma=runtime_sigma,
+            interference=interference, colocation_actions=colocation, base_seed=seed,
+        )
+        return make_vector_env(spec, num_envs, asynchronous=async_envs)
+
+    if curriculum_stages is not None:
+        active_n_jobs = curriculum_stages[0][0]
+    print(f"  [sim_train] vectorized rollout: num_envs={num_envs} "
+          f"async={async_envs and num_envs > 1} (score-warmup disabled in vec mode)")
+
+    vec = _build_vec(active_n_jobs)
+    obs, masks = vec.reset(seed=seed)
+    nstep_bufs = [deque(maxlen=nstep_n) for _ in range(num_envs)]
+    ep_steps = np.zeros(num_envs)
+    ep_reward = np.zeros(num_envs)
+    ep_count = 0
+    last_losses: dict = {}
+    t0 = time.time()
+    step = 0
+
+    while step < total_steps:
+        if curriculum_stages is not None:
+            progress = step / total_steps
+            cum = 0.0
+            stage_n = curriculum_stages[0][0]
+            for nj, frac in curriculum_stages:
+                cum += frac
+                if progress < cum:
+                    stage_n = nj
+                    break
+            if stage_n != active_n_jobs:
+                active_n_jobs = stage_n
+                vec.close()
+                vec = _build_vec(active_n_jobs)
+                obs, masks = vec.reset()
+                nstep_bufs = [deque(maxlen=nstep_n) for _ in range(num_envs)]
+                ep_steps[:] = 0
+                ep_reward[:] = 0
+                print(f"  [curriculum] step={step}: n_jobs → {active_n_jobs}")
+
+        if len(buf) < warmup_steps:
+            acts = [int(rng.choice(np.flatnonzero(m))) for m in masks]
+        else:
+            acts = [agent.select_action(obs[i], masks[i]) for i in range(num_envs)]
+
+        next_obs, next_masks, rews, dones, infos = vec.step(acts)
+        for i in range(num_envs):
+            nxt_o = infos[i]["final_obs"] if dones[i] else next_obs[i]
+            nxt_m = infos[i]["final_mask"] if dones[i] else next_masks[i]
+            nstep_bufs[i].append(Transition(
+                obs=obs[i], act=acts[i], rew=float(rews[i]),
+                next_obs=nxt_o, done=bool(dones[i]),
+                mask=masks[i], next_mask=nxt_m,
+            ))
+            if len(nstep_bufs[i]) == nstep_n or dones[i]:
+                _flush_nstep(nstep_bufs[i], buf, gamma=agent.gamma)
+                if dones[i]:
+                    nstep_bufs[i].clear()
+            ep_steps[i] += 1
+            ep_reward[i] += float(rews[i])
+            if dones[i]:
+                ep_count += 1
+                if log_fh:
+                    log_fh.write(json.dumps({
+                        "step": step, "episode": ep_count, "env": i,
+                        "ep_steps": int(ep_steps[i]), "ep_reward": float(ep_reward[i]),
+                        "avg_jct": infos[i].get("avg_jct", float("nan")),
+                        "completed": infos[i].get("completed", 0),
+                        "n_jobs": active_n_jobs,
+                        "alpha": last_losses.get("alpha"),
+                        "entropy": last_losses.get("entropy"),
+                        "loss_critic": last_losses.get("loss_critic"),
+                        "loss_actor": last_losses.get("loss_actor"),
+                    }) + "\n")
+                ep_steps[i] = 0
+                ep_reward[i] = 0
+
+        obs, masks = next_obs, next_masks
+        step += num_envs
+
+        if len(buf) >= warmup_steps and (step // num_envs) % update_every == 0:
+            for _ in range(utd_ratio):
+                batch = buf.sample(min(batch_size, len(buf)), rng)
+                losses = agent.update(batch)
+                last_losses = losses
+                if use_per and "indices" in batch and "td_errors" in losses:
+                    buf.update_priorities(batch["indices"], losses["td_errors"])
+
+        if step % log_every < num_envs:
+            elapsed = time.time() - t0
+            print(f"  step {step:6d}/{total_steps}  buf={len(buf):6d}  "
+                  f"eps={ep_count}  n_jobs={active_n_jobs}  "
+                  f"alpha={agent.alpha.item():.3f}  elapsed={elapsed:.0f}s")
+
+    vec.close()
+
+
 def sim_train(
     *,
     n_nodes: int = 1,
@@ -104,6 +223,9 @@ def sim_train(
     interference: float = 0.0,
     # Co-location action mode (B; opt-in, doubles the action space)
     colocation: bool = False,
+    # Vectorized rollout (Q2 throughput): >1 runs N parallel envs
+    num_envs: int = 1,
+    async_envs: bool = True,
 ) -> DSACAgent:
     """Run online DSAC training in sim. Returns the trained agent."""
     obs_dim, n_actions = env_dims(n_nodes, gpus_per_node, colocation=colocation)
@@ -163,6 +285,30 @@ def sim_train(
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
         log_fh = open(out_dir / "sim_train.jsonl", "w")
+
+    # ── Vectorized rollout path (Q2): N parallel envs feed the shared learner ──
+    if num_envs > 1:
+        _collect_and_train_vec(
+            agent=agent, buf=buf, rng=rng, log_fh=log_fh,
+            num_envs=num_envs, async_envs=async_envs,
+            families=families, active_n_jobs=active_n_jobs, total_gpus=total_gpus,
+            n_nodes=n_nodes, gpus_per_node=gpus_per_node,
+            reward_mode=reward_mode, reward_scale=reward_scale,
+            potential_shaping=potential_shaping, runtime_sigma=runtime_sigma,
+            interference=interference, colocation=colocation,
+            nstep_n=nstep_n, total_steps=total_steps, warmup_steps=warmup_steps,
+            update_every=update_every, utd_ratio=utd_ratio, batch_size=batch_size,
+            use_per=use_per, seed=seed, log_every=log_every,
+            curriculum_stages=curriculum_stages,
+        )
+        env.close()
+        if log_fh:
+            log_fh.close()
+        if out_dir:
+            ckpt = out_dir / "dsac.pt"
+            agent.save(ckpt)
+            print(f"[sim_train] saved → {ckpt}")
+        return agent
 
     obs, _ = env.reset(seed=seed)
     ep_steps = ep_reward = 0.0
@@ -283,8 +429,8 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--n-nodes",       type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
-    p.add_argument("--trace",         default=["philly", "burst", "ali"],
-                   nargs="+", choices=["philly", "burst", "ali"])
+    p.add_argument("--trace",         default=["philly", "ali"],
+                   nargs="+", choices=["philly", "ali"])
     p.add_argument("--n-jobs",        type=int, default=50)
     p.add_argument("--nstep-n",       type=int, default=10)
     p.add_argument("--no-score-warmup", action="store_true")
@@ -335,6 +481,13 @@ def main(argv=None) -> int:
     p.add_argument("--colocation",           action="store_true",
                    help="add PACK/ISOLATE co-location mode per placement "
                         "(doubles the action space; checkpoint-incompatible)")
+    # Vectorized rollout (Q2 throughput)
+    p.add_argument("--num-envs",             type=int, default=1,
+                   help="parallel rollout envs; >1 enables the vectorized path "
+                        "(score-warmup falls back to random-legal in that path)")
+    p.add_argument("--sync-envs",            action="store_true",
+                   help="with --num-envs>1, step envs in-process instead of in "
+                        "worker processes (no wall-clock win; for debugging)")
     args = p.parse_args(argv)
 
     import torch
@@ -374,6 +527,8 @@ def main(argv=None) -> int:
         runtime_sigma=args.runtime_sigma,
         interference=args.interference,
         colocation=args.colocation,
+        num_envs=args.num_envs,
+        async_envs=not args.sync_envs,
     )
     return 0
 

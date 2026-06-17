@@ -83,7 +83,7 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 | M4 | **§4.5 共置負結果是預算混淆。** ON 有 2× 動作但同 100k 步 → underfit。結論其實是「相同預算下大動作空間學不好」，不是「共置沒用」。 | High | 給 ON 臂**配對的訓練資訊量**（按 log|A| 放大步數，或對 ISOLATE 的稀疏 mask 做 action-embedding / factorized policy）。否則 §4.5 應明確標為「budget-confounded」，不能下「共置無用」的強結論（doc 已部分標註，可再強化）。 |
 | M5 | **無 held-out workload。** 在 philly/burst/ali 混合訓練、又在同三族評估。 | Medium | 做 workload split（train philly+burst、test ali）證明泛化而非記住 trace 統計。對「能應付沒見過的 workload」的宣稱是必要的。 |
 | M6 | **機制堆疊缺 ablation。** n-step、PER、potential shaping、score warmup、雙頭 Z_R/Z_H 全開，沒有逐項 ablation。 | Medium | 至少對 PER、potential shaping、雙頭分解各做一次開關。尤其**雙頭 Z_R/Z_H**（RDSAC 特有的熵回報分離）增加複雜度——若單頭分布式 critic（熵折進 V）效果相當，應簡化。 |
-| M7 | **sim 是純 Python 離散事件、~10 steps/s = 多 seed 研究的算力牆。** 本輪一個 σ 區塊就要 ~4.6h。 | High（間接擋住 M1/R2）| 向量化 / 編譯 sim（numba、或重寫熱路徑），把吞吐拉到 10²–10³ steps/s，多訓練 seed（R2）與三方臂（M1）才在算力上可行。**這是解開 R2/M1 的前置條件。** |
+| M7 | **sim 是純 Python 離散事件、~10 steps/s = 多 seed 研究的算力牆。** 本輪一個 σ 區塊就要 ~4.6h。 | High（間接擋住 M1/R2）| **已做第一階段：向量化**（`sim/vec_env.py` Sync/Async vector env + `sim_train --num-envs N` 多進程並行 rollout，多核近線性放大吞吐）。多訓練 seed（R2）與三方臂（M1）現在算力上可行。**下一階段**（若仍是瓶頸）：numba / 重寫熱路徑把*單 env* steps/s 也拉高一個數量級。 |
 
 **Model 總評：** RDSAC 的實作對齊參考文獻、有測試覆蓋（本輪 +9 測試），σ 消融的方向性結論在理論上合理。但 **M1（拆 distributional vs risk）與 M2（warmup 是否造成 abstain）是兩個最關鍵、最便宜的待答問題**，而 M7（算力牆）是讓 R2/M1 變得可行的前置工程。
 
@@ -102,7 +102,7 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 | P0-1 | **σ 校準到真實 predictor 殘差** | R1 | 量 LightGBM 的 log-residual 分布，σ 用實測值；方法學寫明 |
 | P0-2 | **多訓練 seed（≥3–5）重跑 §4.4/§4.5 關鍵點** | R2, M4 | 每 cell mean±std；gap 單調性的跨 seed 顯著性 |
 | P0-3 | **σ-sweep 補 RDSAC-mean 臂** | M1 | 三方拆解 distributional vs risk 貢獻 |
-| P0-4 | **向量化 / 加速 sim**（前置工程）| M7 | steps/s ↑ 一個數量級，讓 P0-2/P0-3 可行 |
+| P0-4 | **向量化 / 加速 sim**（前置工程，**已做向量化**）| M7 | `--num-envs N` 多進程並行 rollout 已落地，吞吐隨核數放大，讓 P0-2/P0-3 可行；單 env 編譯加速為下一階段 |
 
 ### P1 — 讓 sim 結論能轉移到 live / 更強的對照
 
