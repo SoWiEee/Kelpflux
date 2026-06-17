@@ -306,6 +306,7 @@ class KubefluxSchedEnv:
         self.action_space = spaces.Discrete(n_act)
         self._n_placements = n_nodes * gpus_per_node
         self._no_op        = n_act - 1
+        self._score_sched  = None   # lazily built for score_warmup_action()
 
     # ── Gym API ──────────────────────────────────────────────────────────
 
@@ -429,6 +430,37 @@ class KubefluxSchedEnv:
                         mask[self._encode(i, placement, mode)] = True
         mask[self._no_op] = True
         return mask
+
+    def score_warmup_action(self, mask: np.ndarray, rng: np.random.Generator) -> int:
+        """Score-heuristic action for warmup seeding.
+
+        Mirrors the single-env warmup block in ``sim_train``: order pending jobs
+        by the score scheduler, then return the PACK action on the first
+        placement of the highest-ranked job that is currently legal; fall back to
+        a uniform random legal action. Lets the vectorized rollout reproduce the
+        same high-quality warmup as the single-env path (in-process, so it can
+        read ``self._state`` — Async workers call this inside their worker).
+        """
+        legal = np.flatnonzero(mask)
+        if legal.size == 0:
+            return self._no_op
+        st = self._state
+        if st is None or not st.pending or st.cluster is None:
+            return int(rng.choice(legal))
+        if self._score_sched is None:
+            from .scheduler.score import ScoreScheduler
+            self._score_sched = ScoreScheduler()
+        ordered = self._score_sched.order(st.pending, st.cluster, now=st.now)
+        act = int(rng.choice(legal))
+        for job in ordered:
+            job_idx = next((i for i, j in enumerate(st.pending)
+                            if j.job_id == job.job_id), None)
+            if job_idx is not None:
+                cand = self._encode(job_idx, 0, 0)   # PACK on first placement
+                if cand < mask.shape[0] and mask[cand]:
+                    act = int(cand)
+                    break
+        return act
 
     # ── Internals ────────────────────────────────────────────────────────
 

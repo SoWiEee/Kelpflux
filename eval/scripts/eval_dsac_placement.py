@@ -247,7 +247,7 @@ def main(argv=None) -> int:
                    help="ramp n_jobs 10→30→50 during training")
     p.add_argument("--num-envs",             type=int, default=1,
                    help="parallel rollout envs during training (>1 = vectorized "
-                        "path; score-warmup falls back to random-legal there)")
+                        "path; score-warmup honored via per-env score_actions())")
     # Report-only DRL-vs-score-fallback accounting (live /decide guardrail).
     p.add_argument("--value-abstain",   type=float, default=VALUE_ABSTAIN_DEFAULT,
                    help="report a decision as score-fallback when policy value < this "

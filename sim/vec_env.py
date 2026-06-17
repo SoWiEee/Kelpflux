@@ -134,6 +134,11 @@ class SyncVectorSchedEnv:
         self.spec = spec
         self.num_envs = int(num_envs)
         self.envs = [spec.build(i) for i in range(self.num_envs)]
+        self._rng = np.random.default_rng(spec.base_seed + 991)
+
+    def score_actions(self) -> list[int]:
+        """Per-env score-heuristic warmup action (mirrors single-env warmup)."""
+        return [env.score_warmup_action(env.action_mask(), self._rng) for env in self.envs]
 
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, np.ndarray]:
         obs, masks = [], []
@@ -170,6 +175,7 @@ class SyncVectorSchedEnv:
 def _worker(remote, parent_remote, spec: EnvSpec, index: int) -> None:
     parent_remote.close()
     env = spec.build(index)
+    wrng = np.random.default_rng(spec.base_seed + 991 + index)
     try:
         while True:
             cmd, data = remote.recv()
@@ -177,6 +183,8 @@ def _worker(remote, parent_remote, spec: EnvSpec, index: int) -> None:
                 remote.send(_reset_one(env, data))
             elif cmd == "step":
                 remote.send(_step_one(env, data))
+            elif cmd == "score_action":
+                remote.send(env.score_warmup_action(env.action_mask(), wrng))
             elif cmd == "close":
                 break
             else:  # pragma: no cover - defensive
@@ -212,6 +220,12 @@ class AsyncVectorSchedEnv:
         obs = np.stack([o for o, _ in results])
         masks = np.stack([m for _, m in results])
         return obs, masks
+
+    def score_actions(self) -> list[int]:
+        """Per-env score-heuristic warmup action, computed inside each worker."""
+        for parent in self.parents:
+            parent.send(("score_action", None))
+        return [int(parent.recv()) for parent in self.parents]
 
     def step(self, actions: Sequence[int]):
         for parent, a in zip(self.parents, actions):

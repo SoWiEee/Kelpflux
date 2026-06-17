@@ -132,3 +132,22 @@ def test_async_matches_sync_transitions():
 def test_make_vector_env_falls_back_to_sync_for_single_env():
     assert isinstance(make_vector_env(_spec(), 1), SyncVectorSchedEnv)
     assert isinstance(make_vector_env(_spec(), 4, asynchronous=False), SyncVectorSchedEnv)
+
+
+def test_score_actions_returns_legal_actions_sync_and_async():
+    spec = _spec(num_jobs=10, base_seed=3)
+    sync = SyncVectorSchedEnv(spec, num_envs=2)
+    asyncv = AsyncVectorSchedEnv(spec, num_envs=2)
+    try:
+        _, s_masks = sync.reset(seed=1)
+        _, a_masks = asyncv.reset(seed=1)
+        s_acts = sync.score_actions()
+        a_acts = asyncv.score_actions()
+        assert len(s_acts) == 2 and len(a_acts) == 2
+        # every warmup action must be legal under that env's current mask
+        for acts, masks in ((s_acts, s_masks), (a_acts, a_masks)):
+            for a, m in zip(acts, masks):
+                assert bool(m[a]), "score warmup action must be legal"
+    finally:
+        sync.close()
+        asyncv.close()

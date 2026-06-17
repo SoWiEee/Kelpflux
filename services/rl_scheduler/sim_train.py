@@ -73,14 +73,15 @@ def _collect_and_train_vec(
     reward_mode, reward_scale, potential_shaping, runtime_sigma,
     interference, colocation, nstep_n, total_steps, warmup_steps,
     update_every, utd_ratio, batch_size, use_per, seed, log_every,
-    curriculum_stages,
+    curriculum_stages, score_warmup,
 ) -> None:
     """Vectorized rollout: N parallel envs feed the shared agent/buffer.
 
     Throughput path for multi-seed/arm studies — the pure-Python sim is the wall.
     Async (multiprocess) envs step in parallel across cores; the learner stays in
-    the main process. Score-warmup is single-env-only (it needs in-process
-    ``env._state``), so the vec path warms up with random legal actions instead.
+    the main process. Score-warmup is honored via ``vec.score_actions()`` (each
+    env computes the score-heuristic action in-process / inside its worker), so
+    the vec path reproduces the single-env warmup instead of random-legal.
     """
     from sim.vec_env import EnvSpec, make_vector_env
 
@@ -97,7 +98,7 @@ def _collect_and_train_vec(
     if curriculum_stages is not None:
         active_n_jobs = curriculum_stages[0][0]
     print(f"  [sim_train] vectorized rollout: num_envs={num_envs} "
-          f"async={async_envs and num_envs > 1} (score-warmup disabled in vec mode)")
+          f"async={async_envs and num_envs > 1} score_warmup={score_warmup}")
 
     vec = _build_vec(active_n_jobs)
     obs, masks = vec.reset(seed=seed)
@@ -130,7 +131,10 @@ def _collect_and_train_vec(
                 print(f"  [curriculum] step={step}: n_jobs → {active_n_jobs}")
 
         if len(buf) < warmup_steps:
-            acts = [int(rng.choice(np.flatnonzero(m))) for m in masks]
+            if score_warmup:
+                acts = vec.score_actions()
+            else:
+                acts = [int(rng.choice(np.flatnonzero(m))) for m in masks]
         else:
             acts = [agent.select_action(obs[i], masks[i]) for i in range(num_envs)]
 
@@ -299,7 +303,7 @@ def sim_train(
             nstep_n=nstep_n, total_steps=total_steps, warmup_steps=warmup_steps,
             update_every=update_every, utd_ratio=utd_ratio, batch_size=batch_size,
             use_per=use_per, seed=seed, log_every=log_every,
-            curriculum_stages=curriculum_stages,
+            curriculum_stages=curriculum_stages, score_warmup=score_warmup,
         )
         env.close()
         if log_fh:
@@ -484,7 +488,7 @@ def main(argv=None) -> int:
     # Vectorized rollout (Q2 throughput)
     p.add_argument("--num-envs",             type=int, default=1,
                    help="parallel rollout envs; >1 enables the vectorized path "
-                        "(score-warmup falls back to random-legal in that path)")
+                        "(score-warmup honored via per-env score_actions())")
     p.add_argument("--sync-envs",            action="store_true",
                    help="with --num-envs>1, step envs in-process instead of in "
                         "worker processes (no wall-clock win; for debugging)")
