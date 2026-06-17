@@ -52,6 +52,32 @@ from services.rl_scheduler.distortion import RISK_MODES
 from services.rl_scheduler.sim_train import sim_train
 
 
+# Live /decide fail-safe guardrail defaults (services/rl_scheduler/serve.py).
+# The sim eval lets the DRL policy act on EVERY step (so JCTs stay comparable to
+# eval-writeup §3); these thresholds are used only to *report* how often live
+# would have abstained → fallen back to the score baseline.
+VALUE_ABSTAIN_DEFAULT   = -1.0
+ENTROPY_ABSTAIN_DEFAULT = 2.5
+
+
+def _decision_stats(agent: DSACAgent, obs, mask) -> tuple[float, float]:
+    """(value, entropy) for one decision — mirrors serve.py `_AgentHolder.select`.
+
+    value   = Σ_a π(a|s)·Q(a)   (expected action value under the policy)
+    entropy = −Σ_a π(a|s)·log π(a|s)
+    """
+    import torch
+
+    with torch.no_grad():
+        obs_t  = torch.as_tensor(obs,  dtype=torch.float32, device=agent.device).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.bool,    device=agent.device).unsqueeze(0)
+        probs, log_probs = agent.actor.policy(obs_t, mask_t)
+        q       = agent.action_values(obs_t)
+        entropy = float(-(probs * log_probs).sum(dim=-1).item())
+        value   = float((probs * q).sum(dim=-1).item())
+    return value, entropy
+
+
 def eval_dsac_jct(
     agent: DSACAgent,
     *,
@@ -62,11 +88,23 @@ def eval_dsac_jct(
     seeds: list[int],
     greedy: bool = True,
     per_job_out: list | None = None,
+    value_abstain: float = VALUE_ABSTAIN_DEFAULT,
+    entropy_abstain: float = ENTROPY_ABSTAIN_DEFAULT,
+    accounting_out: dict | None = None,
 ) -> list[float]:
     """Run agent over seeds, return list of avg_jct (seconds).
 
     If ``per_job_out`` is given, per-job JCTs across all seeds are appended to it
     (used for risk-sensitive tail metrics: p95/p99 JCT).
+
+    If ``accounting_out`` (a dict of counters) is given, every decision is
+    classified — **report-only, the action taken is unchanged** — into:
+      ``drl_placement`` : real DRL placement command (action ≠ no-op, passes the
+                          live guardrail);
+      ``no_op``         : DRL chose to wait (advance the sim);
+      ``would_fallback``: live would abstain here (value < ``value_abstain`` or
+                          entropy > ``entropy_abstain``) → score baseline drives.
+    The no-op check takes precedence over the abstain check, mirroring serve.py.
     """
     total_gpus = n_nodes * gpus_per_node
     jcts = []
@@ -85,6 +123,15 @@ def eval_dsac_jct(
         while not done:
             mask = env.action_mask()
             act  = agent.select_action(obs, mask, greedy=greedy)
+            if accounting_out is not None:
+                value, entropy = _decision_stats(agent, obs, mask)
+                accounting_out["total"] += 1
+                if act == env._no_op:
+                    accounting_out["no_op"] += 1
+                elif value < value_abstain or entropy > entropy_abstain:
+                    accounting_out["would_fallback"] += 1
+                else:
+                    accounting_out["drl_placement"] += 1
             obs, _, term, trunc, info = env.step(act)
             done = term or trunc
         if per_job_out is not None:
@@ -131,6 +178,22 @@ def print_table(rows):
         )
 
 
+def _print_decision_split(rows):
+    """Report-only: how the DRL run's decisions split into real commands vs the
+    fallback the live serve guardrail would have taken (→ score baseline)."""
+    header = (f"{'Family':8s}  {'Decisions':>9s}  {'DRL-cmd':>8s}  "
+              f"{'no-op':>7s}  {'→score':>8s}")
+    print("\nDecision provenance (report-only; DRL acted on every step here):")
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(f"{r['family']:8s}  {r['decisions']:9d}  "
+              f"{r['drl_placement_pct']:7.1f}%  {r['no_op_pct']:6.1f}%  "
+              f"{r['score_fallback_pct']:7.1f}%")
+    print("  DRL-cmd = genuine DSAC placement · →score = live would abstain "
+          "(value<VALUE_ABSTAIN or entropy>ENTROPY_ABSTAIN) → score baseline")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--n-nodes",        type=int, default=1)
@@ -147,10 +210,10 @@ def main(argv=None) -> int:
     p.add_argument("--seeds",          type=int, nargs="+",
                    default=[42, 43, 44, 45, 46])
     p.add_argument("--trace-families", nargs="+",
-                   default=["philly", "burst", "ali"])
-    p.add_argument("--train-trace",    default=["philly", "burst", "ali"],
-                   nargs="+", choices=["philly", "burst", "ali"],
-                   help="trace(s) for training; multiple = mixed (default: all three)")
+                   default=["philly", "ali"], choices=["philly", "ali"])
+    p.add_argument("--train-trace",    default=["philly", "ali"],
+                   nargs="+", choices=["philly", "ali"],
+                   help="trace(s) for training; multiple = mixed (default: both)")
     p.add_argument("--out-dir",
                    default=f"runs/eval_dsac_{time.strftime('%Y%m%d-%H%M%S')}")
     p.add_argument("--ckpt",           default=None,
@@ -182,6 +245,16 @@ def main(argv=None) -> int:
                    help="disable Prioritized Experience Replay")
     p.add_argument("--curriculum",           action="store_true",
                    help="ramp n_jobs 10→30→50 during training")
+    p.add_argument("--num-envs",             type=int, default=1,
+                   help="parallel rollout envs during training (>1 = vectorized "
+                        "path; score-warmup falls back to random-legal there)")
+    # Report-only DRL-vs-score-fallback accounting (live /decide guardrail).
+    p.add_argument("--value-abstain",   type=float, default=VALUE_ABSTAIN_DEFAULT,
+                   help="report a decision as score-fallback when policy value < this "
+                        "(live serve VALUE_ABSTAIN; default -1.0)")
+    p.add_argument("--entropy-abstain", type=float, default=ENTROPY_ABSTAIN_DEFAULT,
+                   help="report a decision as score-fallback when policy entropy > this "
+                        "(live serve ENTROPY_ABSTAIN; default 2.5)")
     args = p.parse_args(argv)
 
     out_dir = Path(args.out_dir)
@@ -233,6 +306,7 @@ def main(argv=None) -> int:
             potential_shaping=not args.no_potential_shaping,
             use_per=not args.no_per,
             curriculum=args.curriculum,
+            num_envs=args.num_envs,
         )
         print()
 
@@ -242,10 +316,13 @@ def main(argv=None) -> int:
         print(f"[eval] evaluating {family} ({len(args.seeds)} seeds) ...", end=" ",
               flush=True)
         dsac_per_job: list = []
+        acct = {"total": 0, "drl_placement": 0, "no_op": 0, "would_fallback": 0}
         dsac_jcts  = eval_dsac_jct(
             agent, n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
             trace_family=family, n_jobs=args.n_jobs,
             seeds=args.seeds, greedy=args.greedy, per_job_out=dsac_per_job,
+            value_abstain=args.value_abstain, entropy_abstain=args.entropy_abstain,
+            accounting_out=acct,
         )
         score_jcts = eval_score_jct(
             n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
@@ -271,16 +348,26 @@ def main(argv=None) -> int:
                                 if dsac_per_job else float("nan"),
             "dsac_jcts_h":      [j / 3600 for j in dsac_jcts],
             "score_jcts_h":     [j / 3600 for j in score_jcts],
+            # Report-only decision provenance (DRL command vs live score-fallback)
+            "decisions":          int(acct["total"]),
+            "drl_placement_pct":  100.0 * acct["drl_placement"] / max(1, acct["total"]),
+            "no_op_pct":          100.0 * acct["no_op"]         / max(1, acct["total"]),
+            "score_fallback_pct": 100.0 * acct["would_fallback"]/ max(1, acct["total"]),
         })
         p99h = rows[-1]["dsac_jct_p99_h"]
-        print(f"Δ={pct:+.1f}%  p={p_val:.3f}  p99={p99h:.2f}h")
+        print(f"Δ={pct:+.1f}%  p={p_val:.3f}  p99={p99h:.2f}h  "
+              f"[DRL-cmd {rows[-1]['drl_placement_pct']:.0f}% / "
+              f"no-op {rows[-1]['no_op_pct']:.0f}% / "
+              f"→score {rows[-1]['score_fallback_pct']:.0f}%]")
 
     print_table(rows)
+    _print_decision_split(rows)
 
     # ── Save CSV (without list columns) ────────────────────────────────
     csv_cols = ["family", "dsac_jct_mean_h", "score_jct_mean_h",
                 "delta_pct", "ci95_lo_pct", "ci95_hi_pct",
-                "p_value", "significant", "dsac_jct_p95_h", "dsac_jct_p99_h"]
+                "p_value", "significant", "dsac_jct_p95_h", "dsac_jct_p99_h",
+                "decisions", "drl_placement_pct", "no_op_pct", "score_fallback_pct"]
     csv_path = out_dir / "eval_dsac_placement.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")
