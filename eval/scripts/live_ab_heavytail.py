@@ -161,7 +161,7 @@ def gen_workload(
 
 
 JOB_NAME_PREFIX = "htab"
-HTAB_SACCT_FORMAT = "JobID,JobName%64,State,Submit,Start,End,ElapsedRaw"
+HTAB_SACCT_FORMAT = "JobID,JobName%64,State,Submit,Start,End,ElapsedRaw,NodeList"
 
 
 def job_name(arm: str, round_idx: int, job_id: str) -> str:
@@ -293,6 +293,7 @@ def parse_sacct_jct(raw_text: str) -> dict:
             "submit": submit, "start": start, "end": end,
             "jct": jct, "wait": wait,
             "elapsed": parse_elapsed_seconds(row.get("ElapsedRaw", "")),
+            "node": (row.get("NodeList") or "").strip(),
         }
     return out
 
@@ -317,6 +318,7 @@ def join_records(jobs: List[LiveJob], parsed: dict, arm: str, round_idx: int) ->
             "mps_req": j.mps_req,
             "jct": float(row["jct"]), "wait": float(row["wait"]) if row["wait"] is not None else None,
             "state": row["state"],
+            "node": row.get("node", ""),
         })
     return records
 

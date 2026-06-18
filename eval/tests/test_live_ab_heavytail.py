@@ -16,12 +16,24 @@ from eval.scripts.live_ab_heavytail import (  # noqa: E402
     sbatch_cmd,
 )
 
-_SACCT_SAMPLE = """JobID|JobName|State|Submit|Start|End|ElapsedRaw
-131|htab_score_1_jobA|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:05|2026-06-14T10:01:05|60
-132|htab_RDSAC-cvar_1_jobB|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:10|2026-06-14T10:02:00|110
-133|htab_SAC_0_jobC|FAILED|2026-06-14T10:00:00|2026-06-14T10:00:00|2026-06-14T10:00:01|1
-999|unrelated-job|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:00|2026-06-14T10:00:30|30
+_SACCT_SAMPLE = """JobID|JobName|State|Submit|Start|End|ElapsedRaw|NodeList
+131|htab_score_1_jobA|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:05|2026-06-14T10:01:05|60|slurm-worker-gpu-rtx4070-0
+132|htab_RDSAC-cvar_1_jobB|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:10|2026-06-14T10:02:00|110|slurm-worker-gpu-rtx3080-0
+133|htab_SAC_0_jobC|FAILED|2026-06-14T10:00:00|2026-06-14T10:00:00|2026-06-14T10:00:01|1|slurm-worker-gpu-rtx4070-0
+999|unrelated-job|COMPLETED|2026-06-14T10:00:00|2026-06-14T10:00:00|2026-06-14T10:00:30|30|slurm-worker-cpu-0
 """
+
+
+def test_parse_sacct_captures_node():
+    parsed = parse_sacct_jct(_SACCT_SAMPLE)
+    assert parsed["htab_score_1_jobA"]["node"] == "slurm-worker-gpu-rtx4070-0"
+    assert parsed["htab_RDSAC-cvar_1_jobB"]["node"] == "slurm-worker-gpu-rtx3080-0"
+
+
+def test_join_records_carries_node():
+    parsed = parse_sacct_jct(_SACCT_SAMPLE)
+    recs = join_records([_lj("jobA")], parsed, "score", 1)
+    assert recs[0]["node"] == "slurm-worker-gpu-rtx4070-0"
 
 
 def test_sigma_zero_reported_equals_true():
