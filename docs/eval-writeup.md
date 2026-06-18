@@ -32,8 +32,9 @@
 | 確定性 1×1 sim, fixed-α（§3.3）| 0% | −17/−24% | −25/−121% | **SAC 翻身 ≈/贏 cvar**；淨增益 ≈0 | **✓ 反映**（§4 三方打平）|
 | Live 1×1（§4）| 0% | ≈0% | ≈0% | **三方統計打平**；drift-robust 重跑（§4.4.2）確認、score 在 CVaR 甚至微幅最好 | —（即 live 本身）|
 | 隨機 sim σ=1.0, fixed-α（§3.6 三方）| 0% | −107/−155% | −4.7/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 | **✗ 未反映**（1×1 makespan-bound + 生產 score runtime-blind，結構上測不到；**待 2-node 驗證**，§5.1）|
+| 隨機 sim **2×1**, fixed-α（§3.9 三方）| 0% | −2.8/−5.0（σ0）·−26.4/−17.8（σ1）| −26.3/−12.8（σ0）·−10.2/−30.3（σ1）| **gap 收掉、逼近打平但未贏 score**；2×1 是 **cvar>mean**（§3.6 反向）| —（即 2-node sim 本身；live 半待執行）|
 
-（兩個數字 = philly / ali；ΔJCT% vs score，負值=較慢。**最後一列是 sim 推論，§4 的 live 1×1 結構上無法檢驗 → 標為待 2-node 驗證**）
+（兩個數字 = philly / ali；ΔJCT% vs score，負值=較慢。**§3.6 列是 1×1 sim 推論，§4 的 live 1×1 結構上無法檢驗；§3.9 列是其 2-node 真實拓樸的第一次檢驗——部分證實、單訓練 seed**）
 
 **兩個時期、兩個故事：**
 
@@ -158,12 +159,12 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 1. **確定性 1×1 placement 是退化決策 → 沒有學習法贏得過強啟發式 → 應該打平**（§3.2–3.3）。sim 全 rollout 下無任何 learned model 贏過 score，§4 的 live 1×1 三方乾淨打平**正面印證**。連帶 **auto-α 是壓垮 SAC 的 artifact**（§3.3，釘死 α 後 SAC 翻身）也與 live「SAC 同樣打平、非結構墊底」一致。→ 真實部署要 pin α，不要照搬為 cvar 尺度調的 auto-α 控制器。
 
-**B. sim 內成立、但 live 1×1 結構上反映不出來的推論（⚠ 待 2-node 驗證，§5.1）**
+**B. sim 內成立、但 live 1×1 結構上反映不出來的推論（⚠ sim 半已在 2×1 部分檢驗，§3.9；live 半待執行，§5.1）**
 
 2. **確定性 oracle runtime → 回報塌成點 → CVaR≈mean → 風險機制閒置；補上校準過的真實不確定性後，贏的主因是分布式 critic、CVaR 是尾部加成**（§3.1、§3.4–3.6）。
 3. **共置動作的價值需 ≥2 GPU**（§3.7）。
 
-> **為什麼 B 類在 live 1×1 反映不出來**：(i) 1×1 只有一張 GPU，JCT 被 makespan 綁死，排序動不了它；(ii) 生產 score 的 `ε=0`（runtime-blind，§1.1），注入的 σ 對 score baseline 完全無作用。兩者都讓「σ 越大 RDSAC 越贏」這條 sim 機制在 1×1 沒有可表現的決策面。**所以 B 類在本文只當 sim 推論，不宣稱已轉移**；真正檢驗要等拓樸匹配的 2-node checkpoint（§4.4.2、§5.1）。
+> **為什麼 B 類在 live 1×1 反映不出來**：(i) 1×1 只有一張 GPU，JCT 被 makespan 綁死，排序動不了它；(ii) 生產 score 的 `ε=0`（runtime-blind，§1.1），注入的 σ 對 score baseline 完全無作用。兩者都讓「σ 越大 RDSAC 越贏」這條 sim 機制在 1×1 沒有可表現的決策面。**所以 B 類在本文只當 sim 推論，不宣稱已轉移**。第二節點上線後 **§3.9 已在真實 2×1 拓樸跑完 σ-sweep，是 B 類的第一次檢驗——部分證實**（1×1 災難級差距收掉、逼近打平但仍未贏 score；2×1 下變 cvar>mean，與 §3.6 反向），但仍單訓練 seed，且 live 半（烘 checkpoint 上 2-node 跑 A/B）待執行（§5.1 第 5 項）。
 
 以下 §3.1–3.7 是支撐這些洞察的受控實驗；§4 再看 A 類如何被真實環境反映、B 類為何尚不能。
 
@@ -311,6 +312,31 @@ GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，在 160-dim 
 
 **意涵**：1×1 不是調 recipe 能翻盤的——要有真正的 placement 決策面（§3.7、第 5 項的 **≥2 GPU / 2-node**）才談得上 DRL 是否贏。原始檔：A `runs/eval_160dim_20260617-151916/`、B `runs/eval_160dim_fixedA_sw_20260617-170056/`。
 
+### 3.9 2-node（2×1 異質）σ-sweep：B 類推論的第一次真實拓樸檢驗
+
+> **B 類驗證（部分證實，非乾淨勝利）。** §3.1–3.7 的 B 類推論（σ→RDSAC、分布式 critic 為主因、共置需 ≥2 GPU）此前都標「待 2-node 驗證」。RTX 3080 第二節點上線後（`docs/intergration.md`），本節在**真實匹配的 2×1 拓樸**（obs_dim=166、n_actions=33）首次跑 σ-sweep。**結論是混合的：1×1 的災難級差距在 2×1 收掉了，但 §3.4「σ→RDSAC 贏過 score」與 §3.6「分布式 critic 為主因」都沒有乾淨轉移。**
+
+協定與 §3.4/§3.6 對齊、只換拓樸：`sweep_stochastic.py --n-nodes 2 --gpus-per-node 1`，σ∈{0, 0.5, 1.0} 各訓 SAC / RDSAC-mean / RDSAC-cvar，fixed-α 0.05、curriculum、100k steps、5-seed 配對評估、philly+ali。**ΔJCT% vs score（負=較慢），粗體=該列最佳 learned arm：**
+
+| σ | family | SAC | RDSAC-mean | RDSAC-cvar | cvar p99 / SAC p99 (h) |
+|---|---|---:|---:|---:|---|
+| 0.0 | philly | **−2.8** | −0.4 | −26.3 | 27.98 / 26.64 |
+| 0.0 | ali | **−5.0** | −48.2 | −12.8 | 9.04 / 9.32 |
+| 0.5 | philly | −7.4 | −28.9 | **−3.3** | 21.11 / 22.59 |
+| 0.5 | ali | −5.6 | −27.6 | **−1.8** | 10.55 / 9.20 |
+| 1.0 | philly | −26.4 | −17.9 | **−10.2** | **29.37 / 39.06** |
+| 1.0 | ali | −17.8 | −26.6 | −30.3 | 21.52 / 21.13 |
+
+**三個發現：**
+
+1. **✅（方向性，A 類延伸）2×1 把 1×1 的災難級差距收掉了，但仍未贏過 score。** 1×1 fixed-α 下 learned arm 還在 −17~−24%（§3.3），auto-α 更是 −106~−312%（§3.2）；到 2×1，最好的格子已逼近打平——RDSAC-mean −0.4%（philly σ=0）、RDSAC-cvar −1.8%（ali σ=0.5）。這正面支持 §5.1 第 5 項「要有真正的 placement 決策面（≥2 GPU）DRL 才談得上競爭」。**誠實限制：沒有任何一格真的贏過 score（全 Δ 為負）——是「逼近打平」，不是「翻盤」。**
+
+2. **◐（§3.4 部分證實、非單調）σ→cvar 的方向對，但壓倒性沒重現。** σ=0 時 RDSAC-cvar ≤ SAC（沒尾部可優化，符合「確定性→CVaR≈mean」預期）；σ>0 後 RDSAC-cvar 在 4 格中 3 格反超 SAC，且 **σ=1.0 philly 把 p99 從 39.1→29.4h 砍 25%**——尾部風險故事在真實拓樸上看得到。**但不是 §3.4 在 1×1 那種乾淨單調**：σ=1.0 ali 反而最差（−30.3），且 §3.4-result2 在 1×1「σ=1 RDSAC 贏過 score +53/+74%」**在 2×1 完全沒重現**（cvar 仍 −10/−30%）。推測：動作空間 17→33、訓練預算不變 → 2×1 underfit；加上單 seed 雜訊。
+
+3. **✗（§3.6 不轉移、甚至反向）「分布式 critic 為主因」在 2×1 翻盤成「風險扭曲才關鍵」。** §3.6 在 1×1 結論是 SAC→RDSAC-mean 吃掉幾乎全部增益、cvar 只是小加成。2×1 **正好相反**：RDSAC-mean（純分布式、風險中立）在 σ>0 是**最差**的 learned arm（−28.9/−27.6 @ σ=0.5、−17.9/−26.6 @ σ=1.0），而 RDSAC-cvar（加風險）才是最好。**在真實 2-node 上，是 CVaR 風險扭曲而非裸分布式 critic 在扛**——與 §3.6 的 1×1 拆解相反。
+
+**⚠ 壓倒性 caveat（與 §3.6 同級）**：每個 arm **單一訓練 seed**（eval 才 5 seeds）。§3.6 已有同 config 兩跑擺盪 60–90 pts 的鐵證，故本節**所有細排名都可能翻**——尤其 σ=0 RDSAC-cvar philly −26.3（比自己 σ=0.5 的 −3.3 還差，明顯離群）、σ=0 RDSAC-mean ali −48.2 都像單 seed 壞點。**方向性發現（gap 收掉、cvar>mean@2×1）比點估計穩；要把 §3.9 升級成定論需 multi-seed（§5.1 第 1 項）。** 三個 σ=1.0 checkpoint 已存，直接餵後續 2-node live A/B（§5.1 第 5 項）。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
+
 ---
 
 ## 4. 實機執行結果（Live cluster）
@@ -444,7 +470,9 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 ✓ **重尾 + 高競爭 live A/B（已完成，§4.4.1–4.4.2）。** 首輪 block 設計被 cluster drift 汙染（score 自身 p99 漂移 153→125）；改用 `--interleave`（round-robin 交錯排程方法順序、每方法跨 4 輪輪過 4 位置）後 drift 消掉（score 跨 σ 穩定到 0.5%），得到**乾淨的 1×1 三方打平**——沒有學習方法贏過 score。**剩下的不是再跑一次 1×1**（makespan-bound 天花板已確認），而是第 5 項的 **2-node** 才有真實 placement 決策面。工程規格見 `docs/live-ab-heavytail-spec.md`。
 
 4. **修 train/serve 動作落差（path 已補上，待對齊驗證）。** sim 訓練的是 placement policy（job, node, gpu），而 submit-time `/decide` 只把 RL 選擇轉成 priority boost、Slurm 仍做真正 allocation——這是落差來源。**現在 `rl-placement-controller` 已預設常駐**（透過 slurmrestd 對 held job 寫 `required_nodes`＋release，§3.4），所以「live 真接 explicit placement」這條路已經接上、不再是 sim 獨有。但落差**在 1×1 是退化的**（單 node 只有一個合法目標，explicit placement ≡ priority），要到第 5 項的 **2-node** 才看得出差異；且需先用相符維度的 checkpoint 重訓，否則 `/act` abstain → controller no-op。對齊驗證併入 2-node 那輪做。
-5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。（`rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`，obs_dim 已收斂為 160）。
+5. **拓樸匹配的多節點 checkpoint（RTX 3080 第二節點，`docs/intergration.md`）。** 單卡 placement 退化；2-node（2×1 異質）才讓「放哪張卡」「共置與否」（§3.7）成為真實決策，也才能在 live 分出高下。（`rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`）。
+   - ◐ **sim 半已執行（§3.9）。** 第二節點實體上線後，已在真實匹配的 2×1（obs_dim=166、n_actions=33）跑完 σ-sweep。結果**部分證實 B 類**：1×1 的災難級差距收掉、逼近打平（但仍未贏過 score），且 cvar>mean 在 2×1 成立；**但 §3.4「σ→贏過 score」與 §3.6「分布式 critic 為主因」沒有乾淨轉移**（後者甚至反向）。仍是單訓練 seed，需第 1 項 multi-seed 升級成定論。
+   - ☐ **live 半待執行。** §3.9 的 σ=1.0 checkpoint（`runs/stoch_sweep_2x1_20260618-003742/ckpt_*_sigma1.0.pt`）烘進 166-dim image 部署到 2-node cluster 跑 paired A/B，才是 B 類在真實環境的最終檢驗（§4 的 2-node 對應物）。
 6. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
 
 **演算法與韌性**
@@ -484,6 +512,19 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
   --seeds 42 43 44 45 46 --trace-families philly ali \
   --risk-modes mean cvar --fixed-alpha --init-alpha 0.05 --device cuda
 # 共置消融（§3.7）：加 --colocation --interference 0.3 --no-sac
+```
+
+**2-node（2×1 異質）σ-sweep（§3.9，B 類的真實拓樸檢驗）**
+
+```bash
+# 與上面 §3.4/§3.6 同協定，只把拓樸換成 2×1（obs_dim=166, n_actions=33）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
+  --sigmas 0.0 0.5 1.0 --total-steps 100000 --warmup-steps 2000 --n-jobs 50 \
+  --seeds 42 43 44 45 46 --trace-families philly ali --risk-modes mean cvar \
+  --n-nodes 2 --gpus-per-node 1 --curriculum --fixed-alpha --init-alpha 0.05 \
+  --device cuda --out-dir runs/stoch_sweep_2x1_$(date +%Y%m%d-%H%M%S)
+# 9 個 arm（3 σ × {SAC, RDSAC-mean, RDSAC-cvar}）逐 σ 存 checkpoint + sweep.json；
+# σ=1.0 那組 checkpoint 即後續 2-node live A/B 的輸入。
 ```
 
 **重尾 + 高競爭 live A/B（§4.4，drift-robust round-robin）**
