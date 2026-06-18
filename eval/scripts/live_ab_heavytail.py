@@ -167,17 +167,28 @@ def job_name(arm: str, round_idx: int, job_id: str) -> str:
     return f"{JOB_NAME_PREFIX}_{arm}_{round_idx}_{job_id}"
 
 
-def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *, partition: str = "gpu-rtx4070") -> list[str]:
+def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
+               partition: str = "gpu-rtx4070", hold: bool | None = None) -> list[str]:
     """Build the sbatch argv for one job. --time uses the (noisy) *reported*
-    estimate the scheduler sees; the job actually sleeps the *true* runtime."""
+    estimate the scheduler sees; the job actually sleeps the *true* runtime.
+
+    Hold (``-H``): in the 2-node placement A/B, RL arms submit held so the
+    placement controller can pin ``required_nodes`` (its real node choice) then
+    release; the ``score`` arm submits unheld → vanilla Slurm placement, a clean
+    baseline. ``hold`` defaults to ``arm != "score"``; pass explicitly to override.
+    """
+    if hold is None:
+        hold = arm != "score"
     comment = json.dumps({
         "job_id": job.job_id, "true": round(job.true_runtime_s, 2),
         "reported": round(job.reported_runtime_s, 2), "mps": job.mps_req,
         "arm": arm, "round": round_idx,
     }, separators=(",", ":"))
     time_min = max(1, int(np.ceil(job.reported_runtime_s / 60.0)))
-    return [
-        "sbatch",
+    cmd = ["sbatch"]
+    if hold:
+        cmd.append("-H")  # before the job spec → parsed as a submit flag
+    cmd += [
         f"--job-name={job_name(arm, round_idx, job.job_id)}",
         f"--partition={partition}",
         f"--gres=mps:{job.mps_req}",
@@ -185,6 +196,7 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *, partition: str = "gpu-
         f"--comment={comment}",
         f"--wrap=sleep {int(round(job.true_runtime_s))}",
     ]
+    return cmd
 
 
 def parse_sacct_jct(raw_text: str) -> dict:

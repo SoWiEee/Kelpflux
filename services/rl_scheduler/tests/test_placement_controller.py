@@ -197,6 +197,78 @@ def test_choose_and_apply_shadow_does_not_post_update(monkeypatch):
     assert updates == []
 
 
+def test_drain_and_apply_places_all_held_jobs_in_one_cycle(monkeypatch):
+    """One poll must place EVERY placeable held job, not one-per-cycle — else a
+    burst of N held jobs takes N intervals to drain and unfairly throttles the
+    RL arm of the 2-node placement A/B vs the unheld score arm."""
+    held = {"7", "8", "9"}
+    placed: list[str] = []
+
+    def fake_http_json(method, url, *, jwt_key=None, body=None, timeout=10.0):
+        if url.endswith("/jobs"):
+            return {"jobs": [
+                {"job_id": int(j), "name": f"htab-{j}", "job_state": ["PENDING"],
+                 "state_reason": "JobHeldUser", "tres_req_str": "gres/mps=25",
+                 "submit_time": {"number": int(j)}}
+                for j in sorted(held)
+            ]}
+        if url.endswith("/nodes"):
+            return {"nodes": [{"name": "gpu-0", "state": ["IDLE"],
+                               "tres": "gres/gpu=1,gres/mps=100"}]}
+        if url.endswith("/act"):
+            nxt = sorted(held)[0]  # model commits the lowest remaining held job
+            return {"selected_job_id": nxt, "node_j": 0, "gpu_k": 0,
+                    "action": 3, "value": 1.0, "entropy": 0.1}
+        if "/job/" in url:
+            jid = url.rsplit("/", 1)[1]
+            held.discard(jid)
+            placed.append(jid)
+            return {}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(pc, "http_json", fake_http_json)
+
+    decisions = pc.drain_and_apply(
+        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        jwt_key=b"k", shadow=False, auto_trim_model_topology=False,
+    )
+
+    assert placed == ["7", "8", "9"]
+    assert sum(1 for d in decisions if d.applied) == 3
+    # Terminates with one trailing non-applied cycle (nothing left to place).
+    assert decisions[-1].applied is False
+
+
+def test_drain_and_apply_shadow_does_one_passive_cycle(monkeypatch):
+    """In shadow (score arm) drain must NOT loop placing — one no-op cycle."""
+    calls = {"jobs": 0}
+
+    def fake_http_json(method, url, *, jwt_key=None, body=None, timeout=10.0):
+        if url.endswith("/jobs"):
+            calls["jobs"] += 1
+            return {"jobs": [{
+                "job_id": 7, "name": "htab-1", "job_state": ["PENDING"],
+                "state_reason": "JobHeldUser", "tres_req_str": "gres/mps=25",
+                "submit_time": {"number": 1}}]}
+        if url.endswith("/nodes"):
+            return {"nodes": [{"name": "gpu-0", "state": ["IDLE"],
+                               "tres": "gres/gpu=1,gres/mps=100"}]}
+        if url.endswith("/act"):
+            return {"selected_job_id": "7", "node_j": 0, "gpu_k": 0}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(pc, "http_json", fake_http_json)
+
+    decisions = pc.drain_and_apply(
+        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        jwt_key=b"k", shadow=True, auto_trim_model_topology=False,
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].applied is False
+    assert calls["jobs"] == 1
+
+
 def test_choose_and_apply_abstains_on_dsac_no_op(monkeypatch):
     jobs = {"jobs": [{
         "job_id": 7, "name": "htab-1", "job_state": ["PENDING"],

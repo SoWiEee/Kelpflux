@@ -334,6 +334,27 @@ def choose_and_apply(
     )
 
 
+def drain_and_apply(*, max_placements: int = 256, **kwargs) -> list[PlacementDecision]:
+    """Place EVERY currently-placeable held job in a single poll cycle.
+
+    ``choose_and_apply`` commits one job per call (the model's top pick over the
+    held set). Calling it once per poll means a burst of N held jobs needs N
+    intervals to drain — which would unfairly throttle the RL arm of the 2-node
+    placement A/B against the unheld ``score`` arm. This loops until a cycle
+    applies nothing (held set drained, shadow, or the model no-ops), capped at
+    ``max_placements`` so a stuck job can't spin forever.
+
+    Returns the per-iteration decisions (the trailing one is non-applied).
+    """
+    decisions: list[PlacementDecision] = []
+    for _ in range(max(1, max_placements)):
+        decision = choose_and_apply(**kwargs)
+        decisions.append(decision)
+        if not decision.applied:
+            break
+    return decisions
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply DSAC hard placement via slurmrestd hold/release.")
     parser.add_argument("--rest-url", default=os.getenv("SLURM_REST_URL", "http://slurm-restapi.slurm.svc.cluster.local:6820"))
@@ -354,37 +375,53 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shadow", action=argparse.BooleanOptionalAction, default=_env_bool("PLACEMENT_SHADOW", False))
     parser.add_argument("--auto-trim-model-topology", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-held", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--drain", action=argparse.BooleanOptionalAction,
+                        default=_env_bool("PLACEMENT_DRAIN", True),
+                        help="place every placeable held job each cycle (default) "
+                             "instead of one-per-poll; --no-drain restores the "
+                             "legacy single-placement behaviour")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
     jwt_key = _read_jwt_key(args.jwt_key_path)
 
+    cycle_kwargs = dict(
+        rest_url=args.rest_url,
+        api_version=args.api_version,
+        scheduler_url=args.scheduler_url,
+        jwt_key=jwt_key,
+        node_names=args.node_name,
+        node_name_prefix=args.node_name_prefix,
+        job_id=args.job_id or None,
+        job_name_prefix=args.job_name_prefix,
+        mps_per_gpu=args.mps_per_gpu,
+        default_mps=args.default_mps,
+        default_runtime=args.default_runtime,
+        release=args.release,
+        shadow=args.shadow,
+        release_priority=args.release_priority,
+        auto_trim_model_topology=args.auto_trim_model_topology,
+        require_held=args.require_held,
+    )
+
     while True:
         try:
-            decision = choose_and_apply(
-                rest_url=args.rest_url,
-                api_version=args.api_version,
-                scheduler_url=args.scheduler_url,
-                jwt_key=jwt_key,
-                node_names=args.node_name,
-                node_name_prefix=args.node_name_prefix,
-                job_id=args.job_id or None,
-                job_name_prefix=args.job_name_prefix,
-                mps_per_gpu=args.mps_per_gpu,
-                default_mps=args.default_mps,
-                default_runtime=args.default_runtime,
-                release=args.release,
-                shadow=args.shadow,
-                release_priority=args.release_priority,
-                auto_trim_model_topology=args.auto_trim_model_topology,
-                require_held=args.require_held,
-            )
-            LOG.info(
-                "decision job=%s node=%s gpu=%s action=%s value=%.3f entropy=%.3f applied=%s reason=%s",
-                decision.job_id, decision.node_name, decision.gpu_index, decision.action,
-                decision.value, decision.entropy, decision.applied, decision.reason,
-            )
+            if args.drain:
+                decisions = drain_and_apply(**cycle_kwargs)
+                applied = sum(1 for d in decisions if d.applied)
+                decision = decisions[-1]
+                LOG.info(
+                    "cycle drained: %d placed; last job=%s node=%s applied=%s reason=%s",
+                    applied, decision.job_id, decision.node_name, decision.applied, decision.reason,
+                )
+            else:
+                decision = choose_and_apply(**cycle_kwargs)
+                LOG.info(
+                    "decision job=%s node=%s gpu=%s action=%s value=%.3f entropy=%.3f applied=%s reason=%s",
+                    decision.job_id, decision.node_name, decision.gpu_index, decision.action,
+                    decision.value, decision.entropy, decision.applied, decision.reason,
+                )
         except Exception as exc:  # pragma: no cover - exercised in cluster
             LOG.warning("placement cycle failed: %s", exc)
             decision = None

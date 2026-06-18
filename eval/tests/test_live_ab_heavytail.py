@@ -140,3 +140,26 @@ def test_job_name_roundtrips_into_join():
     assert name == "htab_RDSAC-cvar_1_jobB"
     parsed = parse_sacct_jct(_SACCT_SAMPLE)
     assert name in parsed
+
+
+def test_sbatch_cmd_holds_rl_arms_not_score():
+    """2-node placement A/B: RL arms submit held (-H) so the placement
+    controller can write required_nodes; score stays unheld → vanilla Slurm
+    placement (a clean baseline). Hold is derived from the arm name."""
+    job = _lj("jobA")
+
+    score = sbatch_cmd(job, "score", 1, partition="gpu")
+    assert "-H" not in score
+
+    for arm in ("sac", "rdsac-mean", "rdsac-cvar"):
+        cmd = sbatch_cmd(job, arm, 1, partition="gpu")
+        assert "-H" in cmd, f"{arm} must be held"
+        # -H precedes the job spec so sbatch parses it as a submit flag.
+        assert cmd.index("-H") < cmd.index(f"--partition=gpu")
+
+
+def test_sbatch_cmd_hold_override():
+    """Explicit hold= overrides the arm-derived default (testability hook)."""
+    job = _lj("jobA")
+    assert "-H" in sbatch_cmd(job, "score", 1, hold=True)
+    assert "-H" not in sbatch_cmd(job, "rdsac-cvar", 1, hold=False)
