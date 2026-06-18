@@ -460,9 +460,16 @@ drift 消掉後的三方比較（pooled 兩 σ，每方法 n=208）：
 
 **判定：RL placement 顯著、穩定地輸給 Slurm 預設放置**——mean JCT −16%、p99 −11%、CVaR −23%、tail-slowdown 約 **2× 更差**（8.9 vs 4.5 / 10.0 vs 5.0），**兩個 σ 都 p<0.005 顯著**，且 drift-robust。**σ 完全不改變結果**（σ=0 ≈ σ=1），與 §4.4.2「生產 score `ε=0` runtime-blind」一致。
 
-**誠實解讀**：這**推翻了「≥2 GPU 就能讓 RL 翻盤」的樂觀預期**（§5.1 第 5 項）——至少對這個 checkpoint。最可能成因與 §4.5 前的 live `/act` 探針一致：**模型偏好 node 0（4070）、node 0 滿了就 no-op（而非改放 node 1）**，於是把負載**擠在 4070、閒置 3080**，比 Slurm backfill 的兩台均衡差。這正是 §3.9 壓倒性 caveat（**單訓練 seed、no-op 傾向**的 checkpoint）在真實環境的兌現：sim §3.9 已顯示 2×1 下 cvar 只是「逼近打平、未贏 score」且單 seed 雜訊大；live 把它放到真實 placement 決策面上，**單 seed 的退化策略直接變成顯著淨負**。
+**誠實解讀**：這**推翻了「≥2 GPU 就能讓 RL 翻盤」的樂觀預期**（§5.1 第 5 項）——至少對這個 checkpoint。成因是**負載不均**：補上 `NodeList` 擷取後的確認跑（σ=1、n=24/方法，`runs/htab_live_nodes_20260618-111715/`）**直接量到** RL 把 job 偏放 4070、相對閒置 3080：
 
-**這一輪量不到的 caveat**：`collect_sacct` 沒記每個 job 落在哪個 node，故「擠 4070」的機制是**從 `/act` 探針推論、非本輪實測**。下一步補 `NodeList` 擷取即可直接證實（§5.1）。**範圍限制**：單一 checkpoint（σ=1.0 cvar）、單 family（philly）、n=80；要下「RL placement 一定輸」的普遍結論需 multi-seed checkpoint + SAC/mean 三方 + ali。但**方向（這個 production-候選 checkpoint 的 placement 顯著輸 Slurm）穩健且顯著**。
+| arm | 落在 4070 | 落在 3080 |
+|---|--:|--:|
+| score（Slurm 自選）| 58% | 42% |
+| **RDSAC-cvar** | **71%** | **29%** |
+
+RL 比 Slurm **多 +13pp 倒向 4070**。因為本實驗的 job 是固定 `sleep N`（runtime 與落在哪台無關），JCT 的差異**全來自 wait（排隊）**——RL 把較多 job 擠到 4070 → 該卡佇列更壅塞 → wait 更長 → JCT −16%。這與 §4.5 前 live `/act` 探針觀察到的「偏好 node 0、node 0 滿了就 no-op」一致，是 §3.9 壓倒性 caveat（**單訓練 seed、no-op 傾向**的 checkpoint）在真實環境的兌現。**誠實校正**：偏斜是**真實但溫和**（+13pp），不是「完全閒置 3080」——RL 仍有 29% 放 3080；單 seed 退化策略造成的**輕度失衡**就足以在真實 placement 上由「sim 逼近打平」翻成「live 顯著淨負」。
+
+**範圍限制**：單一 checkpoint（σ=1.0 cvar）、單 family（philly）、JCT n=80 / 節點分佈確認 n=24；要下「RL placement 一定輸」的普遍結論需 multi-seed checkpoint + SAC/mean 三方 + ali。但**方向（這個 production-候選 checkpoint 的 placement 顯著輸 Slurm、且確實偏放 4070）穩健且顯著**。
 
 > 一句話：第一個真實 2-node placement 結果是**乾淨的負結果**——RL（cvar, submit-時 -w）顯著輸 Slurm 預設放置 ~16% JCT、尾部更差，且 σ 無影響。不是「2-node 解鎖 RL」，而是「**單 seed、no-op 傾向的 checkpoint 一旦真的去選 node，就把負載擠歪、比 Slurm 差**」。這把 §3.9 的 sim 內 caveat 變成 live 實證，也讓「先 multi-seed 固實再談 placement」成為下一步的硬前提。
 
