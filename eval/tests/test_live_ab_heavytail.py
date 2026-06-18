@@ -163,3 +163,48 @@ def test_sbatch_cmd_hold_override():
     job = _lj("jobA")
     assert "-H" in sbatch_cmd(job, "score", 1, hold=True)
     assert "-H" not in sbatch_cmd(job, "rdsac-cvar", 1, hold=False)
+
+
+def test_sbatch_cmd_nodelist_adds_w():
+    """Submit-time placement: RL arm pins its chosen node via -w <node>."""
+    job = _lj("jobA")
+    cmd = sbatch_cmd(job, "rdsac-cvar", 1, partition="gpu", hold=False,
+                     nodelist="slurm-worker-gpu-rtx3080-0")
+    assert "-w" in cmd
+    assert cmd[cmd.index("-w") + 1] == "slurm-worker-gpu-rtx3080-0"
+    # score arm with no nodelist → no -w
+    assert "-w" not in sbatch_cmd(job, "score", 1, partition="gpu")
+
+
+def test_parse_free_mps_from_scontrol():
+    from eval.scripts.live_ab_heavytail import parse_free_mps
+    idle = "NodeName=n0 CfgTRES=cpu=8,gres/mps=100 AllocTRES="
+    busy = "NodeName=n0 CfgTRES=cpu=8,gres/mps=100 AllocTRES=cpu=1,gres/mps=25"
+    assert parse_free_mps(idle) == 100
+    assert parse_free_mps(busy) == 75
+    assert parse_free_mps("CfgTRES= AllocTRES=") == 0
+
+
+def test_decide_node_maps_act_node_j_to_name(monkeypatch):
+    from eval.scripts import live_ab_heavytail as m
+    captured = {}
+    def fake_post(url, payload, timeout=30):
+        captured["payload"] = payload
+        return {"node_j": 1, "action": 5, "value": 1.0, "entropy": 0.2}
+    monkeypatch.setattr(m, "_post_act", fake_post)
+    job = _lj("jobA")
+    node = m.decide_node("http://serve", job,
+                         node_free_mps=[100, 100],
+                         node_names=["rtx4070-0", "rtx3080-0"])
+    assert node == "rtx3080-0"
+    # single pending job + 2 nodes in the act payload
+    assert captured["payload"]["n_nodes"] == 2
+    assert len(captured["payload"]["pending_jobs"]) == 1
+
+
+def test_decide_node_noop_returns_none(monkeypatch):
+    from eval.scripts import live_ab_heavytail as m
+    monkeypatch.setattr(m, "_post_act", lambda u, p, timeout=30: {"node_j": None})
+    node = m.decide_node("http://serve", _lj("jobA"),
+                         node_free_mps=[100, 100], node_names=["a", "b"])
+    assert node is None

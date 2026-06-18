@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
+import urllib.request as _urlreq
 import zlib
 from dataclasses import asdict, dataclass
 from typing import List, Optional
@@ -168,17 +170,22 @@ def job_name(arm: str, round_idx: int, job_id: str) -> str:
 
 
 def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
-               partition: str = "gpu-rtx4070", hold: bool | None = None) -> list[str]:
+               partition: str = "gpu-rtx4070", hold: bool | None = None,
+               nodelist: str | None = None) -> list[str]:
     """Build the sbatch argv for one job. --time uses the (noisy) *reported*
     estimate the scheduler sees; the job actually sleeps the *true* runtime.
 
-    Hold (``-H``): in the 2-node placement A/B, RL arms submit held so the
-    placement controller can pin ``required_nodes`` (its real node choice) then
-    release; the ``score`` arm submits unheld → vanilla Slurm placement, a clean
-    baseline. ``hold`` defaults to ``arm != "score"``; pass explicitly to override.
+    Placement (``-w <node>``): in the 2-node placement A/B the RL arms pick a
+    node at submit time (Slurm 21.08 can't re-pin a job post-submit) and pass it
+    as ``--nodelist``; the ``score`` arm omits ``-w`` → vanilla Slurm placement,
+    a clean baseline.
+
+    Hold (``-H``): legacy path for the slurmrestd placement controller (held →
+    controller pins required_nodes → release). Unused by the submit-time ``-w``
+    path; defaults to ``arm != "score"`` only when ``nodelist`` is not given.
     """
     if hold is None:
-        hold = arm != "score"
+        hold = arm != "score" and nodelist is None
     comment = json.dumps({
         "job_id": job.job_id, "true": round(job.true_runtime_s, 2),
         "reported": round(job.reported_runtime_s, 2), "mps": job.mps_req,
@@ -188,6 +195,8 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
     cmd = ["sbatch"]
     if hold:
         cmd.append("-H")  # before the job spec → parsed as a submit flag
+    if nodelist:
+        cmd += ["-w", nodelist]  # submit-time RL node choice
     cmd += [
         f"--job-name={job_name(arm, round_idx, job.job_id)}",
         f"--partition={partition}",
@@ -197,6 +206,60 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         f"--wrap=sleep {int(round(job.true_runtime_s))}",
     ]
     return cmd
+
+
+# ── Submit-time RL placement (Slurm 21.08 can't re-pin post-submit) ───────────
+
+def _mps_from_tres(tres_text: str) -> int:
+    """Pull gres/mps=N out of a Cfg/AllocTRES string (0 if absent)."""
+    m = re.search(r"gres/mps=(\d+)", tres_text or "")
+    return int(m.group(1)) if m else 0
+
+
+def parse_free_mps(scontrol_node_text: str) -> int:
+    """free_mps = configured mps − allocated mps, from one `scontrol show node -o`
+    line (CfgTRES=… AllocTRES=…)."""
+    cfg = re.search(r"CfgTRES=(\S*)", scontrol_node_text)
+    alloc = re.search(r"AllocTRES=(\S*)", scontrol_node_text)
+    cfg_mps = _mps_from_tres(cfg.group(1) if cfg else "")
+    alloc_mps = _mps_from_tres(alloc.group(1) if alloc else "")
+    return max(0, cfg_mps - alloc_mps)
+
+
+def _post_act(serve_url: str, payload: dict, timeout: float = 30.0) -> dict:
+    """POST the rl-scheduler /act endpoint; returns its JSON (node_j, …)."""
+    data = json.dumps(payload).encode()
+    req = _urlreq.Request(serve_url.rstrip("/") + "/act", data=data,
+                          headers={"Content-Type": "application/json"}, method="POST")
+    with _urlreq.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+
+def decide_node(serve_url: str, job: LiveJob, *, node_free_mps: list[int],
+                node_names: list[str], mps_per_gpu: int = LIVE_GPU_MPS,
+                now: float | None = None) -> str | None:
+    """Ask the served RL model which node to place ``job`` on (submit-time).
+
+    Builds a single-job /act request over the given nodes (index ↔ node_names),
+    returns the chosen node name, or None if the model no-ops / picks an
+    out-of-range node (caller then lets Slurm place it)."""
+    payload = {
+        "now": float(now if now is not None else 0.0),
+        "n_nodes": len(node_names),
+        "gpus_per_node": 1,
+        "mps_per_gpu": mps_per_gpu,
+        "pending_jobs": [{
+            "job_id": job.job_id, "mps_req": job.mps_req, "gpu_count": 1,
+            "gpu_type": "rtx4070", "runtime": job.reported_runtime_s,
+            "submit_ts": 0.0, "can_fit": True,
+        }],
+        "nodes": [{"gpus": [{"free_mps": int(fm)}]} for fm in node_free_mps],
+    }
+    resp = _post_act(serve_url, payload)
+    nj = resp.get("node_j")
+    if nj is None or not (0 <= int(nj) < len(node_names)):
+        return None
+    return node_names[int(nj)]
 
 
 def parse_sacct_jct(raw_text: str) -> dict:
@@ -284,19 +347,35 @@ def collect_sacct(since: str, *, kubectl: str = "kubectl", namespace: str = "slu
 def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
                   dry_run: bool = True, partition: str = "gpu-rtx4070",
                   t0: Optional[float] = None,
-                  exec_prefix: Optional[list[str]] = None) -> None:
+                  exec_prefix: Optional[list[str]] = None,
+                  place_fn=None, placement: bool = False) -> None:
     """Submit the stream honouring each job's arrival_offset. dry_run prints.
 
     `exec_prefix` (e.g. ["kubectl","exec","-n","slurm","pod/slurm-login-x","--"])
     is prepended so sbatch runs inside the cluster; each sbatch arg stays a single
     argv element (no shell), so `--wrap=sleep N` survives unquoted.
+
+    `place_fn(job) -> node_name | None` (RL arms in submit-time placement mode):
+    when given, its result is passed as `--nodelist`, so the RL model's node
+    choice is fixed at submit (Slurm 21.08 can't re-pin afterwards). None → no -w.
     """
     t0 = t0 if t0 is not None else time.time()
     for job in jobs:
         wait = job.arrival_offset_s - (time.time() - t0)
         if wait > 0 and not dry_run:
             time.sleep(wait)
-        cmd = (exec_prefix or []) + sbatch_cmd(job, arm, round_idx, partition=partition)
+        nodelist = None
+        if place_fn is not None:
+            try:
+                nodelist = place_fn(job)
+            except Exception as e:  # placement is best-effort; fall back to Slurm
+                sys.stderr.write(f"[htab] place_fn failed for {job.job_id}: {e}\n")
+        # Submit-time placement never holds (the RL choice is the -w node); the
+        # -H path is only for the legacy slurmrestd controller.
+        hold = False if placement else None
+        cmd = (exec_prefix or []) + sbatch_cmd(job, arm, round_idx,
+                                               partition=partition, nodelist=nodelist,
+                                               hold=hold)
         if dry_run:
             print(" ".join(cmd))
             continue

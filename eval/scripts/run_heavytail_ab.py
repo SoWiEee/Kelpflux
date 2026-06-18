@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,8 +27,10 @@ from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (
     collect_sacct,
+    decide_node,
     gen_workload,
     join_records,
+    parse_free_mps,
     submit_stream,
     wait_drain,
 )
@@ -108,8 +111,13 @@ def _post(serve_url: str, path: str, payload: dict, *, dry_run: bool) -> dict:
         return json.loads(resp.read().decode())
 
 
-def _configure_arm(serve_url: str, arm: str, ckpts: dict, *, dry_run: bool) -> None:
-    """score → boost OFF (shadow). learned → load its checkpoint + boost ON."""
+def _configure_arm(serve_url: str, arm: str, ckpts: dict, *, dry_run: bool,
+                   placement: bool = False) -> None:
+    """score → boost OFF (shadow). learned → load its checkpoint.
+
+    In submit-time placement mode the RL treatment is the node choice (``-w``),
+    not the /decide priority boost, so learned arms also run shadow=ON (boost
+    off) — the checkpoint is still loaded so /act answers the node decision."""
     if arm == "score":
         _post(serve_url, "/shadow", {"shadow": True}, dry_run=dry_run)
         return
@@ -117,7 +125,36 @@ def _configure_arm(serve_url: str, arm: str, ckpts: dict, *, dry_run: bool) -> N
     if not ckpt:
         raise ValueError(f"no checkpoint configured for arm {arm!r}")
     _post(serve_url, "/reload", {"checkpoint": ckpt}, dry_run=dry_run)
-    _post(serve_url, "/shadow", {"shadow": False}, dry_run=dry_run)
+    _post(serve_url, "/shadow", {"shadow": placement}, dry_run=dry_run)
+
+
+def _query_free_mps(exec_prefix, node_names: list[str]) -> list[int]:
+    """Run `scontrol show node <names> -o` inside the cluster, parse free MPS per
+    node (configured − allocated). Best-effort: missing node → full capacity."""
+    import subprocess
+    out_by_node = {}
+    cmd = (exec_prefix or []) + ["scontrol", "show", "node", ",".join(node_names), "-o"]
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            m = re.search(r"NodeName=(\S+)", line)
+            if m:
+                out_by_node[m.group(1)] = parse_free_mps(line)
+    return [out_by_node.get(n, 100) for n in node_names]
+
+
+def _make_place_fn(arm: str, *, serve_url: str, node_names: list[str], exec_prefix,
+                   placement: bool, dry_run: bool):
+    """RL arms in placement mode → a closure that picks a node per job via /act.
+    score arm, non-placement mode, or dry_run → None (Slurm places)."""
+    if not placement or arm == "score" or dry_run:
+        return None
+
+    def _place(job):
+        free = _query_free_mps(exec_prefix, node_names)
+        return decide_node(serve_url, job, node_free_mps=free, node_names=node_names)
+
+    return _place
 
 
 def run(args) -> int:
@@ -133,6 +170,11 @@ def run(args) -> int:
     import shlex as _shlex
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
                     args.login_pod, "--"] if args.login_pod else None)
+    gpu_nodes = [n for n in (args.gpu_nodes or "").split(",") if n]
+    if args.placement and not gpu_nodes:
+        print("error: --placement requires --gpu-nodes node0,node1 (index ↔ RL node_j)",
+              file=sys.stderr)
+        return 2
 
     for si, sigma in enumerate(sigmas):
         # Same stream for every method at this σ (CRN: identical generator inputs).
@@ -144,13 +186,18 @@ def run(args) -> int:
         def _do(arm: str, rnd: int, is_warm: bool) -> None:
             tag = "warmup" if is_warm else f"r{rnd - args.warmup + 1}"
             print(f"[ab] σ={sigma} {arm} {tag}: configure + submit {len(jobs)} jobs", flush=True)
-            _configure_arm(args.serve_url, arm, ckpts, dry_run=args.dry_run)
+            _configure_arm(args.serve_url, arm, ckpts, dry_run=args.dry_run,
+                           placement=args.placement)
             # sacct -S is read in the cluster timezone (UTC); use UTC with a back-margin
             # so host/cluster clock skew can't push it into the future. round is in the
             # job_name, so an over-wide window is harmless (join filters by exact name).
             since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 300))
+            place_fn = _make_place_fn(arm, serve_url=args.serve_url,
+                                      node_names=gpu_nodes, exec_prefix=exec_prefix,
+                                      placement=args.placement, dry_run=args.dry_run)
             submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
-                          partition=args.partition, exec_prefix=exec_prefix)
+                          partition=args.partition, exec_prefix=exec_prefix,
+                          place_fn=place_fn, placement=args.placement)
             if args.dry_run:
                 return
             wait_drain(kubectl=args.kubectl, namespace=args.namespace,
@@ -210,6 +257,13 @@ def main(argv=None) -> int:
     p.add_argument("--arrival-mode", choices=["burst", "poisson"], default="burst")
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--partition", default="gpu-rtx4070")
+    p.add_argument("--placement", action="store_true",
+                   help="submit-time RL node placement: RL arms pick a node via "
+                        "/act and submit with -w <node> (Slurm 21.08 can't re-pin "
+                        "post-submit). Requires --gpu-nodes; learned arms run boost-off.")
+    p.add_argument("--gpu-nodes", default="",
+                   help="comma-separated GPU node names in RL node_j index order, "
+                        "e.g. slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0")
     p.add_argument("--kubectl", default="kubectl")
     p.add_argument("--namespace", default="slurm")
     p.add_argument("--controller-pod", default="slurm-controller-0")
