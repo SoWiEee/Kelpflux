@@ -167,7 +167,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 **B. 曾在 1×1-sim 成立、原以為「待 2-node 驗證」、但放到真實 2×1 後沒有轉移的推論（§3.4–3.7 sim + §4.5 live）**
 
 2. **1×1-sim：確定性 oracle runtime → CVaR≈mean → 風險機制閒置；補上不確定性後 RDSAC > SAC、分布式 critic 為主因、CVaR 尾部加成。→ 2×1 重測（§3.4/§3.6）：三方逼近打平、沒人贏過 score、分布式-critic 拆解反向變弱，全在單 seed 雜訊內；live（§4.5）placement 顯著輸 Slurm。**
-3. **共置動作的價值原推測「需 ≥2 GPU」（§3.7）——第二節點上線後正在真實 2×1 重測（colocation ON vs OFF）。**
+3. **共置動作的價值原推測「需 ≥2 GPU」（§3.7）——第二節點上線後在 2×1 重測（colocation ON vs OFF），結果 ON 仍輸 OFF ~20 pts，推測被推翻：瓶頸是 underfit（動作空間 33→65）而非缺決策面。**
 
 > **為什麼 B 類在 1×1 看似成立、放到 2×1 卻沒兌現**：1×1 的 σ-發現（§3.4 舊版）有兩個前提——只有一張卡，沒有「放哪台」的真實決策面；且生產 score `ε=0`（runtime-blind，§1.1）對注入的 σ 無作用。第二節點上線後**直接在 2×1 重跑（§3.4–3.7）**：有了真實 placement 決策面，**結果反而是三方逼近打平、沒人贏過 score、拆解反向**（§3.6）——1×1 sim 那個「σ→RDSAC 壓倒、分布式 critic 為主因」的大效應主要是**單卡 + scalar critic 崩 + 單訓練 seed**的產物，不是可轉移的機制。**live 半（§4.5）更把它釘死成負結果**：四方下三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），且全把負載擠到 4070（88–92% vs score 52%）。
 
@@ -282,21 +282,22 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **強 caveat（單訓練 seed）**：本節所有效應都個位數 pts、**完全落在 §3.4/§3.9 證實的單 seed 60–90 pts 擺盪內**——方向（分布式 vs 風險誰大）**不可細讀、需 multi-seed 才能定論**。能穩健說的只有：**2×1 下分布式 critic 不是 1×1 那種壓倒性主因**。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
 
-### 3.7 共置動作消融：PACK/ISOLATE 在 1×1 反而拖累（負結果）
+### 3.7 共置動作消融（2×1）：PACK/ISOLATE 仍然拖累——「價值需 ≥2 GPU」被推翻
 
-> **⚠ B 類（sim 負結果；其「價值需 ≥2 GPU」的結論本身就指向 2-node，live 1×1 無從檢驗）。**
+> **2-node（本節直接寫 2×1）。** 1×1 版的結論是「共置動作拖累、但**推測**價值需 ≥2 GPU」。第二節點上線後**直接在 2×1 重測**——結果：**加了第二張卡，共置動作還是更差。原推測被推翻。**
 
-把不確定性補回後，下一問題：**讓模型自己決定共置策略**能否在單卡下進一步幫到 RDSAC？給每個放置動作加一個 mode（`colocation_actions`，opt-in，預設關 → 動作空間與舊版逐位元相同）：`PACK`（接受 MPS 共享，付 §3.4 的 interference slowdown）vs `ISOLATE`（要求 GPU 空閒才放，不共享但要等卡空出來）。動作空間 17→33。在 interference=0.3、σ=0.5、fixed-α=0.05、RDSAC-only 下比較 colocation **ON vs OFF**：
+問題：**讓模型自己決定共置策略**能否在 2-node 幫到 RDSAC？給每個放置動作加一個 mode（`colocation_actions`，opt-in）：`PACK`（接受 MPS 共享，付 §3.4 的 interference slowdown）vs `ISOLATE`（要求 GPU 空閒才放，不共享但要等卡空出來）。2×1 動作空間 33→65。在 interference=0.3、σ=0.5、fixed-α=0.05、RDSAC-cvar、5-seed 配對下比較 colocation **ON vs OFF**：
 
 | family | OFF（baseline）ΔJCT% | ON（+共置）ΔJCT% | OFF p99 | ON p99 |
 |---|---:|---:|---:|---:|
-| philly | **+35.8** | −6.0 | **12.2 h** | 23.0 h |
-| ali | **+66.0** | −3.1 | **7.1 h** | 15.0 h |
+| philly | **−7.9** | −29.4 | 22.65 h | 22.71 h |
+| ali | **−1.0** | −21.0 | 10.74 h | **22.12 h** |
 
-共置動作在 philly/ali 都明顯更差（OFF 贏 ~42/~69 pts）、尾部 p99 也變糟。兩個推測成因：
+**判定：在 2×1，共置動作仍然明顯更差**——OFF 贏 ON ~21/20 pts（philly −7.9 vs −29.4、ali −1.0 vs −21.0），ali 尾部 p99 還翻倍（10.74→22.12h）。**「共置的價值需 ≥2 GPU」這個 1×1 推測直接被推翻**：補上第二張卡並沒有讓共置動作變有用。
 
-1. 動作空間加倍、訓練預算不變 → underfit（多出的 ISOLATE 大多被 mask、稀疏）；這是「相同預算」非「能力天花板」比較
-2. 單卡下 ISOLATE = 讓 GPU 閒置等佇列堆積，對 JCT 通常比擠進去吃干擾更糟，interference=0.3 還不夠重到讓「等獨佔」划算。**意涵**：共置作為決策的價值需 **≥2 GPU**（單卡沒有「放哪張卡」的真實選擇），正好接到第二節點（`docs/intergration.md` 的 RTX 3080）。程式保留為 opt-in、預設關。Caveats：每種方法單一訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/b_coloc_*/`。
+**為什麼還是輸**：主因應是 1×1 時就點名的第一條——**動作空間加倍（33→65）、訓練預算不變 → underfit**（多出的 ISOLATE 大多被 mask、稀疏）。1×1 推測的第二條「單卡沒有放哪張卡的真實決策面」**被這次 2×1 結果排除**了（有了兩張卡還是輸），所以瓶頸是**容量/預算**而非缺決策面。這也與 §4.5 一致：learned model 連基本的「兩台均衡」都做不好（擠 4070 88–92%），再加一層共置決策只會更糟。
+
+**對照 1×1（已被取代）**：1×1 OFF 是 +35.8/+66.0（RDSAC 在單卡+干擾下贏 score）、ON −6.0/−3.1；2×1 OFF 由正轉負（−7.9/−1.0，逼近打平，與 §3.4 一致），ON 更負。方向（ON < OFF）兩個拓樸一致。**Caveats**：單訓練 seed、只測 (σ=0.5, interference=0.3) 一點。原始檔 `runs/coloc_2x1_off_20260618-190621/`、`runs/coloc_2x1_on_20260618-201323/`。
 
 ### 3.8 160-dim 字母表重跑 + 決策來源拆分：模型其實「幾乎不下放置指令」
 
@@ -335,7 +336,7 @@ GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，在 160-dim 
 |---|---|---|
 | σ↑ → RDSAC 壓倒 SAC、σ=1 贏過 score（§3.4）| 方向對（σ=0.5 cvar 反超）、但**非單調、沒人贏過 score**；σ=1 ali cvar 最差 | **✗**（且 live §4.5 placement 顯著輸 Slurm）|
 | 分布式 critic 為主因、cvar 小加成（§3.6）| **反向變弱**：SAC→mean 僅 +8.5/−8.8 pts、落在單 seed 雜訊內 | **✗** |
-| 共置動作的價值需 ≥2 GPU（§3.7）| 2×1 colocation ON vs OFF（見 §3.7）| 見 §3.7 |
+| 共置動作的價值需 ≥2 GPU（§3.7）| 2×1：ON（−29/−21%）仍輸 OFF（−8/−1%）~20 pts | **✗ 推翻**（≥2 GPU 沒讓共置變有用；瓶頸是 underfit）|
 
 **為什麼**：1×1-sim 的大效應主要是「**單卡 + scalar critic 崩 + 單訓練 seed**」的產物。到 2×1，三方都逼近打平（最佳 −0.4~−1.8%，但**全 < 0、沒人贏 score**），機制差異縮到個位數 pts、被單 seed 60–90 pts 擺盪淹沒。**live 半（§4.5）把它釘成負結果**：四方下三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），實測全把負載擠到 4070（88–92% vs score 52%）、cvar 最慘。**→ 硬前提：先 multi-seed 固實 checkpoint（§5.1 第 1 項）再談 placement。**
 
