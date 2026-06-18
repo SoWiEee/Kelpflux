@@ -217,34 +217,40 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 > §3.1–§3.3 的共同結論：**在確定性 1×1 sim，分布式/風險機制的淨增益 ≈0**。但這有一個被忽略的前提——sim 的 runtime 是 oracle（`gym_env.step`：`end_ts = now + runtime`），轉移確定性 → 回報分布 `Z_R` 塌成 point mass → **CVaR ≈ mean → 風險機制結構性閒置**。§3.4 起把這個前提拿掉。
 
-### 3.4 隨機性消融：注入 runtime 不確定性
+### 3.4 隨機性消融（2×1）：注入 runtime 不確定性 + 三方對照
 
-> **⚠ B 類（sim 推論，live 1×1 未能反映、待 2-node 驗證）。** 本節「σ 越大 RDSAC 越贏」是 sim 內機制；§4.4.2 已說明 live 1×1（makespan-bound + 生產 score runtime-blind）結構上測不到此效應。
+> **2-node 驗證（本節直接寫 2×1，取代舊 1×1）。** 第二節點（RTX 3080）上線後，在真實匹配的 2×1 拓樸（obs_dim=166、n_actions=33）跑 σ-sweep 三方。1×1 sim 曾顯示「σ 越大 RDSAC 越壓倒、σ=1 甚至贏過 score」——**這在 2×1 沒有乾淨重現**，照數據寫如下。
 
-在 `KubefluxSchedEnv` 加 opt-in 的 mean-preserving lognormal runtime 噪音 σ（方法見 §2.3）。在匹配的 σ∈{0, 0.5, 1.0} 下各訓練 SAC 與 RDSAC-cvar（100k 步、curriculum、5 seed、philly/ali），三者透過同一隨機環境配對評估。
+在 `KubefluxSchedEnv` 加 mean-preserving lognormal runtime 噪音 σ（方法見 §2.3），σ∈{0, 0.5, 1.0} 各訓 **SAC / RDSAC-mean / RDSAC-cvar**（2×1、fixed-α 0.05、100k 步、curriculum、5-seed 配對、philly/ali）。**ΔJCT% vs score（負=較慢，粗體=該列最佳 learned arm）：**
 
-**結果 1 — auto-α 下，RDSAC−SAC 的 ΔJCT% 差距隨 σ 單調拉開**（正 = RDSAC 較優）：
+| σ | family | SAC | RDSAC-mean | RDSAC-cvar |
+|---|---|---:|---:|---:|
+| 0.0 | philly | **−2.8** | −0.4 | −26.3 |
+| 0.0 | ali | **−5.0** | −48.2 | −12.8 |
+| 0.5 | philly | −7.4 | −28.9 | **−3.3** |
+| 0.5 | ali | −5.6 | −27.6 | **−1.8** |
+| 1.0 | philly | −26.4 | −17.9 | **−10.2** |
+| 1.0 | ali | −17.8 | −26.6 | −30.3 |
+
+**RDSAC-cvar − SAC（正 = cvar 較優），逐 σ：**
 
 | σ | philly | ali | 平均 |
 |---|---:|---:|---:|
-| 0.0 | −113 | −16 | **−65**（RDSAC 較差）|
-| 0.5 | +52 | +42 | **+47**（反超）|
-| 1.0 | +65 | +333 | **+199**（壓倒）|
+| 0.0 | −23.5 | −7.8 | **−15.7**（cvar 較差）|
+| 0.5 | +4.1 | +3.8 | **+4.0**（cvar 反超）|
+| 1.0 | +16.2 | −12.5 | **+1.9**（混合）|
 
-σ=0 時 RDSAC 反比 SAC 差（沒有尾部可優化）；σ=0.5 起全面反超；σ=1.0 時 SAC 崩潰、RDSAC 相對穩健。
+兩個發現：
 
-**結果 2 — fixed-α 受控對照（σ=1.0、α 釘死 0.05）**，排除 auto-α 干擾：
+1. **方向對、壓倒性沒重現。** σ=0 時 cvar ≤ SAC（沒尾部可優化，符合「確定性→CVaR≈mean」）；σ>0 後 cvar 在 4 格中 3 格反超 SAC，σ=1.0 philly 還把 p99 從 39.1→29.4h 砍 25%。**但不是 1×1 那種單調壓倒**——σ=1.0 ali 反而 cvar 最差（−30.3），平均只 +1.9。1×1「σ=1 RDSAC 贏過 score +54/+74%」在 2×1 **完全沒重現**（cvar 仍 −10/−30%，**未贏 score**）。
 
-| family | SAC ΔJCT% | RDSAC ΔJCT% | SAC p99 | RDSAC p99 |
-|---|---:|---:|---:|---:|
-| philly | −57.0 | **+53.5** | 69.6 h | **6.2 h** |
-| ali | −68.7 | **+73.8** | 44.3 h | **7.7 h** |
+2. **1×1 的災難級 gap 整體收掉、但仍未贏 score。** 對照 1×1 fixed-α（learned −17~−24%、§3.3）/ auto-α（−106~−312%、§3.2），2×1 最好的格子逼近打平（mean −0.4% philly σ=0、cvar −1.8% ali σ=0.5）——但**沒有任何格子真的贏過 score**。
 
-fixed-α 下 RDSAC 仍贏 SAC（+110~143 pts，排除 α 假象），σ=1.0 時 RDSAC 甚至**贏過 score**（philly +54%、ali +74%）並把 p99 壓低 6–11×。**消融結論**：§3.3「淨增益≈0」的根因是**兩個一起**——(a) oracle runtime 零不確定性、(b) auto-α 壓垮策略；兩個都修正後，風險機制在「有尾部風險可管理」時確實有價值（**sim 內；live 兌現待 2-node**）。原始檔 `runs/stoch_sweep_*/`、`runs/stoch_fixedA_*/`。
+**為什麼壓倒性沒搬過來（推測）**：動作空間 17→33、訓練預算不變 → 2×1 underfit；加上**單訓練 seed**（§3.6 強 caveat）雜訊大。**而且 live 兌現是負的**（§4.5：σ=1 cvar 的 submit-時 placement 顯著輸 Slurm ~16% JCT）——把這裡「sim 逼近打平、單 seed 雜訊」的退化策略放到真實 placement 決策面，就翻成顯著淨負。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
 
 ### 3.5 σ 校準到真實預測誤差：σ=1.0 其實偏保守
 
-> **⚠ B 類支援節（為 §3.4 的 σ 取值背書；同屬 live 1×1 未能反映、待 2-node）。**
+> **方法學支援節（為 §3.4 的 σ 取值背書；與拓樸無關，1×1/2×1 通用）。**
 
 §3.4 的弱點：σ=0.5/1.0 若是憑空挑的，「注入噪音 → 抗噪法贏」近乎套套邏輯。用 §2.4 的方法量生產 LightGBM 預測器的 held-out log-殘差：
 
@@ -255,20 +261,22 @@ fixed-α 下 RDSAC 仍贏 SAC（+110~143 pts，排除 α 假象），σ=1.0 時 
 
 兩個結論：(1) 真實 σ ≈ **1.2–1.45**，故 §3.4 用的 **σ=1.0 落在真實下限以下、是保守值**——RDSAC 在 σ=1.0 就大勝，真實噪音下只會更強；(2) 殘差**近高斯**（excess kurtosis −0.1~+0.4），lognormal 噪音模型沒有低估尾部。**誠實告誡**：這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2–1.45 是「最難預測」上界；真實結構化資料上好 predictor 會更低 → 合理 σ 區間 ≈ **[0.5, 1.45]**，§3.4 測的 {0.5, 1.0} 都落在其中。
 
-### 3.6 拆解：贏的是「分布式 critic」還是「風險扭曲」？
+### 3.6 拆解（2×1）：贏的是「分布式 critic」還是「風險扭曲」？
 
-> **⚠ B 類（sim 推論，live 1×1 未能反映、待 2-node 驗證）。** 「分布式 critic 為主因」是 sim 內的拆解結論；live 1×1 全 abstain，未能反映。
+> **2-node（本節直接寫 2×1）。** 1×1 的拆解結論「**分布式 critic 為主因、cvar 只是尾部小加成**」**在 2×1 反向且大幅變弱**。
 
-§3.4 比的是 SAC（scalar）vs RDSAC-cvar（分布式 + 風險），把兩個貢獻綁死。加入第三方 **RDSAC-mean**（分布式但**風險中立**）即可拆開（σ=1.0、fixed-α=0.05、5 seed、philly/ali）：
+用 §3.4 的 σ=1.0、fixed-α 三方拆開：SAC（scalar）、RDSAC-mean（分布式但**風險中立**）、RDSAC-cvar（分布式 + 風險）。`SAC→mean` 隔離**分布式 critic**的貢獻、`mean→cvar` 隔離**風險扭曲**：
 
 | family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（**分布式**）| mean→cvar（**風險**）|
 |---|---:|---:|---:|---:|---:|
-| philly | −107.4 | +0.7 | −4.7 | **+108.1** | −5.4 |
-| ali | −154.7 | −29.4 | −14.2 | **+125.2** | +15.2 |
+| philly | −26.4 | −17.9 | −10.2 | **+8.5** | +7.7 |
+| ali | −17.8 | −26.6 | −30.3 | **−8.8** | −3.7 |
 
-**核心發現：絕大部分增益來自分布式 critic，不是風險扭曲。** SAC→RDSAC-mean（風險中立）就吃掉 **+108~+125 pts**，幾乎是整個 SAC↔RDSAC 差距——**在有噪音時，把回報「建模成分布」本身才是關鍵**（scalar critic 的單點 Q 在高回報變異下是較差的學習目標，quantile critic 穩健得多）。CVaR（mean→cvar 僅 −5/+15 pts）是**較小、看 workload 的尾部專用加成**：ali 小幅正向（+15 pts）、philly 略負（−5）——在 philly/ali 上 CVaR 的尾部加成不大且依 workload 而定。
+**核心發現（與 1×1 相反）**：在 2×1，**分布式 critic 不再是主因**——`SAC→mean` 只 +8.5/−8.8 pts（philly 小幅正、ali 反而負），遠不是 1×1 的 +108~125 pts。而且**風險扭曲（`mean→cvar`）跟分布式同量級**（philly +7.7、ali −3.7），cvar 在整體 ΔJCT 上反而是最穩的 learned arm（§3.4 σ=0.5 兩 family 最接近打平）。1×1「distributional critic 扛大樑、cvar 只是小加成」的拆解**不轉移**。
 
-**強 caveat（單訓練 seed，有鐵證）**：同一組 config（σ=1.0、fixed-α=0.05、cvar）在 §3.4 fixed-α 對照給 philly **+53.5**/ali **+73.8**，本輪卻是 −4.7/−14.2 —— 同設定兩跑，cvar 擺盪 ~60–90 pts。因此：SAC→mean 的 +108~125 pts 太大、seed 雜訊吃不掉，「**分布式 critic 是主因**」（在 sim 內）穩健；mean→cvar 較小、落在單 seed 雜訊內，**CVaR 淨增益需 multi-seed 才能定論**。原始檔 `runs/item1_calib_*/`。
+**為什麼 1×1 的大效應不見了**：1×1 那個 +108 pts 是因為 scalar critic 在「單卡 + 高回報變異」下真的崩（單點 Q 學不動）；2×1 三方都逼近打平（−10~−30%），scalar 沒崩到那種程度，兩個機制的貢獻就縮到個位數 pts。
+
+**強 caveat（單訓練 seed）**：本節所有效應都個位數 pts、**完全落在 §3.4/§3.9 證實的單 seed 60–90 pts 擺盪內**——方向（分布式 vs 風險誰大）**不可細讀、需 multi-seed 才能定論**。能穩健說的只有：**2×1 下分布式 critic 不是 1×1 那種壓倒性主因**。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
 
 ### 3.7 共置動作消融：PACK/ISOLATE 在 1×1 反而拖累（負結果）
 
