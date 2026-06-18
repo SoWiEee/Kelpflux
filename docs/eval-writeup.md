@@ -14,7 +14,7 @@
 
 - **絕對績效數字（sim → real 轉移差）**：sim 的 JCT/勝幅不會原樣搬到真實系統，故只當定性/序數參考。
 - **A 類——已被 live 反映的機制結論**：「**確定性 1×1 placement 退化 → 沒有學習法贏過強啟發式 → 應該打平**」（連帶「SAC 最差是 auto-α 假象」）。§4 的 live 1×1 三方乾淨打平**正面印證**了這條——這是本文**唯一已在真實環境兌現**的轉移。
-- **B 類——sim 內成立、但 live 1×1 結構上反映不出來的推論**：「oracle runtime → CVaR≈mean → 風險機制空轉」「注入校準過的不確定性後 RDSAC > SAC、分布式 critic 才是主因、CVaR 是尾部加成」「共置要 ≥2 GPU」。這些原理上跟演算法本身綁定、可轉移，**但本系統的 live 1×1（makespan-bound + 生產 score runtime-blind）沒有可表現的決策面 → §4 量不到 → 本文不宣稱已轉移**，列為**待 2-node 驗證**（§5.1）。
+- **B 類——sim 內曾成立、原以為「待 2-node 驗證」的推論**：「注入校準過的不確定性後 RDSAC > SAC、分布式 critic 才是主因、CVaR 是尾部加成」「共置要 ≥2 GPU」。第二節點上線後**已在真實 2×1 檢驗（§3.4–3.7 sim + §4.5 live）——結論是沒有乾淨轉移**：sim 2×1 三方逼近打平、沒有任何 learned model 贏過 score，且「分布式 critic 為主因」的拆解**反向變弱**（§3.6），全部落在單訓練 seed 雜訊內；**live 2-node placement 更是顯著負**——σ=1 cvar 的 submit-時 `-w` 放置比 Slurm 預設差 ~16% JCT、尾部更差（§4.5，p<0.005）。→ **B 類在真實環境未兌現；硬前提變成先 multi-seed 固實 checkpoint 再談 placement**（§5.1）。
 
 > 閱讀順序對應管線：§3（模擬結果）先講 **sim 訓練產出了哪些洞察**；§4（實機結果）再講 **這些洞察與真實環境的關聯/發現**；§5.1 列出 RLPD 微調與多節點驗證的 future work。
 
@@ -31,19 +31,21 @@
 | 確定性 1×1 sim, auto-α（§3.2, 30-seed）| 0% | −106/−312% | −25/−121% | 表面 score > cvar > SAC，**但誤導** | **✓ 反映**（§4 三方打平）|
 | 確定性 1×1 sim, fixed-α（§3.3）| 0% | −17/−24% | −25/−121% | **SAC 翻身 ≈/贏 cvar**；淨增益 ≈0 | **✓ 反映**（§4 三方打平）|
 | Live 1×1（§4）| 0% | ≈0% | ≈0% | **三方統計打平**；drift-robust 重跑（§4.4.2）確認、score 在 CVaR 甚至微幅最好 | —（即 live 本身）|
-| 隨機 sim σ=1.0, fixed-α（§3.6 三方）| 0% | −107/−155% | −4.7/−14.2% | **RDSAC ≫ SAC**；分布式 critic 為主因 | **✗ 未反映**（1×1 makespan-bound + 生產 score runtime-blind，結構上測不到；**待 2-node 驗證**，§5.1）|
+| 隨機 sim **1×1** σ=1.0, fixed-α（舊三方，已被 2×1 取代）| 0% | −107/−155% | −4.7/−14.2% | sim 內 **RDSAC ≫ SAC**、分布式 critic 為主因（曾是 B 類的 hope）| **✗ 2×1 未轉移**——見下兩列（§3.4/§3.6 + §4.5）|
 | 隨機 sim **2×1**, fixed-α（§3.9 三方）| 0% | −2.8/−5.0（σ0）·−26.4/−17.8（σ1）| −26.3/−12.8（σ0）·−10.2/−30.3（σ1）| **gap 收掉、逼近打平但未贏 score**；2×1 是 **cvar>mean**（§3.6 反向）| —（即 2-node sim 本身；live 見下）|
 | **Live 2-node** placement, submit-時 -w（§4.5）| 0% | — | **−15.8（σ0）/ −16.6（σ1）** | **RL placement 顯著輸 Slurm ~16% JCT、尾部更差、σ 無影響（p<0.005）** | —（即 2-node live 本身）|
 
-（兩個數字 = philly / ali；ΔJCT% vs score，負值=較慢。**§3.6 列是 1×1 sim 推論，§4 的 live 1×1 結構上無法檢驗；§3.9 列是其 2-node 真實拓樸的第一次檢驗——部分證實、單訓練 seed**）
+（兩個數字 = philly / ali；ΔJCT% vs score，負值=較慢。**1×1 σ=1 列是舊 sim hope；§3.4/§3.6（2×1 sim）與 §4.5（2-node live）才是現在的主軸——B 類在真實拓樸沒有兌現**）
 
-**兩個時期、兩個故事：**
+**三個時期、一條主軸（一律以 2×1 實機為準）：**
 
-1. **沒有不確定性時（確定性 sim + live）→ 三方分不出高下。** 確定性 sim 表面上 SAC 墊底，但 fixed-α 對照（§3.3）證明那幾乎全是共用 auto-α 控制器 railing 的**假象**；釘死 α 後 SAC 追平甚至贏過 RDSAC-cvar。Live 1×1 三方都在 ±1% 雜訊內、模型幾乎全 abstain 回退 score。根因：oracle runtime 讓回報塌成點 → CVaR≈mean → 風險機制結構性閒置。
+1. **沒有不確定性時（確定性 1×1 sim + live）→ 三方分不出高下。** 確定性 sim 表面上 SAC 墊底，但 fixed-α 對照（§3.3）證明那幾乎全是共用 auto-α 控制器 railing 的**假象**；釘死 α 後 SAC 追平甚至贏過 RDSAC-cvar。Live 1×1 三方都在 ±1% 雜訊內、模型幾乎全 abstain 回退 score。根因：oracle runtime 讓回報塌成點 → CVaR≈mean → 風險機制結構性閒置。
 
-2. **加入真實 runtime 不確定性 → 清楚排名浮現（sim 推論，live 1×1 尚無法驗證）。** 注入的 σ 已**校準到生產預測器的真實 log-殘差**（§3.5：σ≈1.2–1.45，故 §3.4 的 σ=1.0 偏保守）。RDSAC−SAC 差距**隨 σ 單調拉開**（philly/ali 平均 −65→+47→+199 pts，§3.4），σ=1.0 下 RDSAC 甚至贏過 score、p99 尾部低 5–9×。三方拆解（§3.6）指出**贏的主因是「把回報建模成分布」（分布式 critic，SAC→mean +108~125 pts），CVaR 風險扭曲只是尾部專用小加成**。RDSAC 內部則 cvar > mean（§3.1）。**⚠ 這整組（§3.1、§3.4–3.7）是 sim 內的機制推論——§4 的 live 1×1 因 makespan-bound + 生產 score runtime-blind 而結構上反映不出來，須等 2-node 拓樸（§5.1）才能在真實環境檢驗，目前不可當成已轉移的結論。**
+2. **1×1 注入不確定性 → sim 內排名浮現（曾是 B 類的 hope，但只在 1×1 sim 成立）。** σ 已**校準到生產預測器的真實 log-殘差**（§3.5：σ≈1.2–1.45）。1×1 sim 下 RDSAC−SAC 隨 σ 單調拉開（−65→+47→+199 pts）、σ=1 RDSAC 甚至贏過 score、拆解指向分布式 critic 為主因（SAC→mean +108~125 pts）。**但這只是 1×1 sim——下一條把它放到真實 2×1，就垮了。**
 
-**一句話：** 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式（**這一條 sim 與 live 互相印證**）；補上真實不確定性後 **sim 內** RDSAC > SAC，且贏在分布式 critic 本身、CVaR 為尾部加成（**這一條 live 1×1 尚反映不出、待 2-node**）。
+3. **🟥 真實 2×1（sim §3.4–3.7 + live §4.5）→ B 類沒有兌現。** 在拓樸匹配的 2×1：(a) **sim** 三方逼近打平、**沒有任何 learned model 贏過 score**，σ=1「RDSAC 贏過 score」沒重現，「分布式 critic 為主因」的拆解**反向變弱**（§3.6），全部落在單訓練 seed 雜訊內；(b) **live** 更直接——σ=1 cvar 的 submit-時 `-w` 放置**顯著輸 Slurm 預設 ~16% JCT、尾部更差**（§4.5，p<0.005；實測 RL 把負載偏擠 4070 71/29 vs score 58/42）。**這就是本文現在的主結論：B 類在真實多節點未兌現，原因是單 seed / no-op 傾向的退化策略。**
+
+**一句話（2×1 為準）：** 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式（A 類，sim ↔ live 互相印證、仍成立）；曾在 1×1-sim 看到的「σ → RDSAC、分布式 critic 為主因」**到了真實 2×1 沒有轉移**——sim 逼近打平、live placement 顯著輸 Slurm。要再談 placement 的前提是**先做 multi-seed 固實 checkpoint**（§5.1）。
 
 **三個 load-bearing caveats：**（1）**單訓練 seed**——同 cvar config 兩跑擺盪 50–90 pts，故 SAC→mean 大效應穩健、mean-vs-cvar 細排名需 multi-seed；（2）σ 是合成 trace 的最難預測上界（特徵與 runtime 無關），真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]；（3）**全部 1×1**，placement 是退化決策，真正檢驗要等拓樸匹配的多節點 checkpoint。
 
@@ -96,7 +98,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | (3) 實機部署 | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，記錄真實 (obs, act, rew) 資料 | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 A/B（§4）+ 微調語料 |
 | (4) RLPD 微調 | 用 (3) 的真實 JSONL | 以模擬產出的 checkpoint 為 prior，混合真實資料做微調 | 從頭 RLPD = 退回 (1) 的 sample-complexity 與 (2) 的破壞性探索 | 真實環境策略（future work，§5.1） |
 
-在模擬環境中「可大量訓練 + 可配對消融」，代價是模擬環境的絕對數字不轉移；機制性結論裡，**只有 A 類（1×1 退化 → 打平）已在實機反映**，B 類（σ → RDSAC、分布式 critic、共置）**原理上可轉移但實機 1×1 測量不到，待 2-node 驗證**。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；模擬器的 checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上。實機 trace 收集器（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒，等拓樸匹配的多節點 checkpoint 後啟動 (4)。
+在模擬環境中「可大量訓練 + 可配對消融」，代價是模擬環境的絕對數字不轉移；機制性結論裡，**A 類（1×1 退化 → 打平）已在實機反映**；B 類（σ → RDSAC、分布式 critic、共置）原以為「待 2-node 驗證」，第二節點上線後**已在真實 2×1 檢驗（§3.4–3.7 sim + §4.5 live）——結果是沒有轉移**：sim 逼近打平、live placement 顯著輸 Slurm（單 seed checkpoint 退化）。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；模擬器的 checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上。實機 trace 收集器（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒——而 §4.5 的負結果正說明：**直接烘 sim checkpoint 上線不夠，得先 multi-seed 固實或走 RLPD 微調**。
 
 ### 2.1 Simulator paired benchmark
 
@@ -139,6 +141,8 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 1.`gpu-rtx4070` pool 設 `min_replicas=1`（warm pool）—— 消除冷啟動 race，且「恰好 1 個 healthy GPU node」讓 snapshot `nodes=1` 與 1×1 checkpoint 拓樸匹配、`/decide` 正常 boost。
 2. **去除共用單 GPU 的偏差**：丟棄 warmup round 只消得掉**一次性冷啟動**，但整個跑程還有**緩慢 drift**（GPU 越跑越快），block 設計會把 drift 和方法混淆，必須用 **round-robin 交錯方法順序**才能平均掉（證據與解法見 §4.4.1–4.4.2）。live 環境：namespace `slurm`、controller `slurm-controller-0`、GPU partition `gpu-rtx4070`、GRES `gpu:rtx4070:1,mps:rtx4070:100`。指標由 controller pod 的 `sacct` 收。**生產服務拓樸**：跑 `slurmctld` / `rl-scheduler`(serve) / `rl-snapshot-agent`，但**沒有部署 `runtime-predictor` 和 `weight-tuner`**，因此 score 的 `ε`(SJF) 與線上權重調整都是關的（§1.1 生產實況），這是讀 §4 數字時的環境前提。
 
+> **2-node 設定（§4.5）**：以上是 §4.1–4.4 的 1×1 設定。第二節點上線後，§4.5 改用 **2×1 拓樸 + 共享 `gpu` partition**（橫跨 4070/3080 兩台）+ **166-dim checkpoint** + **submit-時 RL placement**（每 job 先 `/act` 選 node、`sbatch -w <node>`；learned arm boost-off → treatment 是純 placement）。為何不用 post-submit controller：Slurm 21.08 的 slurmrestd v0.0.37 把 `required_nodes` 列 disabled key、`scontrol` 也拒絕更新已提交 job 的 required nodes，**21.08 無法 post-submit 重釘節點**（§4.5）。
+
 ### 2.5 為何用 p95 / p99 / CVaR 量尾部（不只看 mean JCT）
 
 全文每張表都同時報 **mean JCT（主）** 與 **p95 / p99 JCT、CVaR(0.25)（尾部）**。納入尾部指標不是裝飾，而是這套評估能不能看見 RDSAC 效應的**前提**的四個理由：
@@ -160,18 +164,18 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 1. **確定性 1×1 placement 是退化決策 → 沒有學習法贏得過強啟發式 → 應該打平**（§3.2–3.3）。sim 全 rollout 下無任何 learned model 贏過 score，§4 的 live 1×1 三方乾淨打平**正面印證**。連帶 **auto-α 是壓垮 SAC 的 artifact**（§3.3，釘死 α 後 SAC 翻身）也與 live「SAC 同樣打平、非結構墊底」一致。→ 真實部署要 pin α，不要照搬為 cvar 尺度調的 auto-α 控制器。
 
-**B. sim 內成立、但 live 1×1 結構上反映不出來的推論（⚠ sim 半已在 2×1 部分檢驗，§3.9；live 半待執行，§5.1）**
+**B. 曾在 1×1-sim 成立、原以為「待 2-node 驗證」、但放到真實 2×1 後沒有轉移的推論（§3.4–3.7 sim + §4.5 live）**
 
-2. **確定性 oracle runtime → 回報塌成點 → CVaR≈mean → 風險機制閒置；補上校準過的真實不確定性後，贏的主因是分布式 critic、CVaR 是尾部加成**（§3.1、§3.4–3.6）。
-3. **共置動作的價值需 ≥2 GPU**（§3.7）。
+2. **1×1-sim：確定性 oracle runtime → CVaR≈mean → 風險機制閒置；補上不確定性後 RDSAC > SAC、分布式 critic 為主因、CVaR 尾部加成。→ 2×1 重測（§3.4/§3.6）：三方逼近打平、沒人贏過 score、分布式-critic 拆解反向變弱，全在單 seed 雜訊內；live（§4.5）placement 顯著輸 Slurm。**
+3. **共置動作的價值原推測「需 ≥2 GPU」（§3.7）——第二節點上線後正在真實 2×1 重測（colocation ON vs OFF）。**
 
-> **為什麼 B 類在 live 1×1 反映不出來**：(i) 1×1 只有一張 GPU，JCT 被 makespan 綁死，排序動不了它；(ii) 生產 score 的 `ε=0`（runtime-blind，§1.1），注入的 σ 對 score baseline 完全無作用。兩者都讓「σ 越大 RDSAC 越贏」這條 sim 機制在 1×1 沒有可表現的決策面。**所以 B 類在本文只當 sim 推論，不宣稱已轉移**。第二節點上線後 **§3.9 已在真實 2×1 拓樸跑完 σ-sweep，是 B 類的第一次檢驗——部分證實**（1×1 災難級差距收掉、逼近打平但仍未贏 score；2×1 下變 cvar>mean，與 §3.6 反向），但仍單訓練 seed，且 live 半（烘 checkpoint 上 2-node 跑 A/B）待執行（§5.1 第 5 項）。
+> **為什麼 B 類在 1×1 看似成立、放到 2×1 卻沒兌現**：1×1 的 σ-發現（§3.4 舊版）有兩個前提——只有一張卡，沒有「放哪台」的真實決策面；且生產 score `ε=0`（runtime-blind，§1.1）對注入的 σ 無作用。第二節點上線後**直接在 2×1 重跑（§3.4–3.7）**：有了真實 placement 決策面，**結果反而是三方逼近打平、沒人贏過 score、拆解反向**（§3.6）——1×1 sim 那個「σ→RDSAC 壓倒、分布式 critic 為主因」的大效應主要是**單卡 + scalar critic 崩 + 單訓練 seed**的產物，不是可轉移的機制。**live 半（§4.5）更把它釘死成負結果**：σ=1 cvar 的 placement 顯著輸 Slurm ~16% JCT。
 
-以下 §3.1–3.7 是支撐這些洞察的受控實驗；§4 再看 A 類如何被真實環境反映、B 類為何尚不能。
+以下 §3.1–3.3 是 1×1 確定性基線（A 類）；**§3.4–3.7 直接以 2×1 重寫（B 類的真實檢驗）**；§4 看 A 類如何被真實環境反映、以及 §4.5 的 2-node placement 負結果。
 
 ### 3.1 確定性 sim：risk-neutral(mean) vs risk-sensitive(cvar)
 
-> **⚠ B 類（sim 推論，live 1×1 未能反映、待 2-node 驗證）。** cvar > mean 是 sim 內結論；live 三方打平（§4.4.2）並未反映此排名。
+> **1×1 確定性基線。** cvar > mean 是 1×1-sim 結論；2×1 重測（§3.4）下 cvar 確實是最穩的 learned arm（σ=0.5 兩 family 最接近打平），但**三方都仍輸 score**，且 live（§4.5）placement 為負——排名細節落在單 seed 雜訊內。
 
 兩 run 只差 `--risk-mode`（reward_scale、步數、seed 全相同），5-seed（後由 §3.2 30-seed 取代雜訊）：
 
@@ -321,30 +325,19 @@ GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，在 160-dim 
 
 **意涵**：1×1 不是調 recipe 能翻盤的——要有真正的 placement 決策面（§3.7、第 5 項的 **≥2 GPU / 2-node**）才談得上 DRL 是否贏。原始檔：A `runs/eval_160dim_20260617-151916/`、B `runs/eval_160dim_fixedA_sw_20260617-170056/`。
 
-### 3.9 2-node（2×1 異質）σ-sweep：B 類推論的第一次真實拓樸檢驗
+### 3.9 2×1 sim → live 小結（B 類在真實拓樸的總帳）
 
-> **B 類驗證（部分證實，非乾淨勝利）。** §3.1–3.7 的 B 類推論（σ→RDSAC、分布式 critic 為主因、共置需 ≥2 GPU）此前都標「待 2-node 驗證」。RTX 3080 第二節點上線後（`docs/intergration.md`），本節在**真實匹配的 2×1 拓樸**（obs_dim=166、n_actions=33）首次跑 σ-sweep。**結論是混合的：1×1 的災難級差距在 2×1 收掉了，但 §3.4「σ→RDSAC 贏過 score」與 §3.6「分布式 critic 為主因」都沒有乾淨轉移。**
+> §3.4–3.7 的完整 2×1 三方數據已寫在各節（不在此重複）；本節只做**sim→live 的橋接總帳**。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`（σ-sweep 三方）。
 
-協定與 §3.4/§3.6 對齊、只換拓樸：`sweep_stochastic.py --n-nodes 2 --gpus-per-node 1`，σ∈{0, 0.5, 1.0} 各訓 SAC / RDSAC-mean / RDSAC-cvar，fixed-α 0.05、curriculum、100k steps、5-seed 配對評估、philly+ali。**ΔJCT% vs score（負=較慢），粗體=該列最佳 learned arm：**
+第二節點上線後，B 類三推論（σ→RDSAC、分布式 critic 為主因、共置需 ≥2 GPU）**第一次在真實 2×1 被檢驗**，結論一句話：**沒有乾淨轉移。**
 
-| σ | family | SAC | RDSAC-mean | RDSAC-cvar | cvar p99 / SAC p99 (h) |
-|---|---|---:|---:|---:|---|
-| 0.0 | philly | **−2.8** | −0.4 | −26.3 | 27.98 / 26.64 |
-| 0.0 | ali | **−5.0** | −48.2 | −12.8 | 9.04 / 9.32 |
-| 0.5 | philly | −7.4 | −28.9 | **−3.3** | 21.11 / 22.59 |
-| 0.5 | ali | −5.6 | −27.6 | **−1.8** | 10.55 / 9.20 |
-| 1.0 | philly | −26.4 | −17.9 | **−10.2** | **29.37 / 39.06** |
-| 1.0 | ali | −17.8 | −26.6 | −30.3 | 21.52 / 21.13 |
+| B 類推論（1×1-sim） | 2×1 sim 重測 | 真實兌現？ |
+|---|---|---|
+| σ↑ → RDSAC 壓倒 SAC、σ=1 贏過 score（§3.4）| 方向對（σ=0.5 cvar 反超）、但**非單調、沒人贏過 score**；σ=1 ali cvar 最差 | **✗**（且 live §4.5 placement 顯著輸 Slurm）|
+| 分布式 critic 為主因、cvar 小加成（§3.6）| **反向變弱**：SAC→mean 僅 +8.5/−8.8 pts、落在單 seed 雜訊內 | **✗** |
+| 共置動作的價值需 ≥2 GPU（§3.7）| 2×1 colocation ON vs OFF（見 §3.7）| 見 §3.7 |
 
-**三個發現：**
-
-1. **✅（方向性，A 類延伸）2×1 把 1×1 的災難級差距收掉了，但仍未贏過 score。** 1×1 fixed-α 下 learned arm 還在 −17~−24%（§3.3），auto-α 更是 −106~−312%（§3.2）；到 2×1，最好的格子已逼近打平——RDSAC-mean −0.4%（philly σ=0）、RDSAC-cvar −1.8%（ali σ=0.5）。這正面支持 §5.1 第 5 項「要有真正的 placement 決策面（≥2 GPU）DRL 才談得上競爭」。**誠實限制：沒有任何一格真的贏過 score（全 Δ 為負）——是「逼近打平」，不是「翻盤」。**
-
-2. **◐（§3.4 部分證實、非單調）σ→cvar 的方向對，但壓倒性沒重現。** σ=0 時 RDSAC-cvar ≤ SAC（沒尾部可優化，符合「確定性→CVaR≈mean」預期）；σ>0 後 RDSAC-cvar 在 4 格中 3 格反超 SAC，且 **σ=1.0 philly 把 p99 從 39.1→29.4h 砍 25%**——尾部風險故事在真實拓樸上看得到。**但不是 §3.4 在 1×1 那種乾淨單調**：σ=1.0 ali 反而最差（−30.3），且 §3.4-result2 在 1×1「σ=1 RDSAC 贏過 score +53/+74%」**在 2×1 完全沒重現**（cvar 仍 −10/−30%）。推測：動作空間 17→33、訓練預算不變 → 2×1 underfit；加上單 seed 雜訊。
-
-3. **✗（§3.6 不轉移、甚至反向）「分布式 critic 為主因」在 2×1 翻盤成「風險扭曲才關鍵」。** §3.6 在 1×1 結論是 SAC→RDSAC-mean 吃掉幾乎全部增益、cvar 只是小加成。2×1 **正好相反**：RDSAC-mean（純分布式、風險中立）在 σ>0 是**最差**的 learned arm（−28.9/−27.6 @ σ=0.5、−17.9/−26.6 @ σ=1.0），而 RDSAC-cvar（加風險）才是最好。**在真實 2-node 上，是 CVaR 風險扭曲而非裸分布式 critic 在扛**——與 §3.6 的 1×1 拆解相反。
-
-**⚠ 壓倒性 caveat（與 §3.6 同級）**：每個 arm **單一訓練 seed**（eval 才 5 seeds）。§3.6 已有同 config 兩跑擺盪 60–90 pts 的鐵證，故本節**所有細排名都可能翻**——尤其 σ=0 RDSAC-cvar philly −26.3（比自己 σ=0.5 的 −3.3 還差，明顯離群）、σ=0 RDSAC-mean ali −48.2 都像單 seed 壞點。**方向性發現（gap 收掉、cvar>mean@2×1）比點估計穩；要把 §3.9 升級成定論需 multi-seed（§5.1 第 1 項）。** 三個 σ=1.0 checkpoint 已存，直接餵後續 2-node live A/B（§5.1 第 5 項）。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
+**為什麼**：1×1-sim 的大效應主要是「**單卡 + scalar critic 崩 + 單訓練 seed**」的產物。到 2×1，三方都逼近打平（最佳 −0.4~−1.8%，但**全 < 0、沒人贏 score**），機制差異縮到個位數 pts、被單 seed 60–90 pts 擺盪淹沒。**live 半（§4.5）把它釘成負結果**：σ=1 cvar 的 placement 顯著輸 Slurm ~16% JCT、實測偏擠 4070。**→ 硬前提：先 multi-seed 固實 checkpoint（§5.1 第 1 項）再談 placement。**
 
 ---
 
@@ -352,11 +345,12 @@ GPU 字母表收斂成 `{rtx4070, rtx3080}`（obs 192→160）後，在 160-dim 
 
 本節是管線的階段 (3)：把 §3 的模擬產出 checkpoint 烘進真實叢集跑 paired A/B。重點是檢驗 §3 機制性洞察與真實環境的關聯，也就是哪些 sim 推論被真實環境反映、哪些反映不出來：
 
-- **A 類被正面反映、「絕對數字不轉移」當場成立**：sim 表面排名 `score > RDSAC > SAC`，但 live 1×1 三方統計打平（Δ 全在 ±1% 雜訊內）、學習模型 abstain 88–100% fail-safe 回退 score。這**正面印證** §3 的 A 類洞察（**1×1 退化 placement → 沒有學習法贏過強啟發式 → 打平**），sim 的勝幅本就不該轉移到這裡。**至於 B 類（σ → RDSAC、分布式 critic、共置），live 1×1 結構上反映不出來**（makespan-bound + 生產 score runtime-blind，§4.4.2），故本文不列為已轉移、留待 2-node。
-- **fail-safe 設計在真實環境驗證有效**：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋——這是讓階段 ③ 能安全 shadow 部署的前提，也是 §2.0 不敢在 live 直接訓練的另一面。
-- **真實微調語料已開始累積**：live A/B 期間 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 ④ RLPD 的輸入；live 環境本身已驗證可收 `sacct` 指標、可逐 (round, idx) 配對。
+- **A 類被正面反映（§4.1–4.4，1×1）**：sim 表面排名 `score > RDSAC > SAC`，但 live 1×1 三方統計打平（Δ 全在 ±1% 雜訊內）、學習模型 abstain 88–100% fail-safe 回退 score。這**正面印證** §3 的 A 類洞察（**1×1 退化 placement → 沒有學習法贏過強啟發式 → 打平**）。
+- **🟥 B 類在真實 2-node 被檢驗、結果是負的（§4.5）**：第二節點上線後，把 σ=1 cvar checkpoint 部署到 2×1 跑 submit-時 `-w` placement A/B——**RL placement 顯著輸 Slurm 預設 ~16% JCT、尾部更差（p<0.005）**，實測 RL 把負載偏擠 4070（71/29 vs score 58/42）。這把 §3.4–3.7 的「sim 逼近打平、單 seed 雜訊」釘成 live 負結果。**B 類沒有在真實環境兌現。**
+- **fail-safe 設計在真實環境驗證有效**：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋——這是讓階段 ③ 能安全 shadow 部署的前提。
+- **真實微調語料已開始累積**：live A/B 期間 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 ④ RLPD 的輸入。
 
-換言之，§4 沒有「DRL 在 live 大勝」的故事——它的價值是**證明模擬環境洞察的方向正確（1×1 該打平、就打平了）、且 sim-to-real 的工程管線（shadow + fail-safe + trace collector）真的能跑**，為多節點上線與 RLPD 微調鋪好路。
+換言之，§4 沒有「DRL 在 live 大勝」的故事——1×1 打平（A 類，§4.1–4.4）、**2-node placement 直接輸 Slurm（§4.5）**。價值在於**用正確的實驗設計拿到誠實的結論**，並證明 sim-to-real 工程管線（shadow + fail-safe + trace collector + 共享 partition + submit-時 placement）真的能跑，為 multi-seed 固實 / RLPD 微調鋪路。
 
 ### 4.1 RDSAC 實機 A/B（cvar-v2 checkpoint）
 
@@ -489,15 +483,16 @@ RL 比 Slurm **多 +13pp 倒向 4070**。因為本實驗的 job 是固定 `sleep
 |---|---|
 | DRL path 能在 live 上跑？ | 可以。warm-pool 穩定化後 RDSAC cvar-v2 live A/B 全 job 乾淨完成、RL boost 確實生效（§4.1）。 |
 | 先前 `alpha` 觸頂是真 bug？修好了？ | 是真 bug（return 尺度壓過 entropy ~300×）。已用 reward_scale 1000→20000 + 放寬 clamp 修好（§2.2）。 |
-| RDSAC 在標準 sim benchmark 打贏 score？ | **確定性 1×1 下還沒有**（§3.2，30-seed philly/ali 都不優於 score；**此條 A 類，live 已反映**）。注入真實不確定性後 σ=1.0 fixed-α 可贏過 score（§3.4）——**但屬 B 類：sim 內成立，live 1×1 未能反映、待 2-node 驗證**。 |
-| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **看環境有沒有不確定性**。確定性 1×1（含 live）淨增益≈0，且「SAC 最差」是 auto-α 假象（§3.3）——**此條 A 類，與 live 打平一致**。一旦注入**校準過的**真實不確定性（§3.5 σ≈1.2–1.45），RDSAC−SAC 差距隨 σ **單調拉開**（philly/ali 平均 −65→+199 pts，§3.4），三方拆解（§3.6）指出**增益主要來自「分布式 critic」**（SAC→mean +108~125 pts），CVaR 是尾部專用小加成——**這整串屬 B 類：sim 內成立，§4 live 1×1 結構上反映不出（makespan-bound + 生產 score runtime-blind），待 2-node 驗證**。CVaR 淨增益另需 multi-seed 才能定論（單 seed 擺盪大）。 |
-| risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **sim 內是**（30-seed 下 cvar 泛化遠勝 mean，−24.6% vs −121%，約 5×，§3.2），支持把 cvar 烘進 live image——**但屬 B 類，live 1×1 三方打平並未反映此排名**。 |
+| RDSAC 在標準 sim benchmark 打贏 score？ | **確定性 1×1 下沒有**（§3.2）。1×1 注入不確定性曾顯示 σ=1 贏過 score（舊 §3.4），**但放到真實 2×1（§3.4 重寫）就沒重現——三方逼近打平、沒人贏過 score**；live 2-node placement 更是顯著輸 Slurm（§4.5）。**淨答案：在這個系統上，RDSAC 還沒有在任何真實可檢驗的設定贏過 score。** |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **1×1-sim 曾說「有」，2×1 重測說「沒兌現」。** 確定性 1×1（含 live）淨增益≈0，「SAC 最差」是 auto-α 假象（§3.3）。1×1 注入不確定性後曾看到 RDSAC−SAC 隨 σ 拉開、拆解指向分布式 critic（SAC→mean +108~125 pts，舊數據）。**但 2×1 重測（§3.4/§3.6）：三方逼近打平、分布式-critic 拆解反向變弱（+8.5/−8.8 pts）、全在單 seed 雜訊內；live（§4.5）placement 顯著輸 Slurm。** 結論：分布式/風險機制的優勢**是 1×1-sim 的產物，未轉移到真實 2-node**；要再談需 multi-seed 固實。 |
+| risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **方向上是、但在雜訊內。** 2×1（§3.4）cvar 是最穩的 learned arm（σ=0.5 最接近打平），優於 mean；但**三方都仍輸 score**，且差異落在單 seed 擺盪內。仍支持把 cvar（而非 mean）當 checkpoint 候選，但**淨優勢需 multi-seed 才能定論**。 |
 | live A/B 已能公平比較 DRL vs score？ | 可以。重尾 + 高競爭 + **round-robin 去 drift** 後（§4.4.2）拿到**乾淨的 1×1 三方打平**：mean/p95 全平，CVaR 上 score 甚至微幅最好，沒有學習方法贏過 score（全 non-significant）。首輪 block 設計的「RDSAC −19% p99」證實是執行順序 × cluster drift 的假象（score 自身 p99 漂移 153→125）。根因：1×1 JCT 被 makespan 綁死、排序動不了它——非 σ-發現被推翻，而是缺真實決策面。 |
-| 最穩定上線策略 | DRL live scheduler 保持 enabled + GPU warm pool，並保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。 |
+| 2-node placement 結果？ | **負**。第二節點上線後跑 submit-時 RL placement A/B（`-w`），**σ=1 cvar 顯著輸 Slurm 預設 ~16% JCT、尾部更差（p<0.005、drift-robust、n=80）**，實測 RL 偏擠 4070（71/29 vs score 58/42，§4.5）。成因：單 seed / no-op 傾向 checkpoint 的退化策略。**前提：先 multi-seed 固實再談 placement。** |
+| 最穩定上線策略 | DRL live scheduler 保持 enabled + GPU warm pool，並保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。**2-node：在 multi-seed 固實前，placement 不應蓋過 Slurm 預設**。 |
 
-**工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的三方受控對照（score/SAC/RDSAC，一個 flag 切換）+ 隨機性消融把「分布式/風險機制何時有用」的條件講清楚。
+**工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的三方受控對照（score/SAC/RDSAC，一個 flag 切換）+ 隨機性消融；(6) **2-node 上線管線**：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點，§4.5）、外加修掉 4 個只在多節點現形的 chart bug（releasePriority 科學記號 CrashLoop、netpol 漏列、`-H` hold 被 score/rl_hook 覆蓋、controller 一次只放一個 job）。
 
-**核心一句話**：在 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式——**這條 sim 與 live 互相印證、是本文唯一已轉移的結論**；補上**校準過的**真實 runtime 不確定性後 **sim 內** RDSAC > SAC，且贏在「把回報建模成分布」這件事本身、CVaR 風險扭曲是尾部專用加成——**但這條因 live 1×1 makespan-bound + 生產 score runtime-blind 而尚未在真實環境反映，列為待 2-node 驗證的推論**。不是只宣稱「用了 DRL / risk-sensitive」就算贏。
+**核心一句話（2×1 為準）**：在 1×1 確定性環境（含 live）三方打平、換演算法贏不了強啟發式——**這條 A 類 sim 與 live 互相印證、穩固**。曾在 1×1-sim 看到的「σ → RDSAC、分布式 critic 為主因、cvar 尾部加成」**到了真實 2×1 沒有轉移**：sim 三方逼近打平、沒人贏過 score、拆解反向且全在單 seed 雜訊內（§3.4–3.7），**live 2-node placement 更顯著輸 Slurm ~16% JCT**（§4.5）。**因此本文目前沒有「DRL 贏」的真實結論；下一步的硬前提是 multi-seed 固實 checkpoint，而非再宣稱「用了 DRL/risk-sensitive」就算贏。**
 
 ### 5.1 未來工作（Future Work）
 
