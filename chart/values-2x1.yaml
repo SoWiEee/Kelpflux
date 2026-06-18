@@ -40,6 +40,15 @@ partitions:
     default: false
     maxTime: INFINITE
     state: UP
+  # Shared GPU partition spanning BOTH GPU hosts. Lets a job land on either node
+  # so the RL placement decision (which node) is real — used by the 2-node
+  # heavy-tail live A/B. Membership comes from each GPU pool's
+  # `extraPartitions: [gpu]` below; the per-type partitions above stay intact
+  # (a Slurm node can belong to multiple partitions).
+  - name: gpu
+    default: false
+    maxTime: INFINITE
+    state: UP
 
 # --- Worker pools: cpu (floating) + one pinned pool per GPU host --------------
 pools:
@@ -80,6 +89,8 @@ pools:
     threadsPerCore: 2
     maxNodes: 1
     features: [gpu, gpu-rtx4070, topology-2x1]
+    # Also a member of the shared `gpu` partition (2-node placement A/B).
+    extraPartitions: [gpu]
     # Pin to the physical RTX 4070 host so type/VRAM assumptions hold.
     nodeSelector:
       gpu-host-class: rtx4070
@@ -109,6 +120,8 @@ pools:
     threadsPerCore: 2
     maxNodes: 1
     features: [gpu, gpu-rtx3080, topology-2x1]
+    # Also a member of the shared `gpu` partition (2-node placement A/B).
+    extraPartitions: [gpu]
     # Pin to the physical RTX 3080 host.
     nodeSelector:
       gpu-host-class: rtx3080

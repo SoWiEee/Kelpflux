@@ -548,7 +548,7 @@ rlScheduler:
     jobNamePrefix: ""      # only act on held jobs whose name starts with this; "" = all held
     requireHeld: true      # only touch jobs submitted held (sbatch -H)
     autoTrimModelTopology: true  # cap node list to checkpoint n_actions
-    releasePriority: 4294967295  # Slurm INFINITE → recompute priority, lift hold
+    releasePriority: "4294967295"  # Slurm INFINITE → recompute priority, lift hold. Quoted: Helm loads large ints as float64 → renders "4.294967295e+09" → argparse type=int rejects it (placement-controller CrashLoop). String keeps it literal.
     resources:
       requests: { cpu: 50m, memory: 128Mi }
       limits:   { cpu: 250m, memory: 256Mi }

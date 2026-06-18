@@ -306,7 +306,10 @@ NodeName={{ $nodeName }} NodeAddr={{ $nodeAddr }} NodeHostname={{ $nodeName }} C
 {{- $nodes := list -}}
 {{- range $.Values.pools -}}
   {{- $pool := . -}}
-  {{- if eq $pool.partition $part.name -}}
+  {{/* A pool joins a partition via its primary `partition` OR any name in the
+       optional `extraPartitions` list (lets one node sit in multiple
+       partitions, e.g. a shared `gpu` partition spanning every GPU host). */}}
+  {{- if or (eq $pool.partition $part.name) (has $part.name ($pool.extraPartitions | default list)) -}}
     {{- range $i, $_ := until (int $pool.maxNodes) -}}
       {{- $nodes = append $nodes (printf "%s-%d" $pool.statefulset $i) -}}
     {{- end -}}
