@@ -420,9 +420,12 @@ data:
         -- value we set; treating delta as an additive nudge keeps fairshare
         -- + age + qos in charge of inter-job ordering and lets score act
         -- as a tiebreaker. The simplest hook is to set priority directly
-        -- when no priority has been assigned yet (held / new submissions);
-        -- M8 may revisit this once we have evaluation data.
-        if not job_desc.priority or job_desc.priority == 0 then
+        -- when no priority has been assigned yet (brand-new submission, nil).
+        -- An explicit user hold arrives as priority == 0 (sbatch -H); leave it
+        -- held so the placement controller can pin required_nodes then release
+        -- it — overwriting 0 with delta would silently lift the hold. Normal
+        -- unheld jobs carry NO_VAL (≠ nil, ≠ 0) and keep Slurm multifactor.
+        if not job_desc.priority then
           job_desc.priority = delta
         end
       end

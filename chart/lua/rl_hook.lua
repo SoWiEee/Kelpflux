@@ -108,7 +108,11 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
   if rl.otel_traceparent and rl.otel_traceparent ~= "" then
     job_desc.admin_comment = "otel=" .. rl.otel_traceparent
   end
-  if rl.priority_boost > 0 then
+  -- Respect an explicit user hold (sbatch -H → job_desc.priority == 0): the
+  -- placement controller releases such jobs after pinning required_nodes, so
+  -- boosting here would lift the hold and let Slurm schedule the job before the
+  -- controller can choose a node. Unheld jobs carry NO_VAL/nil priority (≠ 0).
+  if rl.priority_boost > 0 and job_desc.priority ~= 0 then
     job_desc.priority = (job_desc.priority or 0) + rl.priority_boost
     _log(string.format(
       "[rl] selected=%s boost=+%d new_prio=%d value=%.3f entropy=%.3f",
