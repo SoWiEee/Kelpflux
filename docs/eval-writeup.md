@@ -29,20 +29,20 @@
 
 | 評估 | score | SAC | RDSAC-mean | RDSAC-cvar | 判定 |
 |---|---|---|---|---|---|
-| **sim** 隨機 σ-sweep, fixed-α（§3.1 三方）| 0% | −2.8/−5.0（σ0）·−26.4/−17.8（σ1）| −0.4/−48.2（σ0）·−17.9/−26.6（σ1）| −26.3/−12.8（σ0）·−10.2/−30.3（σ1）| **三方逼近打平、沒人贏過 score**；細排名落在單 seed 雜訊內 |
+| **sim** σ-sweep, fixed-α, **multi-seed**（§3.1，σ=1.0，3 train seed）| 0% | −38.3±12 / −33.6±23 | −12.9±10 / −8.4±3 | −35.4±16 / −42.0±30 | **multi-seed 確認：沒人贏過 score；arm 間排名是訓練雜訊（std 5–30 pts）** |
 | **live** 2-node placement, submit-時 -w（§4.1 四方）| 0% | −12.2/−26.3（σ1/σ0）| −17.4/−28.1 | −24.2/−31.8 | **三個 learned arm 全顯著輸 Slurm（−12~−32% JCT，p<0.01）；越擠 4070 輸越多（cvar 92% 最慘）** |
 
-（sim 兩個數字 = philly / ali；live 兩個數字 = σ=1 / σ=0；ΔJCT% vs score，負值=較慢）
+（sim 兩個數字 = philly / ali（σ=1.0 mean±std）；live 兩個數字 = σ=1 / σ=0；ΔJCT% vs score，負值=較慢）
 
 **一條主軸（一律以 2×1 實機為準）：**
 
-1. **sim（§3.1–3.4）：注入校準過的 runtime 不確定性（σ 校準到生產預測器的 log-殘差 ≈1.2–1.45，§3.2），三方在 2×1 逼近打平、但沒人贏過 score。** σ→cvar 的方向只在 σ=0.5 成立、不單調（§3.1）；「分布式 critic 為主因」的拆解在 2×1 **反向變弱**（SAC→mean 僅 +8.5/−8.8 pts，§3.3）；共置動作（PACK/ISOLATE）即使有第二張卡**仍拖累**（§3.4，「價值需 ≥2 GPU」被推翻）。所有效應都落在**單訓練 seed**的 60–90 pts 擺盪內。
+1. **sim（§3.1–3.4，σ-sweep 部分已 multi-seed）：注入校準過的不確定性後，三方在 2×1 逼近打平、但沒人贏過 score。** 3 個訓練 seed 的 mean±std **確認**了兩件事：(i) **沒人贏 score**（穩健）；(ii) **arm 間的差異是訓練雜訊**——std 5–30 pts、跟 mean 差同量級，同 config 跨 seed 擺盪 30–70 pts，所以單 seed 看到的「cvar 最好」之類排名**不成立**（§3.1）。拆解上唯一半穩健的 slice 是 σ=1.0：**CVaR 風險扭曲反而扣分**（§3.3）。共置動作即使有第二張卡仍拖累（§3.4）。
 
 2. **🟥 live（§4.1）：真實 2-node placement 是乾淨的四方負結果。** 四方 submit-時 `-w` placement，**三個 learned arm 全顯著輸 Slurm 預設（−12~−32% JCT、每格 p<0.01）**。機制直接量到：learned model 全把負載擠到 4070（88–92%）vs Slurm 均衡的 52/48，而且**擠越兇輸越多**（cvar 92% 最慘 −24~−32%、SAC 88% 最輕 −12%）。因為 job 是固定 `sleep`、JCT 差全來自排隊 wait——**過度集中單卡 → 佇列壅塞 → 變慢**。
 
-**一句話：** 在真實 2×1，這批（單訓練 seed 的）DRL checkpoint **沒有在任何可檢驗的設定贏過 score**：sim 逼近打平（落在雜訊內）、live placement 因過度集中 4070 而顯著輸 Slurm。**要再談 RL placement 的硬前提是先做 multi-seed 固實 checkpoint**（§5.1）。
+**一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement 因過度集中 4070 而顯著輸 Slurm。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
 
-**兩個 load-bearing caveats：**（1）**單訓練 seed**——同 config 兩跑可擺盪 60–90 pts，故 sim 內機制的細排名都需 multi-seed 才能定論；（2）σ 是合成 trace 的最難預測上界（特徵與 runtime 無關），真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
+**兩個 load-bearing caveats：**（1）**訓練高變異**——sim σ-sweep 已用 3 train seed 固實（mean±std），但 **live A/B 用的仍是單 seed checkpoint**（§4.1）；要把 live 結論也升級成「對 seed 穩健」需用 multi-seed checkpoint 重跑 live（見下方 live-eval 說明）；（2）σ 是合成 trace 的最難預測上界，真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
 
 ---
 
@@ -168,30 +168,22 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **先講為什麼要注入噪音。** RDSAC 的風險機制（CVaR）是用來「規避下尾風險」的——但風險機制要**有風險可管**才有意義。sim 的 runtime 是 oracle（給定狀態與動作，結束時間是確定的），回報分布塌成一個點，CVaR 就等於 mean、風險機制整個閒置。所以這節在環境裡加一個**校準過的** runtime 不確定性 σ（mean-preserving lognormal，方法見 §2.3；σ 取自生產預測器的真實 log-殘差，§3.2），讓三方在「有尾部風險可管」時較高下。
 
-σ∈{0, 0.5, 1.0} 各訓 **SAC / RDSAC-mean / RDSAC-cvar**（fixed-α 0.05、100k 步、curriculum、5-seed 配對、philly/ali）。**ΔJCT% vs score（負=較慢，粗體=該列最佳 learned arm）：**
+σ∈{0.5, 1.0} 各訓 **SAC / RDSAC-mean / RDSAC-cvar**（fixed-α 0.05、100k 步、curriculum、5-seed 配對、philly/ali）。**關鍵：每個 (σ, arm) 用 3 個訓練 seed（42/43/44）跑，報 mean±std**——這是本文唯一做了 multi-seed 的地方，專門用來打掉單 seed 雜訊。**ΔJCT% vs score（負=較慢）：**
 
 | σ | family | SAC | RDSAC-mean | RDSAC-cvar |
 |---|---|---:|---:|---:|
-| 0.0 | philly | **−2.8** | −0.4 | −26.3 |
-| 0.0 | ali | **−5.0** | −48.2 | −12.8 |
-| 0.5 | philly | −7.4 | −28.9 | **−3.3** |
-| 0.5 | ali | −5.6 | −27.6 | **−1.8** |
-| 1.0 | philly | −26.4 | −17.9 | **−10.2** |
-| 1.0 | ali | −17.8 | −26.6 | −30.3 |
+| 0.5 | philly | −7.1±5.1 | −19.9±9.4 | −7.8±7.5 |
+| 0.5 | ali | −15.0±7.5 | −2.4±5.3 | −3.7±3.2 |
+| 1.0 | philly | −38.3±12.3 | −12.9±10.1 | −35.4±16.3 |
+| 1.0 | ali | −33.6±23.0 | −8.4±3.2 | −42.0±29.8 |
 
-**判定：三方逼近打平、沒人贏過 score。** 最好的格子也只是「逼近打平」（RDSAC-mean −0.4% @ philly σ=0、RDSAC-cvar −1.8% @ ali σ=0.5）——**沒有任何一格真的把 score 比下去（全 Δ < 0）**。
+**兩個判定（multi-seed 後）：**
 
-風險機制有沒有露出價值？看 cvar 對 SAC 的差（正 = cvar 較優）：
+1. **沒有任何 arm 贏過 score——而且這條穩健。** 每個 mean 都是負的，連 +1 個 std 也構不到 0（最接近的 σ=0.5 ali mean/cvar 是 −2.4/−3.7，仍負）。
 
-| σ | philly | ali | 平均 |
-|---|---:|---:|---:|
-| 0.0 | −23.5 | −7.8 | **−15.7**（cvar 較差）|
-| 0.5 | +4.1 | +3.8 | **+4.0**（cvar 反超）|
-| 1.0 | +16.2 | −12.5 | **+1.9**（混合）|
+2. **arm 之間的排名是訓練雜訊，不是真訊號。** std 普遍 **5–30 pts**，跟 arm 之間的 mean 差**同量級甚至更大**。最戲劇性的是 cvar @ ali σ=1.0 三個 seed 給 **+0.1 / −76.3 / −45.9**（mean −42±30）——同一個 config，換個 seed 就從「打平」崩到「慘輸」。這直接打掉先前單 seed 看到的「cvar 是最穩 best arm」：cvar−SAC 只有 σ=0.5 ali 是 **+11.3±7.3**（勉強脫離雜訊），其餘三格 **−0.7±5.8 / +2.9±26.3 / −8.4±23.5** 全在雜訊內。
 
-**方向對、但不穩。** σ=0 時 cvar ≤ SAC（沒尾部可優化，正好印證「確定→CVaR≈mean」的動機）；σ>0 後 cvar 在 4 格中 3 格反超 SAC，σ=1.0 philly 還把 p99 從 39.1→29.4h 砍掉四分之一。**但不是單調壓倒**——σ=1.0 ali 反而 cvar 最差（−30.3），平均只 +1.9。換句話說「σ 越大 cvar 越好」只有在 philly 成立，ali 打臉它。
-
-**一句話**：在 2×1，注入校準過的不確定性後，cvar 在 σ=0.5 是最穩的 learned arm、尾部也看得到改善——但**三方都還是輸 score、且 σ-趨勢被 workload 打架**，整體落在單訓練 seed 的雜訊內（§3.3 會給這個雜訊的鐵證）。原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
+**一句話**：multi-seed 把這節從「三方逼近打平、cvar 似乎略好」收斂成兩句**更強**的結論——(i) **沒人贏 score**（穩健）；(ii) **arm 間差異是單訓練 seed 的高變異產物**（同 config 跨 seed 擺盪 30–70 pts），不是可定論的機制排名。這也呼應 §4.1 live 的退化：訓練本身就高變異、容易長出過度集中的策略。原始檔 `runs/mseed_2x1_s{42,43,44}/`、彙總 `runs/mseed_2x1_agg/SUMMARY.txt`。
 
 ### 3.2 σ 校準到真實預測誤差：σ=1.0 其實偏保守
 
@@ -206,16 +198,16 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 ### 3.3 拆解：贏的是「分布式 critic」還是「風險扭曲」？
 
-§3.1 把 RDSAC 當一整包，但它其實有兩個機制：**分布式 critic**（把回報建模成分布，而非單點 Q）與 **風險扭曲**（CVaR）。要知道哪個在出力，就放第三方 **RDSAC-mean**（有分布式 critic、但風險中立）來夾：`SAC→mean` 隔離分布式 critic 的貢獻、`mean→cvar` 隔離風險扭曲。用 §3.1 的 σ=1.0、fixed-α 三方：
+§3.1 把 RDSAC 當一整包，但它其實有兩個機制：**分布式 critic**（把回報建模成分布，而非單點 Q）與 **風險扭曲**（CVaR）。要知道哪個在出力，就放第三方 **RDSAC-mean**（有分布式 critic、但風險中立）來夾：`SAC→mean` 隔離分布式 critic 的貢獻、`mean→cvar` 隔離風險扭曲。用 §3.1 的 **multi-seed**（3 train seed）σ=1.0 三方，mean±std：
 
 | family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（**分布式**）| mean→cvar（**風險**）|
 |---|---:|---:|---:|---:|---:|
-| philly | −26.4 | −17.9 | −10.2 | **+8.5** | +7.7 |
-| ali | −17.8 | −26.6 | −30.3 | **−8.8** | −3.7 |
+| philly | −38.3±12.3 | −12.9±10.1 | −35.4±16.3 | **+25.4±22.6** | **−22.5±10.4** |
+| ali | −33.6±23.0 | −8.4±3.2 | −42.0±29.8 | **+25.2±22.4** | **−33.6±27.6** |
 
-**判定：沒有單一主因——兩個機制都只剩個位數 pts、且看 workload 正負擺盪。** `SAC→mean`（分布式）philly +8.5、ali 反而 −8.8；`mean→cvar`（風險）philly +7.7、ali −3.7。兩者同量級、方向還相反，**誰是主因不可細讀**。
+**判定（multi-seed，σ=1.0）：分布式 critic 是有用的那一半，CVaR 風險扭曲反而扣分。** 兩個 family 方向一致：`SAC→mean`（加分布式 critic）**+25 pts**（RDSAC-mean 是 σ=1.0 最好的 learned arm），而 `mean→cvar`（再加 CVaR）**−22~−34 pts**（cvar 變成最差）。**這跟 CVaR 的設計意圖相反**——本來想用它管尾部風險，σ=1.0 下卻過度保守/不穩、把 mean 的優勢吐回去。philly 的 `mean→cvar −22.5±10.4` 約 2σ、算半穩健。
 
-**強 caveat（單訓練 seed）**：本節所有效應都個位數 pts、**完全落在單 seed 的 60–90 pts 擺盪內**（§3.1 同一組 cvar config 兩跑就擺盪了 ~60–90 pts，這是鐵證）。所以「分布式 vs 風險誰大」**需 multi-seed 才能定論**；能穩健說的只有：**在 2×1，兩個機制都沒有給出可定論的淨增益。** 原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
+**誠實 caveat**：(i) std 仍大（SAC→mean +25±22 才 ~1σ）；(ii) **這只在 σ=1.0 成立**——σ=0.5 的拆解 family 間打架、落在雜訊內（philly 分布式 −12.8、ali +12.6）。所以能穩健說的是：**CVaR 在 σ=1.0 沒幫上忙、甚至扣分；分布式 critic 是相對有用的一半——但兩者都沒讓 RDSAC 贏過 score。** 原始檔 `runs/mseed_2x1_s{42,43,44}/`。
 
 ### 3.4 共置動作消融：讓模型自己決定 PACK/ISOLATE，反而更差
 
@@ -236,11 +228,11 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 | 問題 | sim（2×1）的答案 |
 |---|---|
-| 注入不確定性後，RDSAC 會贏嗎？（§3.1）| 三方逼近打平、**沒人贏過 score**；cvar 在 σ=0.5 最穩，但 σ-趨勢被 workload 打架、不單調 |
-| 贏在分布式 critic 還是風險扭曲？（§3.3）| **沒有單一主因**——兩機制都只剩個位數 pts、方向還相反，落在單 seed 雜訊內 |
+| 注入不確定性後，RDSAC 會贏嗎？（§3.1）| **沒人贏過 score**（multi-seed 穩健）；arm 間排名是訓練雜訊（std 5–30 pts），單 seed 看到的「cvar 最好」不成立 |
+| 贏在分布式 critic 還是風險扭曲？（§3.3）| σ=1.0 下 **分布式 critic 是有用的一半、CVaR 反而扣分**（−22~−34 pts，與設計意圖相反）；但仍沒讓 RDSAC 贏 score |
 | 加共置動作（需更多卡）有用嗎？（§3.4）| **沒有**——ON 仍輸 OFF ~20 pts，瓶頸是動作空間翻倍後的 underfit |
 
-**一句話**：在 2×1 sim，這批單訓練 seed 的 checkpoint **三方逼近打平、但沒人贏過 score**，機制差異全被單 seed 的 60–90 pts 擺盪淹沒——sim 給不出「DRL 贏」的訊號。**而 live（§4.1）把這個「逼近打平的退化策略」放到真實 placement 決策面，就翻成顯著淨負**：四方下三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），因為它們全把負載擠到 4070（88–92% vs score 均衡 52%）。**→ 硬前提：先 multi-seed 固實 checkpoint（§5.1 第 1 項）再談 placement。** 原始檔 `runs/stoch_sweep_2x1_20260618-003742/`。
+**一句話**：multi-seed 後，2×1 sim 給出兩句穩健結論——**沒人贏過 score**、且 **arm 間差異是訓練雜訊**（同 config 跨 seed 擺盪 30–70 pts）。這個「訓練高變異 + 沒人贏」直接接到 live（§4.1）的退化：四方下三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），全把負載擠到 4070（88–92% vs score 均衡 52%）。**→ 下一步：用 multi-seed checkpoint 重跑 live placement，看負結果對 seed 是否穩健（§5.1 第 1 項）。** 原始檔 `runs/mseed_2x1_*`。
 
 ---
 
@@ -321,7 +313,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **讓現有結論站得住（方法學門檻）**
 
-1. **多訓練 seed（≥3–5）重跑 §3.1 / §3.3 關鍵點。** 目前每 cell 單一訓練 seed，§3.3 已有同 config 兩跑擺盪 50–90 pts 的鐵證；per-family 數字要 mean±std 才能下定論，尤其 mean-vs-cvar 的細排名。
+1. ✓ **sim σ-sweep multi-seed（已完成，§3.1/§3.3）。** §3.1 的 σ-sweep 三方已用 3 個訓練 seed（42/43/44）跑 mean±std——確認「沒人贏 score」穩健、arm 間排名是訓練雜訊（std 5–30 pts、同 config 跨 seed 擺盪 30–70 pts）。**剩下兩塊**：(a) **live A/B 仍用單 seed checkpoint**——要把 live 結論也升級成 seed-穩健，需用 multi-seed checkpoint（或各 arm 取 sim 表現最好的那個 seed）重跑 §4.1 的 placement A/B；(b) 共置/σ=0 等格子尚未 multi-seed。原始檔 `runs/mseed_2x1_*`、彙總 `runs/mseed_2x1_agg/SUMMARY.txt`。
 2. **σ 校準的外部效度。** §3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重量，並把 σ-sweep 落在實測區間。
 3. **向量化 / 加速 sim（已實作）。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h）。已加入 `sim/vec_env.py`（`SyncVectorSchedEnv` 參考實作 + `AsyncVectorSchedEnv` 多進程，autoreset 語義一致、async≡sync 經測試），並把 `sim_train(--num-envs N)` 接成 N 個 env 並行 rollout、共用同一 learner——多核近線性提升 rollout 吞吐，讓上面兩項（multi-seed、σ-sweep）在算力上可行。注意：vec path 的 score-warmup 退回 random-legal（score-warmup 需 in-process `env._state`），且每 iteration 仍 `utd_ratio` 次更新，所以 UTD 隨 N 稀釋——要維持樣本效率就同步調高 `--utd-ratio`。
 
