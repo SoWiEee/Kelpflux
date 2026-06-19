@@ -292,6 +292,8 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **範圍限制**：σ=1.0 三方 checkpoint（單訓練 seed）、單 family（philly）、n=80/arm。要下普遍結論需 multi-seed checkpoint + ali。但**四方一致、單調、p<0.01**——「這批 production-候選 checkpoint 的 placement 顯著輸 Slurm，且因過度集中 4070」是穩健結論。
 
+> **workload caveat（重要）**：本 A/B 的 job 是 `sleep N`、**不做 GPU compute**，所以 runtime 與 placement 無關、placement 只影響排隊 wait——這把「共置干擾、VRAM 限制、異質算力」三個真實 placement 槓桿**結構性抹掉**了（sim 反而有用 `interference=0.3` 建模，是個 sim↔live 不一致）。換成真實 CUDA job 會讓測試更完整、也更公平（見 §5.1 第 4 項）；對目前過度集中的 checkpoint 預期會更慘（多付干擾代價），但那才是讓**好的** placement 策略有機會展現價值的場域。
+
 > 一句話：真實 2-node placement 是**乾淨的四方負結果**——score 均衡放置（52/48），三個 learned arm 全把負載擠到 4070（88–92%）、全顯著輸 Slurm（−12~−32% JCT），且**擠越兇輸越多（cvar 最慘）**。不是「2-node 解鎖 RL」，而是「**單 seed / no-op 傾向的 checkpoint 一旦真的去選 node，就把負載擠歪、比 Slurm 差**」。硬前提：**先 multi-seed 固實再談 placement**。
 
 ---
@@ -327,13 +329,18 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 ✓ **2-node placement A/B + 工程基建（已完成，§4.1）。** 第二節點上線後，跑出真實四方 placement A/B（drift-robust `--interleave`），結論是負的（learned 全輸 Slurm）。沿途打通的基建：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點）、四個只在多節點現形的 chart bug 修復。工程規格見 `docs/live-ab-heavytail-spec.md`、`docs/intergration.md`。
 
-4. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
+**讓 live 測試更真實（最可能改變 placement 結論的方向）**
+
+4. **把 live workload 從 `sleep` 換成真實 CUDA job。** 目前 §4.1 的 live A/B 用 `--wrap=sleep N`，而 `sleep` job **不做任何 GPU compute** → runtime 與 placement **完全無關**（同一張卡上擠幾個都不變慢、放 4070 或 3080 都一樣、不吃 VRAM）。所以 placement 唯一能影響的就是**排隊 wait**，§4.1 量到的「擠 4070 → 佇列壅塞」也只是這個退化面向。真實 CUDA job 會補回三個被 `sleep` 結構性抹掉的槓桿：(i) **MPS 共置干擾**（共residents 真的互相拖慢——這正是 sim 用 `interference=0.3` 建模、但 live 完全沒測的東西，是個 sim↔live 不一致）；(ii) **VRAM 限制**（4070 12GB vs 3080 10GB 變成真約束）；(iii) **異質算力**（雖然 4070/3080 raw FP32 接近，差異主要在 VRAM + 干擾）。
+   - **預期**：對**目前過度集中的 checkpoint，真實 job 大概會讓 RL 更慘**（擠 4070 除了排隊還要付干擾代價、又閒置 3080 算力，而 score 的 bin-pack/VRAM/碎片感知終於派上用場）。但這是**更完整、更公平**的測試——它移除了「placement 決策無足輕重」的結構原因，也是唯一能讓**好的** placement 策略展現價值（把 VRAM 重的 job 路由到 12GB 卡、避免過度打包）的場域。應**與第 1 項 multi-seed 配對**：先有非退化的 checkpoint，再用真實 CUDA job 公平檢驗「RL placement 在 placement 真的有 compute 後果時能否贏 Slurm」。
+   - **工程**：把 `live_ab_heavytail.py` 生成器的 `--wrap=sleep N` 換成**參數化 CUDA workload**（一個 matmul/train loop，調到命中目標 *duration + VRAM + compute intensity*，per `job_id` CRN 可重現）。
+5. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
 
 **演算法與韌性**
 
-5. **return normalization（PopArt）** 取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須釘 α=0.05 的 caveat）。
-6. **機制 ablation**（PER / potential shaping / 雙頭 Z_R/Z_H）。
-7. **per-model 各自調好的溫度**（本輪只釘單一 α=0.05）與 **held-out workload split**（如 train philly、test ali）證明泛化。
+6. **return normalization（PopArt）** 取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須釘 α=0.05 的 caveat）。
+7. **機制 ablation**（PER / potential shaping / 雙頭 Z_R/Z_H）；以及把 critic 換成 Duan et al. 原版 DSAC（高斯回報 + 抑制 Q overestimation）對照 SAC——是公平 ablation，但 §3.3 已測過 critic 型別 ≈ 噪音，不太可能翻盤。
+8. **per-model 各自調好的溫度**（本輪只釘單一 α=0.05）與 **held-out workload split**（如 train philly、test ali）證明泛化。
 
 ---
 
