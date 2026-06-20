@@ -38,7 +38,7 @@
 
 1. **sim（§3.1–3.4，σ-sweep 部分已 multi-seed）：注入校準過的不確定性後，三方在 2×1 逼近打平、但沒人贏過 score。** 3 個訓練 seed 的 mean±std **確認**了兩件事：(i) **沒人贏 score**（穩健）；(ii) **arm 間的差異是訓練雜訊**——std 5–30 pts、跟 mean 差同量級，同 config 跨 seed 擺盪 30–70 pts，所以單 seed 看到的「cvar 最好」之類排名**不成立**（§3.1）。拆解上唯一半穩健的 slice 是 σ=1.0：**CVaR 風險扭曲反而扣分**（§3.3）。共置動作即使有第二張卡仍拖累（§3.4）。
 
-2. **🟥 live（§4.1 sleep / §4.2 真實 CUDA）：真實 2-node placement 是乾淨、seed-robust 的四方負結果。** **主要結論用 sleep-job A/B（§4.1，乾淨可比）**：三個 learned arm 全顯著輸 Slurm（**−12~−32% JCT**，multi-seed 確認），因為全把負載擠到 4070（85–92% vs Slurm 均衡）。換真實 cuBLAS job 也跑了（§4.2），但**只能用獨佔 GPU 模式**（node-2 MPS 壞），這同時改了 sharing → 數字（learned −53~−132%）**含「獨佔/低並行度」confound、不能當純真實算力效果**；能說的是「獨佔 regime 下 learned 仍全輸、方向一致」。乾淨的真實算力對照要等 node-2 OS 升級（§5.1）。
+2. **🟥 live（§4.1 sleep / §4.2 真實 CUDA）：真實 2-node placement 是乾淨、seed-robust 的四方負結果。** sleep-job A/B（§4.1）三個 learned arm 全顯著輸 Slurm（**−12~−32% JCT**，multi-seed），因全把負載擠到 4070。**換真實 cuBLAS job（§4.2、分數 MPS 共置、跟 sleep 同 sharing、331 job 全完成）也是 learned 全輸（−16~−35%、cvar 最慘）——只比 sleep 稍差、不是災難。** 拆 JCT 看：run-time 三方一樣（~14s），差別全在 wait（score 7s→cvar 15s），所以即使有真實 compute+MPS 干擾，**主導因素仍是過度集中造成的排隊不均**，與 sleep 同根。（先前獨佔模式的 −132% 是低並行度 confound，已被這版乾淨對照修正。）
 
 **一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement（sleep §4.1 乾淨、真實 CUDA §4.2 獨佔含 confound）兩種都顯示 learned 因退化放置而輸 Slurm。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
 
@@ -335,29 +335,25 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 > 一句話：真實 2-node placement 是**乾淨、且對訓練 seed 穩健的四方負結果**——score 均衡放置（~50/50），三個 learned arm 全把負載擠到 4070（85–92%）、跨 3 個 seed 全顯著輸 Slurm（每個 seed×arm 都是 −7~−31% JCT），沒有任何 seed 翻盤。不是「2-node 解鎖 RL」，而是「**這套 train+placement 會結構性地長出過度集中的退化策略，比 Slurm 均衡放置差**」。要再談 RL placement，得先改掉這個過度集中（multi-seed 確認過、不是 seed 運氣問題）。
 
-### 4.2 真實 CUDA job（獨佔 GPU）：方向一致（learned 仍全輸），但數字含 confound、不能當「純真實算力效果」
+### 4.2 真實 CUDA job（分數 MPS 共置）：乾淨對照——learned 仍全輸，但只比 sleep 稍差，不是災難
 
-把 workload 從 `sleep` 換成**真實 cuBLAS sgemm job**（`gpu_workload.cu`，§6），讓 placement 真的有算力後果。**但有一個誠實的 caveat 先講在前面**：因為 node-2 的 device-plugin MPS 壞了（gpu-operator `config-manager` CrashLoopBackOff，要對齊 node-2 OS 才能修，§5.1），這節只能用**獨佔 GPU 模式**（`--gres=mps:100`，一卡一 job、無共置）。**這同時改了兩個變數**，不只是「sleep→真實 compute」：
+把 workload 從 `sleep` 換成**真實 cuBLAS sgemm job**（`gpu_workload.cu`，§6），讓 placement 真的有算力後果——而且用**跟 sleep 完全一樣的分數 MPS 共置**（`--cuda-workload`、不加 `--exclusive-gpu`、`mps:25`、一卡 ~4 個 job 共置）。這樣只改了**一個變數**（sleep→真實 compute+干擾），是乾淨對照。**前提**：3080 的 MPS 要能多工——這在把 node-2 對齊到 Ubuntu 24.04 後修好了（§5.1 第 4 項、`docs/intergration.md` §12），實測兩節點都能 4/4 並行 CUDA job。3 train seed、σ=1.0、philly、n=14/round、`--interleave`，331 job 全 COMPLETED：
 
-1. sleep → 真實 cuBLAS compute（想測的）；
-2. **分數 MPS（mps:25、一卡可塞 ~4 個）→ 獨佔整張（一卡只跑 1 個）**（副作用）。
+| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | ΔCVaR% | 落點 4070/3080 | wait/run(s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| score | 21.4±0.1 | 55.1 | 37.3 | （baseline）| | 36/64 | 7/14 |
+| SAC | 24.8±1.9 | 59.9 | 44.4 | **−16.1±8.6** | −19.1±14 | 55/45 | 11/14 |
+| RDSAC-mean | 27.5±3.9 | 69.6 | 49.4 | **−28.5±18** | −32.6±24 | 64/36 | 13/14 |
+| RDSAC-cvar | 28.9±2.1 | 76.2 | 54.6 | **−35.1±10** | −46.5±10 | 61/39 | 15/14 |
 
-第 2 點把**並行度從 ~8 砍到 2**（只有 2 張卡、各 1 job），讓**排隊變成壓倒性因素**、放大任何放置不平衡。所以下表的數字**不是乾淨的「真實算力 vs sleep」對照**——它混入了「獨佔/低並行度 regime」的帳。3 train seed、σ=1.0、philly、n=14/round、`--interleave`：
+**判定：learned 仍全輸 score（−16~−35%、cvar 最慘）——但只比 sleep（§4.1：−12~−32%）稍差，不是災難。** 這正面回答了「真實算力會不會讓結果大不同」：**會變差、但幅度溫和**（SAC −16、mean −29、cvar −35）。cvar 最慘、ΔCVaR −47%，跟 sim（§3.3/§3.6）與 sleep（§4.1）完全一致。**seed-robust。**
 
-| arm | JCT(s) | p99(s) | ΔJCT% | 落點 4070/3080 | wait 佔 JCT |
-|---|---:|---:|---:|---:|---:|
-| score | 13.1±0.1 | 26.4±1 | （baseline）| 20/80 | 65% |
-| RDSAC-mean | 20.1±3.2 | 52.6±4 | **−52.9±25** | 42/58 | 69% |
-| SAC | 22.2±2.7 | 58.4±7 | **−68.7±21** | 48/52 | 71% |
-| RDSAC-cvar | 30.5±11.4 | 92.0±47 | **−132.3±86** | 52/48 | 75% |
+**機制：拆 JCT = wait + run 看得很清楚——run 時間三方幾乎一樣（~14s），差別全在 wait（score 7s → cvar 15s）。** 也就是說即使有真實 compute + MPS 共置干擾，**主導因素仍是排隊均衡**：learned arm 把 job 過度集中到 4070（55–64% vs score 36%）→ 該卡佇列變長 → wait 翻倍。真實算力的「干擾」確實存在（co-resident job 互拖、slowdown 8.4→12），但在這個設定下對 run-time 的差異不大；**負結果主要還是來自過度集中造成的排隊不均**——跟 sleep 的結論同根，只是絕對 JCT 更高、% 影響略放大。原始檔 `runs/mps_live_s{42,43,44}/`、彙總 `runs/mps_live_agg.txt`。
 
-**能穩健說的（方向）**：三個 learned arm 在獨佔 real-CUDA regime 下**仍全輸 score**（−53~−132%），**cvar 最慘、變異最大**（±86，與 sim §3.3/§3.6 一致），且 seed-robust。**不能說的**：「真實算力把負結果放大 2–4×」——那個放大幅度**大部分來自並行度從 ~8 降到 2**（獨佔的副作用），不是純真實算力。要乾淨隔離「真實算力」這一個變數，得用**跟 sleep 同樣的分數 MPS（mps:25）共置**跑 real-CUDA，而那需要 3080 的 MPS 能多工 → **要等 node-2 OS 升級（§5.1 第 4 項）**。
+> **方法學註記（為何先前的 −132% 不可信）**：在修好 3080 MPS 之前，曾用**獨佔 GPU 模式**（`--gres=mps:100`、一卡一 job、無共置）跑過一次（`runs/excl_live_*`），得到 learned −53~−132%。但那同時改了第二個變數（分數共置→獨佔），把**並行度從 ~8 砍到 2**、讓排隊變成壓倒因素，所以那組數字**含 confound、被嚴重放大**。本節的分數-MPS 共置版（−16~−35%）才是乾淨對照——也證實了那個 −132% 大部分是低並行度的帳，不是真實算力本身。
 
-**機制（為何獨佔 regime 放大）：JCT 由排隊 wait 主導（65–75%），不是 run time。** 拆 JCT = wait + run：score wait 8.5s、learned wait 14–23s；run 只差 4.6 vs 6–8s。learned arm 雖然看起來 ~50/50，但**實際丟到 4070 的 job 數是 score 的 ~2.5×**（learned n≈28–34 vs score n=13）。獨佔模式下一卡只能跑一 job，4070 被塞太多 → 排成長隊（**4070 job JCT 30–49s vs 3080 11–13s**）→ wait 爆掉。**RL 的 submit-時 `-w` 不看當下節點佔用 → 把 job 硬塞到忙碌的卡上排隊；score（backfill）只放空閒的卡。**
+> 一句話：把 sleep 換成真實 CUDA job（**同樣的分數 MPS 共置**）後，§4.1 的負結果只**稍微變差**（learned −16~−35% vs sleep −12~−32%）——真實算力 + 干擾讓退化放置多付一點代價，但機制同根（過度集中 → 排隊不均），不是質變。learned 在乾淨真實算力下**仍然全輸 Slurm**。
 
-**範圍限制（重要）**：(i) **獨佔模式 = 兩變數混淆**，本節數字不能當純真實算力效果（見上）；(ii) **沒測到 MPS 干擾**（node-2 MPS 壞、要等 OS 升級）；(iii) 單 family（philly）。**主要 live 結論仍以 §4.1（sleep、乾淨可比、−12~−32%）為準**；本節只當「獨佔 regime 下 learned 仍輸、方向一致」的補充觀察。原始檔 `runs/excl_live_s{42,43,44}/`、彙總 `runs/excl_live_agg.txt`。
-
-> 一句話：真實 CUDA job 只能跑**獨佔 GPU**（node-2 MPS 壞），這同時改了 sharing（分數 MPS→整張），所以 learned 的 −53~−132% **含並行度 confound、不能當純真實算力效果**。能穩健說的是「獨佔 regime 下 learned 仍全輸、cvar 最慘、方向跟 §4.1 一致」。乾淨的真實算力對照要等 node-2 OS 升級。**主要 live 結論仍以 §4.1（sleep）為準。**
 
 ---
 
@@ -377,7 +373,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的四方受控對照（score/SAC/RDSAC-mean/cvar）+ 隨機性/共置消融；(6) **2-node 上線管線**：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點，§4.1）、外加修掉 4 個只在多節點現形的 chart bug（releasePriority 科學記號 CrashLoop、netpol 漏列、`-H` hold 被 score/rl_hook 覆蓋、controller 一次只放一個 job）。
 
-**核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1，乾淨可比）；真實 CUDA job（§4.2）只能跑獨佔模式、數字含並行度 confound，但方向一致（learned 仍全輸）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
+**核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1），**真實 CUDA job（分數 MPS 共置、乾淨對照）−16~−35%**（§4.2，只比 sleep 稍差、機制同根）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
 
 ### 5.1 未來工作（Future Work）
 
@@ -401,8 +397,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **讓 live 測試更真實（最可能改變 placement 結論的方向）**
 
-4. ✓ **真實 CUDA job（部分完成，§4.2）+ 待補：乾淨對照 & MPS 共置干擾。** 已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`），跑出**獨佔 GPU**的真實四方 A/B（§4.2）：learned 仍全輸（−53~−132%），但**獨佔模式同時改了 sharing（兩變數混淆）**，所以那個數字**不能當純真實算力效果**——只能說方向跟 §4.1 一致。**剩兩塊（都要等 node-2 OS 升級到 24.04，解開 3080 MPS）**：
-   - **MPS 共置干擾**還沒測。發現重大事實：**叢集的 MPS 從來沒真正多工過**（兩張卡 Exclusive_Process、但沒跑 MPS 控制 daemon；所有舊 live 結果都用 sleep job、無 CUDA context，所以一直沒現形）。4070 的 device-plugin MPS 可用、但 **node-2（3080）的 gpu-operator `config-manager` 一直 CrashLoopBackOff**（`findPidToSignal` panic）。根因是 **node-2 是 Ubuntu 22.04 / driver 580.159、acane 是 24.04 / 580.167**，且 `580.167` 沒為 22.04 打包 → 安全的 driver 對齊不可行。**修法：把 node-2 對齊到 Ubuntu 24.04**（有實體接觸時、獨立排程做），之後就能跑「共置 + 干擾」的 real-CUDA A/B（沿用 `--cuda-workload` 不加 `--exclusive-gpu`）。
+4. ✓ **真實 CUDA job（已完成，§4.2）。** 已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`），跑出**分數 MPS 共置**（跟 sleep 同 sharing）的乾淨真實四方 A/B（§4.2）：learned −16~−35%、只比 sleep 稍差、機制同根（過度集中→排隊不均）。沿途修掉的重大基建問題：**叢集的 MPS 從來沒真正多工過**（兩卡 Exclusive_Process、沒跑 MPS daemon；舊 live 全用 sleep job、無 CUDA context 所以沒現形）；node-2（3080）的 gpu-operator MPS 因 **OS 落後（22.04 vs acane 24.04）**而壞——**把 node-2 對齊到 Ubuntu 24.04 後修好**，兩節點都能 4/4 並行 CUDA（步驟 + 踩雷見 `docs/intergration.md` §12；有趣的是 `config-manager` 在 24.04 仍 cosmetic 地 crash，但 MPS daemon 本身能跑就會多工）。**剩**：VRAM 限制還沒推到綁定（獨佔/共置都沒讓 VRAM 成為約束）、單 family（philly）。
    - **VRAM 限制**（4070 12GB vs 3080 10GB）也還沒推到綁定——獨佔模式 VRAM 沒成為約束。
    - 管線已就緒：`WorkloadSpec`/`--cuda-workload`/`--exclusive-gpu` 都實作 + 測過，binary 已編到 `/shared/bin/gpu_workload`（兩節點）。
 5. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
