@@ -71,14 +71,16 @@ class WorkloadSpec:
     vram_mb: int = 512
     iters_per_sec: float = 145.0   # idle 4070 @ dim=4096 (calibrated 2026-06-20)
     time_factor: float = 20.0      # --time = true_runtime_s × this (slow-card+contention margin)
-    mps_pipe_dir: str = "/tmp/nvidia-mps"  # connect jobs to the MPS server; "" → direct
+    mps_pipe_dir: str = ""  # "" → inherit the prolog-provided device-plugin path
 
     def wrap(self, job: "LiveJob") -> str:
         iters = max(1, int(round(job.true_runtime_s * self.iters_per_sec)))
         seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
-        # The GPUs are Exclusive_Process; without an MPS pipe dir concurrent CUDA
-        # jobs collide ("device busy"). Setting it routes each job through the MPS
-        # server so co-resident jobs actually share the GPU (real interference).
+        # The GPUs are Exclusive_Process, so concurrent CUDA jobs must route
+        # through an MPS server. The cluster's NVIDIA device-plugin manages MPS
+        # at /mps/nvidia.com/gpu/pipe and the 10-mps-env.sh prolog injects that
+        # path into each job — so by default we DON'T override it (normal-user
+        # path). mps_pipe_dir is an escape hatch for a manually-run daemon.
         env = f"CUDA_MPS_PIPE_DIRECTORY={self.mps_pipe_dir} " if self.mps_pipe_dir else ""
         return f"{env}{self.bin_path} {iters} {self.dim} {self.vram_mb} {seed}"
 
