@@ -238,7 +238,20 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 診斷確定後（瓶頸是「訓練退化→過度集中 + 高變異」，不是演算法），對症下兩帖（§5.1 路線，commit `01de2c9`）：**P1** 在 potential 加節點均衡項（`φ -= balance_coef·std(free_mps_per_node)`，Ng et al. 1999 保證不改最優策略、只導引探索遠離擠單卡）；**P2** running-std 回報正規化（PopArt-lite，消手調 `reward_scale` 的脆弱、降 seed 敏感度）。用 `--balance-coef 5.0 --normalize-reward` 在 σ=1.0、3 train seed 重訓三方，對比 baseline（§3.1）：
 
-| family | model | baseline ΔJCT% | **P1+P2 ΔJCT%** | 改善 |
+**P1+P2 絕對指標**（σ=1.0、3 train seed、mean±std、小時；score 參考 JCT philly 2.1h / ali 1.1h）：
+
+| family | model | JCT(h) | p95(h) | p99(h) | ΔJCT% | Δp99%（vs baseline）|
+|---|---|---:|---:|---:|---:|---:|
+| philly | **cvar** | 2.1±0.1 | 9.3±1.1 | 30.4±3.8 | **−4.1±4.6** | **−17%** |
+| philly | sac | 2.3±0.1 | 11.4±0.5 | 28.4±1.5 | −11.8±4.2 | **−30%** |
+| philly | mean | 2.6±0.1 | 11.7±1.2 | 41.0±8.8 | −23.1±7.4 | +39% |
+| ali | cvar | 1.1±0.1 | 4.3±0.9 | 20.4±0.6 | −12.0±12.0 | **−15%** |
+| ali | sac | 1.2±0.1 | 5.5±1.2 | 21.1±0.3 | −15.2±17.5 | +5% |
+| ali | mean | 1.4±0.1 | 6.6±0.5 | 22.7±2.5 | −32.7±10.4 | +6% |
+
+**vs baseline ΔJCT%（§3.1，改善 = 往 0 靠多少）：**
+
+| family | model | baseline ΔJCT% | P1+P2 ΔJCT% | 改善 |
 |---|---|---:|---:|---:|
 | philly | **cvar** | −35.4±16.3 | **−4.1±4.6** | **+31** |
 | philly | sac | −38.3±12.3 | −11.8±4.2 | +27 |
@@ -247,7 +260,9 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | philly | mean | −12.9±10.1 | −23.1±7.4 | −10 |
 | ali | mean | −8.4±3.2 | −32.7±10.4 | −24 |
 
-**判定：對症有效（但未全勝）。** 三個正面證據：(i) **cvar/SAC 大幅靠近 score**（+19~+31 pts），且 **variance 同步收斂**（cvar philly 16.3→**4.6**，`−4.1±4.6` 是全專案最佳+最穩的 sim 結果）；(ii) **過度集中真的被拉回**——cvar 的節點分佈跨 3 seed 從 baseline ~89% 降到 **80/65/67%（平均 ~71%）**，證明 balance shaping 在動；(iii) **`philly cvar s44 = +2.3%`——全專案第一次有 learned arm 在 sim 贏過 score**。**誠實限制**：(a) 仍**沒人「穩健」贏過 score**（最佳 mean −4%）；(b) **RDSAC-mean 反而退步**（−10/−24 pts——balance shaping 與風險中立 arm 互動不良，待查）；(c) 集中度仍 >50%。**結論**：P1+P2 確認「修訓練、別加花招」方向正確——把退化策略往「均衡、低變異、逼近 score」推進了一大步，值得拿去做真實 CUDA job 的實機檢驗（§5.1 第 4 項）。原始檔 `runs/p1p2_2x1_s{42,43,44}/`、彙總 `runs/p1p2_2x1_agg.txt`。
+（CVaR/slowdown 未列：sim σ-sweep harness 只記錄 JCT/p95/p99；CVaR 僅 live panels 有，見 §4.1。）
+
+**判定：對症有效（但未全勝）。** 三個正面證據：(i) **cvar/SAC 大幅靠近 score**（+19~+31 pts），且 **variance 同步收斂**（cvar philly 16.3→**4.6**，`−4.1±4.6` 是全專案最佳+最穩的 sim 結果），**尾部也跟著改善**（cvar p99 −15~−17%、SAC philly p99 −30%）；(ii) **過度集中真的被拉回**——cvar 的節點分佈跨 3 seed 從 baseline ~89% 降到 **80/65/67%（平均 ~71%）**，證明 balance shaping 在動；(iii) **`philly cvar s44 = +2.3%`——全專案第一次有 learned arm 在 sim 贏過 score**。**誠實限制**：(a) 仍**沒人「穩健」贏過 score**（最佳 mean −4%）；(b) **RDSAC-mean 反而退步**（−10/−24 pts——balance shaping 與風險中立 arm 互動不良，待查）；(c) 集中度仍 >50%。**結論**：P1+P2 確認「修訓練、別加花招」方向正確——把退化策略往「均衡、低變異、逼近 score」推進了一大步，值得拿去做真實 CUDA job 的實機檢驗（§5.1 第 4 項）。原始檔 `runs/p1p2_2x1_s{42,43,44}/`、彙總 `runs/p1p2_2x1_agg.txt`。
 
 ---
 
@@ -297,16 +312,24 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **意外的反轉**：sim §3.1 裡 cvar 是「最穩的 learned arm」；**到了真實 placement，cvar 反而最差**——因為它最積極地把 job 往 node 0 集中。risk-sensitivity 在「選哪台卡」這個決策上變成**過度集中**的壞習慣。
 
-**multi-seed 確認（負結果對訓練 seed 穩健）**：上面是單一 checkpoint。為了排除「剛好抽到壞 seed」，用 3 個訓練 seed（42/43/44）的 checkpoint 各跑一次**同樣的四方 placement A/B**（σ=1.0、sleep job、philly），ΔJCT% vs score mean±std：
+**multi-seed 確認（負結果對訓練 seed 穩健）**：上面是單一 checkpoint。為了排除「剛好抽到壞 seed」，用 3 個訓練 seed（42/43/44）的 checkpoint 各跑一次**同樣的四方 placement A/B**（σ=1.0、sleep job、philly、n=80/arm/seed）。下表給**絕對指標**（跨 3 seed mean±std，單位小時），與模擬表格同規格：
 
-| arm | ΔJCT%（mean±std）| per-seed | 落在 4070 |
-|---|---:|---|---:|
-| score | 0（baseline）| — | 48% |
-| RDSAC-mean | **−13.4±4.4** | −16.7 / −7.1 / −16.3 | 85% |
-| SAC | **−21.6±9.6** | −8.4 / −30.9 / −25.5 | 88% |
-| RDSAC-cvar | **−21.2±6.1** | −13.3 / −22.4 / −28.1 | 89% |
+| arm | JCT(h) | p95(h) | p99(h) | CVaR(h) | slowdown | 落在 4070 |
+|---|---:|---:|---:|---:|---:|---:|
+| score | **8.3±0.4** | 33.7±0.5 | **35.9±1.4** | **19.4±0.7** | **2.0±0.2** | 48% |
+| RDSAC-mean | 9.4±0.3 | 33.1±1.4 | 39.3±1.2 | 22.6±0.7 | 2.4±0.1 | 85% |
+| RDSAC-cvar | 10.0±0.6 | 34.0±1.4 | 39.4±1.0 | 23.4±1.6 | 2.6±0.2 | 89% |
+| SAC | 10.1±1.1 | 34.8±0.3 | 40.7±0.4 | 24.1±1.8 | 2.6±0.4 | 88% |
 
-**結論：seed-robust。** 每個 (seed × arm) 都是負的（範圍 −7.1 ~ −30.9），**沒有任何 seed 讓 learned arm 贏過 score**；過度集中也跨 seed 穩定（全部 85–89% 擠 4070 vs score 48%）。所以 §4.1 的負結果**不是單 seed 壞運，是這套 train+placement 的結構性退化**。（RDSAC-mean 一致最輕 −13.4，與 sim multi-seed「mean 是 σ=1.0 最好的 learned arm」一致。）原始檔 `runs/htab_live_mseed_s{42,43,44}/`、彙總 `runs/mseed_live_agg.txt`。**剩餘範圍限制**：單 family（philly）、sleep job（見下 workload caveat）。
+**配對差（vs score，mean±std，每格 t-test p 取 3 seed 平均）：**
+
+| arm | ΔJCT% | Δp99% | ΔCVaR% | p | per-seed ΔJCT |
+|---|---:|---:|---:|---:|---|
+| RDSAC-mean | **−13.4±4.4** | −9.5±1.1 | −16.6±4.4 | 0.062 | −16.7 / −7.1 / −16.3 |
+| RDSAC-cvar | **−21.2±6.1** | −9.9±6.6 | −20.6±8.7 | **0.000** | −13.3 / −22.4 / −28.1 |
+| SAC | **−21.6±9.6** | −13.5±3.5 | −24.0±7.6 | 0.028 | −8.4 / −30.9 / −25.5 |
+
+**結論：seed-robust，且全指標一致變差。** 每個 (seed × arm) 的 ΔJCT 都是負的（範圍 −7.1 ~ −30.9），**沒有任何 seed 讓 learned arm 贏過 score**；不只 mean JCT——**p99 尾部（+3.4~4.8h）、CVaR（−17~−24%）、slowdown（2.0→2.4~2.6）全部一致變差**。過度集中也跨 seed 穩定（85–89% 擠 4070 vs score 48%）。所以 §4.1 的負結果**不是單 seed 壞運，是這套 train+placement 的結構性退化**。（RDSAC-mean 一致最輕，與 sim multi-seed「mean 是 σ=1.0 最好的 learned arm」一致。）原始檔 `runs/htab_live_mseed_s{42,43,44}/`、彙總 `runs/mseed_live_agg_full.txt`。**剩餘範圍限制**：單 family（philly）、sleep job（見下 workload caveat）。
 
 > **workload caveat（重要）**：本 A/B 的 job 是 `sleep N`、**不做 GPU compute**，所以 runtime 與 placement 無關、placement 只影響排隊 wait——這把「共置干擾、VRAM 限制、異質算力」三個真實 placement 槓桿**結構性抹掉**了（sim 反而有用 `interference=0.3` 建模，是個 sim↔live 不一致）。換成真實 CUDA job 會讓測試更完整、也更公平（見 §5.1 第 4 項）；對目前過度集中的 checkpoint 預期會更慘（多付干擾代價），但那才是讓**好的** placement 策略有機會展現價值的場域。
 
