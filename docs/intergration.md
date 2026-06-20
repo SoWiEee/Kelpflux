@@ -457,3 +457,104 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 4. 用 `--n-nodes 2 --gpus-per-node 1` 從頭重訓 DSAC（§7）。
 5. 更新 Dockerfile checkpoint 並重新 `deploy-2.sh`。
 6. 確認 `/healthz` 顯示 `obs_dim=166, n_actions=33`，且 snapshot metrics（`free_mps≈200`、`nodes=2`）對齊。
+
+## 12. node-2 OS 升級：Ubuntu 22.04 → 24.04（修 3080 MPS）
+
+**動機（為什麼要升）**：node-2 被裝成 **Ubuntu 22.04**，但 acane 是 **24.04**。結果 node-2 的 **device-plugin MPS 控制 daemon 的 `config-manager` sidecar 一直 CrashLoopBackOff**（Go panic `index out of range [0]` at `findPidToSignal`），3080 的 MPS 因此**無法多工**——並行 CUDA job 只有 1/N 成功、其餘 `CUDA-capable device(s) is/are busy`。根因是環境差異：
+
+| | acane（node-1, 4070） | node-2（3080） |
+|---|---|---|
+| OS | Ubuntu 24.04 | **Ubuntu 22.04** |
+| NVIDIA driver（host，`driver.enabled=false`）| 580.167.08-1ubuntu1 | **580.159.03-0ubuntu0.22.04.1** |
+| device-plugin MPS | ✅ 多工正常（4/4 並行 OK） | ❌ config-manager crash → 不多工 |
+
+`580.167.08` **沒有為 22.04 打包**（只在 24.04 repo），所以單純對齊 driver 不可行；要對齊就得升 OS。升完 24.04 會順帶把 host driver 帶到 580.167.08。詳見 `docs/eval-writeup.md` §4.2 / §5.1 第 4 項與 memory `project-mps-never-functional`。
+
+> ⚠️ **高風險操作**：`do-release-upgrade` 在遠端機（node-2 = `nutn-admin@192.168.0.104`）上跑會 reboot、且可能中途失敗 → 機器可能變不可達。**強烈建議在能實體接觸/有 console（IPMI/螢幕鍵盤）時做**。一定要在 `tmux`/`screen` 裡跑，並讓 release-upgrade 開第二個 sshd（port 1022）當 fallback。
+
+### 12.1 升級前檢查清單（逐項打勾）
+
+**A. 備份 / 記錄當前狀態（在 node-2 上，存到 `/shared` 讓 acane 也讀得到）**
+```bash
+ssh nutn-admin@192.168.0.104
+sudo mkdir -p /shared/node2-preupgrade && cd /shared/node2-preupgrade
+# OS / kernel / driver / k3s 版本
+{ lsb_release -a; uname -a; cat /proc/driver/nvidia/version; k3s --version; } > versions.txt 2>&1
+# 套件清單（回滾比對用）
+dpkg -l > dpkg-list.txt
+apt-mark showmanual > apt-manual.txt
+# k3s agent 設定 + token + 關鍵設定檔
+sudo cp -a /etc/rancher/k3s /shared/node2-preupgrade/etc-rancher-k3s 2>/dev/null || true
+sudo cp /etc/systemd/system/k3s-agent.service /shared/node2-preupgrade/ 2>/dev/null || true
+# NVIDIA / containerd 設定
+sudo cp -a /etc/nvidia-container-runtime /shared/node2-preupgrade/ 2>/dev/null || true
+nvidia-smi -q > nvidia-smi-q.txt 2>&1
+```
+
+**B. 相容性確認（升級後要用的版本，先查清楚）**
+- [ ] **k3s 版本**：server（acane）是 `v1.34.6+k3s1`。agent 升級後 **kubelet 不能比 apiserver 新**（§3.2、§10）。24.04 上要**重裝 k3s agent 並釘同一版本**：`curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.34.6+k3s1 K3S_URL=... K3S_TOKEN=... sh -`（token/URL 用 §2 的；node-label `gpu-host-class=rtx3080`）。
+- [ ] **NVIDIA driver**：24.04 repo 有 `nvidia-driver-580 580.167.08-1ubuntu1`（= acane）。升完用 `apt-cache policy nvidia-driver-580` 確認 candidate 是 580.167.08。
+- [ ] **gpu-operator**：`driver.enabled=false`（用 host driver），所以重點是 host driver + nvidia-container-toolkit 在 24.04 上裝好；gpu-operator 的 MPS daemonset 會自己 reconcile。
+- [ ] **NFS client**：24.04 要重裝 `nfs-common`（§3.0），否則 `/shared` PVC 掛不上 → worker `ContainerCreating`。
+- [ ] **ufw / 防火牆**：升級可能重置；事後對照 §3.1（acane 端）與 node-2 端的埠（6443/8472/10250/2049 + routed）。
+
+**C. 叢集側的事前準備（在 acane 上）**
+- [ ] **drain / cordon node-2**，避免升級期間排程到它：`kubectl cordon nutnadmin-e500-g9-ws760t && kubectl drain nutnadmin-e500-g9-ws760t --ignore-daemonsets --delete-emptydir-data --force`。
+- [ ] **記下當前 rl-scheduler image**（目前是實驗用 `slurm-rl-scheduler:htabp1p2`；升級這段可先還原 production `m11`，避免實驗 image 卡住）。
+- [ ] **確認 acane（control-plane）健康**，升級期間 4070 + 控制面要能獨撐：`kubectl get nodes`、`scontrol ping`。
+
+**D. 回滾方案（先想好）**
+- node-2 是 **agent / worker**，不是 control-plane → **最壞情況可以整台重裝**：22.04 或直接 24.04 全新安裝，再照本指南 §3–§6 重新 join。所以「升級失敗」不會弄壞叢集，只是 node-2 要重來。
+- do-release-upgrade 失敗時：機器多半還在舊 OS（升級是先下載再切換）；有 console 就能進 recovery。**沒 console 而 SSH 斷掉 = 要實體去處理**——這就是為什麼建議實體在場。
+
+### 12.2 升級步驟
+
+```bash
+# 在 node-2，務必在 tmux 裡（SSH 斷了 upgrade 不會死）
+ssh nutn-admin@192.168.0.104
+tmux new -s osupg
+sudo apt update && sudo apt full-upgrade -y      # 先把 22.04 內更新到最新
+sudo apt install -y update-manager-core
+sudo do-release-upgrade -d   # -d：22.04→24.04 走第一個釋出階段；會自動開 port 1022 的備援 sshd
+# 全程回答 prompt（保留本機改過的設定檔時，k3s/nvidia 相關選 "keep local"）；最後 reboot
+```
+
+### 12.3 升級後驗證（關鍵：3080 MPS 要真的多工）
+
+```bash
+# 1) node-2 回來、OS/driver 已對齊
+ssh nutn-admin@192.168.0.104 'lsb_release -rs; cat /proc/driver/nvidia/version | head -1'
+#   期望：24.04 ；NVRM 580.167.08
+
+# 2) 重裝/確認 k3s agent（釘 server 版本），nfs-common，nvidia-container-toolkit
+#   （見 12.1-B；若 k3s agent 還在就跳過）
+
+# 3) acane 上：node 回 Ready、uncordon
+kubectl uncordon nutnadmin-e500-g9-ws760t
+kubectl get nodes -o wide
+kubectl -n gpu-operator get pods | grep mps-control      # 期望 2/2 Running（不再 CrashLoop）
+
+# 4) Slurm node 回 UP（升級後通常 DOWN/Not responding；清 phantom gres 要 restart slurmctld）
+kubectl -n slurm exec slurm-controller-0 -- scontrol update nodename=slurm-worker-gpu-rtx3080-0 state=RESUME
+kubectl -n slurm exec slurm-controller-0 -- sinfo -N | grep 3080   # idle 無 '*'
+
+# 5) ★ 決定性測試：3080 上 4 個並行 CUDA job 全 COMPLETE（MPS 真的多工）
+LOGIN=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
+kubectl -n slurm exec "$LOGIN" -- bash -c '
+  for k in 1 2 3 4; do
+    sbatch -w slurm-worker-gpu-rtx3080-0 -p gpu --gres=mps:25 --time=5 \
+      --wrap="/shared/bin/gpu_workload 250 4096 256 $k"; done'
+# 等完成後查：4 個都 COMPLETED（升級前是 1 COMPLETED + 3 FAILED）
+```
+
+**第 5 步 4/4 COMPLETED = MPS 修好。** 然後就能跑乾淨的真實算力 real-CUDA 評估（`docs/eval-writeup.md` §5.1 第 4 項）：沿用 `--cuda-workload`、**拿掉 `--exclusive-gpu`**（分數 MPS 共置、跟 sleep 同 sharing），乾淨隔離「真實算力 + 干擾」這一個變數。
+
+### 12.4 升級後常見風險（接 §10）
+
+| 風險 | 現象 | 處理 |
+|------|------|------|
+| k3s agent 比 server 新 | node `NotReady`、kubelet 報版本錯 | 重裝 agent 釘 `INSTALL_K3S_VERSION=v1.34.6+k3s1`（§3.2）|
+| driver 沒升到 580.167 | `nvidia-smi` 仍 580.159 或裝不起來 | `apt-cache policy nvidia-driver-580` 確認 24.04 candidate；`apt install nvidia-driver-580` + reboot |
+| nfs-common 沒了 | worker 卡 `ContainerCreating`、`/shared` 掛不上 | `apt install nfs-common`（§3.0）|
+| Slurm node phantom gres | `AllocTRES=gres/mps=100` 但無 job、新 job `PENDING Resources` | restart slurmctld（`kubectl delete pod slurm-controller-0`）重建 alloc 狀態 |
+| ufw 被重置 | 跨 node pod/slurmd 不通、node `Not responding` | 對照 §3.1 重開埠 + `default allow routed` |
