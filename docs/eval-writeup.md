@@ -318,6 +318,12 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 ### 5.1 未來工作（Future Work）
 
+> **改善路線（針對診斷出來的病灶）。** 實驗證明瓶頸**不是演算法花招**（SAC vs RDSAC vs critic 型別 ≈ 噪音；CVaR/共置甚至扣分），而是**訓練退化**：策略會結構性地過度集中到單卡（live 85–92% vs Slurm ~50%），且訓練高變異（跨 seed 擺盪 30–90 pts）。**過度集中與高變異是同一個病**（退化崩塌）。所以改善優先序是「修訓練、別加花招」：
+>
+> - **(P1) 反過度集中——load-balance reward shaping**：現在的 `_placement_reward` 雖有碎片懲罰但被 `placement_reward_scale=0.01` 壓到可忽略。加一個 **potential-based 的節點均衡項**（φ 多一個 −`balance_coef`·節點 free-MPS 不均衡；Ng et al. 1999 保證不改最優策略，只導引探索遠離「擠單卡」）。**最對症**。
+> - **(P2) 訓練穩定——return normalization**：用 running mean/std 正規化回報（PopArt-lite），消掉手調 `reward_scale=20000` 的脆弱、降 seed 敏感度。
+> - 做完 P1+P2 → 重跑 multi-seed σ-sweep，比「過度集中是否收斂到均衡、跨 seed 變異是否變小、有沒有更接近 score」。**若有效 → 換真實 CUDA job（下方第 4 項）做最終實機檢驗**。
+
 依「擋住結論的程度」排序：
 
 **讓現有結論站得住（方法學門檻）**

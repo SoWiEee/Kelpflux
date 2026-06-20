@@ -256,6 +256,7 @@ class KubefluxSchedEnv:
         reward_scale: float = 1000.0,
         placement_reward_scale: float = 0.01,
         potential_shaping: bool = False,
+        balance_coef: float = 0.0,
         runtime_sigma: float = 0.0,
         interference: float = 0.0,
         colocation_actions: bool = False,
@@ -276,6 +277,11 @@ class KubefluxSchedEnv:
         self.placement_reward_scale = float(placement_reward_scale)
         self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
         self.potential_shaping      = potential_shaping
+        # P1 (anti-over-concentration): potential-based node-balance shaping.
+        # φ gains a −balance_coef·imbalance term so moving toward an even free-MPS
+        # split across nodes earns shaping reward (Ng et al. 1999: optimal policy
+        # unchanged, only exploration is guided away from crowding one card).
+        self.balance_coef           = float(balance_coef)
         # ── Stochastic execution (opt-in; 0/0 = legacy deterministic env) ──
         # runtime_sigma : multiplicative mean-preserving lognormal noise on the
         #                 *realized* runtime. The obs still shows the nominal
@@ -390,7 +396,7 @@ class KubefluxSchedEnv:
                 end_charge -= (st.now - j.submit_ts) / self.reward_scale
 
         reward = r_place + st.completion_reward + end_charge
-        if self.potential_shaping:
+        if self.potential_shaping or self.balance_coef > 0.0:
             reward += 0.99 * self._potential() - phi_prev
         obs    = self._build_obs()
         info   = {
@@ -623,8 +629,26 @@ class KubefluxSchedEnv:
         st  = self._state
         now = st.now
         n   = max(1, st.n_jobs)
-        return -sum(max(0.0, now - j.submit_ts)
-                    for j in st.pending) / (self.reward_scale * n)
+        phi = -sum(max(0.0, now - j.submit_ts)
+                   for j in st.pending) / (self.reward_scale * n)
+        if self.balance_coef > 0.0 and st.cluster.n_nodes > 1:
+            phi -= self.balance_coef * self._imbalance()
+        return phi
+
+    def _imbalance(self) -> float:
+        """Normalized free-MPS imbalance across nodes (0 = perfectly balanced).
+
+        std(free_mps_per_node) / mps_per_gpu — penalizes concentrating load on a
+        subset of nodes. Used by the P1 balance-shaping potential.
+        """
+        if self._state is None:
+            return 0.0
+        per_node = self._state.cluster.free_mps_per_node()
+        if len(per_node) < 2:
+            return 0.0
+        mean = sum(per_node) / len(per_node)
+        var  = sum((x - mean) ** 2 for x in per_node) / len(per_node)
+        return math.sqrt(var) / max(1.0, float(self.mps_per_gpu))
 
     def episode_jcts(self) -> list[float]:
         """Per-job JCTs of completed jobs this episode (for tail metrics)."""

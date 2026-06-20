@@ -217,6 +217,8 @@ def sim_train(
     target_entropy_ratio: float = 0.1,
     # New improvements
     potential_shaping: bool = True,
+    balance_coef: float = 0.0,        # P1: potential-based node-balance shaping
+    normalize_reward: bool = False,   # P2: running-std reward normalization (PopArt-lite)
     use_per: bool = True,
     risk_mode: str = "mean",
     risk_beta: float = 0.25,
@@ -259,6 +261,7 @@ def sim_train(
         reward_mode=reward_mode,
         reward_scale=reward_scale,
         potential_shaping=potential_shaping,
+        balance_coef=balance_coef,
         runtime_sigma=runtime_sigma,
         interference=interference,
         colocation_actions=colocation,
@@ -320,6 +323,25 @@ def sim_train(
     last_losses: dict = {}
     t0 = time.time()
 
+    # P2: running-std reward normalization (PopArt-lite). Welford running second
+    # moment of the reward; rew/(std+eps) keeps the critic target O(1) without a
+    # hand-tuned reward_scale, reducing seed sensitivity. Mean is kept (only the
+    # scale is normalized) so the sign/structure of the reward is preserved.
+    _rn_count = 0
+    _rn_mean = 0.0
+    _rn_m2 = 0.0
+
+    def _normalize(r: float) -> float:
+        nonlocal _rn_count, _rn_mean, _rn_m2
+        _rn_count += 1
+        d = r - _rn_mean
+        _rn_mean += d / _rn_count
+        _rn_m2 += d * (r - _rn_mean)
+        if not normalize_reward or _rn_count < 2:
+            return r
+        std = (_rn_m2 / _rn_count) ** 0.5
+        return r / (std + 1e-6)
+
     for step in range(total_steps):
         # ── Curriculum: switch n_jobs when crossing a stage boundary ────
         if curriculum_stages is not None:
@@ -370,7 +392,7 @@ def sim_train(
 
         done = bool(term or trunc)
         nstep_buf.append(Transition(
-            obs=obs, act=act, rew=float(rew),
+            obs=obs, act=act, rew=_normalize(float(rew)),
             next_obs=next_obs, done=done,
             mask=mask, next_mask=next_mask,
         ))

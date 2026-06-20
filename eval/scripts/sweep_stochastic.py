@@ -122,6 +122,8 @@ def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args) -> DSACA
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
         colocation=args.colocation,
         seed=args.train_seed,
+        balance_coef=args.balance_coef,
+        normalize_reward=args.normalize_reward,
     )
 
 
@@ -141,6 +143,11 @@ def main(argv=None) -> int:
                    help="training RNG seed (the multi-seed knob: run the sweep "
                         "several times with different --train-seed to get "
                         "mean±std per (σ, arm) and beat the single-seed caveat)")
+    p.add_argument("--balance-coef", type=float, default=0.0,
+                   help="P1: potential-based node-balance shaping coefficient "
+                        "(0 = off; ~5 penalizes crowding one card)")
+    p.add_argument("--normalize-reward", action="store_true",
+                   help="P2: running-std reward normalization (PopArt-lite)")
     p.add_argument("--trace-families", nargs="+", default=["philly", "burst", "ali"])
     p.add_argument("--risk-mode", default="cvar")
     p.add_argument("--risk-modes", nargs="+", default=None,
