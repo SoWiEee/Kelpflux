@@ -210,7 +210,8 @@ def job_name(arm: str, round_idx: int, job_id: str) -> str:
 def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
                partition: str = "gpu-rtx4070", hold: bool | None = None,
                nodelist: str | None = None,
-               workload: "WorkloadSpec | None" = None) -> list[str]:
+               workload: "WorkloadSpec | None" = None,
+               exclusive_gpu: bool = False) -> list[str]:
     """Build the sbatch argv for one job. --time uses the (noisy) *reported*
     estimate the scheduler sees; the job actually sleeps the *true* runtime.
 
@@ -243,10 +244,14 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         cmd.append("-H")  # before the job spec → parsed as a submit flag
     if nodelist:
         cmd += ["-w", nodelist]  # submit-time RL node choice
+    # exclusive_gpu: each job takes the WHOLE GPU (mps:100) → one job per GPU,
+    # no co-residency. Sidesteps MPS multiplexing (needed because node-2's MPS is
+    # broken) while keeping the real-CUDA heterogeneity + queueing placement test.
+    mps = 100 if exclusive_gpu else job.mps_req
     cmd += [
         f"--job-name={job_name(arm, round_idx, job.job_id)}",
         f"--partition={partition}",
-        f"--gres=mps:{job.mps_req}",
+        f"--gres=mps:{mps}",
         f"--time={time_min}",
         f"--comment={comment}",
         f"--wrap={wrap}",
@@ -397,7 +402,8 @@ def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
                   t0: Optional[float] = None,
                   exec_prefix: Optional[list[str]] = None,
                   place_fn=None, placement: bool = False,
-                  workload: "WorkloadSpec | None" = None) -> None:
+                  workload: "WorkloadSpec | None" = None,
+                  exclusive_gpu: bool = False) -> None:
     """Submit the stream honouring each job's arrival_offset. dry_run prints.
 
     `exec_prefix` (e.g. ["kubectl","exec","-n","slurm","pod/slurm-login-x","--"])
@@ -424,7 +430,8 @@ def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
         hold = False if placement else None
         cmd = (exec_prefix or []) + sbatch_cmd(job, arm, round_idx,
                                                partition=partition, nodelist=nodelist,
-                                               hold=hold, workload=workload)
+                                               hold=hold, workload=workload,
+                                               exclusive_gpu=exclusive_gpu)
         if dry_run:
             print(" ".join(cmd))
             continue

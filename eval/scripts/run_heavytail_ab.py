@@ -207,7 +207,7 @@ def run(args) -> int:
             submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
                           partition=args.partition, exec_prefix=exec_prefix,
                           place_fn=place_fn, placement=args.placement,
-                          workload=workload)
+                          workload=workload, exclusive_gpu=args.exclusive_gpu)
             if args.dry_run:
                 return
             wait_drain(kubectl=args.kubectl, namespace=args.namespace,
@@ -271,6 +271,9 @@ def main(argv=None) -> int:
     # MPS interference / VRAM / heterogeneous-card speed surface in JCT.
     p.add_argument("--cuda-workload", action="store_true",
                    help="run real CUDA jobs (gpu_workload sgemm) instead of sleep N")
+    p.add_argument("--exclusive-gpu", action="store_true",
+                   help="each job takes the whole GPU (--gres=mps:100, no co-residency); "
+                        "sidesteps MPS multiplexing, keeps heterogeneity + queueing")
     p.add_argument("--workload-bin", default="/shared/bin/gpu_workload",
                    help="path to the compiled gpu_workload binary (on shared NFS)")
     p.add_argument("--workload-dim", type=int, default=4096,
