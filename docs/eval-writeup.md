@@ -38,9 +38,9 @@
 
 1. **sim（§3.1–3.4，σ-sweep 部分已 multi-seed）：注入校準過的不確定性後，三方在 2×1 逼近打平、但沒人贏過 score。** 3 個訓練 seed 的 mean±std **確認**了兩件事：(i) **沒人贏 score**（穩健）；(ii) **arm 間的差異是訓練雜訊**——std 5–30 pts、跟 mean 差同量級，同 config 跨 seed 擺盪 30–70 pts，所以單 seed 看到的「cvar 最好」之類排名**不成立**（§3.1）。拆解上唯一半穩健的 slice 是 σ=1.0：**CVaR 風險扭曲反而扣分**（§3.3）。共置動作即使有第二張卡仍拖累（§3.4）。
 
-2. **🟥 live（§4.1 sleep / §4.2 真實 CUDA）：真實 2-node placement 是乾淨、seed-robust 的四方負結果。** sleep-job A/B（§4.1）三個 learned arm 全顯著輸 Slurm（**−12~−32% JCT**，multi-seed 確認），因為全把負載擠到 4070（85–92% vs Slurm 均衡）。**把 sleep 換成真實 cuBLAS job（§4.2，獨佔 GPU）→ 負結果放大 2–4×**（learned **−53~−132%**，cvar 最慘），因為獨佔佇列下 RL 不看佔用的 `-w` 放置把 job 硬塞到忙碌的卡上排隊（JCT 由 wait 主導 65–75%）。**placement 越有真實後果，這套退化策略越輸 Slurm。**
+2. **🟥 live（§4.1 sleep / §4.2 真實 CUDA）：真實 2-node placement 是乾淨、seed-robust 的四方負結果。** **主要結論用 sleep-job A/B（§4.1，乾淨可比）**：三個 learned arm 全顯著輸 Slurm（**−12~−32% JCT**，multi-seed 確認），因為全把負載擠到 4070（85–92% vs Slurm 均衡）。換真實 cuBLAS job 也跑了（§4.2），但**只能用獨佔 GPU 模式**（node-2 MPS 壞），這同時改了 sharing → 數字（learned −53~−132%）**含「獨佔/低並行度」confound、不能當純真實算力效果**；能說的是「獨佔 regime 下 learned 仍全輸、方向一致」。乾淨的真實算力對照要等 node-2 OS 升級（§5.1）。
 
-**一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement（sleep 與真實 CUDA 都測過）因退化放置而顯著輸 Slurm、真實算力下更慘。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
+**一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement（sleep §4.1 乾淨、真實 CUDA §4.2 獨佔含 confound）兩種都顯示 learned 因退化放置而輸 Slurm。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
 
 **兩個 load-bearing caveats：**（1）**訓練高變異（已用 multi-seed 量化、兩端都固實）**——sim σ-sweep（§3.1）與 live placement（§4.1）**都已用 3 個訓練 seed 跑 mean±std**：sim 確認「沒人贏 score、arm 排名是訓練雜訊」，live 確認「負結果 seed-robust（每個 seed×arm 都輸 score）」。訓練本身高變異（同 config 跨 seed 擺盪 30–70 pts）是這套方法的核心限制；（2）σ 是合成 trace 的最難預測上界，真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
 
@@ -335,9 +335,14 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 > 一句話：真實 2-node placement 是**乾淨、且對訓練 seed 穩健的四方負結果**——score 均衡放置（~50/50），三個 learned arm 全把負載擠到 4070（85–92%）、跨 3 個 seed 全顯著輸 Slurm（每個 seed×arm 都是 −7~−31% JCT），沒有任何 seed 翻盤。不是「2-node 解鎖 RL」，而是「**這套 train+placement 會結構性地長出過度集中的退化策略，比 Slurm 均衡放置差**」。要再談 RL placement，得先改掉這個過度集中（multi-seed 確認過、不是 seed 運氣問題）。
 
-### 4.2 真實 CUDA job（獨佔 GPU）：placement 有真實算力後果時，負結果放大 2–4×
+### 4.2 真實 CUDA job（獨佔 GPU）：方向一致（learned 仍全輸），但數字含 confound、不能當「純真實算力效果」
 
-§4.1 的 caveat 是 job 用 `sleep`、placement 只影響排隊。這節把 workload 換成**真實 cuBLAS sgemm job**（`gpu_workload.cu`，§6），讓 placement 真的有算力後果。**因為 node-2 的 device-plugin MPS 壞了（gpu-operator `config-manager` CrashLoopBackOff，需對齊 node-2 OS 才能修，§5.1）**，這節用**獨佔 GPU 模式**（`--gres=mps:100`，一卡一 job、無共置）——犧牲「MPS 共置干擾」訊號（sim §3.3/§3.6 已涵蓋），但保留 sleep job 測不到的兩個真實槓桿：**4070 vs 3080 的 ~4× 異質算力**、與**獨佔佇列**（一卡同時只跑一 job）。3 train seed、σ=1.0、philly、n=14/round、`--interleave`：
+把 workload 從 `sleep` 換成**真實 cuBLAS sgemm job**（`gpu_workload.cu`，§6），讓 placement 真的有算力後果。**但有一個誠實的 caveat 先講在前面**：因為 node-2 的 device-plugin MPS 壞了（gpu-operator `config-manager` CrashLoopBackOff，要對齊 node-2 OS 才能修，§5.1），這節只能用**獨佔 GPU 模式**（`--gres=mps:100`，一卡一 job、無共置）。**這同時改了兩個變數**，不只是「sleep→真實 compute」：
+
+1. sleep → 真實 cuBLAS compute（想測的）；
+2. **分數 MPS（mps:25、一卡可塞 ~4 個）→ 獨佔整張（一卡只跑 1 個）**（副作用）。
+
+第 2 點把**並行度從 ~8 砍到 2**（只有 2 張卡、各 1 job），讓**排隊變成壓倒性因素**、放大任何放置不平衡。所以下表的數字**不是乾淨的「真實算力 vs sleep」對照**——它混入了「獨佔/低並行度 regime」的帳。3 train seed、σ=1.0、philly、n=14/round、`--interleave`：
 
 | arm | JCT(s) | p99(s) | ΔJCT% | 落點 4070/3080 | wait 佔 JCT |
 |---|---:|---:|---:|---:|---:|
@@ -346,11 +351,11 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | SAC | 22.2±2.7 | 58.4±7 | **−68.7±21** | 48/52 | 71% |
 | RDSAC-cvar | 30.5±11.4 | 92.0±47 | **−132.3±86** | 52/48 | 75% |
 
-**判定：負結果放大 2–4×、且 seed-robust。** 三個 learned arm 全輸 score——SAC −69%、mean −53%、**cvar −132%**（vs §4.1 sleep 的 −12~−32%）。**cvar 最慘、變異最大**（±86），與 sim（§3.3 σ=1.0 CVaR 扣分、§3.6 cvar 高變異）一致。
+**能穩健說的（方向）**：三個 learned arm 在獨佔 real-CUDA regime 下**仍全輸 score**（−53~−132%），**cvar 最慘、變異最大**（±86，與 sim §3.3/§3.6 一致），且 seed-robust。**不能說的**：「真實算力把負結果放大 2–4×」——那個放大幅度**大部分來自並行度從 ~8 降到 2**（獨佔的副作用），不是純真實算力。要乾淨隔離「真實算力」這一個變數，得用**跟 sleep 同樣的分數 MPS（mps:25）共置**跑 real-CUDA，而那需要 3080 的 MPS 能多工 → **要等 node-2 OS 升級（§5.1 第 4 項）**。
 
-**機制（為何放大）：JCT 由排隊 wait 主導（65–75%），不是 run time。** 拆 JCT = wait + run：score wait 8.5s，learned wait 14–23s；run 只差 4.6 vs 6–8s。關鍵在**獨佔佇列**——learned arm 雖然看起來 ~50/50，但**實際丟到 4070 的 job 數是 score 的 ~2.5×**（learned n≈28–34 vs score n=13）。獨佔模式下一卡只能跑一 job，4070 被塞太多 → 排成長隊（**4070 上的 job JCT 30–49s vs 3080 上的 11–13s**）→ wait 爆掉。score 反而把大宗 job 卸到 3080、讓兩卡的佇列都短。**也就是：在「placement 有真實後果」的場域，RL 的 submit-時 `-w` 放置不看當下節點佔用 → 把 job 硬塞到忙碌的卡上排隊；score（backfill）只放到空閒的卡 → 排隊短。**
+**機制（為何獨佔 regime 放大）：JCT 由排隊 wait 主導（65–75%），不是 run time。** 拆 JCT = wait + run：score wait 8.5s、learned wait 14–23s；run 只差 4.6 vs 6–8s。learned arm 雖然看起來 ~50/50，但**實際丟到 4070 的 job 數是 score 的 ~2.5×**（learned n≈28–34 vs score n=13）。獨佔模式下一卡只能跑一 job，4070 被塞太多 → 排成長隊（**4070 job JCT 30–49s vs 3080 11–13s**）→ wait 爆掉。**RL 的 submit-時 `-w` 不看當下節點佔用 → 把 job 硬塞到忙碌的卡上排隊；score（backfill）只放空閒的卡。**
 
-**範圍限制**：獨佔模式（無共置）→ **沒測到 MPS 干擾**這個槓桿（node-2 MPS 修好後可補；sim §3.3/§3.6 已涵蓋干擾），單 family（philly）。但**四方一致、放大顯著、seed-robust**——「真實算力後果讓 RL placement 的退化更嚴重」是穩健結論。原始檔 `runs/excl_live_s{42,43,44}/`、彙總 `runs/excl_live_agg.txt`。
+**範圍限制（重要）**：(i) **獨佔模式 = 兩變數混淆**，本節數字不能當純真實算力效果（見上）；(ii) **沒測到 MPS 干擾**（node-2 MPS 壞、要等 OS 升級）；(iii) 單 family（philly）。**主要 live 結論仍以 §4.1（sleep、乾淨可比、−12~−32%）為準**；本節只當「獨佔 regime 下 learned 仍輸、方向一致」的補充觀察。原始檔 `runs/excl_live_s{42,43,44}/`、彙總 `runs/excl_live_agg.txt`。
 
 > 一句話：把 sleep 換成真實 CUDA job（獨佔 GPU）後，§4.1 的負結果**放大 2–4 倍**（learned −53~−132% vs sleep 的 −12~−32%）——因為獨佔佇列下，RL 不看佔用的 `-w` 放置把 job 塞到忙碌的卡上排隊，wait 爆掉。**placement 越有真實後果，這套退化策略越輸 Slurm。**
 
@@ -372,7 +377,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的四方受控對照（score/SAC/RDSAC-mean/cvar）+ 隨機性/共置消融；(6) **2-node 上線管線**：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點，§4.1）、外加修掉 4 個只在多節點現形的 chart bug（releasePriority 科學記號 CrashLoop、netpol 漏列、`-H` hold 被 score/rl_hook 覆蓋、controller 一次只放一個 job）。
 
-**核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1），**換真實 CUDA job（獨佔 GPU）負結果放大到 −53~−132%**（§4.2，placement 有真實後果就更慘）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
+**核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1，乾淨可比）；真實 CUDA job（§4.2）只能跑獨佔模式、數字含並行度 confound，但方向一致（learned 仍全輸）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
 
 ### 5.1 未來工作（Future Work）
 
