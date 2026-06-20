@@ -357,7 +357,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **範圍限制（重要）**：(i) **獨佔模式 = 兩變數混淆**，本節數字不能當純真實算力效果（見上）；(ii) **沒測到 MPS 干擾**（node-2 MPS 壞、要等 OS 升級）；(iii) 單 family（philly）。**主要 live 結論仍以 §4.1（sleep、乾淨可比、−12~−32%）為準**；本節只當「獨佔 regime 下 learned 仍輸、方向一致」的補充觀察。原始檔 `runs/excl_live_s{42,43,44}/`、彙總 `runs/excl_live_agg.txt`。
 
-> 一句話：把 sleep 換成真實 CUDA job（獨佔 GPU）後，§4.1 的負結果**放大 2–4 倍**（learned −53~−132% vs sleep 的 −12~−32%）——因為獨佔佇列下，RL 不看佔用的 `-w` 放置把 job 塞到忙碌的卡上排隊，wait 爆掉。**placement 越有真實後果，這套退化策略越輸 Slurm。**
+> 一句話：真實 CUDA job 只能跑**獨佔 GPU**（node-2 MPS 壞），這同時改了 sharing（分數 MPS→整張），所以 learned 的 −53~−132% **含並行度 confound、不能當純真實算力效果**。能穩健說的是「獨佔 regime 下 learned 仍全輸、cvar 最慘、方向跟 §4.1 一致」。乾淨的真實算力對照要等 node-2 OS 升級。**主要 live 結論仍以 §4.1（sleep）為準。**
 
 ---
 
@@ -401,7 +401,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **讓 live 測試更真實（最可能改變 placement 結論的方向）**
 
-4. ✓ **真實 CUDA job（部分完成，§4.2）+ 待補：MPS 共置干擾。** 已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`），跑出**獨佔 GPU**的真實四方 A/B（§4.2）：負結果放大 2–4×（learned −53~−132%）。**已驗證的預期**——真實算力後果讓退化放置更慘。**剩兩塊**：
+4. ✓ **真實 CUDA job（部分完成，§4.2）+ 待補：乾淨對照 & MPS 共置干擾。** 已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`），跑出**獨佔 GPU**的真實四方 A/B（§4.2）：learned 仍全輸（−53~−132%），但**獨佔模式同時改了 sharing（兩變數混淆）**，所以那個數字**不能當純真實算力效果**——只能說方向跟 §4.1 一致。**剩兩塊（都要等 node-2 OS 升級到 24.04，解開 3080 MPS）**：
    - **MPS 共置干擾**還沒測。發現重大事實：**叢集的 MPS 從來沒真正多工過**（兩張卡 Exclusive_Process、但沒跑 MPS 控制 daemon；所有舊 live 結果都用 sleep job、無 CUDA context，所以一直沒現形）。4070 的 device-plugin MPS 可用、但 **node-2（3080）的 gpu-operator `config-manager` 一直 CrashLoopBackOff**（`findPidToSignal` panic）。根因是 **node-2 是 Ubuntu 22.04 / driver 580.159、acane 是 24.04 / 580.167**，且 `580.167` 沒為 22.04 打包 → 安全的 driver 對齊不可行。**修法：把 node-2 對齊到 Ubuntu 24.04**（有實體接觸時、獨立排程做），之後就能跑「共置 + 干擾」的 real-CUDA A/B（沿用 `--cuda-workload` 不加 `--exclusive-gpu`）。
    - **VRAM 限制**（4070 12GB vs 3080 10GB）也還沒推到綁定——獨佔模式 VRAM 沒成為約束。
    - 管線已就緒：`WorkloadSpec`/`--cuda-workload`/`--exclusive-gpu` 都實作 + 測過，binary 已編到 `/shared/bin/gpu_workload`（兩節點）。
