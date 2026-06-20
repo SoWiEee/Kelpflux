@@ -131,6 +131,7 @@ def gen_workload(
     mps_oversub: float = 4.0,
     arrival_window_frac: float = 0.1,
     arrival_mode: str = "burst",
+    mps_buckets: Optional[List[int]] = None,
 ) -> List[LiveJob]:
     """Produce a heavy-tail, oversubscribed, σ-noisy LiveJob stream.
 
@@ -179,17 +180,30 @@ def gen_workload(
 
     base_mps = np.array([max(1, int(j.mps_req)) for j in jobs], dtype=float)
 
-    # Scale MPS so demand-peak ≈ mps_oversub × capacity. Build a provisional stream
-    # to measure the raw peak under these arrivals, then rescale.
-    provisional = [
-        LiveJob(ids[i], float(arrivals[i]), float(true[i]), float(reported[i]),
-                int(np.clip(round(base_mps[i]), 1, LIVE_GPU_MPS)))
-        for i in range(n)
-    ]
-    raw_peak = peak_concurrent_mps(provisional)
-    target_peak = mps_oversub * LIVE_GPU_MPS
-    mps_scale = target_peak / max(1, raw_peak)
-    final_mps = np.clip(np.round(base_mps * mps_scale), 1, LIVE_GPU_MPS).astype(int)
+    if mps_buckets:
+        # Heterogeneous GPU-fraction demands snapped to clean MPS-slot buckets
+        # (e.g. 25/50/75/100 = 1/2/3/4 of the 4-slot card; 100 = whole GPU, no
+        # co-residency). Bucket chosen by the job's size RANK so bigger jobs ask
+        # for more GPU (realistic) AND every bucket appears; CRN-stable because
+        # the rank derives from the deterministic `true` runtimes (seed-fixed),
+        # so the same job_id gets the same bucket across arms.
+        buckets = sorted(int(b) for b in mps_buckets)
+        order = np.argsort(np.argsort(true))          # 0..n-1 rank by runtime
+        idx = (order * len(buckets) // max(1, n)).clip(0, len(buckets) - 1)
+        final_mps = np.array([buckets[k] for k in idx], dtype=int)
+        final_mps = np.clip(final_mps, 1, LIVE_GPU_MPS).astype(int)
+    else:
+        # Scale MPS so demand-peak ≈ mps_oversub × capacity. Build a provisional
+        # stream to measure the raw peak under these arrivals, then rescale.
+        provisional = [
+            LiveJob(ids[i], float(arrivals[i]), float(true[i]), float(reported[i]),
+                    int(np.clip(round(base_mps[i]), 1, LIVE_GPU_MPS)))
+            for i in range(n)
+        ]
+        raw_peak = peak_concurrent_mps(provisional)
+        target_peak = mps_oversub * LIVE_GPU_MPS
+        mps_scale = target_peak / max(1, raw_peak)
+        final_mps = np.clip(np.round(base_mps * mps_scale), 1, LIVE_GPU_MPS).astype(int)
 
     return [
         LiveJob(ids[i], float(arrivals[i]), float(true[i]), float(reported[i]),

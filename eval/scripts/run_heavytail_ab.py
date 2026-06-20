@@ -165,6 +165,7 @@ def run(args) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     sigmas = [float(s) for s in args.sigmas]
+    mps_buckets = [int(b) for b in args.mps_buckets.split(",") if b.strip()] or None
     all_records: list[dict] = []
     reports: list[dict] = []
 
@@ -189,7 +190,7 @@ def run(args) -> int:
         # Same stream for every method at this σ (CRN: identical generator inputs).
         jobs = gen_workload(args.family, args.n_jobs, seed=args.seed, sigma=sigma,
                             target_max_s=args.target_max_s, mps_oversub=args.mps_oversub,
-                            arrival_mode=args.arrival_mode)
+                            arrival_mode=args.arrival_mode, mps_buckets=mps_buckets)
         records_by_arm: dict = {a: [] for a in arms}
 
         def _do(arm: str, rnd: int, is_warm: bool) -> None:
@@ -264,6 +265,11 @@ def main(argv=None) -> int:
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--target-max-s", type=float, default=180.0)
     p.add_argument("--mps-oversub", type=float, default=4.0)
+    p.add_argument("--mps-buckets", default="",
+                   help="comma-separated MPS-slot buckets, e.g. '25,50,75,100' "
+                        "(1/2/3/4 of the 4-slot card; 100=whole GPU). Assigns each "
+                        "job a clean fraction by size-rank instead of the scaled "
+                        "demand-peak value. Empty = legacy oversub scaling.")
     p.add_argument("--arrival-mode", choices=["burst", "poisson"], default="burst")
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--partition", default="gpu-rtx4070")
