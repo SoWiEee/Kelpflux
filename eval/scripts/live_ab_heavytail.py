@@ -71,11 +71,16 @@ class WorkloadSpec:
     vram_mb: int = 512
     iters_per_sec: float = 145.0   # idle 4070 @ dim=4096 (calibrated 2026-06-20)
     time_factor: float = 20.0      # --time = true_runtime_s × this (slow-card+contention margin)
+    mps_pipe_dir: str = "/tmp/nvidia-mps"  # connect jobs to the MPS server; "" → direct
 
     def wrap(self, job: "LiveJob") -> str:
         iters = max(1, int(round(job.true_runtime_s * self.iters_per_sec)))
         seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
-        return f"{self.bin_path} {iters} {self.dim} {self.vram_mb} {seed}"
+        # The GPUs are Exclusive_Process; without an MPS pipe dir concurrent CUDA
+        # jobs collide ("device busy"). Setting it routes each job through the MPS
+        # server so co-resident jobs actually share the GPU (real interference).
+        env = f"CUDA_MPS_PIPE_DIRECTORY={self.mps_pipe_dir} " if self.mps_pipe_dir else ""
+        return f"{env}{self.bin_path} {iters} {self.dim} {self.vram_mb} {seed}"
 
     def time_min(self, job: "LiveJob") -> int:
         return max(2, int(np.ceil(job.true_runtime_s * self.time_factor / 60.0)))

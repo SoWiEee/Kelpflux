@@ -1,0 +1,35 @@
+# P1+P2 real-CUDA live A/B image — bakes the σ=1.0 P1+P2 checkpoints (balance
+# shaping + reward normalization, §3.6) for all 3 train seeds (42/43/44) so
+# run_heavytail_ab can /reload each seed's arms. Boot model = cvar s42 (166-dim).
+#
+# Build (context = repo root):
+#   docker build -t slurm-rl-scheduler:htabp1p2 -f services/rl_scheduler/Dockerfile.htab_p1p2 .
+FROM python:3.12-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY services/rl_scheduler/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY sim /app/sim
+COPY services/rl_scheduler /app/services/rl_scheduler
+COPY services/__init__.py /app/services/__init__.py
+
+# 166-dim boot model + per-seed σ=1.0 P1+P2 arms (9) under /models/htab/
+COPY runs/p1p2_2x1_s42/ckpt_rdsac-cvar_sigma1.0.pt /models/dsac.pt
+COPY runs/p1p2_2x1_s42/ckpt_sac_sigma1.0.pt        /models/htab/sac_s42.pt
+COPY runs/p1p2_2x1_s42/ckpt_rdsac-mean_sigma1.0.pt /models/htab/rdsac_mean_s42.pt
+COPY runs/p1p2_2x1_s42/ckpt_rdsac-cvar_sigma1.0.pt /models/htab/rdsac_cvar_s42.pt
+COPY runs/p1p2_2x1_s43/ckpt_sac_sigma1.0.pt        /models/htab/sac_s43.pt
+COPY runs/p1p2_2x1_s43/ckpt_rdsac-mean_sigma1.0.pt /models/htab/rdsac_mean_s43.pt
+COPY runs/p1p2_2x1_s43/ckpt_rdsac-cvar_sigma1.0.pt /models/htab/rdsac_cvar_s43.pt
+COPY runs/p1p2_2x1_s44/ckpt_sac_sigma1.0.pt        /models/htab/sac_s44.pt
+COPY runs/p1p2_2x1_s44/ckpt_rdsac-mean_sigma1.0.pt /models/htab/rdsac_mean_s44.pt
+COPY runs/p1p2_2x1_s44/ckpt_rdsac-cvar_sigma1.0.pt /models/htab/rdsac_cvar_s44.pt
+
+ENV PYTHONPATH=/app LOG_LEVEL=INFO SHADOW_MODE=true SNAPSHOT_TTL_S=30 PRIORITY_BOOST=1000
+EXPOSE 8002
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8002/healthz || exit 1
+CMD ["python", "-m", "services.rl_scheduler.serve", \
+     "--policy-dir", "/models", "--port", "8002", "--host", "0.0.0.0"]
