@@ -547,7 +547,13 @@ kubectl -n slurm exec "$LOGIN" -- bash -c '
 # 等完成後查：4 個都 COMPLETED（升級前是 1 COMPLETED + 3 FAILED）
 ```
 
-**第 5 步 4/4 COMPLETED = MPS 修好。** 然後就能跑乾淨的真實算力 real-CUDA 評估（`docs/eval-writeup.md` §5.1 第 4 項）：沿用 `--cuda-workload`、**拿掉 `--exclusive-gpu`**（分數 MPS 共置、跟 sleep 同 sharing），乾淨隔離「真實算力 + 干擾」這一個變數。
+**第 5 步 4/4 COMPLETED = MPS 修好。**（實測 2026-06-21 升完 24.04 後通過。）然後就能跑乾淨的真實算力 real-CUDA 評估（`docs/eval-writeup.md` §5.1 第 4 項）：沿用 `--cuda-workload`、**拿掉 `--exclusive-gpu`**（分數 MPS 共置、跟 sleep 同 sharing），乾淨隔離「真實算力 + 干擾」這一個變數。
+
+> **實測 gotchas（2026-06-21 升級踩到的，照順序）**：
+> 1. **anydesk third-party repo 讓 `apt update` 失敗**（TLS handshake 錯）→ do-release-upgrade 第一步 `cache.update()` 中止。升級前先把**所有 non-ubuntu repo 移開**（`/etc/apt/sources.list.d/`），用不到的（如 anydesk）直接刪。
+> 2. **非互動升級會卡在 conffile 衝突 prompt**（`*** xrdp.ini (Y/I/N/O/D/Z) [default=N]`），DistUpgradeViewNonInteractive 沒自動帶預設。對策：在 node-2 背景跑一個 `tmux send-keys -t osupg Enter` 的迴圈（每 3s 一次），自動以預設「保留現有設定」答完。
+> 3. **Secure Boot 拒簽 DKMS 模組**：別裝 `nvidia-driver-580-server`（走 DKMS → 本地建的 module 沒簽 → `modprobe: Key was rejected by service` → `nvidia-smi` 失敗）。要用 **Canonical 預簽的 prebuilt 模組** `linux-modules-nvidia-580-<kernel>-generic`（`.ko.sig`），**purge 掉 `nvidia-dkms-580*`**（含 -server）後 `--reinstall` 簽好的那顆 + `depmod -a`。driver 維持 24.04 標準 repo 的 580.159.03（580.167 從來不是關鍵變數）。
+> 4. **config-manager 仍會 CrashLoopBackOff（同 `findPidToSignal` panic）——但這是 cosmetic**。`mps-control-daemon-ctr` 本身 Running 就會多工；config-manager 只負責「設定變更時 signal reload」，靜態設定下不影響。判定 MPS 好壞**一律以第 5 步的 4/4 並行測試為準**，不要看 config-manager 的 pod readiness。
 
 ### 12.4 升級後常見風險（接 §10）
 
