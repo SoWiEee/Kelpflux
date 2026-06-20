@@ -234,6 +234,21 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **一句話**：multi-seed 後，2×1 sim 給出兩句穩健結論——**沒人贏過 score**、且 **arm 間差異是訓練雜訊**（同 config 跨 seed 擺盪 30–70 pts）。這個「訓練高變異 + 沒人贏」直接接到 live（§4.1）的退化：三個 learned arm 全把負載擠到 4070、全輸 Slurm。**而 live 也做了 multi-seed（3 個 train seed checkpoint 各跑一次四方 A/B）→ 負結果 seed-robust**：每個 seed×arm 都輸 score（−7~−31% JCT）、過度集中跨 seed 穩定（§4.1）。所以兩端都固實了。原始檔 `runs/mseed_2x1_*`、`runs/htab_live_mseed_s*`。
 
+### 3.6 對症改善：load-balance shaping（P1）+ reward normalization（P2）
+
+診斷確定後（瓶頸是「訓練退化→過度集中 + 高變異」，不是演算法），對症下兩帖（§5.1 路線，commit `01de2c9`）：**P1** 在 potential 加節點均衡項（`φ -= balance_coef·std(free_mps_per_node)`，Ng et al. 1999 保證不改最優策略、只導引探索遠離擠單卡）；**P2** running-std 回報正規化（PopArt-lite，消手調 `reward_scale` 的脆弱、降 seed 敏感度）。用 `--balance-coef 5.0 --normalize-reward` 在 σ=1.0、3 train seed 重訓三方，對比 baseline（§3.1）：
+
+| family | model | baseline ΔJCT% | **P1+P2 ΔJCT%** | 改善 |
+|---|---|---:|---:|---:|
+| philly | **cvar** | −35.4±16.3 | **−4.1±4.6** | **+31** |
+| philly | sac | −38.3±12.3 | −11.8±4.2 | +27 |
+| ali | cvar | −42.0±29.8 | −12.0±12.0 | +30 |
+| ali | sac | −33.6±23.0 | −15.2±17.5 | +19 |
+| philly | mean | −12.9±10.1 | −23.1±7.4 | −10 |
+| ali | mean | −8.4±3.2 | −32.7±10.4 | −24 |
+
+**判定：對症有效（但未全勝）。** 三個正面證據：(i) **cvar/SAC 大幅靠近 score**（+19~+31 pts），且 **variance 同步收斂**（cvar philly 16.3→**4.6**，`−4.1±4.6` 是全專案最佳+最穩的 sim 結果）；(ii) **過度集中真的被拉回**——cvar 的節點分佈跨 3 seed 從 baseline ~89% 降到 **80/65/67%（平均 ~71%）**，證明 balance shaping 在動；(iii) **`philly cvar s44 = +2.3%`——全專案第一次有 learned arm 在 sim 贏過 score**。**誠實限制**：(a) 仍**沒人「穩健」贏過 score**（最佳 mean −4%）；(b) **RDSAC-mean 反而退步**（−10/−24 pts——balance shaping 與風險中立 arm 互動不良，待查）；(c) 集中度仍 >50%。**結論**：P1+P2 確認「修訓練、別加花招」方向正確——把退化策略往「均衡、低變異、逼近 score」推進了一大步，值得拿去做真實 CUDA job 的實機檢驗（§5.1 第 4 項）。原始檔 `runs/p1p2_2x1_s{42,43,44}/`、彙總 `runs/p1p2_2x1_agg.txt`。
+
 ---
 
 ## 4. 實機執行結果（Live cluster）
@@ -310,7 +325,8 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **方向上 sim 內 cvar 較穩、但在雜訊內。** 2×1（§3.1）cvar 是最穩的 learned arm（σ=0.5 最接近打平）；但**三方都仍輸 score**，差異落在單 seed 擺盪內。**而 live placement 反而 cvar 最差**（過度集中 4070 最兇，§4.1）——sim 與 live 對 cvar 的評價相反。 |
 | 共置動作（PACK/ISOLATE）有用嗎？ | **沒有，即使有 2 GPU。** 2×1 colocation ON 仍輸 OFF ~20 pts（§3.4），「價值需 ≥2 GPU」被推翻；瓶頸是動作空間加倍（33→65）的 underfit。 |
 | 2-node placement 結果？ | **負（四方一致、且 seed-robust）**。單 checkpoint：learned 全顯著輸 Slurm（−12~−32% JCT、p<0.01、drift-robust）。**multi-seed 確認**：3 個 train seed 各跑一次四方，每個 seed×arm 都輸 score（SAC −21.6±9.6、mean −13.4±4.4、cvar −21.2±6.1）。機制：learned 全把負載擠到 4070（85–89% vs score ~50%），不是 seed 運氣（§4.1）。 |
-| 最穩定上線策略 | 保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。**在 multi-seed 固實前，RL placement 不應蓋過 Slurm 預設**。 |
+| 退化能修嗎？ | **能、方向對。** 對症加 P1 load-balance shaping + P2 reward normalization（§3.6）：cvar/SAC 改善 +19~+31 pts、variance 收斂（cvar philly `−4.1±4.6`）、過度集中從 ~89% 拉回 ~71%，且**首次有 learned arm 在 sim 贏過 score**（philly cvar +2.3%）。仍未穩健贏 score、mean 反而退步——是「修訓練」方向的有效一步，下一步拿去真實 CUDA job 實機檢驗。 |
+| 最穩定上線策略 | 保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。**在策略證明能穩健均衡放置前，RL placement 不應蓋過 Slurm 預設**。 |
 
 **工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的四方受控對照（score/SAC/RDSAC-mean/cvar）+ 隨機性/共置消融；(6) **2-node 上線管線**：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點，§4.1）、外加修掉 4 個只在多節點現形的 chart bug（releasePriority 科學記號 CrashLoop、netpol 漏列、`-H` hold 被 score/rl_hook 覆蓋、controller 一次只放一個 job）。
 
@@ -320,9 +336,9 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 > **改善路線（針對診斷出來的病灶）。** 實驗證明瓶頸**不是演算法花招**（SAC vs RDSAC vs critic 型別 ≈ 噪音；CVaR/共置甚至扣分），而是**訓練退化**：策略會結構性地過度集中到單卡（live 85–92% vs Slurm ~50%），且訓練高變異（跨 seed 擺盪 30–90 pts）。**過度集中與高變異是同一個病**（退化崩塌）。所以改善優先序是「修訓練、別加花招」：
 >
-> - **(P1) 反過度集中——load-balance reward shaping**：現在的 `_placement_reward` 雖有碎片懲罰但被 `placement_reward_scale=0.01` 壓到可忽略。加一個 **potential-based 的節點均衡項**（φ 多一個 −`balance_coef`·節點 free-MPS 不均衡；Ng et al. 1999 保證不改最優策略，只導引探索遠離「擠單卡」）。**最對症**。
-> - **(P2) 訓練穩定——return normalization**：用 running mean/std 正規化回報（PopArt-lite），消掉手調 `reward_scale=20000` 的脆弱、降 seed 敏感度。
-> - 做完 P1+P2 → 重跑 multi-seed σ-sweep，比「過度集中是否收斂到均衡、跨 seed 變異是否變小、有沒有更接近 score」。**若有效 → 換真實 CUDA job（下方第 4 項）做最終實機檢驗**。
+> - ✓ **(P1) 反過度集中——load-balance reward shaping（已實作 + 有效，§3.6）**：potential-based 節點均衡項（`balance_coef`）把 cvar 的過度集中從 ~89% 拉回 ~71%。
+> - ✓ **(P2) 訓練穩定——return normalization（已實作 + 有效，§3.6）**：running-std PopArt-lite 把 cvar variance 從 16→5、整體 +19~+31 pts 靠近 score。
+> - ✓ **重跑 multi-seed 比對（已完成，§3.6）**：有效——過度集中收斂、variance 下降、首次有 learned arm 在 sim 贏 score（philly cvar +2.3%）。**剩**：mean 退步待查；**下一步換真實 CUDA job（下方第 4 項）做最終實機檢驗**。
 
 依「擋住結論的程度」排序：
 
