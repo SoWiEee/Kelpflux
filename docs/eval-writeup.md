@@ -30,7 +30,7 @@
 | 評估 | score | SAC | RDSAC-mean | RDSAC-cvar | 判定 |
 |---|---|---|---|---|---|
 | **sim** σ-sweep, fixed-α, **multi-seed**（§3.1，σ=1.0，3 train seed）| 0% | −38.3±12 / −33.6±23 | −12.9±10 / −8.4±3 | −35.4±16 / −42.0±30 | **multi-seed 確認：沒人贏過 score；arm 間排名是訓練雜訊（std 5–30 pts）** |
-| **live** 2-node placement, submit-時 -w（§4.1 四方）| 0% | −12.2/−26.3（σ1/σ0）| −17.4/−28.1 | −24.2/−31.8 | **三個 learned arm 全顯著輸 Slurm（−12~−32% JCT，p<0.01）；越擠 4070 輸越多（cvar 92% 最慘）** |
+| **live** 2-node placement, submit-時 -w（§4.1 四方，**multi-seed**）| 0% | −21.6±9.6 | −13.4±4.4 | −21.2±6.1 | **三個 learned arm 全輸 Slurm、seed-robust（3 train seed mean±std，每個 seed×arm −7~−31% JCT）；全過度集中 4070（85–89%）** |
 
 （sim 兩個數字 = philly / ali（σ=1.0 mean±std）；live 兩個數字 = σ=1 / σ=0；ΔJCT% vs score，負值=較慢）
 
@@ -42,7 +42,7 @@
 
 **一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement 因過度集中 4070 而顯著輸 Slurm。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
 
-**兩個 load-bearing caveats：**（1）**訓練高變異**——sim σ-sweep 已用 3 train seed 固實（mean±std），但 **live A/B 用的仍是單 seed checkpoint**（§4.1）；要把 live 結論也升級成「對 seed 穩健」需用 multi-seed checkpoint 重跑 live（見下方 live-eval 說明）；（2）σ 是合成 trace 的最難預測上界，真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
+**兩個 load-bearing caveats：**（1）**訓練高變異（已用 multi-seed 量化、兩端都固實）**——sim σ-sweep（§3.1）與 live placement（§4.1）**都已用 3 個訓練 seed 跑 mean±std**：sim 確認「沒人贏 score、arm 排名是訓練雜訊」，live 確認「負結果 seed-robust（每個 seed×arm 都輸 score）」。訓練本身高變異（同 config 跨 seed 擺盪 30–70 pts）是這套方法的核心限制；（2）σ 是合成 trace 的最難預測上界，真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
 
 ---
 
@@ -232,7 +232,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | 贏在分布式 critic 還是風險扭曲？（§3.3）| σ=1.0 下 **分布式 critic 是有用的一半、CVaR 反而扣分**（−22~−34 pts，與設計意圖相反）；但仍沒讓 RDSAC 贏 score |
 | 加共置動作（需更多卡）有用嗎？（§3.4）| **沒有**——ON 仍輸 OFF ~20 pts，瓶頸是動作空間翻倍後的 underfit |
 
-**一句話**：multi-seed 後，2×1 sim 給出兩句穩健結論——**沒人贏過 score**、且 **arm 間差異是訓練雜訊**（同 config 跨 seed 擺盪 30–70 pts）。這個「訓練高變異 + 沒人贏」直接接到 live（§4.1）的退化：四方下三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），全把負載擠到 4070（88–92% vs score 均衡 52%）。**→ 下一步：用 multi-seed checkpoint 重跑 live placement，看負結果對 seed 是否穩健（§5.1 第 1 項）。** 原始檔 `runs/mseed_2x1_*`。
+**一句話**：multi-seed 後，2×1 sim 給出兩句穩健結論——**沒人贏過 score**、且 **arm 間差異是訓練雜訊**（同 config 跨 seed 擺盪 30–70 pts）。這個「訓練高變異 + 沒人贏」直接接到 live（§4.1）的退化：三個 learned arm 全把負載擠到 4070、全輸 Slurm。**而 live 也做了 multi-seed（3 個 train seed checkpoint 各跑一次四方 A/B）→ 負結果 seed-robust**：每個 seed×arm 都輸 score（−7~−31% JCT）、過度集中跨 seed 穩定（§4.1）。所以兩端都固實了。原始檔 `runs/mseed_2x1_*`、`runs/htab_live_mseed_s*`。
 
 ---
 
@@ -282,11 +282,20 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **意外的反轉**：sim §3.1 裡 cvar 是「最穩的 learned arm」；**到了真實 placement，cvar 反而最差**——因為它最積極地把 job 往 node 0 集中。risk-sensitivity 在「選哪台卡」這個決策上變成**過度集中**的壞習慣。
 
-**範圍限制**：σ=1.0 三方 checkpoint（單訓練 seed）、單 family（philly）、n=80/arm。要下普遍結論需 multi-seed checkpoint + ali。但**四方一致、單調、p<0.01**——「這批 production-候選 checkpoint 的 placement 顯著輸 Slurm，且因過度集中 4070」是穩健結論。
+**multi-seed 確認（負結果對訓練 seed 穩健）**：上面是單一 checkpoint。為了排除「剛好抽到壞 seed」，用 3 個訓練 seed（42/43/44）的 checkpoint 各跑一次**同樣的四方 placement A/B**（σ=1.0、sleep job、philly），ΔJCT% vs score mean±std：
+
+| arm | ΔJCT%（mean±std）| per-seed | 落在 4070 |
+|---|---:|---|---:|
+| score | 0（baseline）| — | 48% |
+| RDSAC-mean | **−13.4±4.4** | −16.7 / −7.1 / −16.3 | 85% |
+| SAC | **−21.6±9.6** | −8.4 / −30.9 / −25.5 | 88% |
+| RDSAC-cvar | **−21.2±6.1** | −13.3 / −22.4 / −28.1 | 89% |
+
+**結論：seed-robust。** 每個 (seed × arm) 都是負的（範圍 −7.1 ~ −30.9），**沒有任何 seed 讓 learned arm 贏過 score**；過度集中也跨 seed 穩定（全部 85–89% 擠 4070 vs score 48%）。所以 §4.1 的負結果**不是單 seed 壞運，是這套 train+placement 的結構性退化**。（RDSAC-mean 一致最輕 −13.4，與 sim multi-seed「mean 是 σ=1.0 最好的 learned arm」一致。）原始檔 `runs/htab_live_mseed_s{42,43,44}/`、彙總 `runs/mseed_live_agg.txt`。**剩餘範圍限制**：單 family（philly）、sleep job（見下 workload caveat）。
 
 > **workload caveat（重要）**：本 A/B 的 job 是 `sleep N`、**不做 GPU compute**，所以 runtime 與 placement 無關、placement 只影響排隊 wait——這把「共置干擾、VRAM 限制、異質算力」三個真實 placement 槓桿**結構性抹掉**了（sim 反而有用 `interference=0.3` 建模，是個 sim↔live 不一致）。換成真實 CUDA job 會讓測試更完整、也更公平（見 §5.1 第 4 項）；對目前過度集中的 checkpoint 預期會更慘（多付干擾代價），但那才是讓**好的** placement 策略有機會展現價值的場域。
 
-> 一句話：真實 2-node placement 是**乾淨的四方負結果**——score 均衡放置（52/48），三個 learned arm 全把負載擠到 4070（88–92%）、全顯著輸 Slurm（−12~−32% JCT），且**擠越兇輸越多（cvar 最慘）**。不是「2-node 解鎖 RL」，而是「**單 seed / no-op 傾向的 checkpoint 一旦真的去選 node，就把負載擠歪、比 Slurm 差**」。硬前提：**先 multi-seed 固實再談 placement**。
+> 一句話：真實 2-node placement 是**乾淨、且對訓練 seed 穩健的四方負結果**——score 均衡放置（~50/50），三個 learned arm 全把負載擠到 4070（85–92%）、跨 3 個 seed 全顯著輸 Slurm（每個 seed×arm 都是 −7~−31% JCT），沒有任何 seed 翻盤。不是「2-node 解鎖 RL」，而是「**這套 train+placement 會結構性地長出過度集中的退化策略，比 Slurm 均衡放置差**」。要再談 RL placement，得先改掉這個過度集中（multi-seed 確認過、不是 seed 運氣問題）。
 
 ---
 
@@ -297,15 +306,15 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | DRL path 能在 2-node 上跑？ | 可以。166-dim checkpoint 上線、共享 `gpu` partition、submit-時 placement A/B 全 job 乾淨完成（§4.1）。 |
 | 先前 `alpha` 觸頂是真 bug？修好了？ | 是真 bug（return 尺度壓過 entropy ~300×）。已用 reward_scale 1000→20000 + 放寬 clamp 修好（§2.2）。 |
 | RDSAC / SAC 在 2×1 贏過 score？ | **沒有。** sim 三方逼近打平、沒人贏過 score（§3.1）；live 2-node placement 三個 learned arm 全顯著輸 Slurm（§4.1）。**淨答案：在真實 2×1，沒有任何 learned model 在可檢驗的設定贏過 score。** |
-| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **2×1 下沒有可定論的優勢。** σ-sweep 三方逼近打平（§3.1）；拆解「分布式 critic vs 風險扭曲」兩者都只剩個位數 pts、且看 workload 正負擺盪、全在單 seed 雜訊內（§3.3）。live placement 三方全輸 Slurm（§4.1）。要再談需 multi-seed 固實。 |
+| 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **2×1 下沒有可定論的優勢（multi-seed 確認）。** σ-sweep 三方（3 train seed）沒人贏 score、arm 排名是訓練雜訊（§3.1）；拆解上 σ=1.0 的 CVaR 反而扣分、分布式 critic 是相對有用的一半（§3.3）。live placement 三方全輸 Slurm 且 **seed-robust**（§4.1）。 |
 | risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **方向上 sim 內 cvar 較穩、但在雜訊內。** 2×1（§3.1）cvar 是最穩的 learned arm（σ=0.5 最接近打平）；但**三方都仍輸 score**，差異落在單 seed 擺盪內。**而 live placement 反而 cvar 最差**（過度集中 4070 最兇，§4.1）——sim 與 live 對 cvar 的評價相反。 |
 | 共置動作（PACK/ISOLATE）有用嗎？ | **沒有，即使有 2 GPU。** 2×1 colocation ON 仍輸 OFF ~20 pts（§3.4），「價值需 ≥2 GPU」被推翻；瓶頸是動作空間加倍（33→65）的 underfit。 |
-| 2-node placement 結果？ | **負（四方一致）**。**三個 learned arm 全顯著輸 Slurm（−12~−32% JCT、每格 p<0.01、drift-robust、n=80/arm）**；機制直接量到——learned 全把負載擠到 4070（88–92% vs score 均衡 52%），**擠越兇輸越多（cvar 92% 最慘）**（§4.1）。成因：單 seed / no-op 傾向 checkpoint 一去選 node 就過度集中。**前提：先 multi-seed 固實再談 placement。** |
+| 2-node placement 結果？ | **負（四方一致、且 seed-robust）**。單 checkpoint：learned 全顯著輸 Slurm（−12~−32% JCT、p<0.01、drift-robust）。**multi-seed 確認**：3 個 train seed 各跑一次四方，每個 seed×arm 都輸 score（SAC −21.6±9.6、mean −13.4±4.4、cvar −21.2±6.1）。機制：learned 全把負載擠到 4070（85–89% vs score ~50%），不是 seed 運氣（§4.1）。 |
 | 最穩定上線策略 | 保留 stale snapshot / low confidence / service down 時的 heuristic/Slurm fallback。**在 multi-seed 固實前，RL placement 不應蓋過 Slurm 預設**。 |
 
 **工程貢獻**：(1) 可上線的 DRL inference path（非僅 notebook/sim）；(2) DRL 對齊 Ma et al. RDSAC，有單元/行為測試；(3) 定位並修好 temperature auto-tune 的 reward-scale 根因；(4) sim + live trace collector 已能支援後續 RLPD；(5) 乾淨的四方受控對照（score/SAC/RDSAC-mean/cvar）+ 隨機性/共置消融；(6) **2-node 上線管線**：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點，§4.1）、外加修掉 4 個只在多節點現形的 chart bug（releasePriority 科學記號 CrashLoop、netpol 漏列、`-H` hold 被 score/rl_hook 覆蓋、controller 一次只放一個 job）。
 
-**核心一句話**：在真實 2×1，這批單訓練 seed 的 DRL checkpoint **沒有在任何可檢驗的設定贏過 score**——sim 三方逼近打平（落在雜訊內，§3.1–3.4），**live 2-node placement 四方全顯著輸 Slurm（−12~−32% JCT，learned 全過度集中 4070、cvar 最慘）**（§4.1）。**下一步的硬前提是 multi-seed 固實 checkpoint，而非宣稱「用了 DRL/risk-sensitive」就算贏。**
+**核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm、每個 seed×arm 都輸（−7~−31% JCT），全因過度集中 4070**（§4.1）。瓶頸是**這套 train+placement 會結構性地長出過度集中的退化策略**——下一步要改的是這個（架構/訓練穩定性），而非宣稱「用了 DRL/risk-sensitive」就算贏。
 
 ### 5.1 未來工作（Future Work）
 
@@ -313,7 +322,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 
 **讓現有結論站得住（方法學門檻）**
 
-1. ✓ **sim σ-sweep multi-seed（已完成，§3.1/§3.3）。** §3.1 的 σ-sweep 三方已用 3 個訓練 seed（42/43/44）跑 mean±std——確認「沒人贏 score」穩健、arm 間排名是訓練雜訊（std 5–30 pts、同 config 跨 seed 擺盪 30–70 pts）。**剩下兩塊**：(a) **live A/B 仍用單 seed checkpoint**——要把 live 結論也升級成 seed-穩健，需用 multi-seed checkpoint（或各 arm 取 sim 表現最好的那個 seed）重跑 §4.1 的 placement A/B；(b) 共置/σ=0 等格子尚未 multi-seed。原始檔 `runs/mseed_2x1_*`、彙總 `runs/mseed_2x1_agg/SUMMARY.txt`。
+1. ✓ **sim + live multi-seed（已完成，§3.1/§3.3/§4.1）。** sim σ-sweep 三方用 3 個訓練 seed（42/43/44）跑 mean±std → 確認「沒人贏 score」穩健、arm 排名是訓練雜訊；live placement A/B 也用 3 個 seed 的 checkpoint 各跑一次四方 → 負結果 **seed-robust**（每個 seed×arm 都輸 score −7~−31%、過度集中跨 seed 穩定）。**剩下**：共置/σ=0 等 sim 格子尚未 multi-seed、live 只測 philly。原始檔 `runs/mseed_2x1_*`、`runs/htab_live_mseed_s*`、彙總 `runs/mseed_*_agg*`。
 2. **σ 校準的外部效度。** §3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重量，並把 σ-sweep 落在實測區間。
 3. **向量化 / 加速 sim（已實作）。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h）。已加入 `sim/vec_env.py`（`SyncVectorSchedEnv` 參考實作 + `AsyncVectorSchedEnv` 多進程，autoreset 語義一致、async≡sync 經測試），並把 `sim_train(--num-envs N)` 接成 N 個 env 並行 rollout、共用同一 learner——多核近線性提升 rollout 吞吐，讓上面兩項（multi-seed、σ-sweep）在算力上可行。注意：vec path 的 score-warmup 退回 random-legal（score-warmup 需 in-process `env._state`），且每 iteration 仍 `utd_ratio` 次更新，所以 UTD 隨 N 稀釋——要維持樣本效率就同步調高 `--utd-ratio`。
 
