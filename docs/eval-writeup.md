@@ -13,7 +13,7 @@
 **本文的聚焦點是：在拓樸匹配的真實 2×1 環境，DRL 排程到底有沒有贏過強啟發式 score。** 兩個層面：
 
 - **絕對績效數字（sim → real 轉移差）**：sim 的 JCT/勝幅不會原樣搬到真實系統，故 §3 的 sim 數字只當定性/序數參考、用來抽機制與做配對消融。
-- **真實 2×1 的判定**：第二節點（RTX 3080）上線後，在拓樸匹配的 2×1 跑 sim（§3）與 live（§4）。**結論是負的**——sim 三方逼近打平、沒人贏過 score（落在單訓練 seed 雜訊內）；live 2-node placement 三個 learned arm 全顯著輸 Slurm（−12~−32% JCT），因為 learned model 全把負載過度集中到 4070（88–92% vs Slurm 均衡 52%）。→ 硬前提是**先做 multi-seed 固實 checkpoint 再談 placement**（§5.1）。
+- **真實 2×1 的判定（sim + live 都已 multi-seed 固實）**：第二節點（RTX 3080）上線後，在拓樸匹配的 2×1 跑 sim（§3）與 live（§4），兩端都用 3 個訓練 seed 跑 mean±std。**結論是負的、且 seed-robust**——sim 三方逼近打平、沒人贏過 score，arm 間排名是訓練雜訊；live placement 三個 learned arm **每個 seed×arm 都輸 Slurm**（−7~−31% JCT），全因 learned model 把負載過度集中到 4070（85–89% vs Slurm 均衡 ~50%）。→ 瓶頸是**這套 train+placement 會長出過度集中的退化策略**，要改的是架構/訓練穩定性（§5.1）。
 
 > 閱讀順序：§3（模擬結果）講 2×1 sim 的配對消融與機制；§4（實機結果）給真實 2-node placement 的四方 A/B；§5.1 列出 multi-seed 固實與 RLPD 微調的 future work。
 
@@ -93,7 +93,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 | (3) 實機部署 | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，記錄真實 (obs, act, rew) 資料 | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 A/B（§4）+ 微調語料 |
 | (4) RLPD 微調 | 用 (3) 的真實 JSONL | 以模擬產出的 checkpoint 為 prior，混合真實資料做微調 | 從頭 RLPD = 退回 (1) 的 sample-complexity 與 (2) 的破壞性探索 | 真實環境策略（future work，§5.1） |
 
-在模擬環境中「可大量訓練 + 可配對消融」，代價是模擬環境的絕對數字不轉移：機制性洞察（§3，2×1 sim）只當定性參考，真實判定由 §4 的 live A/B 給——而 §4.1 的結果是負的（learned placement 顯著輸 Slurm）。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；模擬器的 checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上。實機 trace 收集器（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒——而 §4.1 的負結果正說明：**直接烘單 seed sim checkpoint 上線不夠，得先 multi-seed 固實或走 RLPD 微調**。
+在模擬環境中「可大量訓練 + 可配對消融」，代價是模擬環境的絕對數字不轉移：機制性洞察（§3，2×1 sim）只當定性參考，真實判定由 §4 的 live A/B 給——而 §4.1 的結果是負的（learned placement 顯著輸 Slurm）。RLPD（**R**L with **P**rior **D**ata）的前提就是從一個既有 prior 出發再微調；模擬器的 checkpoint 不是被丟掉，而是 RLPD 站在它肩膀上。實機 trace 收集器（`live_daemon.py` → JSONL → `rlpd_finetune.py`）已就緒——而 §4.1 的 multi-seed 負結果（seed-robust）正說明：**直接烘 sim checkpoint 上線會輸，而且不是 seed 運氣問題；要贏得改架構/訓練穩定性，或走 RLPD 用真實資料微調**。
 
 ### 2.1 Simulator paired benchmark
 
@@ -162,7 +162,7 @@ heuristic score 是目前最穩定的 submit-time baseline。它不需要訓練�
 2. **拆解：分布式 critic vs 風險扭曲（§3.3）**：用 SAC→RDSAC-mean→RDSAC-cvar 拆兩個貢獻。**結果：兩者都只剩個位數 pts、且看 workload 正負擺盪——沒有單一主因。**
 3. **共置動作消融（§3.4）**：PACK/ISOLATE 在 2×1 ON vs OFF。**結果：仍拖累（ON 輸 OFF ~20 pts），「價值需 ≥2 GPU」被推翻。**
 
-> **共同前提（讀數字前先知道）**：所有 sim 效應都落在**單訓練 seed**的 60–90 pts 擺盪內（§3.3 有同 config 兩跑擺盪的鐵證），故**機制方向比點估計可信、細排名需 multi-seed 才能定論**。§3.2 給 σ 取值的外部效度，§3.5 把 sim 收斂到 live（§4.1）的負結果。
+> **共同前提（讀數字前先知道）**：sim 訓練本身**高變異**——同 config 跨訓練 seed 可擺盪 30–90 pts。§3.1 的 σ-sweep 已用 **3 個訓練 seed 跑 mean±std** 把這個變異量化（其餘格子仍單 seed，看方向別細讀點估計）。§3.2 給 σ 取值的外部效度，§3.5 把 sim 收斂到 live（§4.1）的負結果。
 
 ### 3.1 隨機性消融：注入 runtime 不確定性後，三方怎麼排？
 
