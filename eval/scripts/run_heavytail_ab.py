@@ -26,6 +26,7 @@ from typing import Optional
 from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (
+    WorkloadSpec,
     collect_sacct,
     decide_node,
     gen_workload,
@@ -170,6 +171,14 @@ def run(args) -> int:
     import shlex as _shlex
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
                     args.login_pod, "--"] if args.login_pod else None)
+    # Real-CUDA workload (replaces sleep): same spec across all arms → fair.
+    workload = (WorkloadSpec(bin_path=args.workload_bin, dim=args.workload_dim,
+                             vram_mb=args.workload_vram_mb,
+                             iters_per_sec=args.iters_per_sec,
+                             time_factor=args.workload_time_factor)
+                if args.cuda_workload else None)
+    if workload is not None:
+        print(f"[ab] CUDA workload: {workload}", flush=True)
     gpu_nodes = [n for n in (args.gpu_nodes or "").split(",") if n]
     if args.placement and not gpu_nodes:
         print("error: --placement requires --gpu-nodes node0,node1 (index ↔ RL node_j)",
@@ -197,7 +206,8 @@ def run(args) -> int:
                                       placement=args.placement, dry_run=args.dry_run)
             submit_stream(jobs, arm, rnd, dry_run=args.dry_run,
                           partition=args.partition, exec_prefix=exec_prefix,
-                          place_fn=place_fn, placement=args.placement)
+                          place_fn=place_fn, placement=args.placement,
+                          workload=workload)
             if args.dry_run:
                 return
             wait_drain(kubectl=args.kubectl, namespace=args.namespace,
@@ -257,6 +267,22 @@ def main(argv=None) -> int:
     p.add_argument("--arrival-mode", choices=["burst", "poisson"], default="burst")
     p.add_argument("--beta", type=float, default=0.25)
     p.add_argument("--partition", default="gpu-rtx4070")
+    # Real-CUDA workload (replaces sleep): a normal user-style CUDA sbatch job so
+    # MPS interference / VRAM / heterogeneous-card speed surface in JCT.
+    p.add_argument("--cuda-workload", action="store_true",
+                   help="run real CUDA jobs (gpu_workload sgemm) instead of sleep N")
+    p.add_argument("--workload-bin", default="/shared/bin/gpu_workload",
+                   help="path to the compiled gpu_workload binary (on shared NFS)")
+    p.add_argument("--workload-dim", type=int, default=4096,
+                   help="sgemm matrix dim (compute intensity + base VRAM)")
+    p.add_argument("--workload-vram-mb", type=int, default=512,
+                   help="extra VRAM scratch per job (independent VRAM pressure)")
+    p.add_argument("--iters-per-sec", type=float, default=145.0,
+                   help="idle reference-card (4070) iters/s at --workload-dim; "
+                        "iters = true_runtime_s × this (CRN by job_id)")
+    p.add_argument("--workload-time-factor", type=float, default=20.0,
+                   help="--time = true_runtime_s × this (slow-card × contention "
+                        "margin so jobs aren't killed; uniform across arms → fair)")
     p.add_argument("--placement", action="store_true",
                    help="submit-time RL node placement: RL arms pick a node via "
                         "/act and submit with -w <node> (Slurm 21.08 can't re-pin "

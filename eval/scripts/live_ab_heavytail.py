@@ -50,6 +50,37 @@ class LiveJob:
     gpu_count: int = 1
 
 
+@dataclass(frozen=True)
+class WorkloadSpec:
+    """Real-CUDA workload config (replaces `sleep N`).
+
+    The heavy-tail job's ``true_runtime_s`` is its *idle-reference* duration:
+    ``iters = round(true_runtime_s * iters_per_sec)`` fixes the WORK, calibrated
+    so an unloaded reference card (the 4070, ~iters_per_sec) hits ~true_runtime_s.
+    The same iters run LONGER on a slower card (the 3080) or under MPS contention
+    — so heterogeneity + interference surface in JCT, unlike a `sleep` job whose
+    runtime is placement-independent.
+
+    CRN: the workload seed is derived from ``job_id`` so the same logical job is
+    byte-identical across arms (paired comparison preserved).
+    ``time_factor`` inflates Slurm ``--time`` (worst case ≈ slow-card × contention)
+    so jobs aren't killed before finishing; applied uniformly across arms → fair.
+    """
+    bin_path: str = "/shared/bin/gpu_workload"
+    dim: int = 4096
+    vram_mb: int = 512
+    iters_per_sec: float = 145.0   # idle 4070 @ dim=4096 (calibrated 2026-06-20)
+    time_factor: float = 20.0      # --time = true_runtime_s × this (slow-card+contention margin)
+
+    def wrap(self, job: "LiveJob") -> str:
+        iters = max(1, int(round(job.true_runtime_s * self.iters_per_sec)))
+        seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
+        return f"{self.bin_path} {iters} {self.dim} {self.vram_mb} {seed}"
+
+    def time_min(self, job: "LiveJob") -> int:
+        return max(2, int(np.ceil(job.true_runtime_s * self.time_factor / 60.0)))
+
+
 def _job_noise(job_id: str, sigma: float, seed: int = 0) -> float:
     """Mean-preserving lognormal multiplier exp(σZ − σ²/2), E=1.
 
@@ -171,7 +202,8 @@ def job_name(arm: str, round_idx: int, job_id: str) -> str:
 
 def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
                partition: str = "gpu-rtx4070", hold: bool | None = None,
-               nodelist: str | None = None) -> list[str]:
+               nodelist: str | None = None,
+               workload: "WorkloadSpec | None" = None) -> list[str]:
     """Build the sbatch argv for one job. --time uses the (noisy) *reported*
     estimate the scheduler sees; the job actually sleeps the *true* runtime.
 
@@ -191,7 +223,14 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         "reported": round(job.reported_runtime_s, 2), "mps": job.mps_req,
         "arm": arm, "round": round_idx,
     }, separators=(",", ":"))
-    time_min = max(1, int(np.ceil(job.reported_runtime_s / 60.0)))
+    # sleep mode: --time from the (noisy) reported estimate the scheduler sees.
+    # CUDA mode: --time inflated for slow-card × contention so jobs aren't killed.
+    if workload is not None:
+        time_min = workload.time_min(job)
+        wrap = workload.wrap(job)
+    else:
+        time_min = max(1, int(np.ceil(job.reported_runtime_s / 60.0)))
+        wrap = f"sleep {int(round(job.true_runtime_s))}"
     cmd = ["sbatch"]
     if hold:
         cmd.append("-H")  # before the job spec → parsed as a submit flag
@@ -203,7 +242,7 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         f"--gres=mps:{job.mps_req}",
         f"--time={time_min}",
         f"--comment={comment}",
-        f"--wrap=sleep {int(round(job.true_runtime_s))}",
+        f"--wrap={wrap}",
     ]
     return cmd
 
@@ -350,7 +389,8 @@ def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
                   dry_run: bool = True, partition: str = "gpu-rtx4070",
                   t0: Optional[float] = None,
                   exec_prefix: Optional[list[str]] = None,
-                  place_fn=None, placement: bool = False) -> None:
+                  place_fn=None, placement: bool = False,
+                  workload: "WorkloadSpec | None" = None) -> None:
     """Submit the stream honouring each job's arrival_offset. dry_run prints.
 
     `exec_prefix` (e.g. ["kubectl","exec","-n","slurm","pod/slurm-login-x","--"])
@@ -377,7 +417,7 @@ def submit_stream(jobs: List[LiveJob], arm: str, round_idx: int, *,
         hold = False if placement else None
         cmd = (exec_prefix or []) + sbatch_cmd(job, arm, round_idx,
                                                partition=partition, nodelist=nodelist,
-                                               hold=hold)
+                                               hold=hold, workload=workload)
         if dry_run:
             print(" ".join(cmd))
             continue
