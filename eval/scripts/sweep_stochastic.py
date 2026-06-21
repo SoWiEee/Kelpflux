@@ -83,7 +83,7 @@ def _rollout(env: KubefluxSchedEnv, policy: Callable[[], int], seed: int):
 def _eval_policy(
     *, make_policy, family: str, sigma: float, interference: float,
     n_jobs: int, seeds: list[int], n_nodes: int, gpus_per_node: int,
-    colocation: bool = False,
+    colocation: bool = False, node_speeds=None,
 ) -> tuple[list[float], list[float]]:
     """Return (per-seed avg JCTs, pooled per-job JCTs) for one policy/family."""
     total_gpus = n_nodes * gpus_per_node
@@ -98,7 +98,7 @@ def _eval_policy(
             _factory, n_nodes=n_nodes, gpus_per_node=gpus_per_node,
             max_steps=n_jobs * 200, reward_mode="jct_aligned",
             runtime_sigma=sigma, interference=interference,
-            colocation_actions=colocation,
+            colocation_actions=colocation, node_speeds=node_speeds,
         )
         policy = make_policy(env)
         avg, jcts = _rollout(env, policy, seed)
@@ -224,6 +224,8 @@ def main(argv=None) -> int:
                     seeds=args.seeds, n_nodes=args.n_nodes,
                     gpus_per_node=args.gpus_per_node,
                     colocation=args.colocation,
+                    node_speeds=([float(s) for s in args.node_speeds.split(",") if s.strip()]
+                                 if args.node_speeds else None),
                 )
                 ev[name] = {"avg": np.array(avg), "per_job": np.array(per_job)}
 
