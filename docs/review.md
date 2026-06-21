@@ -1,46 +1,49 @@
-# Kelpflux 系統審查報告（v7）
+# Kelpflux 系統審查報告（v8）
 
-> **評估時間：** 2026-06-13
-> **評估快照：** main @ `c26b268`（A/B sim-fidelity 實驗併入後）
+> **評估時間：** 2026-06-22
+> **評估快照：** main @ `d0f5523`（item-1 異質性曝光 + full PopArt + node-exporter host metrics 併入後）
 > **評估視角：** IEEE 期刊/會議審稿人 + AI Infra 專家 + ML/Model 專家
 > **評估範圍：** RDSAC 演算法與評估方法學、sim-to-live 保真度、單卡/異質叢集基礎設施、研究可發表性。
-> **與 v6 的關係：** v6（HPC/SRE/ML-systems 視角）對「平台工程完整度」的判斷大致仍成立；v7 不重複那些，改用三個更嚴格的專家視角重審 **研究主張的可辯護性**，並把本輪 sim 隨機性消融（eval §4.4–4.5）的新證據納入。
+> **與 v7 的關係：** v7 把核心研究問題從「測不出」推進到「有方向性答案」並確立「沒人贏 score」的負結果；v8 不重複那些，聚焦本輪三件實質工程：**(1) item-1 把先前對卡型完全失明的策略接上異質性曝光（sim 驗證、live 待跑）、(2) full PopArt 取代 PopArt-lite、(3) node-2 OS 升級解鎖 3080 MPS + 補上 host-metrics 監控盲區**。核心負結論（真實 2×1 無任何 DRL 臂贏 score）**不變**，本輪是縮小 gap 與穩定訓練，不是翻案。
 
 ---
 
 ## 0. 執行摘要
 
-**一句話判斷：** Kelpflux 的系統工程已經成熟（v6 已肯定），本輪最大的進展是**把「分布式/風險機制到底有沒有用」這個核心研究問題從「測不出來」推進到「測得出來、且有方向性結論」**——但這個結論目前**只在模擬器內、單一訓練 seed、人工注入的噪音下成立**，距離可發表/可上線還有三道關卡（噪音的真實性、訓練 seed 的統計顯著性、sim-to-live 的動作落差）。
+**一句話判斷：** Kelpflux 的系統工程持續成熟，但**核心負結論不變**：在真實 2×1（RTX 4070 + RTX 3080）上，**沒有任何 DRL 臂在任何可檢驗設定贏過 score 啟發式**——sim 多 seed、sleep live、真實 CUDA live 三端一致（eval §3.1/§4.1/§4.2）。本輪三件工程（item-1 異質性曝光、full PopArt、host 監控 + 3080 MPS 解鎖）都是**縮小 gap、穩定訓練、補測試平台缺口**，不是「贏過 score」的主張。
 
-本輪確立的事實（eval §4.3–4.5）：
+本輪確立的事實：
 
-1. **確定性 1×1 sim 下三者打平**，根因是**兩個一起**：oracle runtime（零不確定性 → CVaR≈mean，風險機制結構性閒置）+ auto-α 控制器 railing 壓垮策略。
-2. **注入 runtime 不確定性後，RDSAC 隨 σ 單調拉開對 SAC 的差距**（−73 → +47 → +196 pts），且 **fixed-α 對照排除 α 假象**（仍 +90～+143 pts），σ=1.0 時甚至**贏過 score** 並把 p99 尾部壓低 5–9×。
-3. **共置動作（PACK/ISOLATE）在 1×1 是負結果**——動作空間加倍在相同預算下 underfit，且單卡隔離=閒置；其價值需 ≥2 GPU。
+1. **item-1（異質性曝光，sim 驗證）**：先前策略**對卡型完全失明**——sim runtime 無 per-node 速度因子、obs 把 GPU one-hot 硬編成 `[1,0,0]`（一律當 4070）。現在 obs 曝露真實 gpu_type、sim cluster 模 node 速度（4070=1.0×、3080≈0.25×）。在**同一異質環境**裡公平比 homo-baseline vs hetero-trained（皆 vs score）：**hetero-trained 贏 10/12（seed,arm,family）格**，2 個輸的都是崩塌的 seed-42。非崩塌 seed 上，失明的 homo 策略在真異質叢集做得很差（−48～−172%），hetero 把多數補回（ali cvar 甚至 +3.4%、贏過 score）。這直接對應 §4.2「大 job 沒放對」的失敗。**但仍 sim-only、仍 seed-variant（seed-42 hetero 反崩到 −133%），且未在 live 驗證。**
+2. **full PopArt（已實作 + 驗證；重訓進行中）**：把 P2 的「PopArt-lite」（reward 前正規化）換成 critic 內的正規 PopArt（van Hasselt 2016）——reward head 出正規化回報、running μ/σ、output-preserving 重縮放（驗證逐位元 9.5e-7）、Z_R 在所有消費點反正規化。`--use-popart` flag、寫進 checkpoint、預設關（54 測試通過）。單 seed 初讀：對 RDSAC ali 有幫助（cvar −29→−3、mean −43→−8）、philly 大致中性、**vanilla SAC 反而變差**——與「PopArt 主要穩定 IQN 回報尺度」一致。**3-seed mean±std 待補。**
+3. **node-2 OS 升級 22.04→24.04（已完成）**：解鎖 3080 的 MPS（先前是打包缺口——driver 580 沒為 22.04 build）。3080 現通過 4-concurrent MPS 測試。**伴隨發現：MPS 先前根本沒在多工**——sleep job 不建 CUDA context 所以掩蓋了壞掉的 MPS，真 cuBLAS job 才暴露 → 現在真實-CUDA eval（§4.2）才成立。
+4. **host-metrics 監控盲區補上（已完成）**：加 node-exporter（hostNetwork DaemonSet，per-node host CPU/mem/disk/net）+「Node / Host」Grafana dashboard。起因是 node-2 掉線前無 host 遙測——這盲區現已覆蓋（既有 DCGM/Slurm dashboard 早已 multi-node-aware）。
 
-**三個專家視角的共同結論：** 目前的瓶頸已經**不是工程，而是方法學與測試平台規模**。三個視角各自指出的最高優先改進（詳見 §2）：
+**狀態 caveat：** node-2 **目前掉線**（疑似一次性硬體/網路故障，正實體排查中），所以**異質性感知的 live A/B 尚待跑**。item-1 應記為 **sim-validated、live-pending**。
+
+**三個專家視角的共同結論：** 瓶頸仍是**方法學與測試平台規模**，本輪推進了其中幾項但沒有翻動核心判斷。三個視角各自的最高優先改進（詳見 §2）：
 
 | 視角 | 最高優先改進 | 為什麼擋住結論 |
 |---|---|---|
-| **IEEE 審稿人** | 把 σ **校準到 runtime predictor 的真實殘差分布**，並補**多訓練 seed**（≥3–5）| 否則「注入噪音 → 抗噪方法贏」近乎套套邏輯；單 seed 的 per-family 數字審稿人不會接受 |
-| **AI Infra** | 修正 **train/serve 動作落差**（sim 學 placement，live 只套 priority boost）| 否則 sim 結論無法外推到 live；live 永遠只能 demo fallback |
-| **ML/Model** | 在 σ-sweep 補 **RDSAC-mean 臂**，拆開「分布式 critic」與「風險扭曲」兩個貢獻 | 目前 SAC vs RDSAC-cvar 把兩件事混在一起，無法歸因 |
+| **IEEE 審稿人** | **多訓練 seed 的統計顯著性**仍是門檻：item-1 的「贏 10/12」是 3-seed 點數、且 1 個 seed 完全崩塌；PopArt 只有單 seed 初讀 | 否則「曝露異質性有幫助」與「PopArt 穩定訓練」都只是 anecdote，且訓練變異仍主宰 |
+| **AI Infra** | **異質性感知的 live A/B**（解 node-2 掉線後跑）+ 仍未解的 **train/serve 動作落差** | sim 已證 item-1 縮 gap，但 live 才是真實裁判；node-2 上線後這是最高價值的下一個實機實驗 |
+| **ML/Model** | **PopArt 的 3-seed 確認**，並釐清它為何對 SAC 有害、對 RDSAC 有益 | 單 seed 不能下「PopArt 穩定訓練」結論；SAC 變差暗示它與 scalar critic 互動不良，需歸因 |
 
 ---
 
-## 1. 自 v6 以來的狀態變更（delta）
+## 1. 自 v7 以來的狀態變更（delta）
 
-| 項目 | v6（2026-05-31） | v7（2026-06-13） |
+| 項目 | v7（2026-06-13） | v8（2026-06-22） |
 |---|---|---|
-| 演算法命名 | 「DSAC」 | **RDSAC**：雙頭 IQN 分布式 critic（Z_R/Z_H）+ categorical actor + 風險扭曲；`use_iqn` flag 切換 vanilla SAC ↔ RDSAC。**注意命名陷阱**：這不是 Duan et al. 2021 的連續控制 DSAC，是 Christodoulou 2019 + Dabney 2018 + 風險變體的自組版本 |
-| 三方對照 | 缺 | 已有 score / SAC / RDSAC 三方（eval §4.3），靠單一 flag 切換 |
-| auto-α 假象 | 未診斷 | 已定位並用 fixed-α 對照拆解（§4.3.1）——SAC 墊底大半是共用 α 控制器 railing |
-| 評估種子數 | 5-seed | eval 用 30-seed paired；**但訓練仍單 seed**（最大方法學缺口）|
-| 不確定性消融 | 無 | **新增 §4.4**：opt-in runtime σ + 干擾模型，證明風險機制在有尾部時有用 |
-| 共置動作 | 無 | **新增 §4.5**：PACK/ISOLATE，1×1 負結果，待 2-node |
-| 第二節點 | 「待建 2×2」 | RTX 3080（Ubuntu 24.04）即將加入 → 2-node **異質 2×1**；`docs/intergration.md` 已備 runbook（並標出 3080 在 codebase 完全缺席的異質性缺口）|
+| 測試平台拓樸 | 異質 2×1「即將上線」 | **已上線並跑出多 seed 結果**：sim σ-sweep（3 train seed）+ live placement A/B（3 train seed）+ 真實 CUDA job（§3.1/§4.1/§4.2）。核心負結論在三端固實 |
+| 卡型異質性 | 策略**對卡型完全失明**（runtime 無 per-node 速度、obs GPU one-hot 硬編 `[1,0,0]`）| **item-1 已修（sim 驗證）**：obs 曝露真實 gpu_type、sim 模 node 速度（4070=1.0×/3080≈0.25×）；hetero-trained 在同異質環境贏 homo-baseline 10/12 格（commit `bc69c0e`/`6db9a36`）。obs_dim 仍 166（dim-preserving）|
+| Return normalization | PopArt-lite（reward 前正規化，§3.6 P2）| **full PopArt**（critic 內、van Hasselt 2016；output-preserving 重縮放驗證 9.5e-7；`--use-popart`，預設關，54 測試通過，commit `14f824f`）。單 seed 初讀：助 RDSAC、傷 SAC；3-seed 待補 |
+| 3080 MPS | runbook 已備、但實際**未驗證多工** | **已解鎖**：node-2 22.04→24.04 升級修好 device-plugin config-manager CrashLoop，3080 通過 4-concurrent MPS（`intergration.md §12`）。**發現：MPS 先前根本沒多工**——sleep job 無 CUDA context 掩蓋了它 |
+| Host 監控 | 只有 GPU(DCGM)/Slurm/k8s/RL，**無 host-level metrics** | **已補**：node-exporter（hostNetwork DaemonSet）+「Node / Host」Grafana dashboard（per-node CPU/mem/disk/net），commit `d0f5523`。起因 node-2 掉線前無 host 遙測 |
+| 真實 CUDA eval | sleep job（runtime 與 placement 無關）| **已換真實 cuBLAS**（`gpu_workload.cu`，異質 MPS 需求 25/50/75/100，§4.2）；輸贏關鍵=大 job 有沒有放對 |
+| node-2 狀態 | — | **目前掉線**（疑一次性故障，實體排查中）→ 異質性感知的 **live A/B 待跑** |
 
-v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix）部分由 §4.4 隨機性消融推進；P1-3（score-residual RDSAC）仍未做，且 §4.5 的負結果反而提高了它的優先序。
+v7 的 P0/P1 推進情況：P0-2（多 seed）已做（sim+live 皆 3 train seed）；P0-3（拆 distributional vs risk）已做（§3.3，結論：分布式 critic 是有用的一半、CVaR 反扣分）；P0-4（向量化）已落地（`--num-envs N`）；P0-1（σ 校準）已做（§3.2）。本輪新增 item-1 與 full PopArt 對應 v7 的 I3/P2-1/P2-5（彈性/正規化）方向。
 
 ---
 
@@ -48,44 +51,46 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 
 ### 2.1 IEEE 審稿人視角：這份結果能不能過 peer review？
 
-審稿人會先肯定**誠實的負結果**（§4.3.1 自我修正、§4.5 負結果）——這在系統論文裡是加分而非減分。但會在以下五點要求 major revision：
+審稿人會先肯定**誠實的負結果**（§3.5 自我修正、§4.1 seed-robust 負結果、§4.2 大 job 失敗剖析）——這在系統論文裡是加分而非減分。R1（σ 校準）與 R2（多 seed）自 v7 起已大幅解決，但仍有未竟之處：
 
-| # | 審稿意見 | 嚴重度 | 改進 |
+| # | 審稿意見 | 嚴重度 | 狀態 / 改進 |
 |---|---|:---:|---|
-| R1 | **注入噪音的真實性未經校準。** 核心正結果是「在人工 mean-preserving lognormal σ 下，風險敏感法贏」。σ=0.5/1.0 從何而來？若噪音是任意選的，這個結果近乎套套邏輯（加風險 → 抗風險法贏）。 | **Critical** | 你們**已經有 LightGBM runtime predictor**——量它在真實 trace 上的 log-residual 分布，用**那個** σ（與形狀）當作 sim 噪音。把「σ 來自實測預測誤差」寫進方法學，這個結果才站得住。 |
-| R2 | **訓練單 seed。** eval 用 30 種子是評估隨機性，但每個 (algo, σ) 只訓練**一次**。doc 自己承認 §4.3.1 細排名是單訓練 seed 雜訊。per-family 的 +52/+189/+333 不能只報點值。 | **Critical** | 每個 cell 至少 3–5 個訓練 seed，報 mean±std 或 IQR；對「RDSAC−SAC gap 隨 σ 單調」做跨 seed 的顯著性。沒有這個，所有 §4.4/§4.5 的數字都是 anecdote。 |
-| R3 | **baseline 太單薄。** 只比自家 `score` 啟發式 + vanilla SAC。 | High | 補：FCFS、SJF（你有 oracle runtime，SJF 是強 baseline）、Tetris/packing 啟發式；理想上一個已發表的 RL scheduler（Decima / DeepRM 改編）。再加一個近似上界（clairvoyant SJF 或離線排程 LP）讓 ΔJCT% 有尺度感。 |
-| R4 | **外部效度 / sim-to-real gap 未量化。** 全部正結果在 sim；live 1×1 全數打平（模型 abstain ~90–100%）。 | High | 明確分離兩個主張：(a) sim 內的演算法比較（需 R1/R2 才成立）、(b) live 的**韌性**（fail-safe，不是效能）。寫一個 Threats to Validity：單卡天花板、注入噪音、單訓練 seed、僅啟發式 baseline、消費級 GPU 與桌面遊戲共享造成的熱/競爭干擾。 |
-| R5 | **命名與定位。** 「RDSAC/DSAC」與已發表的 Duan 2021 DSAC 撞名，審稿人第一眼就會混淆。 | Medium | 換一個乾淨名稱（如 *discrete risk-sensitive distributional SAC, dRSAC*）或在標題/摘要就重度 caveat。貢獻定位建議照 v6 §6：主軸是 **safe + observable ML-assisted scheduling platform**，RL 超越 baseline 是「在有尾部風險時」的條件式加分，不是無條件主張。 |
+| R1 | **注入噪音的真實性。** 核心結果依賴注入的 mean-preserving lognormal σ。 | ~~Critical~~ **已解** | **DONE**：§3.2 用生產 LightGBM 量真實 trace 的 log-殘差 std（philly 1.45 / ali 1.24），證明 §3.1 用的 σ=1.0 是保守下界、且殘差近高斯。剩餘：σ 是合成 trace 的最難預測上界，應在真實結構化 trace 上重量（v7 P0-1 的尾巴）。 |
+| R2 | **訓練單 seed。** | ~~Critical~~ **大幅解** | **DONE（多數）**：sim σ-sweep 與 live A/B 都用 3 train seed（42/43/44）報 mean±std。**但 item-1 與 PopArt 兩個新結果尚未達標**——item-1 是 3-seed 點數但含 1 個完全崩塌的 seed-42；PopArt 只有單 seed 初讀。這兩個仍是 anecdote 等級。 |
+| R3 | **baseline 太單薄。** 只比自家 `score` 啟發式 + vanilla SAC。 | High（未解）| 補：FCFS、SJF（有 oracle runtime，SJF 是強 baseline）、Tetris/packing 啟發式；理想上一個已發表的 RL scheduler（Decima / DeepRM 改編）。再加一個近似上界讓 ΔJCT% 有尺度感。 |
+| R4 | **外部效度 / sim-to-real gap。** | High（部分解）| sim-to-live gap 現有**真數據**：sim 與 live placement 對 cvar 評價相反（sim 較穩 vs live 最差）。明確分離兩個主張：(a) sim 內演算法比較、(b) live 的**負結果 + 韌性（fail-safe）**。Threats to Validity 要寫：訓練高變異（跨 seed 擺盪 30–90 pts）、item-1 sim-only、消費級 GPU 與桌面遊戲共享干擾。 |
+| R5 | **命名與定位。** 「RDSAC/DSAC」與 Duan 2021 DSAC 撞名。 | Medium（未解）| 換乾淨名稱（如 *discrete risk-sensitive distributional SAC, dRSAC*）或標題/摘要重度 caveat。定位主軸應是 **safe + observable ML-assisted scheduling platform 的誠實負結果 + 機制剖析**，而非「RL 贏 heuristic」。 |
+| R6（新）| **item-1 的因果宣稱過強。** 「曝露異質性 → 贏 10/12」聽起來像正結果，但 12 格全是「vs score 的負值往 0 靠」、非真贏 score（只有 ali cvar 1 格 +3.4%），且含 1 個崩塌 seed。 | High | 把 item-1 框成「**縮小 §4.2 的 gap**」而非「贏」；補多 seed 讓「曝露異質性的效果 > 訓練變異」可被統計檢定；最關鍵是**在 live 異質叢集驗證**（node-2 上線後）。 |
 
-**審稿人總評（模擬）：** 系統貢獻（OTel trace bridge、sim-to-live、MPS-aware、誠實的消融）足以撐一篇 systems track。但若標題押「risk-sensitive RL beats heuristic GPU scheduling」，以目前證據會被打回——因為它在**校準噪音 + 多 seed + 多 baseline** 下尚未驗證。R1+R2 是過關門檻。
+**審稿人總評（模擬）：** 系統貢獻（OTel trace bridge、sim-to-live、MPS-aware、誠實的多 seed 負結果、異質性曝光的機制修正）足以撐一篇 systems track，且 R1/R2 的補強讓方法學顯著變硬。但若標題押「risk-sensitive / heterogeneity-aware RL beats heuristic GPU scheduling」，以目前證據仍會被打回——因為**沒人贏 score** 是本研究最穩健的事實。可發表的故事是「我們用嚴謹的多 seed + 校準噪音的設計，誠實地證明在此規模下啟發式仍勝出，並剖析了 DRL 退化的機制」。
 
 ### 2.2 AI Infra 專家視角：這套東西在真實基礎設施上站得住嗎？
 
-| # | 觀察 | 嚴重度 | 改進 |
+| # | 觀察 | 嚴重度 | 狀態 / 改進 |
 |---|---|:---:|---|
-| I1 | **train/serve 動作落差。** sim 訓練的是 placement policy（job, node, gpu），但 live 的 Lua hook 只把 RL 的選擇轉成 **priority boost**——Slurm 仍做真正的 allocation，`node_j/gpu_k` 在 live 並未被強制執行。等於訓練一個放置策略、上線只用了它的「選哪個 job」那一半。 | **Critical** | 兩條路擇一：(a) 把 live 真正接上 explicit placement（`live_daemon` 已有 `srun` 明確放置的雛形，但預設 SHADOW），讓 serve 的 placement 真的被執行；或 (b) 把 sim 的 action 改成只學 priority/job-selection，與 live 對齊。現在的不一致讓任何 sim 結論都無法宣稱能轉移到 live。 |
-| I2 | **MPS 不是生產級共享原語。** 無記憶體/故障隔離：一個 job OOM 可拖垮共置者。§4.4 的干擾模型是 `1 + k·factor` 線性近似，真實干擾取決於 kernel overlap、記憶體頻寬、L2 競爭，可能是非線性甚至災難式。 | High | 消費卡無 MIG，可接受用 MPS demo，但要在 Threats 寫明；干擾模型至少做一次**實測校準**（在真卡上跑 2 個 compute-bound job 量 slowdown 分布），別只用線性假設。生產敘事需提 MIG/時間片的取捨。 |
-| I3 | **固定拓樸的 obs/action 空間 = 反彈性。** `gym_env` 的 obs_dim / n_actions 綁死 N_NODES×N_GPUS，節點 join/leave 就 checkpoint 不相容、要從零重訓。對「cloud-native 彈性叢集」的宣稱是根本性矛盾——這也是為什麼加一台 3080 就要重訓。 | High | 中期應走 **permutation-invariant / 可變長度** 的 obs（set-based 編碼，如對節點/GPU token 做 attention pooling，往「節點數無關」推進），讓單一 policy 跨拓樸。否則每次擴縮都重訓，無法營運。 |
-| I4 | **submit-path 同步延遲。** Lua 在 `slurm_job_submit` 同步呼叫 `/decide`（150ms timeout）。負載高時這是 submit 關鍵路徑。 | Medium | 量 `/decide` 的 p99 與在 batch submit 風暴下的 slurmctld 影響；serve 確保 CPU 推論 + warm pool（memory 已記 `min_replicas=1`）。把 decision latency、snapshot age、abstain rate 設成有 alert 的 SLO。 |
-| I5 | **測試平台規模 vs 宣稱。** 整個「叢集」是一張與 Steam 遊戲共享的消費級 RTX 4070 上的 k3s 單節點；第二台是異質消費卡 3080。 | Medium | 這不是缺陷、是限制——但要在論文/報告誠實標示，且 live 數字要排除遊戲佔卡造成的熱節流/競爭（本輪訓練就曾因 `wwm.exe` 佔卡使 CUDA 不可用）。理想上把實驗挪到專用機或雲端 spot GPU 做最終數據。 |
-| I6 | **單副本關鍵服務 + operator 無 leader election**（v6 已記，仍未解）。 | Medium | 維持 v6 建議：operator active-passive leader election；rl-scheduler 可 2 replicas + PDB。fail-safe 讓 submit 不壞，但 snapshot pusher / live_daemon 仍是 SPOF。 |
+| I1 | **train/serve 動作落差。** sim 訓練 placement（job, node, gpu），live 過去只把 RL 選擇轉成 priority boost。 | ~~Critical~~ **已解** | **DONE**：live A/B 現走 explicit placement（`run_heavytail_ab --placement`，submit-時 `-w` 釘節點，因 Slurm 21.08 無法 post-submit 重釘）。serve 的 node 選擇真的被執行——這也是為什麼 §4.1 能量化「learned 全把負載擠到 4070（85–89%）」這個鐵證。落差已關上，留下的是**結果本身是負的**。 |
+| I2 | **MPS 不是生產級共享原語 + 干擾模型未實測。** | High（部分解）| **進展**：§4.2 已用真實 cuBLAS job 取代 sleep（線性干擾假設不再是唯一證據）；且本輪發現 **MPS 先前根本沒在多工**（sleep 無 CUDA context 掩蓋之），node-2 升級後 3080 才真的 4-concurrent。仍未解：消費卡無 MIG/故障隔離要在 Threats 寫明；2-job slowdown 分布的正式實測校準仍缺。 |
+| I3 | **固定拓樸的 obs/action 空間 = 反彈性。** obs_dim / n_actions 綁死 N_NODES×N_GPUS，節點 join/leave 就 checkpoint 不相容。 | High（部分解）| **進展**：item-1 讓 GPU one-hot 反映真實卡型（4070→`[1,0,0]`/3080→`[0,1,0]`），**dim-preserving（obs_dim 仍 166）**——所以策略現在「看得到」異質性而不需改維度。但這只解了「同拓樸內的異質性」；**節點數變動仍要重訓**。中期仍應走 permutation-invariant / set-based obs（attention pooling），讓單一 policy 跨拓樸。 |
+| I4 | **submit-path 同步延遲。** Lua 在 `slurm_job_submit` 同步呼叫 `/decide`（timeout）。 | Medium（未解）| 量 `/decide` 的 p99 與 batch submit 風暴下的 slurmctld 影響；把 decision latency、snapshot age、abstain rate 設成有 alert 的 SLO。**本輪補的 node-exporter host metrics 是這方向的前置**——現在至少能看到 node 的 CPU/load/mem 壓力。 |
+| I5 | **測試平台規模 vs 宣稱。** 消費級 4070（與 Steam 共享）+ 異質 3080。 | Medium（持續）| 這是限制不是缺陷，但要誠實標示。本輪 node-2 **掉線**正是消費級測試平台脆弱性的活證據——理想上最終數據挪到專用機/雲端 spot。live 數字要排除遊戲佔卡的熱節流（曾因 `wwm.exe` 佔卡使 CUDA 不可用）。 |
+| I6 | **可觀測性盲區 + 單副本關鍵服務。** | Medium（部分解）| **進展**：node-exporter（hostNetwork DaemonSet）+「Node / Host」dashboard 補上 host-level CPU/mem/disk/net 盲區（先前只有 GPU/Slurm/k8s/RL）——node-2 掉線前的記憶體壓力/load 之類現在看得到。**仍未解**：operator 無 leader election；rl-scheduler 單副本；snapshot pusher / live_daemon 仍是 SPOF。 |
 
-**Infra 總評：** 可觀測性與 fail-safe 設計是真強項（v6 已肯定）。但 **I1（train/serve 動作落差）是把 sim 成果接到 live 的根本障礙**，沒解掉，live 永遠只能展示「壞 checkpoint 也不會讓 JCT 變差」，無法展示「RL 讓 JCT 變好」。I3 則決定這套東西能不能叫「彈性叢集」。
+**Infra 總評：** I1（train/serve 動作落差）這個 v7 的最大障礙**本輪已關上**——live 真的執行 RL 的 placement，代價是讓負結果無所遁形（learned 全擠 4070）。可觀測性（I6）與測試平台脆弱性（I5）本輪都有進展（host metrics、3080 MPS 解鎖），但 node-2 掉線把「異質性感知 live A/B」這個最關鍵的下一步擋住了。I3 的彈性問題只解了一半（同拓樸異質性 OK，跨拓樸仍重訓）。
 
 ### 2.3 ML / Model 專家視角：建模與方法本身是否扎實？
 
-| # | 觀察 | 嚴重度 | 改進 |
+| # | 觀察 | 嚴重度 | 狀態 / 改進 |
 |---|---|:---:|---|
-| M1 | **歸因未拆乾淨。** σ-sweep 比的是 SAC（scalar）vs RDSAC-**cvar**（分布式 + 風險扭曲），把「分布式 critic」與「風險扭曲」兩個貢獻綁在一起。 | **Critical** | 在 σ-sweep 補 **RDSAC-mean 臂**（分布式但風險中立）。三方 SAC / RDSAC-mean / RDSAC-cvar 才能回答「贏是因為 distributional critic 還是因為 CVaR」。這是最便宜、最高價值的下一個實驗。 |
-| M2 | **score-warmup 可能是 live abstain ~90% 的元兇。** 訓練前期用 score 排程器產生種子 transition，模型可能直接 clone 了 score（1×1 近最優）→ 學不到偏離 score 的放置 → 上線就 no-op。 | High | 做 warmup on/off 的 ablation；或改成「衰減式」warmup（前期高、後期關）。若關掉 warmup 後 live abstain 率下降，這就是 1×1 live 全打平的真正機制（而非「策略本來就該 no-op」）。 |
-| M3 | **auto-α 修法是 band-aid。** 需要 reward_scale=20000 + 放寬 clamp 才不 railing，說明根因是 return 尺度 vs entropy 項失衡；discrete-SAC 的 target-entropy 啟發式本就 finicky。 | High | 用 **return normalization（PopArt / reward 標準化）**讓單一 α 控制器跨 SAC/RDSAC 都穩，不必 per-algorithm 調 reward_scale。這也讓 §4.3.1 必須釘 α 的 caveat 消失。 |
-| M4 | **§4.5 共置負結果是預算混淆。** ON 有 2× 動作但同 100k 步 → underfit。結論其實是「相同預算下大動作空間學不好」，不是「共置沒用」。 | High | 給 ON 臂**配對的訓練資訊量**（按 log|A| 放大步數，或對 ISOLATE 的稀疏 mask 做 action-embedding / factorized policy）。否則 §4.5 應明確標為「budget-confounded」，不能下「共置無用」的強結論（doc 已部分標註，可再強化）。 |
-| M5 | **無 held-out workload。** 在 philly/burst/ali 混合訓練、又在同三族評估。 | Medium | 做 workload split（train philly+burst、test ali）證明泛化而非記住 trace 統計。對「能應付沒見過的 workload」的宣稱是必要的。 |
-| M6 | **機制堆疊缺 ablation。** n-step、PER、potential shaping、score warmup、雙頭 Z_R/Z_H 全開，沒有逐項 ablation。 | Medium | 至少對 PER、potential shaping、雙頭分解各做一次開關。尤其**雙頭 Z_R/Z_H**（RDSAC 特有的熵回報分離）增加複雜度——若單頭分布式 critic（熵折進 V）效果相當，應簡化。 |
-| M7 | **sim 是純 Python 離散事件、~10 steps/s = 多 seed 研究的算力牆。** 本輪一個 σ 區塊就要 ~4.6h。 | High（間接擋住 M1/R2）| **已做第一階段：向量化**（`sim/vec_env.py` Sync/Async vector env + `sim_train --num-envs N` 多進程並行 rollout，多核近線性放大吞吐）。多訓練 seed（R2）與三方臂（M1）現在算力上可行。**下一階段**（若仍是瓶頸）：numba / 重寫熱路徑把*單 env* steps/s 也拉高一個數量級。 |
+| M1 | **歸因未拆乾淨。** 分布式 critic 與風險扭曲綁在一起。 | ~~Critical~~ **已解** | **DONE**：§3.3 補了 RDSAC-mean 臂（分布式但風險中立），三方 3-seed。結論：σ=1.0 下**分布式 critic 是有用的一半（SAC→mean +25 pts）、CVaR 風險扭曲反而扣分（mean→cvar −22~−34 pts）**——與設計意圖相反，但兩者都沒讓 RDSAC 贏 score。歸因問題解了，答案是「設計的風險機制沒帶來預期收益」。 |
+| M2 | **score-warmup 可能造成 live 過度集中 / no-op。** | High（部分轉向）| 1×1 的 abstain 問題在 2×1 已被「過度集中到 4070」取代（learned 不再 no-op，而是學壞）。§3.6 的診斷指向**訓練退化**（過度集中 + 高變異）而非單純 clone score。warmup on/off ablation 仍值得做，但 P1 balance-shaping 已把集中度從 89%→~71%（§3.6），方向對。 |
+| M3 | **auto-α 修法是 band-aid（reward_scale=20000 手調）。** | ~~High~~ **進行中** | **進展**：full PopArt（critic 內 return normalization，van Hasselt 2016）已實作 + 驗證 output-preserving（9.5e-7），目標正是消掉手調 reward_scale 與固定 α=0.05 的 caveat。**但**單 seed 初讀顯示它**對 SAC 反而有害**（與 scalar critic 互動不良？），對 RDSAC ali 有益、philly 中性——3-seed 確認與「為何傷 SAC」的歸因都還沒做。先前的 PopArt-lite（§3.6 P2）才是已驗證有效的那個。 |
+| M4 | **§3.4 共置負結果是預算混淆。** ON 有 2× 動作但同步數 → underfit。 | High（持平）| 給 ON 臂配對的訓練資訊量（按 log\|A\| 放大步數），或對 ISOLATE 稀疏 mask 做 action-embedding。否則維持「budget-confounded」標註，不下「共置無用」強結論。 |
+| M5 | **無 held-out workload。** | Medium（未解）| workload split（train philly、test ali）證明泛化而非記住 trace 統計。item-1 之後更該做——「異質性曝露幫助大 job 放置」是否泛化到沒見過的 workload？ |
+| M6 | **機制堆疊缺 ablation。** n-step、PER、shaping、warmup、雙頭 Z_R/Z_H 全開。 | Medium（部分解）| **進展**：§3.6 對 balance-shaping + reward-norm 做了開關對比（有效，cvar/SAC +19~+31 pts）。仍缺：PER、雙頭 Z_R/Z_H 的逐項 ablation。尤其雙頭分解增加複雜度——若單頭（熵折進 V）效果相當應簡化。 |
+| M7 | **sim 算力牆。** 純 Python 離散事件。 | ~~High~~ **已解（第一階段）** | **DONE**：`sim/vec_env.py` + `sim_train --num-envs N` 多進程並行 rollout 已落地（caveat：vec path 的 score-warmup 退回 random-legal，UTD 隨 N 稀釋需同步調高 `--utd-ratio`）。多 seed（R2）與三方臂（M1）已在算力上可行並已執行。 |
+| M8（新）| **item-1 的 sim 速度建模太粗。** 3080≈0.25× 是固定純量縮放，真實異質性（不同 kernel 對記憶體頻寬/SM 數的敏感度不同）非單一純量。 | Medium | 把 0.25× 標為一階近似；理想上 per-workload 量真實 4070-vs-3080 的 runtime 比，餵進 sim。否則 item-1 的「贏 10/12」帶著一個未校準的速度假設。 |
 
-**Model 總評：** RDSAC 的實作對齊參考文獻、有測試覆蓋（本輪 +9 測試），σ 消融的方向性結論在理論上合理。但 **M1（拆 distributional vs risk）與 M2（warmup 是否造成 abstain）是兩個最關鍵、最便宜的待答問題**，而 M7（算力牆）是讓 R2/M1 變得可行的前置工程。
+**Model 總評：** v7 的兩個關鍵歸因問題本輪都有答案：M1 已拆（分布式有用、CVaR 反扣分）、M7 算力牆已解。新的待答是 **M3（PopArt 為何傷 SAC + 3-seed 確認）與 M8（item-1 速度建模的校準）**。整體圖像未變：機制層面沒有任何花招讓 DRL 贏 score，瓶頸是**訓練退化（過度集中 + 高變異）**，本輪的 item-1 與 PopArt 都是朝「修訓練/縮 gap」的正確方向，但都還在單/少 seed 的 anecdote 階段。
 
 ---
 
@@ -93,52 +98,50 @@ v6 列的 P1-1（建 2-node 環境）正在硬體層發生；P1-2（eval matrix�
 
 > 原則：先做能讓**研究結論成立**的事（P0），再做能讓**結論轉移到 live**的事（P1），最後才是工程韌性與清理（P2，多數沿用 v6）。
 
-**已解決，不再列入待辦（自 v6 / 本輪）：** 三方 score/SAC/RDSAC 對照（§4.3）、auto-α 診斷 + fixed-α 受控對照（§4.3.1）、30-seed paired eval、隨機性消融能力與 σ-sweep（§4.4）、共置動作能力與其 1×1 負結果（§4.5）、2-node 加入 runbook（`docs/intergration.md`）、`chart/values-2x2.yaml`、runtime predictor 測試（`services/runtime_predictor/tests/` 已含 feature/cold-start/retrain 三項，對應 v6 P2-2）、7 個 CI workflow（v6 C1/S2）。
+**已解決，不再列入待辦（自 v7 / 本輪）：** 三方 score/SAC/RDSAC 對照 + auto-α 診斷 + fixed-α 對照（§3.1）、σ 校準到真實 predictor 殘差（§3.2，✅ v7 P0-1）、σ-sweep 補 RDSAC-mean 臂拆解 distributional/risk（§3.3，✅ v7 P0-3）、sim+live 雙端 3 train seed（§3.1/§4.1，✅ v7 P0-2）、向量化 sim（`--num-envs N`，✅ v7 P0-4）、**train/serve 動作落差**（live 真接 explicit placement，§4.1，✅ v7 P1-1 I1）、**真實 CUDA job eval**（§4.2 取代 sleep，✅ v7 P1-6 部分）、**item-1 異質性曝光**（sim 驗證，✅ 本輪）、**full PopArt 實作 + 驗證**（本輪，3-seed 確認待補）、**node-2 上線 + 3080 MPS 解鎖**（`intergration.md §12`，✅ 本輪 I2 部分）、**host-metrics 監控**（node-exporter + dashboard，✅ 本輪 I6 部分）。
 
 ### P0 — 沒做就無法下結論（方法學門檻）
 
-| ID | 項目 | 對應視角 | 產出 |
+| ID | 項目 | 對應視角 | 狀態 |
 |---|---|---|---|
-| P0-1 | **σ 校準到真實 predictor 殘差** | R1 | 量 LightGBM 的 log-residual 分布，σ 用實測值；方法學寫明 |
-| P0-2 | **多訓練 seed（≥3–5）重跑 §4.4/§4.5 關鍵點** | R2, M4 | 每 cell mean±std；gap 單調性的跨 seed 顯著性 |
-| P0-3 | **σ-sweep 補 RDSAC-mean 臂** | M1 | 三方拆解 distributional vs risk 貢獻 |
-| P0-4 | **向量化 / 加速 sim**（前置工程，**已做向量化**）| M7 | `--num-envs N` 多進程並行 rollout 已落地，吞吐隨核數放大，讓 P0-2/P0-3 可行；單 env 編譯加速為下一階段 |
+| P0-1 | **item-1 / PopArt 的多訓練 seed 確認** | R2, R6, M3 | **OPEN（最高優先）**：item-1 含 1 個崩塌 seed-42、PopArt 只有單 seed 初讀。兩者都還是 anecdote，要 3–5 seed mean±std 才能下結論 |
+| P0-2 | **異質性感知的 live A/B**（item-1 上線檢驗）| I1, R6 | **BLOCKED（node-2 掉線）**：sim 已證 item-1 縮 gap，但 live 才是裁判。node-2 修復後立刻跑 |
+| P0-3 | **PopArt 為何傷 SAC 的歸因** | M3 | **OPEN**：單 seed 顯示 PopArt 助 RDSAC、傷 SAC；釐清是 scalar critic 互動還是 seed 雜訊 |
+| P0-4 | **真實結構化 trace 上重量 σ** | R1 尾巴 | **OPEN**：§3.2 的 σ 是合成 trace 最難預測上界，應在 `load_philly()` 真實 trace 上重量 |
 
 ### P1 — 讓 sim 結論能轉移到 live / 更強的對照
 
-| ID | 項目 | 對應視角 | 備註 |
+| ID | 項目 | 對應視角 | 狀態 / 備註 |
 |---|---|---|---|
-| P1-1 | **修 train/serve 動作落差** | I1 | 二選一：live 真接 explicit placement，或 sim 改學 priority/selection |
-| P1-2 | **score-residual RDSAC**（`final = score + RL_delta`，bounded）| v6 P1-3, R5 | §4.5 負結果後優先序升高；學「何時修正啟發式」而非從零學 |
-| P1-3 | **warmup on/off ablation**（驗證 live abstain 成因）| M2 | 可能直接解釋 1×1 live 全打平 |
-| P1-4 | **補強 baseline**：FCFS / SJF / packing / 近似上界 | R3 | ΔJCT% 才有尺度感 |
-| P1-5 | **2-node（4070+3080）異質實驗** | I3, §4.5 | `rtx3080` 已建模進 `GPU_TYPES` / `_gpu_type_to_vram`（10GB，字母表收斂為 {4070,3080}）；剩 2×1 拓樸重訓 + 共置動作在真 2-GPU 重評 |
-| P1-6 | **干擾模型實測校準** | I2 | 真卡量 2-job slowdown 分布，取代線性假設 |
+| P1-1 | **score-residual RDSAC**（`final = score + RL_delta`，bounded）| R5, M2 | **OPEN**：過度集中負結果後優先序更高；學「何時修正啟發式」而非從零學、且天然 fail-safe 回 score |
+| P1-2 | **補強 baseline**：FCFS / SJF / packing / 近似上界 | R3 | **OPEN**：有 oracle runtime，SJF 是強 baseline；讓 ΔJCT% 有尺度感 |
+| P1-3 | **共置動作在真 2-GPU 重評** | M4, §3.4 | **部分**：2×1 已上線但共置仍 budget-confounded；MPS 多工已解鎖，可在真共置下重評 |
+| P1-4 | **干擾模型實測校準** | I2 | **OPEN**：真卡量 2-job slowdown 分布，取代線性假設（MPS 現已能真共置 → 可量了）|
+| P1-5 | **item-1 速度建模校準** | M8 | **OPEN**：3080≈0.25× 是固定純量；per-workload 量真實 4070-vs-3080 runtime 比 |
 
-### P2 — 工程韌性與清理（多沿用 v6，仍有效）
+### P2 — 工程韌性與清理（多沿用 v7，仍有效）
 
-| ID | 項目 | 來源 |
-|---|---|---|
-| P2-1 | return normalization（PopArt）取代 reward_scale 手調 | M3 |
-| P2-2 | 機制 ablation（PER / shaping / 雙頭 Z_R/Z_H）| M6 |
-| P2-3 | held-out workload split | M5 |
-| P2-4 | operator leader election；rl-scheduler 2 replicas + PDB | v6 P1-5/P2-1, I6 |
-| P2-5 | permutation-invariant obs（往跨拓樸 policy）| I3 |
-| P2-6 | fragmentation 維持 shadow + 加 progress penalty；NFS mount tuning | v6 P2-3/P2-5 |
-| P2-7 | submit-path chaos 實機數據；decision-latency/abstain SLO + alert | v6 P1-4, I4 |
+| ID | 項目 | 來源 | 狀態 |
+|---|---|---|---|
+| P2-1 | 機制 ablation（PER / shaping / 雙頭 Z_R/Z_H）| M6 | 部分（§3.6 做了 shaping/reward-norm 開關）|
+| P2-2 | held-out workload split | M5 | OPEN |
+| P2-3 | operator leader election；rl-scheduler 2 replicas + PDB | I6 | OPEN（snapshot pusher / live_daemon 仍 SPOF）|
+| P2-4 | permutation-invariant obs（往跨拓樸 policy）| I3 | OPEN（item-1 只解同拓樸異質性，跨拓樸仍重訓）|
+| P2-5 | fragmentation 維持 shadow + 加 progress penalty；NFS mount tuning | v6 P2-3/P2-5 | OPEN |
+| P2-6 | submit-path chaos 實機數據；decision-latency/abstain SLO + alert | I4 | 部分（host metrics 已補，SLO/alert 仍缺）|
 
 ---
 
 ## 4. 更新後評分卡
 
-| 面向 | v6 | v7 | 變動說明 |
-|---|:---:|:---:|---|
-| 工程完整度 | 4/5 | 4/5 | 維持；A/B 工具 + 測試再增 |
-| Live 安全性 | 4/5 | 4/5 | fail-safe 已多次實證；仍缺實機 chaos 數據 |
-| 可觀測性 | 5/5 | 5/5 | 最強項，未變 |
-| 生產化韌性 | 3/5 | 3/5 | leader election / 單副本仍未解 |
-| **DRL 研究方法學** | 2.5/5 | **3/5** | 隨機性消融 + fixed-α 對照是實質方法學進步；但單訓練 seed、未校準噪音、未拆 distributional/risk 仍壓住分數 |
-| **可發表性（IEEE）** | — | **2.5/5** | 系統貢獻夠；演算法主張需 P0-1/P0-2/P0-3 才過門檻 |
-| **sim-to-live 保真度** | — | **2/5** | I1 動作落差是最大未解項 |
+| 面向 | v6 | v7 | v8 | 變動說明 |
+|---|:---:|:---:|:---:|---|
+| 工程完整度 | 4/5 | 4/5 | **4.5/5** | item-1 + full PopArt + 2-node 上線管線 + 真實 CUDA eval；接近滿分，缺的是 baseline 廣度 |
+| Live 安全性 | 4/5 | 4/5 | 4/5 | fail-safe 多次實證；仍缺實機 chaos 數據 |
+| 可觀測性 | 5/5 | 5/5 | 5/5 | host-metrics 盲區補上，鞏固最強項 |
+| 生產化韌性 | 3/5 | 3/5 | **3.5/5** | host monitoring 補上、3080 MPS 解鎖；leader election / 單副本 SPOF 仍未解 |
+| **DRL 研究方法學** | 2.5/5 | 3/5 | **3.5/5** | σ 校準 + 多 seed（sim+live）+ 拆 distributional/risk + 向量化全到位；扣分轉到 item-1/PopArt 仍單/少 seed |
+| **可發表性（IEEE）** | — | 2.5/5 | **3/5** | R1/R2/I1 已解，誠實負結果 + 機制剖析是可發表故事；仍缺多 baseline 與 item-1 的統計顯著性 |
+| **sim-to-live 保真度** | — | 2/5 | **3/5** | I1 動作落差已關（live 真執行 placement）；真實 CUDA + 3080 MPS 解鎖；扣分轉到 node-2 掉線使異質 live A/B 待跑 |
 
-**結論：** 本輪把核心研究問題從「測不出」推進到「有方向性答案」，是真進展。但三個專家視角一致指向同一個瓶頸——**結論目前活在「模擬器 + 單訓練 seed + 人工噪音」的三重溫室裡**。接下來最該投資的不是更多功能，而是 **P0 四項**（校準噪音、多 seed、拆 distributional/risk、加速 sim）把溫室拆掉；其次是 **P1-1** 把 sim 與 live 的動作對齊。把這些做掉，這份研究才從「我們做了一個能跑的平台」升級成「我們有一個站得住的結論」。
+**結論：** v7 把研究問題從「測不出」推進到「有方向性答案」；**v8 把那答案釘成了三端一致的穩健負結論**（sim 多 seed + sleep live + 真實 CUDA live：**沒人贏 score**），同時關掉了 v7 最大的 sim-to-live 障礙（I1 動作落差）並開始縮小已知 gap（item-1 異質性曝光、full PopArt）。但本輪的兩個新改進都還活在**單/少訓練 seed 的溫室**裡——item-1 含一個崩塌 seed、PopArt 只有單 seed 初讀。接下來最該投資的是 **P0**：把 item-1/PopArt 補到 3–5 seed、等 node-2 修復後跑異質性感知的 live A/B、補強 baseline。把這些做掉，這份研究的定位才從「我們有一個能跑的平台 + 誠實的負結果」升級成「我們有一個被多 seed 統計支撐、且在 live 異質叢集驗證過的結論」。**切記：item-1 與 PopArt 是縮 gap / 穩訓練的工程，不是贏過 score 的主張——後者目前不成立，且是本研究最穩健的事實。**

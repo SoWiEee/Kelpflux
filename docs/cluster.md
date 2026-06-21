@@ -1,8 +1,10 @@
 # Kubernetes Cluster Architecture
 
-> 本文件對齊 Phase 5 完成後的實作（Lmod + Helm chart cutover + k3s + RTX 4070 已驗證）。
+> 本文件對齊目前實機：**2-node × 1-GPU（2×1）異質叢集**（RTX 4070 + RTX 3080），
+> 由 Helm chart `chart/` 搭配 `chart/values-2x1.yaml` overlay 部署。
 > 部署來源由 `manifests/core/slurm-static.yaml` 改為 `chart/`（Helm chart）；
 > `bootstrap.sh` / `render-core.py` 已退役。
+> 第二台 GPU 節點的加入流程記錄於 `docs/intergration.md`。
 
 ---
 
@@ -30,25 +32,59 @@
 
 ## 1. 架構總覽
 
-實機運行於 **Ubuntu 24.04 + k3s v1.34 + RTX 4070 (driver 595-open)**，由
-**Helm chart `chart/`** 一鍵部署整個 Slurm 平台。Kind / Docker Desktop 仍然支援
-作為開發 baseline（`values.yaml` 的預設值）。
+實機是 **2-node × 1-GPU 異質叢集**，兩台都跑 **Ubuntu 24.04 + k3s v1.34 + NVIDIA driver 580**，由
+**Helm chart `chart/`** 搭配 **`chart/values-2x1.yaml` overlay** 一鍵部署整個 Slurm 平台。
+單張 RTX 4070 demo（`values-k3s.yaml`）與 Kind / Docker Desktop（`values.yaml` 預設值）仍然支援作為開發 baseline。
+
+- **Node 1 — `acane`**：k3s control-plane，**RTX 4070（12 GB，Ada Lovelace，compute 8.9）**，16 logical CPU、~62.6 GiB RAM。primary / 快節點。
+- **Node 2 — `nutnadmin-e500-g9-ws760t`**：GPU worker（k3s agent），**RTX 3080（10 GB，Ampere，compute 8.6）**，20 logical CPU、~7.4 GiB RAM。慢節點（sim 中以 ~0.25× 4070 速度建模）。近期由 Ubuntu 22.04 升級到 24.04（升級記錄見 `docs/intergration.md §12`）。
+- **GPU 異質性**：4070（快）vs 3080（慢）。RL scheduler 的 obs 已內含 per-card 型別 one-hot（`GPU_TYPES = ("rtx4070", "rtx3080")`）；2×1 拓樸下 `obs_dim=166`、`n_actions=33`。
+
+各層職責：
 
 - **Slurm**：HPC 排程器，靜態預宣告所有節點到 `maxNodes`；scaling 只改 K8s replicas，不重新生成 `slurm.conf`
 - **Kubernetes (k3s)**：管理 Pod 生命週期、Service DNS、Volume、NetworkPolicy
 - **Elastic Operator**：Python 控制迴圈，輪詢 slurmrestd 並 patch worker StatefulSet replicas
-- **GPU Operator + MPS Control Daemon**：NVIDIA 官方 operator 提供 device-plugin、driver validator 與 MPS sharing；單張 RTX 4070 可同時切成 4 個 `nvidia.com/gpu` slot
+- **GPU Operator + MPS Control Daemon**：NVIDIA 官方 operator 提供 device-plugin、driver validator 與 MPS sharing；**兩張卡都可用 MPS** 各自切成 4 個 `nvidia.com/gpu` slot（由 gpu-operator 的 `mps-control-daemon` 管理）
 - **NFS subdir provisioner**：把 host 上 `/srv/nfs/k8s` 動態 provision 為 RWX PVC，所有 Slurm pod 共享 `/shared`
-- **Prometheus + Grafana + Alertmanager**：scrape slurm-exporter、operator、kube-state-metrics
+- **Prometheus + Grafana + Alertmanager + DCGM/node-exporter + Tempo/OTel**：scrape slurm-exporter、operator、kube-state-metrics、per-node DCGM 與 node-exporter
+
+### 1.1 節點硬體 / 軟體規格
+
+| 項目 | Node 1 — `acane`（control-plane） | Node 2 — `nutnadmin-e500-g9-ws760t`（worker） |
+|------|------------------------------------|------------------------------------------------|
+| k3s 角色 | `control-plane`（server） | agent |
+| GPU | **RTX 4070**，12 GB（12282 MiB） | **RTX 3080**，10 GB（10240 MiB） |
+| GPU 架構 / compute cap | Ada Lovelace / 8.9 | Ampere / 8.6 |
+| `gpu-host-class` label | `rtx4070` | `rtx3080` |
+| device-plugin config | `rtx4070-mps`（4 slot） | `rtx3080-mps`（4 slot） |
+| logical CPU | 16 | 20 |
+| RAM | ~62.6 GiB（65677412 Ki） | ~7.4 GiB（7718660 Ki） |
+| OS | Ubuntu 24.04.4 LTS | Ubuntu 24.04.4 LTS（由 22.04 升級） |
+| Kernel | 6.17.0-35-generic | 6.8.0-124-generic |
+| k3s version | v1.34.6+k3s1 | v1.34.6+k3s1 |
+| NVIDIA driver | 580.167.08 | 580.159.03 |
+| CUDA runtime | 13.0 | 13.0 |
+| Container runtime | containerd 2.2.2 | containerd 2.2.2 |
+| InternalIP | 192.168.0.111 | 192.168.0.104 |
+| sim 相對速度 | 1.0×（基準） | ~0.25× |
+
+> 兩台都帶 `nvidia.com/mps.capable=true`、`nvidia.com/gpu.sharing-strategy=mps`、`nvidia.com/gpu.replicas=4`，
+> 因此各自把 1 張實體 GPU 廣告成 4 個 `nvidia.com/gpu` share slot（型別 label 為 `...-SHARED`）。
 
 ```mermaid
 graph TD
     USER["Engineer<br/>ssh / kubectl exec"] --> LOGIN
 
-    subgraph HOST["Linux Host (acane: Ubuntu 24.04 + k3s)"]
-        NVDR["NVIDIA Driver 595-open<br/>+ container-toolkit"]
-        GPU0["/dev/nvidia0 - RTX 4070"]
+    subgraph HOST1["Node 1: acane (control-plane, Ubuntu 24.04 + k3s)"]
+        NVDR["NVIDIA Driver 580<br/>+ container-toolkit"]
+        GPU0["/dev/nvidia0 - RTX 4070 (12GB)"]
         NFSH["NFS export<br/>/srv/nfs/k8s"]
+    end
+
+    subgraph HOST2["Node 2: nutnadmin-e500-g9-ws760t (agent, Ubuntu 24.04)"]
+        NVDR2["NVIDIA Driver 580<br/>+ container-toolkit"]
+        GPU1["/dev/nvidia0 - RTX 3080 (10GB)"]
     end
 
     subgraph K3S["k3s cluster"]
@@ -58,8 +94,8 @@ graph TD
             OP["slurm-elastic-operator<br/>Deployment"]
             EXP["slurm-exporter<br/>Deployment :9341"]
             CPU["slurm-worker-cpu<br/>StatefulSet"]
-            R70["slurm-worker-gpu-rtx4070<br/>StatefulSet"]
-            R80["slurm-worker-gpu-rtx4080<br/>StatefulSet"]
+            R70["slurm-worker-gpu-rtx4070<br/>StatefulSet → acane"]
+            R80["slurm-worker-gpu-rtx3080<br/>StatefulSet → node-2"]
             DBD["slurmdbd<br/>Deployment :6819"]
             SQL["mysql<br/>StatefulSet :3306"]
         end
@@ -75,6 +111,9 @@ graph TD
             GRAF["grafana :3000"]
             AM["alertmanager :9093"]
             KSM["kube-state-metrics"]
+            NEXP["node-exporter<br/>DaemonSet (per-node)"]
+            DCGM["DCGM exporter<br/>DaemonSet (per-node)"]
+            OTEL["otel-collector + tempo"]
         end
 
         subgraph NP["nfs-provisioner namespace"]
@@ -101,15 +140,25 @@ graph TD
     CTL -- "AccountingStorage :6819" --> DBD
     DBD -- ":3306" --> SQL
 
+    CTL -- "step launch :6818" --> R80
+
+    OP -- "patch replicas" --> R80
+    EXP -- "HTTP :6820" --> CTL
+
     DP -- "advertise nvidia.com/gpu x 4" --> R70
-    MPS -- "manage MPS daemon" --> GPU0
+    DP -- "advertise nvidia.com/gpu x 4" --> R80
+    MPS -- "manage MPS daemon (both nodes)" --> GPU0
+    MPS -- "manage MPS daemon (both nodes)" --> GPU1
     R70 -- "use GPU + MPS" --> GPU0
+    R80 -- "use GPU + MPS" --> GPU1
     NVDR --> GPU0
+    NVDR2 --> GPU1
 
     PROV -- "NFS mount" --> NFSH
     PROV -- "dynamic PV (RWX)" --> CTL
     PROV -- "dynamic PV (RWX)" --> CPU
     PROV -- "dynamic PV (RWX)" --> R70
+    PROV -- "dynamic PV (RWX)" --> R80
     PROV -- "dynamic PV (RWX)" --> LOGIN
 ```
 
@@ -180,20 +229,37 @@ graph TD
 | Gres | 無 |
 | 縮放 | Operator 依 pending CPU job 數量 patch replicas |
 
-#### StatefulSet `slurm-worker-gpu-rtx4070`（replicas 0–2，min 0）
+#### StatefulSet `slurm-worker-gpu-rtx4070`（replicas=1，固定，釘 acane）
 
 | 項目 | 值 |
 |------|-----|
 | Image | `slurm-worker:latest` |
 | `runtimeClassName` | `nvidia`（k3s 模式自動加上） |
+| `nodeSelector` | `gpu-host-class: rtx4070`（釘到 Node 1 `acane`） |
 | Resource limits | `nvidia.com/gpu: 1` |
-| Features | `gpu, gpu-rtx4070` |
+| Features | `gpu, gpu-rtx4070, topology-2x1` |
 | Gres | `gpu:rtx4070:1`, `mps:100`（單卡切成 4 slot，單 slot 25%） |
 | 對應 device-plugin config key | `rtx4070-mps`（節點 label `nvidia.com/device-plugin.config=rtx4070-mps` 觸發） |
+| Partition | `gpu-rtx4070`（並同時為共享 `gpu` partition 成員，供 2-node A/B placement） |
 
-#### StatefulSet `slurm-worker-gpu-rtx4080`（replicas 0–2，預留）
+#### StatefulSet `slurm-worker-gpu-rtx3080`（replicas=1，固定，釘 node-2）
 
-與 rtx4070 結構相同，差別在 features=`gpu,gpu-rtx4080`、gres=`gpu:rtx4080:1`、device-plugin config key=`rtx4080-exclusive`。目前實機沒有 RTX 4080，replicas 永遠 0。
+異質叢集的第二個 GPU pool，結構與 rtx4070 對稱、釘到 Node 2 的 RTX 3080：
+
+| 項目 | 值 |
+|------|-----|
+| Image | `slurm-worker:latest` |
+| `runtimeClassName` | `nvidia` |
+| `nodeSelector` | `gpu-host-class: rtx3080`（釘到 Node 2 `nutnadmin-e500-g9-ws760t`） |
+| Resource limits | `nvidia.com/gpu: 1` |
+| Features | `gpu, gpu-rtx3080, topology-2x1` |
+| Gres | `gpu:rtx3080:1`, `mps:100`（同樣切 4 slot，單 slot 25%） |
+| 對應 device-plugin config key | `rtx3080-mps`（由 `values-2x1.yaml` 的 `nfdRules` 依 PCI device id 自動套用） |
+| Partition | `gpu-rtx3080`（並同時為共享 `gpu` partition 成員） |
+
+> 兩個 GPU pool 都 `minReplicas=1 / maxReplicas=1`（warm pool，永不 scale-to-0），各用
+> `nodeSelector: gpu-host-class` 釘到對應實體機，避免 4070/3080 的 job 混卡錯置。
+> 舊的 `rtx4080` 預留 pool（demo 占位）已由真實的 `rtx3080` pool 取代。
 
 #### Deployment `slurm-login`（replicas=1）
 
@@ -239,8 +305,8 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 | `slurm-controller` | Headless (`clusterIP: None`, `publishNotReadyAddresses: true`) | 6817 | slurm-controller | NodeName / SlurmctldHost 解析；publish-not-ready 讓 worker 在 controller 還沒過 readiness 之前就能 DNS 解析 |
 | `slurm-restapi` | ClusterIP | 6820 | slurm-controller | slurmrestd HTTP 入口（operator + exporter 用） |
 | `slurm-worker-cpu` | Headless | 6818 | worker pods | per-pod DNS（StatefulSet ordinal） |
-| `slurm-worker-gpu-rtx4070` | Headless | 6818 | worker pods | 同上 |
-| `slurm-worker-gpu-rtx4080` | Headless | 6818 | worker pods | 同上 |
+| `slurm-worker-gpu-rtx4070` | Headless | 6818 | worker pods（acane） | 同上 |
+| `slurm-worker-gpu-rtx3080` | Headless | 6818 | worker pods（node-2） | 同上 |
 | `slurm-login` | ClusterIP | 22 | slurm-login | login SSH（內部用） |
 | `slurm-exporter` | ClusterIP | 9341 | slurm-exporter | Prometheus scrape target |
 | `slurm-elastic-operator` | ClusterIP | 8000 | operator | operator `/metrics`（Prometheus scrape） |
@@ -266,9 +332,9 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 #### `slurm-config-nodes`（chart `_helpers.tpl::slurmConfNodes` + `gresConf`）
 
 - `slurm.nodes.conf`：依 `values.pools` 順序展開，從 `<statefulset>-0` 到 `<statefulset>-(maxNodes-1)`，並輸出 `PartitionName=...`（GPU 空 partition 會被略過）
-- `gres.conf`：每個 GPU 節點輸出 `NodeName=... Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0`；MPS 節點輸出 `NodeName=... Name=mps Count=100`（不帶 File / Type，由 device-plugin 接管）
+- `gres.conf`：每個 GPU 節點依其型別輸出 `NodeName=... Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0`（3080 pool 為 `Type=rtx3080`）；MPS 節點輸出 `NodeName=... Name=mps Type=<rtx4070|rtx3080> Count=100`（由 device-plugin 接管）
 
-> **靜態預宣告**：`maxNodes=2` 的 GPU pool 從一開始就在 `slurm.nodes.conf` 寫出 `slurm-worker-gpu-rtx4070-0`、`-1` 兩條 NodeName。Operator 縮放只動 K8s replicas，slurmctld 看到的節點名單永遠不變，避免 scale event 期間引發大量 DNS 解析失敗。
+> **靜態預宣告**：每個 GPU pool 從一開始就把全部 `maxReplicas` 節點寫進 `slurm.nodes.conf`（2×1 下 `gpu-rtx4070-0` 與 `gpu-rtx3080-0` 各一）。Operator 縮放只動 K8s replicas，slurmctld 看到的節點名單永遠不變，避免 scale event 期間引發大量 DNS 解析失敗。
 
 #### `slurm-ddp-runtime`（chart `templates/login.yaml` 內聯）
 
@@ -393,10 +459,10 @@ operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operat
 由 `scripts/deploy-2.sh` 透過 NVIDIA 官方 helm chart `nvidia/gpu-operator` 安裝（**獨立 helm release，不在 slurm-platform chart 內**），但 chart 仍負責：
 
 - 建立 `gpu-operator` namespace（`pod-security.kubernetes.io/enforce: privileged`），加上 `helm.sh/resource-policy: keep`
-- 寫入 device-plugin 設定 ConfigMap `slurm-platform-device-plugin-config`（key: `default`、`rtx4070-mps`、`rtx4080-exclusive`）
-- post-install Job `slurm-platform-gpu-labeler`：依 `values.gpu.nodeAssignments` 把 `nvidia.com/device-plugin.config=<key>` 貼到對應節點
+- 寫入 device-plugin 設定 ConfigMap `slurm-platform-device-plugin-config`（key: `default`、`rtx4070-mps`、`rtx3080-mps`、`rtx4080-exclusive`）
+- 由 `values-2x1.yaml` 的 `gpu.nfdRules` 依 **PCI device id 自動**把 `rtx4070-mps` / `rtx3080-mps` 套到對應節點（node 重建 / k3s 重裝後自動收斂）；post-install Job `slurm-platform-gpu-labeler` 仍依 `values.gpu.nodeAssignments` 作為 fallback 貼 `nvidia.com/device-plugin.config=<key>`
 
-**GPU Operator 部署的物件（單張 RTX 4070 上實機）：**
+**GPU Operator 部署的物件（DaemonSet 在 acane 與 node-2 兩台都各跑一份）：**
 
 | 物件 | Kind | 說明 |
 |------|------|------|
@@ -410,10 +476,11 @@ operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operat
 | `nvidia-operator-validator` | DaemonSet | toolkit/runtime/cuda/plugin/mps 全套 validator |
 | `nvidia-cuda-validator` / `nvidia-device-plugin-validator` | Job | 一次性 sanity check |
 
-**MPS sharing 設定（`values.yaml::gpu.deviceConfigs.rtx4070-mps`）：**
+**MPS sharing 設定（`values.yaml::gpu.deviceConfigs.rtx4070-mps` + `values-2x1.yaml::...rtx3080-mps`）：**
 
 ```yaml
-rtx4070-mps:
+# values.yaml（4070）與 values-2x1.yaml（3080）各一份，replicas 都是 4：
+rtx4070-mps:        # rtx3080-mps 結構相同
   version: v1
   sharing:
     mps:
@@ -422,22 +489,31 @@ rtx4070-mps:
           replicas: 4
 ```
 
-device-plugin 會把 1 張實體 RTX 4070 廣告為 4 個 `nvidia.com/gpu` slot。
-Slurm 配合 `Gres=gpu:rtx4070:1,mps:100` + `--gres=mps:N` 旗標切 SM 比例（每 25 對應一個 MPS slot）。
+device-plugin 在**兩台節點**上都把 1 張實體 GPU 廣告為 4 個 `nvidia.com/gpu` slot（4070 與 3080 各 4 slot）。
+Slurm 配合 `Gres=gpu:<type>:1,mps:100` + `--gres=mps:N` 旗標切 SM 比例（每 25 對應一個 MPS slot）。
 
-
-**節點 label 連動：**
+**節點 label 連動（acane / node-2 各自）：**
 
 ```
-post-install Job 貼上：
-  nvidia.com/device-plugin.config=rtx4070-mps  （values.gpu.nodeAssignments）
-
-GPU Operator NFD 自動補：
+acane（Node 1）：
+  nvidia.com/device-plugin.config=rtx4070-mps
+  gpu-host-class=rtx4070
   nvidia.com/gpu.product=NVIDIA-GeForce-RTX-4070-SHARED
+  nvidia.com/gpu.family=ada-lovelace   nvidia.com/gpu.memory=12282
+  nvidia.com/cuda.driver-version.full=580.167.08
+
+node-2（Node 2）：
+  nvidia.com/device-plugin.config=rtx3080-mps
+  gpu-host-class=rtx3080
+  nvidia.com/gpu.product=NVIDIA-GeForce-RTX-3080-SHARED
+  nvidia.com/gpu.family=ampere         nvidia.com/gpu.memory=10240
+  nvidia.com/cuda.driver-version.full=580.159.03
+
+兩台共同（GPU Operator NFD 自動補）：
   nvidia.com/gpu.replicas=4
   nvidia.com/gpu.sharing-strategy=mps
   nvidia.com/mps.capable=true
-  nvidia.com/cuda.driver-version.full=595.58.03
+  nvidia.com/cuda.runtime-version.full=13.0
   ...
 ```
 
@@ -521,8 +597,11 @@ flowchart LR
     subgraph M["monitoring ns"]
         PROM["prometheus :9090<br/>+ alert rules ConfigMap"]
         AM["alertmanager :9093<br/>+ slack receiver optional"]
-        GRAF["grafana :3000<br/>+ datasource + 3 dashboards"]
+        GRAF["grafana :3000<br/>+ datasource + dashboards"]
         KSM["kube-state-metrics :8080"]
+        NEXP["node-exporter :9100<br/>DaemonSet (per-node)"]
+        DCGM["DCGM exporter :9400<br/>DaemonSet (per-node)"]
+        OTEL["otel-collector + tempo<br/>(otel.enabled)"]
     end
 
     subgraph S["slurm ns"]
@@ -539,9 +618,12 @@ flowchart LR
     PROM -- "scrape :9341" --> EXP
     PROM -- "scrape :8000" --> OP
     PROM -- "scrape :8080" --> KSM
+    PROM -- "scrape :9100 (acane+node-2)" --> NEXP
+    PROM -- "scrape :9400 (acane+node-2)" --> DCGM
 
     PROM -- "alerts" --> AM
     GRAF -- "query" --> PROM
+    GRAF -- "query traces" --> OTEL
 ```
 
 | 物件 | Kind | 說明 |
@@ -552,9 +634,12 @@ flowchart LR
 | `alertmanager` | Deployment | 預設 sink 是 `dev-null`；當 `values.monitoring.alertmanager.slack.webhookUrl` 非空時自動切到 Slack receiver |
 | `alertmanager-config` | ConfigMap | route/receiver |
 | `grafana` | Deployment | admin/admin（預設） |
-| `grafana-provisioning` | ConfigMap | datasource (Prometheus) + dashboard provider 設定 |
-| `grafana-dashboards` | ConfigMap | 3 個 dashboard JSON：`bridge-overview`、`operator`、`sla-efficiency`（由 `chart/dashboards/*.json` 經 `Files.Glob.AsConfig` 內嵌） |
+| `grafana-provisioning` | ConfigMap | datasource (Prometheus + Tempo) + dashboard provider 設定 |
+| `grafana-dashboards` | ConfigMap | dashboard JSON（由 `chart/dashboards/*.json` 經 `Files.Glob.AsConfig` 內嵌）：`bridge-overview`、`operator`、`sla-efficiency`、`gpu`、`per-job-gpu`、`scheduler-live`、`node-host`（**新增「Node / Host (node-exporter)」**主機 CPU/mem/disk/net） |
 | `kube-state-metrics` | Deployment + RBAC | 預設端點，scrape K8s 物件狀態 |
+| `node-exporter` | DaemonSet（每節點） | host CPU / mem / disk / net；acane + node-2 各一份（`monitoring.nodeExporter.enabled`） |
+| `dcgm-exporter`（`nvidia-dcgm-exporter`） | DaemonSet（每節點，gpu-operator 提供） | per-GPU SM% / VRAM / Tensor Core 使用率，由 Prometheus scrape |
+| `otel-collector` + `tempo` | Deployment / StatefulSet | OpenTelemetry 分散式追蹤（`monitoring.otel.enabled`）；operator 與 rl-scheduler 自動帶 `OTEL_ENABLED` |
 
 **存取：**
 
@@ -618,8 +703,8 @@ flowchart TD
       OP[slurm-elastic-operator]
       EXP[slurm-exporter :9341]
       CPU[worker-cpu-*]
-      R70[worker-rtx4070-*]
-      R80[worker-rtx4080-*]
+      R70[worker-rtx4070-0 → acane]
+      R80[worker-rtx3080-0 → node-2]
       DBD[slurmdbd :6819]
       DB[mysql :3306]
     end
@@ -633,6 +718,7 @@ flowchart TD
     OP -- "HTTP :6820 (JWT)" --> CTL
     OP -- "patch replicas (apps/v1)" --> CPU
     OP -- "patch replicas (apps/v1)" --> R70
+    OP -- "patch replicas (apps/v1)" --> R80
 
     EXP -- "HTTP :6820 (JWT)" --> CTL
     PROM[prometheus] -- scrape --> EXP
@@ -640,12 +726,15 @@ flowchart TD
 
     CPU -. "/shared RWX" .- NFS[NFS slurm-shared-nfs]
     R70 -. "/shared RWX" .- NFS
+    R80 -. "/shared RWX" .- NFS
     LOGIN -. "/shared RWX" .- NFS
     CTL -. "/shared RWX" .- NFS
 
     R70 -- "request nvidia.com/gpu × 1\n(MPS slot)" --> DP[nvidia-device-plugin]
-    DP -- "advertise 4 slots\nfrom 1 RTX 4070" --> KUBELET[kubelet]
+    R80 -- "request nvidia.com/gpu × 1\n(MPS slot)" --> DP
+    DP -- "advertise 4 slots / GPU\n(4070 on acane, 3080 on node-2)" --> KUBELET[kubelet]
     R70 -- "CUDA → MPS pipe" --> MPSD[nvidia-mps-control-daemon]
+    R80 -- "CUDA → MPS pipe" --> MPSD
 ```
 
 關鍵 port 速查：
@@ -718,7 +807,13 @@ bash scripts/verify-live.sh
 # 驗證 live cluster
 bash scripts/verify-live.sh        # chart render + rollout + NFS RWX + GPU/GRES + monitoring + DSAC smoke
 
-# 2×2 DRL 實驗 overlay（需要兩個 Slurm GPU worker，每個 worker 2 GPU）
+# 目前實機部署：2×1 異質 overlay（RTX 4070 on acane + RTX 3080 on node-2）
+sudo helm upgrade --install slurm-platform ./chart \
+  -f chart/values-k3s.yaml \
+  -f chart/values-2x1.yaml \
+  -n slurm
+
+# 2×2 DRL 實驗 overlay（需要兩個 Slurm GPU worker，每個 worker 2 GPU；目前硬體不符）
 sudo helm upgrade slurm-platform ./chart \
   -f chart/values-k3s.yaml \
   -f chart/values-2x2.yaml \
@@ -828,8 +923,8 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 |------|------|------|------|
 | `slurm-controller` | StatefulSet | chart | slurmctld + slurmrestd（同 pod） |
 | `slurm-worker-cpu` | StatefulSet | chart | CPU pool（1–4 replicas） |
-| `slurm-worker-gpu-rtx4070` | StatefulSet | chart | RTX 4070 pool（0–2 replicas，MPS 4 slot） |
-| `slurm-worker-gpu-rtx4080` | StatefulSet | chart | RTX 4080 pool（保留，0–2） |
+| `slurm-worker-gpu-rtx4070` | StatefulSet | chart | RTX 4070 pool（釘 acane，replicas=1，MPS 4 slot） |
+| `slurm-worker-gpu-rtx3080` | StatefulSet | chart + values-2x1 | RTX 3080 pool（釘 node-2，replicas=1，MPS 4 slot） |
 | `slurm-login` | Deployment | chart | 使用者入口 |
 | `slurm-elastic-operator` | Deployment | chart | 自動縮放 |
 | `slurm-exporter` | Deployment | chart | Prometheus metrics exporter |
@@ -837,7 +932,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | `mysql` | StatefulSet | manifests/core/slurm-accounting.yaml | accounting DB |
 | `slurm-controller` | Service Headless | chart | NodeName DNS + 6817 |
 | `slurm-restapi` | Service ClusterIP | chart | slurmrestd 6820 |
-| `slurm-worker-cpu` / `-gpu-rtx4070` / `-gpu-rtx4080` | Service Headless | chart | per-pod DNS + 6818 |
+| `slurm-worker-cpu` / `-gpu-rtx4070` / `-gpu-rtx3080` | Service Headless | chart | per-pod DNS + 6818 |
 | `slurm-login` / `slurm-exporter` / `slurm-elastic-operator` | Service ClusterIP | chart | login 22 / exporter 9341 / op 8000 |
 | `slurmdbd` / `mysql` | Service | manifests/core | 6819 / 3306 |
 | `slurm-config-static` / `slurm-config-nodes` | ConfigMap | chart | slurm.conf / slurm.nodes.conf / gres.conf |
@@ -855,7 +950,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | 名稱 | Kind | 來源 | 說明 |
 |------|------|------|------|
 | `gpu-operator` | Namespace | chart `gpu/gpu-operator-namespace.yaml` | PSS=privileged, resource-policy=keep |
-| `slurm-platform-device-plugin-config` | ConfigMap | chart `gpu/device-plugin-config.yaml` | 3 個 sharing 策略 |
+| `slurm-platform-device-plugin-config` | ConfigMap | chart `gpu/device-plugin-config.yaml` + values-2x1 | sharing 策略：`default` / `rtx4070-mps` / `rtx3080-mps` / `rtx4080-exclusive` |
 | `slurm-platform-gpu-labeler` | Job + SA + ClusterRole + Binding | chart `gpu/node-labeler-job.yaml`（post-install hook） | 把 `nvidia.com/device-plugin.config` 標到節點 |
 | `gpu-operator` | Deployment | GPU Operator helm | operator 本體 |
 | `gpu-operator-node-feature-discovery-master/gc` | Deployment | GPU Operator helm | NFD master + GC |
@@ -874,8 +969,11 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | `alertmanager` | Deployment + Service | 9093 |
 | `alertmanager-config` | ConfigMap | route + receiver |
 | `grafana` | Deployment + Service | 3000 |
-| `grafana-provisioning` / `grafana-dashboards` | ConfigMap | datasource + 3 dashboard JSON |
+| `grafana-provisioning` / `grafana-dashboards` | ConfigMap | datasource (Prometheus + Tempo) + 7 dashboard JSON |
 | `kube-state-metrics` | Deployment + Service + RBAC | 8080 |
+| `node-exporter` | DaemonSet（per-node） | 9100，host CPU/mem/disk/net |
+| `nvidia-dcgm-exporter` | DaemonSet（per-node，gpu-operator） | 9400，per-GPU SM%/VRAM |
+| `otel-collector` / `tempo` | Deployment / StatefulSet | OTel 追蹤（otel.enabled） |
 
 ### `nfs-provisioner` namespace（chart `templates/storage.yaml`）
 
