@@ -25,24 +25,27 @@
 > [!IMPORTANT]
 > 目前在實機環境 (RTX 4070 + RTX 3080) 拓樸上，沒有任何 DRL 排程策略打贏啟發式。
 
-評估在拓樸匹配的 **2×1**（obs_dim=166、n_actions=33）做，分 sim（§3）與 live（§4）：
+評估在拓樸匹配的 **2×1**（obs_dim=166、n_actions=33）做，有分成模擬評估 (§3) 和實機評估 (§4)：
 
 | 評估 | score | SAC | RDSAC-mean | RDSAC-cvar | 判定 |
 |---|---|---|---|---|---|
-| **sim** σ-sweep, fixed-α, **multi-seed**（§3.1，σ=1.0，3 train seed）| 0% | −38.3±12 / −33.6±23 | −12.9±10 / −8.4±3 | −35.4±16 / −42.0±30 | **multi-seed 確認：沒人贏過 score；arm 間排名是訓練雜訊（std 5–30 pts）** |
-| **live** 2-node placement, submit-時 -w（§4.1 四方，**multi-seed**）| 0% | −21.6±9.6 | −13.4±4.4 | −21.2±6.1 | **三個 learned arm 全輸 Slurm、seed-robust（3 train seed mean±std，每個 seed×arm −7~−31% JCT）；全過度集中 4070（85–89%）** |
+| 模擬 σ-sweep, fixed-α, multi-seed（§3.1，σ=1.0，3 train seed）| 0% | −38.3±12 / −33.6±23 | −12.9±10 / −8.4±3 | −35.4±16 / −42.0±30 | 沒人贏過 score，模型間排名是訓練雜訊 |
+| 實機）| 0% | −21.6±9.6 | −13.4±4.4 | −21.2±6.1 | 三個 DRL 策略都輸 Slurm/score；過度集中在 4070 |
 
 （sim 兩個數字 = philly / ali（σ=1.0 mean±std）；live 兩個數字 = σ=1 / σ=0；ΔJCT% vs score，負值=較慢）
 
-**一條主軸（一律以 2×1 實機為準）：**
+### 模擬結果摘要
 
-1. **sim（§3.1–3.4，σ-sweep 部分已 multi-seed）：注入校準過的不確定性後，三方在 2×1 逼近打平、但沒人贏過 score。** 3 個訓練 seed 的 mean±std **確認**了兩件事：(i) **沒人贏 score**（穩健）；(ii) **arm 間的差異是訓練雜訊**——std 5–30 pts、跟 mean 差同量級，同 config 跨 seed 擺盪 30–70 pts，所以單 seed 看到的「cvar 最好」之類排名**不成立**（§3.1）。拆解上唯一半穩健的 slice 是 σ=1.0：**CVaR 風險扭曲反而扣分**（§3.3）。共置動作即使有第二張卡仍拖累（§3.4）。
+- 紀錄於 §3.1~§3.4，σ-sweep 部分已做 multi-seed 評估
+- 注入校準過的不確定性後，三方逼近打平、但沒人贏過 score
+- 3 個訓練 seed 的 mean±std 確認了兩件事：
+  - 沒人贏過 score（穩健）
+  - 模型間的差異是訓練雜訊（std 5–30 pts、跟 mean 差同量級，同 config 跨 seed 擺盪 30–70 pts）
 
-2. **🟥 live（§4.1 sleep / §4.2 真實 CUDA）：真實 2-node placement 是 learned 全輸的四方負結果，且跨多種 workload 都成立。** sleep-job A/B（§4.1）learned 全輸 Slurm（**−12~−32% JCT**，multi-seed）。**換真實 cuBLAS job（§4.2，含異質 MPS 需求 25/50/75/100、整張卡 job 都有）也是 learned 全輸（−7~−22%）**，輸的關鍵是「大 job 沒放對」（big-job JCT：mean 37s≈score 38s，SAC/cvar 45s）。**穩健結論：跨 sleep / 固定分數 / 異質 MPS 三種 real workload，「learned 全輸 score」每次成立；但哪個 arm 最好隨 workload 漂移（無穩定最佳）——跟 sim §3.1「沒人贏 score 穩健、arm 排名是雜訊」同調。**（先前獨佔模式的 −132% 是低並行度 confound、已修正。）
+### 實機結果摘要
 
-**一句話：** 在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score**：sim σ-sweep（已 multi-seed）三方逼近打平、沒人贏 score、且 arm 間排名是訓練雜訊；live placement（sleep §4.1 乾淨、真實 CUDA §4.2 獨佔含 confound）兩種都顯示 learned 因退化放置而輸 Slurm。multi-seed 還揭露**訓練本身高變異**（同 config 跨 seed 擺盪 30–70 pts），正是 live 容易長出退化策略的根。
-
-**兩個 load-bearing caveats：**（1）**訓練高變異（已用 multi-seed 量化、兩端都固實）**——sim σ-sweep（§3.1）與 live placement（§4.1）**都已用 3 個訓練 seed 跑 mean±std**：sim 確認「沒人贏 score、arm 排名是訓練雜訊」，live 確認「負結果 seed-robust（每個 seed×arm 都輸 score）」。訓練本身高變異（同 config 跨 seed 擺盪 30–70 pts）是這套方法的核心限制；（2）σ 是合成 trace 的最難預測上界，真實結構化資料 predictor 會更準 → 合理區間 [0.5, 1.45]。
+- 紀錄於 §4.1（四方）和 §4.2（真實 CUDA）
+- 真實 cuBLAS job 含異質 MPS 需求 25/50/75/100，DRL 策略都輸 score，關鍵在於「大 job 沒放對」
 
 ---
 
@@ -128,7 +131,7 @@
 
 ### 2.3 σ 校準方法（讓注入的噪音不是憑空挑的）
 
-由注入模型 `σ = std(log(actual/predicted))` —— 正是 runtime 預測器的 log-殘差標準差。`eval/scripts/measure_predictor_sigma.py` 用**生產級 LightGBM 預測器**（同 `services/runtime_predictor` 的 features、time-honest 80/20 split、超參）在真實 trace 上量 held-out log-殘差 std，當作要注入 sim 的 σ。結果見 §3.2。
+由注入模型 `σ = std(log(actual/predicted))`，正是 runtime 預測器的 log-殘差標準差。`eval/scripts/measure_predictor_sigma.py` 使用**生產級 LightGBM 預測器**（同 `services/runtime_predictor` 的 features、time-honest 80/20 split、超參）在真實 trace 上量 held-out log-殘差 std，當作要注入模擬器的 σ，結果見 §3.2。
 
 ### 2.4 實機 A/B 評估設定
 
@@ -140,16 +143,13 @@
 > 目前尚未部署 runtime predictor 和 weight tuner ，因此 score 的 `ε`(SJF) 與線上權重調整都是關的
 
 
-### 2.5 為何用 p95 / p99 / CVaR 量尾部（不只看 mean JCT）
+### 為何多用 p95/p99/CVaR 測量？
 
-全文每張表都同時報 **mean JCT（主）** 與 **p95 / p99 JCT、CVaR(0.25)（尾部）**。納入尾部指標不是裝飾，而是這套評估能不能看見 RDSAC 效應的**前提**的四個理由：
+每張表格都有主要指標 mean JCT 和 p95/p99 JCT、CVaR(0.25)。納入尾部指標不是裝飾，而是這套評估能不能看見 RDSAC 效應的**前提**的三個理由：
 
-1. **mean 會把排程病態洗掉。** straggler、queue starvation、head-of-line blocking 的典型表現是「多數 job 正常、少數被拖很慢」；這幾個慢 job 攤進整批裡幾乎不動 mean，但主導使用者體感。p95/p99 專抓「最差 5%/1% 有多慢」，正是 mean 結構上看不到的那段。
-2. **尾部是 RDSAC/CVaR 的靶心——不量它就無法檢驗它。** RDSAC-cvar 的設計目標就是優化回報下尾（= JCT 上尾）；只量 mean 等於拿不會動的尺去量專門改尾部的方法，結構上必然測不出差異。鐵證在 §3.1：RDSAC 對 SAC 的 **mean 差距有限，p99 卻差 6–11×**，優勢全在尾部。
-3. **重尾 workload 下 mean 本身不穩。** §4.1 的 live workload 刻意重尾，重尾分布的 mean 由極端值主導、估計噪音大；分位數對重尾更穩健。**CVaR(0.25)=「最差 25% 的平均」**，比單點 p99（小樣本下只是最差 1–2 個 job、噪音主導）穩定，故本文以 **CVaR 為主要尾部判別指標、p99 為輔助**。
-4. **領域慣例。** GPU cluster scheduling / SLO 文獻裡，tail JCT、tail slowdown（p95/p99）本就是標準指標（p99 幾乎是 SLO 代名詞）；mean 必要但不充分。
-
-這也是為何 §4.1 的判定不是只看 mean，而是同時看 p99 / CVaR——尾部指標才是真正能分開四方的那把尺。
+- mean JCT 會把排程病態洗掉：straggler、queue starvation、head-of-line blocking 的典型表現是「多數 job 正常、少數被拖很慢」；這幾個慢 job 攤進整批裡幾乎不動 mean，但主導使用者體感。p95/p99 專抓「最差 5%/1% 有多慢」，正是 mean 結構上看不到的那段。
+- 尾部是 RDSAC/CVaR 的靶心：RDSAC-cvar 的設計目標就是優化回報下尾（= JCT 上尾）；只測量 mean 等於拿不會動的尺去量專門改尾部的方法，結構上必然測不出差異。鐵證在 §3.1：RDSAC 對 SAC 的 **mean 差距有限，p99 卻差 6–11×**，優勢全在尾部。
+- 領域慣例：GPU cluster scheduling / SLO 文獻裡，tail JCT、tail slowdown（p95/p99）本就是標準指標（p99 幾乎是 SLO 代名詞），mean 是必要但不充分。
 
 ---
 
@@ -189,27 +189,33 @@
 
 ### 3.2 σ 校準到真實預測誤差：σ=1.0 其實偏保守
 
-**這節是為 §3.1 的 σ 取值背書。** §3.1 的弱點：σ=0.5/1.0 若是憑空挑的，「注入噪音 → 抗噪法贏」就近乎套套邏輯。所以用 §2.3 的方法，量生產 LightGBM 預測器在真實 trace 上的 held-out log-殘差，當作該注入的 σ：
+由於 §3.1 的弱點：σ=0.5/1.0 若是憑空挑的，「注入噪音 → 抗噪法贏」就近乎套套邏輯。所以用 §2.3 的方法，測量生產 LightGBM 預測器在真實 trace 上的 held-out log-殘差，當作該注入的 σ：
 
 | workload | σ（殘差 std）| 95% CI | 形狀 |
 |---|---:|---|---|
 | philly | **1.45** | [1.31, 1.58] | near-Gaussian |
 | ali | **1.24** | [1.11, 1.38] | near-Gaussian |
 
-兩個結論：(1) 真實 σ ≈ **1.2–1.45**，故 §3.1 用的 **σ=1.0 落在真實下限以下、是保守值**——RDSAC 在 σ=1.0 就大勝，真實噪音下只會更強；(2) 殘差**近高斯**（excess kurtosis −0.1~+0.4），lognormal 噪音模型沒有低估尾部。**誠實告誡**：這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2–1.45 是「最難預測」上界；真實結構化資料上好 predictor 會更低 → 合理 σ 區間 ≈ **[0.5, 1.45]**，§3.1 測的 {0.5, 1.0} 都落在其中。
+可以發現真實 $σ ≈ [1.2, 1.45]$，故 §3.1 用的 $σ=1.0$ 落在真實下限以下、是保守值。以及殘差**近高斯**（excess kurtosis −0.1~+0.4），lognormal 噪音模型沒有低估尾部。
+
+> [!WARNING]
+> 這些合成 trace 的 runtime 與特徵無關（corr(log_rt, gpu_count)=0.04，predictor 打不過 predict-the-mean），所以 1.2~1.45 是**最難預測**上界；真實結構化資料上好 predictor 會更低，因此合理 $σ ≈ [0.5, 1.45]$，且 §3.1 測的 {0.5, 1.0} 都落在其中。
 
 ### 3.3 拆解：贏的是「分布式 critic」還是「風險扭曲」？
 
-§3.1 把 RDSAC 當一整包，但它其實有兩個機制：**分布式 critic**（把回報建模成分布，而非單點 Q）與 **風險扭曲**（CVaR）。要知道哪個在出力，就放第三方 **RDSAC-mean**（有分布式 critic、但風險中立）來夾：`SAC→mean` 隔離分布式 critic 的貢獻、`mean→cvar` 隔離風險扭曲。用 §3.1 的 **multi-seed**（3 train seed）σ=1.0 三方，mean±std：
+在 §3.1 把 RDSAC 當一整包，但它其實有**分布式 critic**（把 reward 建模成分布，而非單點 Q）與 **風險扭曲**（CVaR）。若要知道哪個在出力，就放第三方 RDSAC-mean（有分布式 critic、但風險中立）來實驗，使用 3 train seed, $σ=1.0$ 三方，計算 mean±std：
 
-| family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（**分布式**）| mean→cvar（**風險**）|
+| family | SAC | RDSAC-mean | RDSAC-cvar | SAC→mean（分布式）| mean→cvar（風險）|
 |---|---:|---:|---:|---:|---:|
 | philly | −38.3±12.3 | −12.9±10.1 | −35.4±16.3 | **+25.4±22.6** | **−22.5±10.4** |
 | ali | −33.6±23.0 | −8.4±3.2 | −42.0±29.8 | **+25.2±22.4** | **−33.6±27.6** |
 
-**判定（multi-seed，σ=1.0）：分布式 critic 是有用的那一半，CVaR 風險扭曲反而扣分。** 兩個 family 方向一致：`SAC→mean`（加分布式 critic）**+25 pts**（RDSAC-mean 是 σ=1.0 最好的 learned arm），而 `mean→cvar`（再加 CVaR）**−22~−34 pts**（cvar 變成最差）。**這跟 CVaR 的設計意圖相反**——本來想用它管尾部風險，σ=1.0 下卻過度保守/不穩、把 mean 的優勢吐回去。philly 的 `mean→cvar −22.5±10.4` 約 2σ、算半穩健。
+可以發現分布式 critic 是有用的那一半，CVaR 風險扭曲反而扣分。
 
-**誠實 caveat**：(i) std 仍大（SAC→mean +25±22 才 ~1σ）；(ii) **這只在 σ=1.0 成立**——σ=0.5 的拆解 family 間打架、落在雜訊內（philly 分布式 −12.8、ali +12.6）。所以能穩健說的是：**CVaR 在 σ=1.0 沒幫上忙、甚至扣分；分布式 critic 是相對有用的一半——但兩者都沒讓 RDSAC 贏過 score。** 原始檔 `runs/mseed_2x1_s{42,43,44}/`。
+> [!WARNING]
+> 目前標準差仍然很大、並且這結論只在 $σ=1.0$ 成立。CVaR 在 $σ=1.0$ 沒幫上忙、甚至扣分，分布式 critic 是相對有用的一半，但是兩者都沒讓 RDSAC 贏過 score。
+
+> 原始檔 `runs/mseed_2x1_s{42,43,44}/`
 
 ### 3.5 模擬環境評估統整
 
@@ -269,13 +275,13 @@
 
 ## 4. 實機執行結果
 
-本節是管線的階段 (3)：把 §3 的模擬產出 checkpoint 烘進真實叢集，在拓樸匹配的 2×1 跑 paired A/B。**結論是乾淨的四方負結果**：
+本節是管線的階段 (3)：把 §3 的模擬產出 checkpoint 烘進真實叢集。主要結論如下：
 
-- **🟥 2-node placement：三個 learned arm 全顯著輸 Slurm（§4.1）**：四方 submit-時 `-w` placement A/B——**SAC / RDSAC-mean / RDSAC-cvar 全顯著輸 Slurm 預設（−12~−32% JCT，每格 p<0.01）**，且**越把負載擠到 4070 輸越多**（learned 全擠 88–92% vs score 均衡 52%，cvar 92% 最慘）。這把 §3.1–3.4 的「sim 逼近打平、單 seed 雜訊」釘成 live 負結果。
-- **fail-safe 設計在真實環境驗證有效**：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋——這是讓 shadow 部署能安全跑的前提。
-- **真實微調語料已開始累積**：live A/B 期間 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 ④ RLPD 的輸入。
+- 三個 DRL 模型（SAC、RDSAC-mean、RDSAC-cvar）全顯著輸 Slurm 預設（p<0.01），且越把負載擠到 4070 輸越多。
+- fail-fallback 設計在真實環境驗證有效：`/decide` 失敗或低信心時自動回退 score，slurmctld 從不被擋，這是讓 shadow 部署能安全跑的前提。
+- 真實微調語料已開始累積：實機 A/B 測試時 `live_daemon.py` 記錄的真實 (obs, act, rew) 即階段 (4) RLPD 的輸入。
 
-換言之，§4 沒有「DRL 在 live 大勝」的故事——**2-node placement 直接輸 Slurm**。價值在於**用正確的實驗設計（共享 partition + submit-時 placement + drift-robust interleave）拿到誠實的結論**，並證明 sim-to-real 工程管線真的能跑，為 multi-seed 固實 / RLPD 微調鋪路。
+> 主要價值在於用正確的實驗設計（共享 partition + placement + drift-robust interleave）拿到真實的結論，並證明 sim-to-real 工程管線真的能跑，為 multi-seed 固實、RLPD 微調鋪路。
 
 ### 4.1 實機配對 A/B 測試
 
@@ -333,8 +339,6 @@
 > [!NOTE]
 > 本節評估 job 固定 `sleep N`，不做 GPU 計算，所以 runtime 與 placement 無關、placement 只影響排隊 wait。之後換成真實 CUDA job 會讓測試更完整、也更公平（見 §5.1 第 4 項）；對目前過度集中的 checkpoint 預期會更慘（多付干擾代價），但那才是讓好的 placement 策略有機會展現價值的場域。
 
-> 一句話：真實 2-node placement 是**乾淨、且對訓練 seed 穩健的四方負結果**——score 均衡放置（~50/50），三個 learned arm 全把負載擠到 4070（85–92%）、跨 3 個 seed 全顯著輸 Slurm（每個 seed×arm 都是 −7~−31% JCT），沒有任何 seed 翻盤。不是「2-node 解鎖 RL」，而是「**這套 train+placement 會結構性地長出過度集中的退化策略，比 Slurm 均衡放置差**」。要再談 RL placement，得先改掉這個過度集中（multi-seed 確認過、不是 seed 運氣問題）。
-
 ### 4.2 真實 CUDA job（異質 MPS 需求）
 
 使用真實 cuBLAS sgemm workload `gpu_workload.cu`，讓排程決策真的有算力後果。MPS 需求有 `--mps-buckets 25,50,75,100`，按照 job 大小指派（大 job 要更多 GPU、CRN 穩定），這樣才會壓到 score 的 `f_mps_fit`/碎片感知。好的策略要會把 `25+75`、`50+50` 打包同卡、把 `mps:100` 的 job 送去閒置的 GPU。
@@ -350,7 +354,7 @@
 
 結果 DRL 仍然沒贏過啟發式 score，但 RDSAC-mean 最接近打平。
 
-大工作（75, 100）主宰 JCT（38~45s vs 小 job 11~15s）。RDSAC-mean 把大 job 處理得跟 score 一樣好 (37s vs 38s)才會接近打平；而 SAC/cvar 把大 job 擺爛，就是那 −20% 的來源，小 job 三方都差不多。也就是說：**在有異質 GPU-fraction 需求時，輸贏的關鍵是大 job 有沒有放對**。
+大工作（75, 100）主宰 JCT。RDSAC-mean 把大 job 處理得跟 score 一樣好才會接近打平；而 SAC/cvar 把大 job 擺爛，就是那 −20% 的來源，小 job 三方都差不多。也就是說：在有異質 GPU-fraction 需求時，輸贏的關鍵是大 job 有沒有放對。
 
 > 原始檔 `runs/mpsbuckets_s{42,43,44}/`
 
@@ -362,7 +366,7 @@
 |---|---|
 | DRL path 能在 2-node 上跑？ | 可以。166-dim checkpoint 上線、共享 `gpu` partition、submit-時 placement A/B 全 job 乾淨完成（§4.1）。 |
 | 先前 `alpha` 觸頂是真 bug？修好了？ | 是真 bug（return 尺度壓過 entropy ~300×）。已用 reward_scale 1000→20000 + 放寬 clamp 修好（§2.2）。 |
-| RDSAC / SAC 在 2×1 贏過 score？ | **沒有。** sim 三方逼近打平、沒人贏過 score（§3.1）；live 2-node placement 三個 learned arm 全顯著輸 Slurm（§4.1）。**淨答案：在真實 2×1，沒有任何 learned model 在可檢驗的設定贏過 score。** |
+| RDSAC / SAC 在 2×1 贏過 score？ | **沒有。** sim 三方逼近打平、沒人贏過 score（§3.1）；live 2-node placement 三個 learned arm 全顯著輸 Slurm（§4.1）。在真實 2×1，沒有任何 DRL 策略 在可檢驗的設定贏過 score。 |
 | 分布式 / 風險機制有用嗎？(score vs SAC vs RDSAC) | **2×1 下沒有可定論的優勢（multi-seed 確認）。** σ-sweep 三方（3 train seed）沒人贏 score、arm 排名是訓練雜訊（§3.1）；拆解上 σ=1.0 的 CVaR 反而扣分、分布式 critic 是相對有用的一半（§3.3）。live placement 三方全輸 Slurm 且 **seed-robust**（§4.1）。 |
 | risk-sensitive(cvar) 優於 risk-neutral(mean)？ | **方向上 sim 內 cvar 較穩、但在雜訊內。** 2×1（§3.1）cvar 是最穩的 learned arm（σ=0.5 最接近打平）；但**三方都仍輸 score**，差異落在單 seed 擺盪內。**而 live placement 反而 cvar 最差**（過度集中 4070 最兇，§4.1）——sim 與 live 對 cvar 的評價相反。 |
 | 共置動作（PACK/ISOLATE）有用嗎？ | **沒有，即使有 2 GPU。** 2×1 colocation ON 仍輸 OFF ~20 pts（§3.4），「價值需 ≥2 GPU」被推翻；瓶頸是動作空間加倍（33→65）的 underfit。 |
@@ -374,7 +378,7 @@
 
 **核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1），**真實 CUDA job（含異質 MPS 需求、整張卡 job 都有）−7~−22%**（§4.2，輸在大 job 沒放對；跨 workload「沒人贏 score」穩健、arm 排名隨 workload 漂移）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
 
-### 5.1 Future Work
+## 6. 後續改進（Future Work）
 
 從前面的實驗證明瓶頸並非演算法花招 (SAC vs. RDSAC)，而是**訓練退化**。策略會結構性地過度集中到單一 GPU 上，且發現**訓練高變異**（跨 seed 擺盪 30~90 pts）。這兩個瓶頸都是退化崩塌，所以改善優先級是**修訓練、別加花招**。
 
@@ -386,7 +390,7 @@
 - [ ] σ 校準的外部效度：§3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重新量測，並把 σ-sweep 落在實測區間。
 - [X] 真實 CUDA job 評估：已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`）並編譯到 `/shared/bin/gpu_workload`（兩節點），跑出分數 MPS 共置的實機評估 (§4.2)
 - [ ] 補強 baseline：目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
-- 完整 PopArt return normalization：取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須釘 α=0.05 的 caveat）。
+- [ ] 完整 PopArt return normalization：取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須固定 α=0.05 的 caveat）。
 
 ---
 
