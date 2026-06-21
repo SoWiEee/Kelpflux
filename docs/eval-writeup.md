@@ -374,38 +374,19 @@
 
 **核心一句話**：在真實 2×1，DRL 排程 **沒有在任何可檢驗的設定贏過 score，而且這結論對訓練 seed 穩健**——sim σ-sweep（3 train seed）三方逼近打平、沒人贏 score、arm 排名是訓練雜訊（§3.1–3.4）；**live 2-node placement（3 train seed）四方全輸 Slurm**——sleep job −7~−31% JCT（§4.1），**真實 CUDA job（含異質 MPS 需求、整張卡 job 都有）−7~−22%**（§4.2，輸在大 job 沒放對；跨 workload「沒人贏 score」穩健、arm 排名隨 workload 漂移）。瓶頸是**這套 train+placement 會結構性地長出退化的放置策略**——下一步要改的是這個（架構/訓練穩定性，§3.6 的 P1+P2 已是有效一步），而非宣稱「用了 DRL/risk-sensitive」就算贏。
 
-### 5.1 未來工作（Future Work）
+### 5.1 Future Work
 
-> **改善路線（針對診斷出來的病灶）。** 實驗證明瓶頸**不是演算法花招**（SAC vs RDSAC vs critic 型別 ≈ 噪音；CVaR/共置甚至扣分），而是**訓練退化**：策略會結構性地過度集中到單卡（live 85–92% vs Slurm ~50%），且訓練高變異（跨 seed 擺盪 30–90 pts）。**過度集中與高變異是同一個病**（退化崩塌）。所以改善優先序是「修訓練、別加花招」：
->
-> - ✓ **(P1) 反過度集中——load-balance reward shaping（已實作 + 有效，§3.6）**：potential-based 節點均衡項（`balance_coef`）把 cvar 的過度集中從 ~89% 拉回 ~71%。
-> - ✓ **(P2) 訓練穩定——return normalization（已實作 + 有效，§3.6）**：running-std PopArt-lite 把 cvar variance 從 16→5、整體 +19~+31 pts 靠近 score。
-> - ✓ **重跑 multi-seed 比對（已完成，§3.6）**：有效——過度集中收斂、variance 下降、首次有 learned arm 在 sim 贏 score（philly cvar +2.3%）。**剩**：mean 退步待查；**下一步換真實 CUDA job（下方第 4 項）做最終實機檢驗**。
+從前面的實驗證明瓶頸並非演算法花招 (SAC vs. RDSAC)，而是**訓練退化**。策略會結構性地過度集中到單一 GPU 上，且發現**訓練高變異**（跨 seed 擺盪 30~90 pts）。這兩個瓶頸都是退化崩塌，所以改善優先級是**修訓練、別加花招**。
 
-依「擋住結論的程度」排序：
-
-**讓現有結論站得住（方法學門檻）**
-
-1. ✓ **sim + live multi-seed（已完成，§3.1/§3.3/§4.1）。** sim σ-sweep 三方用 3 個訓練 seed（42/43/44）跑 mean±std → 確認「沒人贏 score」穩健、arm 排名是訓練雜訊；live placement A/B 也用 3 個 seed 的 checkpoint 各跑一次四方 → 負結果 **seed-robust**（每個 seed×arm 都輸 score −7~−31%、過度集中跨 seed 穩定）。**剩下**：共置/σ=0 等 sim 格子尚未 multi-seed、live 只測 philly。原始檔 `runs/mseed_2x1_*`、`runs/htab_live_mseed_s*`、彙總 `runs/mseed_*_agg*`。
-2. **σ 校準的外部效度。** §3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重量，並把 σ-sweep 落在實測區間。
-3. **向量化 / 加速 sim（已實作）。** 純 Python 離散事件 ~10 steps/s 是多 seed 研究的算力牆（一個 σ 區塊 ~4.6h）。已加入 `sim/vec_env.py`（`SyncVectorSchedEnv` 參考實作 + `AsyncVectorSchedEnv` 多進程，autoreset 語義一致、async≡sync 經測試），並把 `sim_train(--num-envs N)` 接成 N 個 env 並行 rollout、共用同一 learner——多核近線性提升 rollout 吞吐，讓上面兩項（multi-seed、σ-sweep）在算力上可行。注意：vec path 的 score-warmup 退回 random-legal（score-warmup 需 in-process `env._state`），且每 iteration 仍 `utd_ratio` 次更新，所以 UTD 隨 N 稀釋——要維持樣本效率就同步調高 `--utd-ratio`。
-
-**已完成的 2-node 上線管線（§4.1）**
-
-✓ **2-node placement A/B + 工程基建（已完成，§4.1）。** 第二節點上線後，跑出真實四方 placement A/B（drift-robust `--interleave`），結論是負的（learned 全輸 Slurm）。沿途打通的基建：共享 `gpu` partition、submit-時 RL placement（`-w`，因 Slurm 21.08 無法 post-submit 重釘節點）、四個只在多節點現形的 chart bug 修復。工程規格見 `docs/live-ab-heavytail-spec.md`、`docs/intergration.md`。
-
-**讓 live 測試更真實（最可能改變 placement 結論的方向）**
-
-4. ✓ **真實 CUDA job（已完成，§4.2）。** 已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`），跑出**分數 MPS 共置**（跟 sleep 同 sharing）的乾淨真實四方 A/B（§4.2）：learned −16~−35%、只比 sleep 稍差、機制同根（過度集中→排隊不均）。沿途修掉的重大基建問題：**叢集的 MPS 從來沒真正多工過**（兩卡 Exclusive_Process、沒跑 MPS daemon；舊 live 全用 sleep job、無 CUDA context 所以沒現形）；node-2（3080）的 gpu-operator MPS 因 **OS 落後（22.04 vs acane 24.04）**而壞——**把 node-2 對齊到 Ubuntu 24.04 後修好**，兩節點都能 4/4 並行 CUDA（步驟 + 踩雷見 `docs/intergration.md` §12；有趣的是 `config-manager` 在 24.04 仍 cosmetic 地 crash，但 MPS daemon 本身能跑就會多工）。**剩**：VRAM 限制還沒推到綁定（獨佔/共置都沒讓 VRAM 成為約束）、單 family（philly）。
-   - **VRAM 限制**（4070 12GB vs 3080 10GB）也還沒推到綁定——獨佔模式 VRAM 沒成為約束。
-   - 管線已就緒：`WorkloadSpec`/`--cuda-workload`/`--exclusive-gpu` 都實作 + 測過，binary 已編到 `/shared/bin/gpu_workload`（兩節點）。
-5. **補強 baseline。** 目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
-
-**演算法與韌性**
-
-6. **return normalization（PopArt）** 取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須釘 α=0.05 的 caveat）。
-7. **機制 ablation**（PER / potential shaping / 雙頭 Z_R/Z_H）；以及把 critic 換成 Duan et al. 原版 DSAC（高斯回報 + 抑制 Q overestimation）對照 SAC——是公平 ablation，但 §3.3 已測過 critic 型別 ≈ 噪音，不太可能翻盤。
-8. **per-model 各自調好的溫度**（本輪只釘單一 α=0.05）與 **held-out workload split**（如 train philly、test ali）證明泛化。
+- [X] Load-balance reward shaping：避免過度集中，potential-based 節點均衡項（`balance_coef`）已把 cvar 的過度集中從 ~89% 拉回 ~71%。
+- [X] Return normalization：：running-std PopArt-lite 把 cvar variance 從 16→5、整體 +19~+31 pts 靠近 score。
+- [X] 重跑 multi-seed 比對：有效讓過度集中收斂、變異數下降、首次有 DRL 策略在模擬環境贏過 score。
+- [X] 模擬和實機都用 multi-seed：σ-sweep 三方用 3 個訓練種子 (42/43/44)，實機 A/B 測試也用 3 個 seed 的 checkpoint 各跑一次四方
+- [X] 向量化加速模擬：把 `sim_train(--num-envs N)` 接成 N 個 env 並行 rollout、共用同一 learner。注意：vec path 的 score-warmup 退回 random-legal（score-warmup 需 in-process `env._state`），且每 iteration 仍 `utd_ratio` 次更新，所以 UTD 隨 N 稀釋——要維持樣本效率就同步調高 `--utd-ratio`。
+- [ ] σ 校準的外部效度：§3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重新量測，並把 σ-sweep 落在實測區間。
+- [X] 真實 CUDA job 評估：已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`）並編譯到 `/shared/bin/gpu_workload`（兩節點），跑出分數 MPS 共置的實機評估 (§4.2)
+- [ ] 補強 baseline：目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
+- 完整 PopArt return normalization：取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須釘 α=0.05 的 caveat）。
 
 ---
 
