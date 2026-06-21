@@ -1,0 +1,52 @@
+{{- if .Values.monitoring.enabled -}}
+{{/*
+node-exporter — host-level metrics (CPU / memory / disk / network / load) for
+EVERY node, including GPU worker nodes. Runs as a hostNetwork DaemonSet on
+:9100; Prometheus scrapes each node's host IP (see prometheus.yaml node-exporter
+job). This is the host-metrics layer the GPU-operator stack does NOT provide —
+it's what lets you see a node's memory pressure / load before it falls over.
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists      # run on every node incl. control-plane / tainted
+      containers:
+        - name: node-exporter
+          image: {{ .Values.monitoring.nodeExporter.image | default "quay.io/prometheus/node-exporter:v1.8.2" }}
+          args:
+            - --path.rootfs=/host/root
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --web.listen-address=:9100
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+          ports:
+            - { containerPort: 9100, hostPort: 9100, name: metrics }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - { name: proc, mountPath: /host/proc, readOnly: true }
+            - { name: sys,  mountPath: /host/sys,  readOnly: true }
+            - { name: root, mountPath: /host/root, mountPropagation: HostToContainer, readOnly: true }
+      volumes:
+        - { name: proc, hostPath: { path: /proc } }
+        - { name: sys,  hostPath: { path: /sys } }
+        - { name: root, hostPath: { path: / } }
+{{- end }}

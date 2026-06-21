@@ -48,6 +48,18 @@ data:
       - job_name: kube-state-metrics
         static_configs:
           - targets: ['kube-state-metrics.{{ $mNs }}.svc.cluster.local:8080']
+      {{- if .Values.monitoring.nodeExporter.enabled }}
+      # node-exporter (host CPU/mem/disk/net) — hostNetwork DaemonSet on :9100,
+      # scraped at each node's host IP. Per-node targets carry an `instance`
+      # label = node name so the Node/Host dashboard breaks down by node.
+      - job_name: node-exporter
+        static_configs:
+          {{- range $name, $ip := .Values.monitoring.nodeExporter.nodes }}
+          - targets: ['{{ $ip }}:9100']
+            labels:
+              instance: {{ $name }}
+          {{- end }}
+      {{- end }}
       {{- if .Values.monitoring.dcgmExporter.enabled }}
       # R5: DCGM exporter (deployed by GPU Operator into gpu-operator namespace).
       # Provides DCGM_FI_DEV_GPU_UTIL (real SM%), DCGM_FI_DEV_FB_USED (VRAM

@@ -682,6 +682,16 @@ monitoring:
     namespace: gpu-operator
     serviceName: nvidia-dcgm-exporter
     port: 9400
+  # node-exporter — host CPU/mem/disk/net per node (the GPU-operator stack does
+  # NOT provide host metrics). hostNetwork DaemonSet on :9100; Prometheus scrapes
+  # each node's host IP. `nodes` maps node-name → host IP (used for the static
+  # scrape targets + the per-node `instance` label on the Node/Host dashboard).
+  nodeExporter:
+    enabled: true
+    image: "quay.io/prometheus/node-exporter:v1.8.2"
+    nodes:
+      acane: 192.168.0.111
+      nutnadmin-e500-g9-ws760t: 192.168.0.104
   # Phase 7-A: OpenTelemetry distributed tracing (Tempo + OTel Collector).
   # Set enabled: true to deploy Tempo + otel-collector and wire Grafana datasource.
   otel:
