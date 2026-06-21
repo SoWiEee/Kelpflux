@@ -221,28 +221,37 @@ SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 
 > 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
 
-### 快速訓練（本機 CPU）
+### 快速訓練（目前拓樸 = 2×1，obs_dim=166 / n_actions=33）
 
 ```bash
-# 預設：500k steps, n-step=10, PER, potential shaping, IQN/RDSAC critic
+# 目前生產拓樸：2 nodes × 1 GPU。預設 PER + potential shaping + IQN/RDSAC critic。
+# P1/P2 改進（§3.6）：--balance-coef 反過度集中、--normalize-reward 穩定溫度。
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
-    --n-nodes 1 --gpus-per-node 1 \
+    --n-nodes 2 --gpus-per-node 1 \
     --trace philly ali \
-    --total-steps 500000 \
-    --out-dir runs/dsac_sim_$(date +%Y%m%d)
+    --total-steps 100000 --curriculum --device cuda \
+    --fixed-alpha --init-alpha 0.05 \
+    --balance-coef 5.0 --normalize-reward \
+    --risk-mode cvar \
+    --out-dir runs/dsac_2x1_$(date +%Y%m%d)
 
-# 加 GPU 加速
-PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
-    --device cuda --total-steps 500000 \
-    --curriculum \
-    --out-dir runs/dsac_cuda_$(date +%Y%m%d)
+# vanilla SAC（scalar twin-Q）：加 --no-iqn
+# 1×1（舊單卡）：--n-nodes 1 --gpus-per-node 1（obs_dim=160 / n_actions=17）
+```
 
-# 2×2 DRL 實驗：需搭配 chart/values-2x2.yaml 與新的 dsac.pt checkpoint。
-PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
-    --n-nodes 2 --gpus-per-node 2 \
-    --trace philly ali \
-    --total-steps 500000 \
-    --out-dir runs/dsac_2x2_$(date +%Y%m%d)
+### Multi-seed σ-sweep（三方 score / SAC / RDSAC，跨訓練 seed 求 mean±std）
+
+```bash
+# 對每個 (σ, arm) 用多個 --train-seed 重跑，得 mean±std（打掉單 seed 雜訊，§3.1）
+for SEED in 42 43 44; do
+  PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
+    --sigmas 0.5 1.0 --total-steps 100000 --warmup-steps 2000 --n-jobs 50 \
+    --seeds 42 43 44 45 46 --trace-families philly ali --risk-modes mean cvar \
+    --n-nodes 2 --gpus-per-node 1 --curriculum --fixed-alpha --init-alpha 0.05 \
+    --balance-coef 5.0 --normalize-reward \
+    --train-seed $SEED --device cuda \
+    --out-dir runs/sweep_2x1_s${SEED}
+done
 ```
 
 ### 快速 benchmark：DSAC/SAC vs heuristic score
@@ -324,6 +333,46 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 | `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
 | `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
+| `--balance-coef` | **P1**：potential-based 節點均衡項，反過度集中（§3.6）；~5 起 | 0（關）|
+| `--normalize-reward` | **P2**：running-std 回報正規化，穩定溫度、降 seed 敏感（§3.6） | 關 |
+| `--fixed-alpha` / `--init-alpha` | 釘住溫度 α（不 auto-tune）；本文評估用 `--init-alpha 0.05` | auto-α |
+| `--train-seed` | 訓練 RNG seed（multi-seed 研究的旋鈕，§3.1） | 42 |
+
+### 實機 2-node placement A/B（sleep / 真實 CUDA / 異質 MPS）
+
+`run_heavytail_ab.py` 跑四方（score / SAC / RDSAC-mean / RDSAC-cvar）submit-時 `-w` placement A/B。需要 rl-scheduler 上線（serve checkpoint）+ port-forward 8002。
+
+```bash
+LOGIN=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
+kubectl -n slurm port-forward svc/rl-scheduler 8002:8002 &
+
+# (a) sleep job（§4.1，乾淨可比的負結果 baseline）
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
+  --serve-url http://localhost:8002 --login-pod $LOGIN --controller-pod slurm-controller-0 \
+  --placement --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
+  --partition gpu --family philly --n-jobs 14 --target-max-s 8 \
+  --sigmas 1.0 --rounds 2 --warmup 1 --interleave \
+  --sac-ckpt /models/htab/sac_s42.pt \
+  --rdsac-mean-ckpt /models/htab/rdsac_mean_s42.pt \
+  --rdsac-cvar-ckpt /models/htab/rdsac_cvar_s42.pt \
+  --out-dir runs/live_sleep_$(date +%Y%m%d-%H%M%S)
+
+# (b) 真實 CUDA job + 異質 MPS 需求（§4.2，最有代表性）
+#     gpu_workload.cu 要先在 worker 內編到 /shared/bin（見 docs/intergration.md §12）。
+#     需要 MPS 多工：兩節點都得是 Ubuntu 24.04（§12）。加 --cuda-workload --mps-buckets。
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
+  --serve-url http://localhost:8002 --login-pod $LOGIN --controller-pod slurm-controller-0 \
+  --placement --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
+  --partition gpu --family philly --n-jobs 14 --target-max-s 8 \
+  --sigmas 1.0 --rounds 2 --warmup 1 --interleave \
+  --cuda-workload --mps-buckets 25,50,75,100 \
+  --workload-bin /shared/bin/gpu_workload --workload-dim 4096 --iters-per-sec 145 \
+  --sac-ckpt /models/htab/sac_s42.pt \
+  --rdsac-mean-ckpt /models/htab/rdsac_mean_s42.pt \
+  --rdsac-cvar-ckpt /models/htab/rdsac_cvar_s42.pt \
+  --out-dir runs/live_cuda_$(date +%Y%m%d-%H%M%S)
+# 加 --exclusive-gpu = 整張卡一 job（無共置；數字含並行度 confound，僅供對照）
+```
 
 ### 執行單元測試
 

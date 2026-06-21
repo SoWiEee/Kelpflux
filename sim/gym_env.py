@@ -141,8 +141,10 @@ def _gpu_feat(cluster: Cluster, node_i: int, gpu_i: int) -> np.ndarray:
         for alloc in plan
         if alloc.node_id == node_i and gpu_i in alloc.gpu_indices
     )
-    # gpu_type one-hot — currently homogeneous cluster (all rtx4070)
-    gpu_type_oh = [1.0, 0.0, 0.0]   # rtx4070 / other_a / other_b
+    # gpu_type one-hot — derived from per-node speed so the policy can see card
+    # heterogeneity (fast rtx4070 vs slow rtx3080). Homogeneous (speed 1.0) keeps
+    # the legacy [1,0,0]; a slow node flips to [0,1,0].
+    gpu_type_oh = ([1.0, 0.0, 0.0] if node.speed >= 1.0 else [0.0, 1.0, 0.0])
     return np.array([
         free_ratio,
         vram_ratio,
@@ -257,6 +259,7 @@ class KubefluxSchedEnv:
         placement_reward_scale: float = 0.01,
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
+        node_speeds: Optional[list] = None,
         runtime_sigma: float = 0.0,
         interference: float = 0.0,
         colocation_actions: bool = False,
@@ -282,6 +285,11 @@ class KubefluxSchedEnv:
         # split across nodes earns shaping reward (Ng et al. 1999: optimal policy
         # unchanged, only exploration is guided away from crowding one card).
         self.balance_coef           = float(balance_coef)
+        # Item-1 (node heterogeneity): per-node relative speed. None → homogeneous.
+        # A slow card (e.g. 3080 at 0.25) runs jobs ~4× longer AND shows a distinct
+        # gpu-type one-hot in the obs, so the policy can learn to route big/long
+        # jobs to the fast card instead of being blind to which node is which.
+        self.node_speeds            = list(node_speeds) if node_speeds else None
         # ── Stochastic execution (opt-in; 0/0 = legacy deterministic env) ──
         # runtime_sigma : multiplicative mean-preserving lognormal noise on the
         #                 *realized* runtime. The obs still shows the nominal
@@ -331,6 +339,7 @@ class KubefluxSchedEnv:
             n_nodes=self.n_nodes,
             gpus_per_node=self.gpus_per_node,
             mps_per_gpu=self.mps_per_gpu,
+            node_speeds=self.node_speeds,
         )
         events: list = []
         seq = 0
@@ -516,6 +525,13 @@ class KubefluxSchedEnv:
         the chosen job already appears in ``cluster.active``.
         """
         base = job.runtime
+        # Node heterogeneity (always applies): a slower card runs the job longer.
+        # With speed==1.0 (homogeneous) this is a no-op, preserving legacy
+        # bit-for-bit determinism.
+        node_id = plan[0].node_id if plan else 0
+        speed = cluster.nodes[node_id].speed
+        if speed != 1.0:
+            base = max(MIN_RUNTIME_S, base / speed)
         if self.runtime_sigma <= 0.0 and self.interference <= 0.0:
             return base
         mult = 1.0

@@ -35,6 +35,11 @@ class _GPU:
 class _Node:
     node_id: int
     gpus: List[_GPU]
+    # Relative compute speed (1.0 = fast reference card e.g. RTX 4070). A slower
+    # card (e.g. RTX 3080 at ~0.25) runs the same job ~4× longer — this is what
+    # lets the policy learn to route by card speed (else the cluster is
+    # homogeneous and the obs gpu-type one-hot carries no signal).
+    speed: float = 1.0
 
     def free_whole_gpus(self, mps_per_gpu: int) -> List[int]:
         return [i for i, g in enumerate(self.gpus) if g.free_mps == mps_per_gpu]
@@ -48,12 +53,16 @@ class Cluster:
     n_nodes: int
     gpus_per_node: int
     mps_per_gpu: int = MPS_PER_GPU
+    # Per-node relative speed; None → homogeneous (all 1.0, legacy behaviour).
+    node_speeds: Optional[List[float]] = None
     nodes: List[_Node] = field(init=False)
     active: dict = field(init=False)  # job_id -> List[Allocation]
 
     def __post_init__(self) -> None:
+        speeds = self.node_speeds or [1.0] * self.n_nodes
         self.nodes = [
-            _Node(i, [_GPU(self.mps_per_gpu) for _ in range(self.gpus_per_node)])
+            _Node(i, [_GPU(self.mps_per_gpu) for _ in range(self.gpus_per_node)],
+                  speed=float(speeds[i]))
             for i in range(self.n_nodes)
         ]
         self.active = {}
