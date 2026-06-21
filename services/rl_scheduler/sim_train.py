@@ -220,6 +220,7 @@ def sim_train(
     balance_coef: float = 0.0,        # P1: potential-based node-balance shaping
     node_speeds: Optional[list] = None,  # item-1: per-node relative speed (heterogeneity)
     normalize_reward: bool = False,   # P2: running-std reward normalization (PopArt-lite)
+    use_popart: bool = False,         # full PopArt on the critic reward head
     use_per: bool = True,
     risk_mode: str = "mean",
     risk_beta: float = 0.25,
@@ -272,7 +273,7 @@ def sim_train(
         raise NotImplementedError("--node-speeds not wired into the vec path; use --num-envs 1")
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
-        use_iqn=use_iqn,
+        use_iqn=use_iqn, use_popart=use_popart,
         risk_mode=risk_mode, risk_beta=risk_beta,
         fixed_alpha=fixed_alpha, init_alpha=init_alpha,
         target_entropy_ratio=target_entropy_ratio,
@@ -522,6 +523,8 @@ def main(argv=None) -> int:
                    help="P1: potential-based node-balance shaping coefficient (§3.6)")
     p.add_argument("--normalize-reward",     action="store_true",
                    help="P2: running-std reward normalization (§3.6)")
+    p.add_argument("--use-popart",           action="store_true",
+                   help="full PopArt on the critic reward head (output-preserving)")
     p.add_argument("--node-speeds",          default="",
                    help="item-1: comma-separated per-node relative speed, e.g. "
                         "'1.0,0.25' (node-1 = slow 3080 at 4×). Empty = homogeneous.")
@@ -566,6 +569,7 @@ def main(argv=None) -> int:
         colocation=args.colocation,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
+        use_popart=args.use_popart,
         node_speeds=[float(s) for s in args.node_speeds.split(",") if s.strip()] or None,
         num_envs=args.num_envs,
         async_envs=not args.sync_envs,

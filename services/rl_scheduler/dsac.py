@@ -178,6 +178,8 @@ class DSACAgent:
         risk_mode: str = "mean",
         risk_beta: float = 0.25,
         risk_alpha: float | None = None,   # deprecated alias for risk_beta
+        use_popart: bool = False,          # full PopArt on the reward-return head
+        popart_beta: float = 1e-3,         # EMA decay for the running mean/std
         device: str = "cpu",
     ) -> None:
         if risk_mode not in RISK_MODES:
@@ -195,6 +197,18 @@ class DSACAgent:
         self.risk_beta = float(risk_beta)
         self.target_entropy_ratio = target_entropy_ratio
         self.fixed_alpha = fixed_alpha
+        # ── Full PopArt (van Hasselt et al. 2016) on the reward-return head ──
+        # The head emits NORMALISED returns; targets are normalised before the
+        # loss; the running mean μ / std σ track the reward-return scale; and on
+        # every stats update the output layer's weights are rescaled so the
+        # UNNORMALISED predictions are preserved exactly (the "POP"). This makes
+        # the critic scale-invariant — a proper replacement for the P2 reward
+        # pre-normalisation, and it auto-tunes the temperature's return scale.
+        self.use_popart = bool(use_popart)
+        self.popart_beta = float(popart_beta)
+        self.device = torch.device(device)
+        self.popart_mu = torch.zeros((), device=self.device)
+        self.popart_nu = torch.ones((), device=self.device)   # 2nd moment → σ=1 init
         self.device = torch.device(device)
 
         def _critic():
@@ -231,6 +245,7 @@ class DSACAgent:
     def _risk_value(self, z_r: torch.Tensor, z_h: torch.Tensor,
                     taus: torch.Tensor) -> torch.Tensor:
         """Combined action value ρ[Z_R] + α·E[Z_H]. z_* (B,N,A), taus (B,N) → (B,A)."""
+        z_r = self._popart_denorm(z_r)   # normalised head output → real return
         a = z_r.shape[-1]
         taus_a = taus.unsqueeze(1).expand(-1, a, -1)                   # (B, A, N)
         rho_r = distorted_values(z_r.permute(0, 2, 1), taus_a,
@@ -241,6 +256,49 @@ class DSACAgent:
     def _soft_update(self, src: nn.Module, tgt: nn.Module) -> None:
         for p, pt in zip(src.parameters(), tgt.parameters()):
             pt.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
+
+    # ── PopArt helpers (reward-return head) ───────────────────────────────────
+    def _popart_sigma(self) -> torch.Tensor:
+        return (self.popart_nu - self.popart_mu ** 2).clamp(min=1e-8).sqrt().clamp(min=1e-4)
+
+    def _popart_denorm(self, z: torch.Tensor) -> torch.Tensor:
+        """Normalised return → real return. Identity when PopArt is off (μ=0,σ=1)."""
+        if not self.use_popart:
+            return z
+        return z * self._popart_sigma() + self.popart_mu
+
+    def _popart_norm(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.use_popart:
+            return y
+        return (y - self.popart_mu) / self._popart_sigma()
+
+    def _popart_reward_heads(self):
+        """The output Linear layers carrying the reward-return scale (all 4 critics).
+        IQN → head_r; scalar critic → the encoder's final Linear."""
+        crits = (self.q1, self.q2, self.q1_target, self.q2_target)
+        if self.use_iqn:
+            return [c.head_r for c in crits]
+        return [c.encoder[-1] for c in crits]
+
+    def _popart_update_and_rescale(self, targets: torch.Tensor) -> None:
+        """EMA-update μ/σ from the (unnormalised) targets, then rescale the reward
+        heads so their UNNORMALISED outputs are preserved (van Hasselt 2016)."""
+        if not self.use_popart:
+            return
+        sigma_old = self._popart_sigma()
+        mu_old = self.popart_mu.clone()
+        with torch.no_grad():
+            y = targets.detach().flatten()
+            b = self.popart_beta
+            self.popart_mu = (1.0 - b) * self.popart_mu + b * y.mean()
+            self.popart_nu = (1.0 - b) * self.popart_nu + b * (y ** 2).mean()
+            sigma_new = self._popart_sigma()
+            mu_new = self.popart_mu
+            # output-preserving rescale: σ_new·(W'x+b') + μ_new = σ_old·(Wx+b) + μ_old
+            #   W' = W·σ_old/σ_new ;  b' = (σ_old·b + μ_old − μ_new)/σ_new
+            for lin in self._popart_reward_heads():
+                lin.weight.mul_(sigma_old / sigma_new)
+                lin.bias.copy_((sigma_old * lin.bias + (mu_old - mu_new)) / sigma_new)
 
     def update(self, batch: Dict[str, np.ndarray]) -> dict:
         def _t(k, dtype=torch.float32):
@@ -272,9 +330,14 @@ class DSACAgent:
             idx = next_acts.view(b, 1, 1).expand(-1, n, 1)
             zr_next = torch.minimum(zr1.gather(2, idx), zr2.gather(2, idx)).squeeze(2)
             zh_next = torch.minimum(zh1.gather(2, idx), zh2.gather(2, idx)).squeeze(2)
+            zr_next = self._popart_denorm(zr_next)   # normalised → real return
             g = (gammas * (1.0 - dones)).unsqueeze(1)                  # (B,1)
-            target_r = rews.unsqueeze(1) + g * zr_next                 # (B,N)
+            target_r_real = rews.unsqueeze(1) + g * zr_next           # (B,N) real scale
             target_h = g * (zh_next - logp_next.unsqueeze(1))          # (B,N)
+        # PopArt: update μ/σ from the real-scale target + rescale reward heads,
+        # then the loss runs on the NORMALISED scale (head emits normalised Z_R).
+        self._popart_update_and_rescale(target_r_real)
+        target_r = self._popart_norm(target_r_real)                   # (B,N)
 
         loss_critic = obs.new_zeros(())
         td_accum = obs.new_zeros(b)
@@ -358,16 +421,19 @@ class DSACAgent:
         # IQN path keeps a target actor; that is an RDSAC choice, not SAC.)
         with torch.no_grad():
             probs_n, logp_n = self.actor.policy(next_obs, next_masks)
-            min_qn = torch.minimum(self.q1_target.q_values(next_obs),
-                                   self.q2_target.q_values(next_obs))
+            min_qn = self._popart_denorm(
+                torch.minimum(self.q1_target.q_values(next_obs),
+                              self.q2_target.q_values(next_obs)))   # real scale
             v_next = (probs_n * (min_qn - self.alpha.detach() * logp_n)).sum(-1)
-            target = rews + gammas * (1.0 - dones) * v_next               # (B,)
+            target_real = rews + gammas * (1.0 - dones) * v_next          # (B,) real
+        self._popart_update_and_rescale(target_real)
+        target = self._popart_norm(target_real)                          # normalised
 
         aidx = acts.view(b, 1)
         loss_critic = obs.new_zeros(())
         td_accum = obs.new_zeros(b)
         for q in (self.q1, self.q2):
-            q_sa = q.q_values(obs).gather(1, aidx).squeeze(1)             # (B,)
+            q_sa = q.q_values(obs).gather(1, aidx).squeeze(1)             # (B,) normalised
             per_sample = F.mse_loss(q_sa, target, reduction="none")       # (B,)
             loss_critic = loss_critic + (is_weights * per_sample).mean()
             td_accum = td_accum + (q_sa - target).detach().abs()
@@ -385,7 +451,8 @@ class DSACAgent:
         # ---- Actor: J = Σ π(a|s)[α logπ − minQ] ----
         probs, log_probs = self.actor.policy(obs, masks)
         with torch.no_grad():
-            min_q = torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs))
+            min_q = self._popart_denorm(
+                torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs)))
         loss_actor = (probs * (self.alpha.detach() * log_probs - min_q)).sum(-1).mean()
         self.opt_pi.zero_grad()
         loss_actor.backward()
@@ -422,7 +489,8 @@ class DSACAgent:
     def action_values(self, obs: torch.Tensor) -> torch.Tensor:
         """Per-action value. IQN: ρ[Z_R]+α·E[Z_H]; SAC: min(Q1,Q2). (B,obs)→(B,A)."""
         if not self.use_iqn:
-            return torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs))
+            return self._popart_denorm(
+                torch.minimum(self.q1.q_values(obs), self.q2.q_values(obs)))
         b = obs.shape[0]
         taus = torch.rand(b, self.q1.N_QUANT, device=self.device)
         zr1, zh1 = self.q1.quantile_q(obs, taus)
@@ -467,6 +535,9 @@ class DSACAgent:
             "hidden": list(self.hidden),
             "obs_dim": self.obs_dim, "n_actions": self.n_actions,
             "update_count": self._update_count,
+            "use_popart": self.use_popart, "popart_beta": self.popart_beta,
+            "popart_mu": float(self.popart_mu.item()),
+            "popart_nu": float(self.popart_nu.item()),
         }, str(path))
 
     @classmethod
@@ -480,6 +551,8 @@ class DSACAgent:
             risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
             risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),
             target_entropy_ratio=data.get("target_entropy_ratio", 0.1),
+            use_popart=kwargs.pop("use_popart", data.get("use_popart", False)),
+            popart_beta=kwargs.pop("popart_beta", data.get("popart_beta", 1e-3)),
             **kwargs)
         agent.actor.load_state_dict(data["actor"])
         agent.actor_target.load_state_dict(data["actor_target"])
@@ -494,4 +567,7 @@ class DSACAgent:
         if agent.opt_alpha and data.get("opt_alpha"):
             agent.opt_alpha.load_state_dict(data["opt_alpha"])
         agent._update_count = data.get("update_count", 0)
+        with torch.no_grad():
+            agent.popart_mu.fill_(float(data.get("popart_mu", 0.0)))
+            agent.popart_nu.fill_(float(data.get("popart_nu", 1.0)))
         return agent
