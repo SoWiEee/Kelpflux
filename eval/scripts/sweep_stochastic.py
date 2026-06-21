@@ -124,6 +124,8 @@ def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args) -> DSACA
         seed=args.train_seed,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
+        node_speeds=([float(s) for s in args.node_speeds.split(",") if s.strip()]
+                     if args.node_speeds else None),
     )
 
 
@@ -143,6 +145,9 @@ def main(argv=None) -> int:
                    help="training RNG seed (the multi-seed knob: run the sweep "
                         "several times with different --train-seed to get "
                         "mean±std per (σ, arm) and beat the single-seed caveat)")
+    p.add_argument("--node-speeds", default=None,
+                   help="item-1: comma-separated per-node speed, e.g. '1.0,0.25' "
+                        "(node-1 = slow 3080). Empty = homogeneous.")
     p.add_argument("--balance-coef", type=float, default=0.0,
                    help="P1: potential-based node-balance shaping coefficient "
                         "(0 = off; ~5 penalizes crowding one card)")

@@ -300,6 +300,13 @@ def _post_act(serve_url: str, payload: dict, timeout: float = 30.0) -> dict:
         return json.loads(resp.read().decode() or "{}")
 
 
+def _node_gpu_type(node_name: str) -> str:
+    """Infer card type from the node name (…rtx3080… → rtx3080, else rtx4070).
+    Lets the policy see card heterogeneity instead of every node looking like a
+    4070 (item-1)."""
+    return "rtx3080" if "3080" in node_name else "rtx4070"
+
+
 def decide_node(serve_url: str, job: LiveJob, *, node_free_mps: list[int],
                 node_names: list[str], mps_per_gpu: int = LIVE_GPU_MPS,
                 now: float | None = None) -> str | None:
@@ -318,7 +325,11 @@ def decide_node(serve_url: str, job: LiveJob, *, node_free_mps: list[int],
             "gpu_type": "rtx4070", "runtime": job.reported_runtime_s,
             "submit_ts": 0.0, "can_fit": True,
         }],
-        "nodes": [{"gpus": [{"free_mps": int(fm)}]} for fm in node_free_mps],
+        # Per-node real card type (item-1): the model now sees which node is the
+        # slow 3080 vs the fast 4070, so it can route big/long jobs accordingly.
+        "nodes": [{"gpus": [{"free_mps": int(fm),
+                             "gpu_type": _node_gpu_type(nm)}]}
+                  for fm, nm in zip(node_free_mps, node_names)],
     }
     resp = _post_act(serve_url, payload)
     nj = resp.get("node_j")

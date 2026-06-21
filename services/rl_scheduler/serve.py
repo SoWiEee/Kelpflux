@@ -144,7 +144,10 @@ def _job_feat(j: JobView, now: float, mps_per_gpu: int) -> np.ndarray:
 
 def _gpu_feat(g: GpuView, mps_per_gpu: int) -> np.ndarray:
     free_ratio = g.free_mps / mps_per_gpu if mps_per_gpu > 0 else 0.0
-    gpu_oh     = [1.0, 0.0, 0.0]  # rtx4070 / other_a / other_b (homogeneous)
+    # gpu_type one-hot — derived from the per-GPU type so the policy sees card
+    # heterogeneity (must match sim/gym_env _gpu_feat: rtx4070→[1,0,0], the slow
+    # rtx3080→[0,1,0]). Caller (decide_node / live_daemon) sets g.gpu_type.
+    gpu_oh = [0.0, 1.0, 0.0] if g.gpu_type == "rtx3080" else [1.0, 0.0, 0.0]
     return np.array([
         free_ratio,
         free_ratio,                   # vram proxy (same scale as MPS in sim)
