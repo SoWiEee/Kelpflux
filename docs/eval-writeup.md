@@ -358,6 +358,29 @@
 
 > 原始檔 `runs/mpsbuckets_s{42,43,44}/`
 
+### 4.3 暴露 GPU 異質性後的實機 A/B（item-1）
+
+§4.2 的 checkpoint 是**同質訓練**——obs 裡的 GPU one-hot 寫死、sim 裡兩張卡同速，所以策略對「4070 快 / 3080 慢」是**盲的**，大 job 才會放錯卡。item-1 修正：obs 暴露每張卡的 `gpu_type`、sim cluster 給每節點速度（4070=1.0×、3080≈0.25×）。sim 配對證實有效（同質 baseline vs 異質訓練、兩者都在異質環境，異質訓練贏 10/12 格；§3 / `eval/scripts/compare_hetero_vs_homo.py`）。本節把**異質感知的 checkpoint（seed-43）**搬上真實 4070+3080。
+
+σ=1.0、philly、real cuBLAS（`target_max_s=60`、buckets 25/50/75/100）、placement 模式、n=96/arm（2 measured round）：
+
+| arm | mean JCT | p95 | p99 | CVaR | ΔJCT% | t-test p |
+|---|---:|---:|---:|---:|---:|---:|
+| score | 474.9 | 1016.8 | 1108.2 | 944.4 | （baseline）| |
+| SAC | 474.2 | 1019.5 | 1093.2 | 949.3 | +0.1 | 0.845 |
+| **RDSAC-mean** | **456.2** | 1022.0 | 1102.0 | 956.2 | **+3.9** | **0.116** |
+| RDSAC-cvar | 520.7 | 1023.2 | 1093.2 | 956.7 | **−9.7** | **0.0007** |
+
+（正 ΔJCT% = RL 較快；尾端 p95/p99/CVaR 四方差異全在 ±1.4% 內、無顯著差異。）
+
+**發現：暴露異質性把 learned 從「全輸」拉到「打平 / 名目小贏」，但還不是統計顯著的勝利。**
+- **§4.2（同質）learned 全輸 −7~−22%** → **§4.3（異質感知）RDSAC-mean 翻成名目 +3.9%、SAC 打平**。方向跟 sim 的 item-1 發現同調（暴露卡片異質性有幫助）。
+- 但 RDSAC-mean 的 +3.9% **統計不顯著**（p=0.116），稱不上真實勝出;**RDSAC-cvar 反而顯著變差 −9.7%**（p=0.0007，與 §3.3「CVaR 風險扭曲在某些設定吃虧」呼應）。
+
+**兩個 load-bearing caveats：**（1）**極端競爭**——slowdown_p99 ≈ 460（job 等了 ~460× 自身 runtime）；在這種飽和下卡滿時 RL arm 也常 abstain → 退回 vanilla Slurm，稀釋 RL 效果。（2）**單一 seed-43 checkpoint、單 σ、2 round**——要下「item-1 在實機顯著贏」的結論，需多 seed checkpoint + 多 round 收更穩的尾端統計，並接 RLPD 用真實資料微調（§5.1）。
+
+> 原始檔 `runs/htab_item1_20260622-103714/`
+
 ---
 
 ## 5. 結論
