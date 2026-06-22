@@ -147,7 +147,13 @@ def node_view(node: dict[str, Any], *, mps_per_gpu: int, default_gpus_per_node: 
     cfg = _node_tres_text(node, ("tres", "cfg_tres", "gres", "gres_detail", "features", "active_features", "available_features"))
     if not re.search(r"(gpu|gres/mps|mps)", cfg + "," + _node_name(node), flags=re.IGNORECASE):
         return None
-    alloc = _node_tres_text(node, ("alloc_tres", "alloc_gres"))
+    # Allocated TRES field name varies by slurmrestd API version: older builds
+    # expose `alloc_tres`/`alloc_gres`; v0.0.37+ uses `tres_used` (clean
+    # `gres/mps=<slots>` form). Without `tres_used` the alloc parse silently
+    # returns 0 → free_mps stuck at the configured total (the "Free MPS always
+    # 200" dashboard bug). `gres_used` is intentionally excluded: its
+    # `mps:<type>:<n>` counts jobs, not slots, and would mis-parse.
+    alloc = _node_tres_text(node, ("alloc_tres", "alloc_gres", "tres_used"))
     parsed_gpu_count = _parse_tres_int(cfg, ("gpu",), default=0) or default_gpus_per_node
     # Slurm/NVIDIA MPS may expose logical GPU replicas in TRES. The DSAC
     # checkpoint shape is tied to the configured physical GPUs per node, so
