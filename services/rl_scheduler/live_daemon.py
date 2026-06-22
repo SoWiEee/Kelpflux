@@ -484,6 +484,12 @@ def main(argv=None) -> int:
     print(f"[daemon] loading agent from {ckpt}")
     agent = DSACAgent.load(str(ckpt))
 
+    # value_abstain: env-overridable (mirrors serve.py VALUE_ABSTAIN). The
+    # default -1.0 abstains whenever the policy value < -1, which silences a
+    # checkpoint whose values sit at O(-10) (e.g. seed-43) — so it logs no
+    # transitions at all. For RLPD transition COLLECTION, set a very low
+    # threshold so the policy's decisions are actually recorded.
+    value_abstain = float(os.environ.get("VALUE_ABSTAIN", "-1.0"))
     run_daemon(
         agent=agent,
         node_names=args.node_name,
@@ -495,6 +501,7 @@ def main(argv=None) -> int:
         log_dir=Path(args.log_dir),
         runtime_predictor_url=args.predictor_url,
         buf_capacity=args.buf_capacity,
+        value_abstain=value_abstain,
     )
     return 0
 
