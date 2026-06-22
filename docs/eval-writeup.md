@@ -377,7 +377,7 @@
 - **§4.2（同質）learned 全輸 −7~−22%** → **§4.3（異質感知）RDSAC-mean 翻成名目 +3.9%、SAC 打平**。方向跟 sim 的 item-1 發現同調（暴露卡片異質性有幫助）。
 - 但 RDSAC-mean 的 +3.9% **統計不顯著**（p=0.116），稱不上真實勝出;**RDSAC-cvar 反而顯著變差 −9.7%**（p=0.0007，與 §3.3「CVaR 風險扭曲在某些設定吃虧」呼應）。
 
-**兩個 load-bearing caveats：**（1）**極端競爭**——slowdown_p99 ≈ 460（job 等了 ~460× 自身 runtime）；在這種飽和下卡滿時 RL arm 也常 abstain → 退回 vanilla Slurm，稀釋 RL 效果。（2）**單一 seed-43 checkpoint、單 σ、2 round**——要下「item-1 在實機顯著贏」的結論，需多 seed checkpoint + 多 round 收更穩的尾端統計，並接 RLPD 用真實資料微調（§5.1）。
+**兩個 load-bearing caveats：**（1）**極端競爭**——slowdown_p99 ≈ 460（job 等了 ~460× 自身 runtime）；在這種飽和下卡滿時 RL arm 也常 abstain → 退回 vanilla Slurm，稀釋 RL 效果。（2）**單一 seed-43 checkpoint、單 σ、2 round**——要下「item-1 在實機顯著贏」的結論，需多 seed checkpoint + 多 round 收更穩的尾端統計，並接 RLPD 用真實 transition 微調（§6）。
 
 > 原始檔 `runs/htab_item1_20260622-103714/`
 
@@ -413,7 +413,11 @@
 - [ ] σ 校準的外部效度：§3.2 的 σ 是合成 trace 的最難預測上界；應在真實結構化 trace（`load_philly()`）上重新量測，並把 σ-sweep 落在實測區間。
 - [X] 真實 CUDA job 評估：已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`）並編譯到 `/shared/bin/gpu_workload`（兩節點），跑出分數 MPS 共置的實機評估 (§4.2)
 - [ ] 補強 baseline：目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
-- [ ] 完整 PopArt return normalization：取代手調 reward_scale，讓單一 α 控制器穩定（消掉本文必須固定 α=0.05 的 caveat）。
+- [~] 完整 PopArt return normalization：已實作（`dsac.py --use-popart`，輸出保值 rescale、誤差 9.5e-7 驗證過），但 **3-seed 反而比 P2 reward-norm 更差（−23~−48% vs −12~−33%）、變異更大** → **否決**，保留關閉、預設仍用 P2。
+- [X] 暴露 GPU 異質性（item-1）：obs 加 per-card `gpu_type`、sim 加 per-node 速度（4070=1.0×/3080≈0.25×）。sim 配對贏 10/12；**實機把 learned 從 §4.2「全輸 −7~−22%」拉到「打平 / 名目 +3.9%」（RDSAC-mean，§4.3）**。seed-43 hetero checkpoint 為目前最佳。
+- [ ] **讓 §4.3 的 +3.9% 達到統計顯著**：目前 p=0.116。三個正交手段——(a) **更多配對樣本**（更多 round / job，n 96→300+ 收緊 SE）；(b) **降低 JCT 變異的 regime**（§4.3 是 slowdown_p99≈460 的極端飽和，巨大尾端淹沒訊號；改用非飽和負載讓效果浮出）；(c) **多 seed checkpoint**（跨 3 個訓練 seed 報 mean±std，排除單 seed 運氣）。
+- [ ] **RLPD 走真實 transition logging（取代 trace-replay）**：`--online-trace`（把 live sacct trace 當 score demonstrations 回放）**在飽和與非飽和兩個 regime 都退化 prior**（seed-43 −19.6%/−4.5% → −97~−174% / −79%），病根是 demonstration 機制本身（拉向 sim-score + reward/scale 不匹配）非資料飽和。正確路線：部署 `live_daemon`（SHADOW_MODE）記**真實 `(obs,act,rew)` transitions** → `rlpd_finetune --online-log` + **保守 offline RL**（大 offline anchor、低 online-ratio、限制更新步數、可加 CQL 式保守項）。
+- [ ] 完整 PopArt 的替代：既然 PopArt 否決，溫度穩定改用「固定 α + 良好 reward_scale」或 per-arm reward 標準化。
 
 ---
 
