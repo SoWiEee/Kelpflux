@@ -404,6 +404,69 @@
 
 > 原始檔 `runs/htab_item1_20260622-103714/`（§4.3）、`runs/htab_item1_sig_20260622-183551/`（2-arm 反轉）、`runs/htab_4arm_sig_20260623-001716/`（s43 四方）、`runs/htab_4arm_s44_20260623-041243/`（s44 四方,多 seed）
 
+### 4.4 實機評估的 seed 方法學：能不能自動選 seed？
+
+§4.3.1 是手動挑「sim 沒崩」的 seed-43/44 來上線,這是 **selection bias**——真實部署只會訓一個 seed,而它有機會就是崩掉的那個。所以要問:**能否用一個部署前可算、不碰 live test 的準則自動選 seed?** 最自然的候選是 **sim-validation**(用 sim 分數選),前提是它要能預測 live 排名。直接檢驗:把 sim 裡**崩掉的 seed-42**(hetero sim：cvar −133% / mean −139%,遠差於 43/44 的 −6~−43%)也丟上實機跑同一套四方協定。
+
+**完整四方 × 三 seed 的 live 結果**（每 arm n=246、非飽和 regime、real cuBLAS；JCT/p95/p99/CVaR 單位秒,ΔJCT% 為對 score 配對、負值=較慢）：
+
+**seed-42（sim 崩潰：cvar −133% / mean −139%）**
+
+| arm | JCT(mean) | p95 | p99 | CVaR | ΔJCT% | t-test p |
+|---|--:|--:|--:|--:|--:|--:|
+| score | 170.5 | 399.8 | 430.9 | 376.8 | —（baseline）| |
+| SAC | 176.0 | 404.8 | 429.1 | 382.8 | −3.2 | 2.2e-11 |
+| RDSAC-mean | 172.7 | 395.8 | 426.1 | 374.1 | **−1.3** | 0.044 |
+| RDSAC-cvar | 175.0 | 404.8 | 426.2 | 382.5 | −2.6 | 7.0e-09 |
+
+**seed-43（sim 正常）**
+
+| arm | JCT(mean) | p95 | p99 | CVaR | ΔJCT% | t-test p |
+|---|--:|--:|--:|--:|--:|--:|
+| score | 167.8 | 398.0 | 425.6 | 374.7 | —（baseline）| |
+| SAC | 174.0 | 402.0 | 432.4 | 379.5 | −3.7 | 3.7e-16 |
+| RDSAC-mean | 174.5 | 402.0 | 435.8 | 379.5 | −4.0 | 2.1e-17 |
+| RDSAC-cvar | 175.5 | 403.8 | 432.8 | 381.6 | −4.6 | 5.3e-12 |
+
+**seed-44（sim 正常）**
+
+| arm | JCT(mean) | p95 | p99 | CVaR | ΔJCT% | t-test p |
+|---|--:|--:|--:|--:|--:|--:|
+| score | 170.0 | 399.0 | 432.8 | 375.8 | —（baseline）| |
+| SAC | 176.8 | 404.8 | 432.2 | 382.9 | −4.0 | 5.5e-10 |
+| RDSAC-mean | 173.4 | 400.0 | 428.0 | 379.4 | −2.0 | 1.1e-06 |
+| RDSAC-cvar | 175.4 | 405.5 | 432.2 | 381.7 | −3.1 | 1.8e-14 |
+
+**綜合三 seed（mean ± std，這正是「報全 seed 分布」建議的落地形式）：**
+
+| arm | JCT(mean) | p95 | p99 | CVaR | ΔJCT% vs score |
+|---|--:|--:|--:|--:|--:|
+| score | 169.4 ± 1.4 | 398.9 ± 0.9 | 429.8 ± 3.7 | 375.8 ± 1.1 | —（baseline）|
+| SAC | 175.6 ± 1.4 | 403.9 ± 1.6 | 431.2 ± 1.9 | 381.7 ± 1.9 | **−3.6 ± 0.4** |
+| RDSAC-mean | 173.5 ± 0.9 | 399.3 ± 3.2 | 430.0 ± 5.1 | 377.7 ± 3.1 | **−2.4 ± 1.4** |
+| RDSAC-cvar | 175.3 ± 0.3 | 404.7 ± 0.9 | 430.4 ± 3.6 | 381.9 ± 0.5 | **−3.4 ± 1.0** |
+
+**綜合推論：**
+
+1. **三個 learned arm 跨 seed 一致輸 score**：ΔJCT% = SAC −3.6±0.4、cvar −3.4±1.0、mean −2.4±1.4——**全部 (mean − std) 仍 < 0**,沒有一個 arm 在任何 seed 翻正。負結果**穩健**,不是單 seed 運氣。
+2. **沒有任何方法改善尾端**：p95/p99/CVaR 四方在 std 內幾乎重疊;尤其 **RDSAC-cvar（專為壓尾設計）的 CVaR 反而略高於 score（381.9 vs 375.8）**——風險扭曲在此 regime 沒兌現它的賣點。RL 不但沒贏 mean,連它最該贏的尾端也沒贏。
+3. **learned arm 之間的排名是雜訊**：RDSAC-mean（−2.4）名目最不爛,但其 ±1.4 與 SAC（−3.6±0.4）、cvar（−3.4±1.0）重疊——sub-ranking 不可下結論(呼應 §3.1「arm 排名是訓練雜訊」)。
+4. **機制解讀**：live 下 RL 訊號很小(飽和 abstain → fallback、非飽和 placement 差異有限),所以異質感知策略只能在 score 的放置上做**小幅擾動,而擾動略微有害**(~−3% JCT、尾端持平或略差),且這小擾動的大小不取決於 sim 長相(故 §4.4 sim 不預測 live)。
+
+**結論（與全文一致、且現在統計顯著 + 跨 seed 穩健）**：真實 2×1 上,**沒有任何 DRL 排程策略贏過 score**;異質感知(item-1)把 §4.2 的大幅落後收斂成「**一致、顯著、但小幅(~−3%)的落後且無尾端紅利**」。要真的贏過 score,瓶頸不在演算法花招,而在(a)讓 RL 訊號在 live 真正起作用(降低 fallback/abstain 比例)、(b)穩定訓練(§6)、(c)用真實 transition 做保守 RLPD(§6,已試 trace-replay 失敗)。
+
+**判定：sim-validation 不能預測 live,自動選 seed 失敗。** sim 排名是 43≈44 ≫ 42（42 崩),但 **live 排名是 42≈43≈44**——seed-42 落在同一個窄帶(−1.3~−3.2%)、甚至是所有 learned arm 裡**最不爛的那個**(RDSAC-mean −1.3%)。**sim 的崩潰沒有轉移到 live**;若按 sim-validation 選 seed,會錯誤丟掉一個實機表現正常的 checkpoint。
+
+**機制**:live 下 RL 訊號很小——飽和時 arm 大量 abstain → 退回 vanilla Slurm,非飽和時 placement 差異也有限——所以**不管 sim 長相如何,所有 learned arm 在 live 都收斂到「比 score 略差 ~−1~−5%」**。sim 端的高變異(seed collapse)在 live 被這個「小訊號 + fallback」洗掉了。
+
+**可解釋、穩定的實機評估協定（結論）：**
+
+1. **測量端控變異**：非飽和 regime(poisson + `--mps-oversub 1.0`)+ 高 n + per-job paired CRN（§4.3.1）——這把「排名不穩」的測量雜訊壓掉,讓「score vs DRL」的 gap 變顯著且可重現。
+2. **訓練端不要手動挑 seed,也別靠 sim 自動選**（已證 sim 不預測 live）。改**報全 seed 分布**(mean±std over all seeds,含失敗)——這正好可行,因為 live 對 seed 穩健:三個 seed × 三個 arm 全部落在 −1.3~−4.6%。
+3. **不要排名 DRL arm 之間**(SAC vs mean vs cvar 的高低是訓練雜訊);只報**穩健的 top-level 結論**:`score > 所有 DRL arm`,跨 seed、跨 arm、統計顯著。
+
+> 原始檔 `runs/htab_4arm_s42_20260623-101559/`（seed-42 live,sim-validation 檢驗）
+
 ---
 
 ## 5. 結論
