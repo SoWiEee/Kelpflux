@@ -124,7 +124,6 @@ def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args) -> DSACA
         seed=args.train_seed,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
-        use_popart=args.use_popart,
         node_speeds=([float(s) for s in args.node_speeds.split(",") if s.strip()]
                      if args.node_speeds else None),
     )
@@ -149,8 +148,6 @@ def main(argv=None) -> int:
     p.add_argument("--node-speeds", default=None,
                    help="item-1: comma-separated per-node speed, e.g. '1.0,0.25' "
                         "(node-1 = slow 3080). Empty = homogeneous.")
-    p.add_argument("--use-popart", action="store_true",
-                   help="full PopArt on the critic reward head")
     p.add_argument("--balance-coef", type=float, default=0.0,
                    help="P1: potential-based node-balance shaping coefficient "
                         "(0 = off; ~5 penalizes crowding one card)")
