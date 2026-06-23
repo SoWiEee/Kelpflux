@@ -404,6 +404,30 @@
 
 > 原始檔 `runs/htab_item1_20260622-103714/`（§4.3）、`runs/htab_item1_sig_20260622-183551/`（2-arm 反轉）、`runs/htab_4arm_sig_20260623-001716/`（s43 四方）、`runs/htab_4arm_s44_20260623-041243/`（s44 四方,多 seed）
 
+### 4.4 實機評估的 seed 方法學：能不能自動選 seed？
+
+§4.3.1 是手動挑「sim 沒崩」的 seed-43/44 來上線,這是 **selection bias**——真實部署只會訓一個 seed,而它有機會就是崩掉的那個。所以要問:**能否用一個部署前可算、不碰 live test 的準則自動選 seed?** 最自然的候選是 **sim-validation**(用 sim 分數選),前提是它要能預測 live 排名。直接檢驗:把 sim 裡**崩掉的 seed-42**(hetero sim：cvar −133% / mean −139%,遠差於 43/44 的 −6~−43%)也丟上實機跑同一套四方協定。
+
+**跨 seed 的 live ΔJCT%（vs score，全 p<0.05）：**
+
+| arm | seed-42 | seed-43 | seed-44 |
+|---|--:|--:|--:|
+| SAC | −3.2（2.2e-11）| −3.7（3.7e-16）| −4.0（5.5e-10）|
+| RDSAC-mean | **−1.3（0.044）** | −4.0（2.1e-17）| −2.0（1.1e-06）|
+| RDSAC-cvar | −2.6（7.0e-09）| −4.6（5.3e-12）| −3.1（1.8e-14）|
+
+**判定：sim-validation 不能預測 live,自動選 seed 失敗。** sim 排名是 43≈44 ≫ 42（42 崩),但 **live 排名是 42≈43≈44**——seed-42 落在同一個窄帶(−1.3~−3.2%)、甚至是所有 learned arm 裡**最不爛的那個**(RDSAC-mean −1.3%)。**sim 的崩潰沒有轉移到 live**;若按 sim-validation 選 seed,會錯誤丟掉一個實機表現正常的 checkpoint。
+
+**機制**:live 下 RL 訊號很小——飽和時 arm 大量 abstain → 退回 vanilla Slurm,非飽和時 placement 差異也有限——所以**不管 sim 長相如何,所有 learned arm 在 live 都收斂到「比 score 略差 ~−1~−5%」**。sim 端的高變異(seed collapse)在 live 被這個「小訊號 + fallback」洗掉了。
+
+**可解釋、穩定的實機評估協定（結論）：**
+
+1. **測量端控變異**：非飽和 regime(poisson + `--mps-oversub 1.0`)+ 高 n + per-job paired CRN（§4.3.1）——這把「排名不穩」的測量雜訊壓掉,讓「score vs DRL」的 gap 變顯著且可重現。
+2. **訓練端不要手動挑 seed,也別靠 sim 自動選**（已證 sim 不預測 live）。改**報全 seed 分布**(mean±std over all seeds,含失敗)——這正好可行,因為 live 對 seed 穩健:三個 seed × 三個 arm 全部落在 −1.3~−4.6%。
+3. **不要排名 DRL arm 之間**(SAC vs mean vs cvar 的高低是訓練雜訊);只報**穩健的 top-level 結論**:`score > 所有 DRL arm`,跨 seed、跨 arm、統計顯著。
+
+> 原始檔 `runs/htab_4arm_s42_20260623-101559/`（seed-42 live,sim-validation 檢驗）
+
 ---
 
 ## 5. 結論
