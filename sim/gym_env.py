@@ -275,6 +275,7 @@ class KubefluxSchedEnv:
         interference: float = 0.0,
         colocation_actions: bool = False,
         slo_penalty: float = 0.0,
+        noop_penalty: float = 0.0,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
@@ -320,6 +321,13 @@ class KubefluxSchedEnv:
         # lateness penalty ∝ (jct − slo_s), teaching the policy to prioritise
         # latency-critical inference over best-effort training.
         self.slo_penalty            = float(slo_penalty)
+        # Anti-idle (opt-in; 0 = legacy). At every decision point _advance_to_decision
+        # guarantees ≥1 schedulable job, so choosing NO_OP there is always idling
+        # when work is available. A small penalty discourages the cold-start
+        # "learn to no-op" collapse (env gives placement −0.01 / no-op 0, so an
+        # untrained policy hides in no-op → low utilization). Only charged when a
+        # real placement is actually legal.
+        self.noop_penalty           = float(noop_penalty)
 
         self._step_count = 0
         self._state: Optional[_RunState] = None
@@ -401,6 +409,8 @@ class KubefluxSchedEnv:
                     r_place = -0.01   # infeasible pick
             else:
                 r_place = -0.01
+        elif self.noop_penalty > 0.0 and any(st.cluster.can_allocate(j) for j in top):
+            r_place -= self.noop_penalty   # idling while schedulable work exists
 
         st.completion_reward = 0.0
         if not scheduled and st.events:

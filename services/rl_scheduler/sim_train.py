@@ -233,6 +233,9 @@ def sim_train(
     colocation: bool = False,
     # SLO-aware reward (aiserve workload; 0 = off): lateness penalty on inference
     slo_penalty: float = 0.0,
+    # Anti-idle (0 = off): penalty for NO_OP at a decision point where a job could
+    # be scheduled — counters the cold-start "learn to no-op" low-utilization collapse
+    noop_penalty: float = 0.0,
     # Episode length cap = n_jobs × this. 200 is generous; lower (e.g. 40) bounds
     # the cost of cold-start episodes where an untrained policy fails to schedule
     # and the episode would otherwise spin to the cap (good episodes are ~n_jobs).
@@ -275,6 +278,7 @@ def sim_train(
         interference=interference,
         colocation_actions=colocation,
         slo_penalty=slo_penalty,
+        noop_penalty=noop_penalty,
     )
     if num_envs > 1 and node_speeds:
         raise NotImplementedError("--node-speeds not wired into the vec path; use --num-envs 1")
@@ -526,6 +530,9 @@ def main(argv=None) -> int:
     p.add_argument("--max-steps-mult",       type=int, default=200,
                    help="episode length cap = n_jobs × this; lower (e.g. 40) "
                         "truncates cold-start spin episodes fast")
+    p.add_argument("--noop-penalty",         type=float, default=0.0,
+                   help="penalty for NO_OP when a job is schedulable; counters "
+                        "the cold-start no-op/low-utilization collapse")
     # Vectorized rollout (Q2 throughput)
     p.add_argument("--num-envs",             type=int, default=1,
                    help="parallel rollout envs; >1 enables the vectorized path "
@@ -580,6 +587,7 @@ def main(argv=None) -> int:
         interference=args.interference,
         colocation=args.colocation,
         slo_penalty=args.slo_penalty,
+        noop_penalty=args.noop_penalty,
         max_steps_mult=args.max_steps_mult,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
