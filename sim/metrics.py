@@ -29,6 +29,15 @@ class JobRecord:
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
     runtime: float = 0.0
+    slo_s: float = 0.0        # latency-SLO deadline (s); >0 = JCT target (inference)
+    job_class: str = "batch"  # inference / training / batch
+
+    @property
+    def slo_violated(self) -> Optional[bool]:
+        """True/False for SLO jobs (slo_s>0); None for best-effort jobs."""
+        if self.slo_s <= 0 or self.jct is None:
+            return None
+        return self.jct > self.slo_s
 
     @property
     def jct(self) -> Optional[float]:
@@ -97,7 +106,19 @@ class MetricCollector:
                 if prev.start_ts is None or prev.start_ts > r.start_ts:
                     bf += 1
                     break
-        return {
+        # SLO: violation rate over jobs carrying a deadline (slo_s>0, i.e. inference)
+        slo_jobs = [r for r in finished if r.slo_s > 0]
+        slo_violations = [r for r in slo_jobs if r.slo_violated]
+        # per-class JCT breakdown (inference latency vs training throughput)
+        by_class: dict = {}
+        for cls in sorted({r.job_class for r in finished}):
+            cj = [r.jct for r in finished if r.job_class == cls]
+            by_class[cls] = {
+                "n": len(cj),
+                "jct_mean": statistics.fmean(cj),
+                "jct_p99": _pct(cj, 99),
+            }
+        out = {
             "n_jobs": len(finished),
             "makespan": last_end - first_submit,
             "jct_mean": statistics.fmean(jcts),
@@ -113,18 +134,25 @@ class MetricCollector:
             "slowdown_p99": _pct(slows, 99) if slows else 0.0,
             "utilization": util,
             "bf_rate": bf / len(finished),
+            "slo_n": len(slo_jobs),
+            "slo_violations": len(slo_violations),
+            "slo_violation_rate": (len(slo_violations) / len(slo_jobs)) if slo_jobs else 0.0,
         }
+        if by_class:
+            out["by_class"] = by_class
+        return out
 
     def write_per_job_csv(self, path: str) -> None:
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(
-                ["job_id", "user", "gpu_count", "mps_req",
+                ["job_id", "user", "gpu_count", "mps_req", "job_class", "slo_s",
                  "submit_ts", "start_ts", "end_ts",
-                 "runtime", "wait", "jct", "slowdown"])
+                 "runtime", "wait", "jct", "slowdown", "slo_violated"])
             for r in sorted(self.records.values(), key=lambda x: x.submit_ts):
                 w.writerow([
-                    r.job_id, r.user, r.gpu_count, r.mps_req,
+                    r.job_id, r.user, r.gpu_count, r.mps_req, r.job_class,
+                    f"{r.slo_s:.3f}",
                     f"{r.submit_ts:.3f}",
                     f"{r.start_ts:.3f}" if r.start_ts is not None else "",
                     f"{r.end_ts:.3f}" if r.end_ts is not None else "",
@@ -132,6 +160,7 @@ class MetricCollector:
                     f"{r.wait:.3f}" if r.wait is not None else "",
                     f"{r.jct:.3f}" if r.jct is not None else "",
                     f"{r.slowdown:.6f}" if r.slowdown is not None else "",
+                    "" if r.slo_violated is None else int(r.slo_violated),
                 ])
 
 

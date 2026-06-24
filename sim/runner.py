@@ -61,7 +61,8 @@ def run(
     for j in jobs:
         metrics.record_submit(
             job_id=j.job_id, user=j.user, gpu_count=j.gpu_count,
-            mps_req=j.mps_req, submit_ts=j.submit_ts, runtime=j.runtime)
+            mps_req=j.mps_req, submit_ts=j.submit_ts, runtime=j.runtime,
+            slo_s=j.slo_s, job_class=j.job_class)
 
     events: List = []
     seq = 0

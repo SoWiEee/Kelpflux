@@ -46,6 +46,8 @@ class Job:
     mem_req: float
     mps_req: int  # per-GPU MPS slots; MPS_PER_GPU = whole-GPU
     latency_class: str = ""  # optional live replay hint: cpu/gpu warm/cold/hard placement
+    job_class: str = "batch"  # workload class: inference / training / batch (SLO + analysis)
+    slo_s: float = 0.0        # latency-SLO deadline (s); >0 = JCT target (inference). 0 = best-effort
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -71,6 +73,8 @@ def _job_from_dict(item: dict) -> Job:
         mem_req=float(item.get("mem_req", 0.0)),
         mps_req=int(item.get("mps_req", MPS_PER_GPU)),
         latency_class=str(item.get("latency_class", "")),
+        job_class=str(item.get("job_class", "batch")),
+        slo_s=float(item.get("slo_s", 0.0)),
     )
 
 
@@ -330,10 +334,84 @@ def generate_ali_like(
     return jobs
 
 
+def generate_ai_serving(
+    n_jobs: int = 400,
+    *,
+    seed: int = 42,
+    n_gpus: int = 2,            # target cluster GPU-equivalents (2×1 default)
+    load: float = 0.7,         # offered load ρ in (0,1]; <1 = moderate, not saturated
+    inference_frac: float = 0.6,
+    n_users: int = 20,
+    slo_factor: float = 4.0,   # inference SLO deadline = service_time × slo_factor
+    gang_frac: float = 0.25,   # fraction of training jobs that are 2-GPU gang
+) -> List[Job]:
+    """Mixed AI-server workload: latency-SLO inference + best-effort training.
+
+    Built to exercise the scheduling dimensions that DO separate schedulers on a
+    small MPS cluster (e.g. 2×1) — temporal ordering, MPS co-location, SLO-
+    awareness — rather than multi-node packing (which needs scale).
+
+    - **inference** (``inference_frac`` of jobs): short (~secs), MPS-fractional
+      ({25,50}), 1-GPU, carries a latency SLO (``slo_s`` = runtime × slo_factor).
+      A good scheduler must not let these queue behind long training jobs.
+    - **training** (rest): long (~mins), whole-/big-MPS, ``gang_frac`` of them a
+      2-GPU cross-node gang; best-effort (``slo_s=0``).
+
+    ``load`` sets the offered load ρ: arrival gaps are scaled so
+    Σ(work)/(n_gpus·horizon) ≈ ``load``. ρ<1 keeps the system in the MODERATE-
+    contention sweet spot where ordering/SLO decisions have leverage, instead of
+    the saturated regime that flattens every scheduler to the same JCT.
+    """
+    rng = random.Random(seed)
+    users = [f"u{i:02d}" for i in range(n_users)]
+    gpu_types = ["rtx4070", "rtx3080"]
+    gpu_type_weights = [0.6, 0.4]
+
+    # 1) draw job features (class, gpu_count, mps, runtime, slo)
+    feats = []
+    for _ in range(n_jobs):
+        if rng.random() < inference_frac:
+            runtime = max(2.0, rng.lognormvariate(math.log(20.0), 0.7))   # median ~20s
+            gpu, mps = 1, rng.choice(MPS_SMALL_TIERS)                     # 25 or 50
+            feats.append(("inference", gpu, mps, runtime, runtime * slo_factor))
+        else:
+            runtime = max(60.0, rng.lognormvariate(math.log(600.0), 1.0))  # median ~10min
+            if rng.random() < gang_frac:
+                gpu, mps = 2, MPS_PER_GPU                                  # 2-GPU gang (cross-node @2×1)
+            else:
+                gpu, mps = 1, rng.choice((75, MPS_PER_GPU))
+            feats.append(("training", gpu, mps, runtime, 0.0))
+
+    # 2) set Poisson arrival rate so offered load ≈ `load`
+    mean_work = sum(rt * gc * (mp / MPS_PER_GPU) for _c, gc, mp, rt, _s in feats) / max(1, n_jobs)
+    mean_gap = mean_work / max(1e-6, n_gpus * load)
+
+    jobs: List[Job] = []
+    t = 0.0
+    for i, (cls, gpu, mps, runtime, slo) in enumerate(feats):
+        t += rng.expovariate(1.0 / mean_gap) if mean_gap > 0 else 0.0
+        jobs.append(
+            Job(
+                job_id=f"ai-{i:05d}",
+                user=rng.choice(users),
+                gpu_count=gpu,
+                gpu_type=rng.choices(gpu_types, gpu_type_weights)[0],
+                submit_ts=round(t, 3),
+                runtime=round(runtime, 3),
+                mem_req=0.0,
+                mps_req=mps,
+                job_class=cls,
+                slo_s=round(slo, 3),
+            )
+        )
+    return jobs
+
+
 TRACE_FAMILIES = {
     "philly": generate_philly_like,
     "burst": generate_burst_heavy,
     "ali": generate_ali_like,
+    "aiserve": generate_ai_serving,
 }
 
 
