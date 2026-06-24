@@ -73,7 +73,7 @@ def _collect_and_train_vec(
     reward_mode, reward_scale, potential_shaping, runtime_sigma,
     interference, colocation, nstep_n, total_steps, warmup_steps,
     update_every, utd_ratio, batch_size, use_per, seed, log_every,
-    curriculum_stages, score_warmup,
+    curriculum_stages, score_warmup, slo_penalty=0.0,
 ) -> None:
     """Vectorized rollout: N parallel envs feed the shared agent/buffer.
 
@@ -91,7 +91,8 @@ def _collect_and_train_vec(
             n_nodes=n_nodes, gpus_per_node=gpus_per_node, max_steps=nj * 200,
             reward_mode=reward_mode, reward_scale=reward_scale,
             potential_shaping=potential_shaping, runtime_sigma=runtime_sigma,
-            interference=interference, colocation_actions=colocation, base_seed=seed,
+            interference=interference, colocation_actions=colocation,
+            slo_penalty=slo_penalty, base_seed=seed,
         )
         return make_vector_env(spec, num_envs, asynchronous=async_envs)
 
@@ -230,6 +231,8 @@ def sim_train(
     interference: float = 0.0,
     # Co-location action mode (B; opt-in, doubles the action space)
     colocation: bool = False,
+    # SLO-aware reward (aiserve workload; 0 = off): lateness penalty on inference
+    slo_penalty: float = 0.0,
     # Vectorized rollout (Q2 throughput): >1 runs N parallel envs
     num_envs: int = 1,
     async_envs: bool = True,
@@ -267,6 +270,7 @@ def sim_train(
         runtime_sigma=runtime_sigma,
         interference=interference,
         colocation_actions=colocation,
+        slo_penalty=slo_penalty,
     )
     if num_envs > 1 and node_speeds:
         raise NotImplementedError("--node-speeds not wired into the vec path; use --num-envs 1")
@@ -311,6 +315,7 @@ def sim_train(
             update_every=update_every, utd_ratio=utd_ratio, batch_size=batch_size,
             use_per=use_per, seed=seed, log_every=log_every,
             curriculum_stages=curriculum_stages, score_warmup=score_warmup,
+            slo_penalty=slo_penalty,
         )
         env.close()
         if log_fh:
@@ -460,7 +465,7 @@ def main(argv=None) -> int:
     p.add_argument("--n-nodes",       type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--trace",         default=["philly", "ali"],
-                   nargs="+", choices=["philly", "ali"])
+                   nargs="+", choices=["philly", "ali", "burst", "aiserve"])
     p.add_argument("--n-jobs",        type=int, default=50)
     p.add_argument("--nstep-n",       type=int, default=10)
     p.add_argument("--no-score-warmup", action="store_true")
@@ -511,6 +516,9 @@ def main(argv=None) -> int:
     p.add_argument("--colocation",           action="store_true",
                    help="add PACK/ISOLATE co-location mode per placement "
                         "(doubles the action space; checkpoint-incompatible)")
+    p.add_argument("--slo-penalty",          type=float, default=0.0,
+                   help="SLO-aware reward (use with --trace aiserve): lateness "
+                        "penalty on inference jobs past their deadline; 0 = off")
     # Vectorized rollout (Q2 throughput)
     p.add_argument("--num-envs",             type=int, default=1,
                    help="parallel rollout envs; >1 enables the vectorized path "
@@ -564,6 +572,7 @@ def main(argv=None) -> int:
         runtime_sigma=args.runtime_sigma,
         interference=args.interference,
         colocation=args.colocation,
+        slo_penalty=args.slo_penalty,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
         node_speeds=[float(s) for s in args.node_speeds.split(",") if s.strip()] or None,

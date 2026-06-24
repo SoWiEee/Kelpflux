@@ -114,9 +114,19 @@ MIN_RUNTIME_S = 1.0
 # ── Feature extractors ────────────────────────────────────────────────────
 
 def _job_feat(job: Job, now: float, mps_per_gpu: int) -> np.ndarray:
-    """9-dim per-job feature vector."""
+    """9-dim per-job feature vector.
+
+    Indices 7/8 carry the SLO signal so the policy can be latency-aware on the
+    aiserve workload (else they are 0, i.e. legacy behaviour for best-effort
+    traces with no SLO):
+      [7] slo_urgency — fraction of the latency deadline already consumed
+          (wait / slo_s; >1 = already late). 0 for best-effort jobs (slo_s==0).
+      [8] is_inference — 1.0 for the latency class, 0.0 for training/batch.
+    """
     gpu_oh = [1.0 if job.gpu_type == t else 0.0 for t in GPU_TYPES]
     wait = max(0.0, now - job.submit_ts)
+    slo_urgency = (wait / job.slo_s) if job.slo_s > 0 else 0.0
+    is_inference = 1.0 if job.job_class == "inference" else 0.0
     return np.array([
         job.mps_req / mps_per_gpu,
         float(job.gpu_count),
@@ -124,8 +134,8 @@ def _job_feat(job: Job, now: float, mps_per_gpu: int) -> np.ndarray:
         math.log1p(job.runtime),
         math.log1p(wait),
         math.log1p(wait),               # age (duplicate until priority age added)
-        0.0,                            # deadline_remaining placeholder
-        0.0,                            # retry_count placeholder
+        slo_urgency,                    # SLO budget consumed (0 = best-effort)
+        is_inference,                   # latency-class flag
     ], dtype=np.float32)
 
 
@@ -263,6 +273,7 @@ class KubefluxSchedEnv:
         runtime_sigma: float = 0.0,
         interference: float = 0.0,
         colocation_actions: bool = False,
+        slo_penalty: float = 0.0,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
@@ -303,6 +314,11 @@ class KubefluxSchedEnv:
         # ── Co-location action mode (opt-in; 1 mode = legacy action space) ──
         self.colocation_actions     = bool(colocation_actions)
         self._n_modes               = 2 if colocation_actions else 1
+        # SLO-aware reward (opt-in; 0 = legacy). On an aiserve job's completion a
+        # latency-class job (slo_s>0) that finished past its deadline incurs a
+        # lateness penalty ∝ (jct − slo_s), teaching the policy to prioritise
+        # latency-critical inference over best-effort training.
+        self.slo_penalty            = float(slo_penalty)
 
         self._step_count = 0
         self._state: Optional[_RunState] = None
@@ -587,6 +603,9 @@ class KubefluxSchedEnv:
                                      + b_slow * (-math.log(slowdown)))
         else:  # jct_aligned
             st.completion_reward += -jct / self.reward_scale
+        # SLO lateness penalty (opt-in): latency-class jobs past deadline.
+        if self.slo_penalty > 0.0 and j.slo_s > 0.0 and jct > j.slo_s:
+            st.completion_reward += -self.slo_penalty * (jct - j.slo_s) / self.reward_scale
 
     def _placement_reward(
         self, job: Job, node_j: int, gpu_k: int, cluster: Cluster

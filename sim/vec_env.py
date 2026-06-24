@@ -85,6 +85,7 @@ class EnvSpec:
     runtime_sigma: float = 0.0
     interference: float = 0.0
     colocation_actions: bool = False
+    slo_penalty: float = 0.0
     base_seed: int = 0
 
     def build(self, index: int) -> KubefluxSchedEnv:
@@ -106,6 +107,7 @@ class EnvSpec:
             runtime_sigma=self.runtime_sigma,
             interference=self.interference,
             colocation_actions=self.colocation_actions,
+            slo_penalty=self.slo_penalty,
         )
 
 
