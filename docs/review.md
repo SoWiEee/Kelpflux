@@ -11,6 +11,8 @@
 
 item-1 異質性曝光把 §4.2 的大幅落後收斂成「**一致、顯著、但小幅（~−3%）、無尾端紅利**」的落後：完整四方 live A/B（score/SAC/RDSAC-mean/RDSAC-cvar）在非飽和 regime + 樣本三倍化 n=246 + 配對 CRN 下，最初的名目 +3.9% 翻轉成三方全顯著輸 score——SAC −3.7%、RDSAC-mean −4.0%、RDSAC-cvar −4.6%（p 全 ≪ 0.05），seed 42/43/44 一致（§4.3.1/§4.4）。「縮小 gap」成立，「贏 score」不成立。
 
+**更大的脈絡（§4.5,新）：** 把 score 與 **Slurm 原生 FCFS/multifactor/packing** 實機對照（3 seed + run-position 漂移對照),**四個排程器全部統計打平**（ΔJCT% vs score 全在 ±0.4~1.7±std、跨 0）。所以不只 DRL 贏不了 score——**連 score 自己對 trivial baseline 都沒優勢**;在此規模整個排程策略空間是平的,瓶頸不在挑排程器/演算法花招,而在叢集規模與工作負載結構本身。
+
 研究的真正定位是「**一個被多 seed 統計支撐、且在 live 異質叢集驗證過的負結論 + 一個可觀測的 fail-safe 平台**」，而非「RL 贏 heuristic」。剩餘的改進多屬「讓結論更站得住（多 baseline、Threats）」與「修訓練的兩條支線已撞牆（PopArt 否決、RLPD 退化）後的替代路線」。
 
 ---
@@ -19,9 +21,9 @@ item-1 異質性曝光把 §4.2 的大幅落後收斂成「**一致、顯著、�
 
 審稿人會先肯定**誠實的負結果**（§3.5 自我修正、§4.1 seed-robust 負結果、§4.2 大 job 失敗剖析），這在系統論文裡是加分。已解決的幾項：**注入噪音真實性**（原本核心結果依賴 σ=1.0 的 mean-preserving lognormal，受真實性質疑；現用生產 LightGBM 量真實 trace 的 log-殘差 std（philly 1.45 / ali 1.24）證明 σ=1.0 是保守下界、殘差近高斯，§3.2）、**訓練單 seed**（原本只跑單 seed；現 sim+live 皆 seed 42/43/44 報 mean±std，live 負結果 n=246 + 配對 CRN 已統計顯著，§4.3.1/§4.4）、**item-1 因果宣稱過強**（原本「曝露異質性 → 贏 10/12」聽起來像正結果；現 live 四方 A/B 證實是顯著負、屬縮 gap 而非贏，§4.3.1）。仍需改進：
 
-### baseline 太單薄
+### baseline 太單薄（已大幅補強：Slurm 原生 baseline 已實機對照）
 
-目前只比自家 `score` 啟發式 + vanilla SAC，「啟發式勝出」這個結論別人沒法站上去。應**在實機補可切換的 Slurm 內建 baseline**（工程價值來自所有排程同場上線比較，而非只留在 sim）：FCFS ≈ `SchedulerType=sched/builtin` + `PriorityType=priority/basic`、multifactor ≈ `PriorityType=priority/multifactor`（chart 已設權重）、packing ≈ `SelectTypeParameters=CR_Pack_Nodes`（對 vs `CR_LLN`），三者都是改設定即可切換、應在實機跟 score/DRL 同場比。**SJF 沒有 Slurm 原生 plugin**，現有 score 的 SJF-inspired factor（`f_runtime_short` + runtime_predictor）就是 live 版 SJF 近似，不是待做 baseline。理想上再加一個已發表 RL scheduler（Decima / DeepRM 改編）與近似上界，讓 ΔJCT% 有尺度感。
+原本只比自家 `score` 啟發式 + vanilla SAC，「啟發式勝出」這個結論別人沒法站上去。**已在實機補上三個 Slurm 原生 baseline**（改設定即可切換、同場上線比，§4.5）：FCFS（`sched/builtin`+`priority/basic`）、multifactor（`priority/multifactor`）、packing（`CR_Pack_Nodes`）；每臂關掉 Lua 的 score/RL hook 讓 Slurm 原生排程接管，跑與 §4.3.1 相同的 heavy-tail CRN workload。**結果（3 seed、run-position 對照）：score 與三個 Slurm 原生排程全部統計打平**（ΔJCT% vs score：multifactor +0.4±1.0、packing +0.6±1.1、fcfs +1.7±2.9，mean±std 全跨 0）。方法學插曲:單 pass 一度顯示 fcfs +5%，但那與 run-order 完美單調相關（GPU restore 後暖機漂移），3 seed × 3 種臂順序對照後消失（fcfs 隨位置在 +5.0/+0.5/−0.4 擺盪）。**SJF 沒有 Slurm 原生 plugin**，score 的 `f_runtime_short`+predictor 就是 live 版 SJF 近似，不另比。這把核心結論放進更大脈絡:**不只 DRL 贏不了 score，連 score 自己對 trivial baseline 都只是打平——在此規模整個排程策略空間是平的**。仍可選做:加一個已發表 RL scheduler（Decima / DeepRM 改編）與近似上界讓 ΔJCT% 有絕對尺度感。
 
 ### 外部效度與「sim 不預測 live」
 
@@ -152,7 +154,7 @@ n-step、PER、shaping、warmup、雙頭 Z_R/Z_H 全開。§3.6 已對 balance-s
 | 1 | σ 在真實結構化 trace 上重量 | IEEE | P0 | 現用合成 trace 最難預測上界（保守下界）；應在 `load_philly()` 真實 trace 重量 |
 | 2 | auto-α 的乾淨解（非 PopArt） | ML | P0 | PopArt 已 3-seed 否決；改走固定 α + 良好 reward_scale 或 per-arm reward 標準化 |
 | 3 | RLPD 改部署 daemon 進叢集收真實 transition | ML | P0 | 三次 trace-replay/host-side 全退化；正路是低延遲 squeue/sacct + 保守 offline RL（CQL 式） |
-| 4 | 補多 baseline（實機切換 Slurm 內建） | IEEE | P1 | FCFS=`sched/builtin`+`priority/basic`、multifactor=`priority/multifactor`、packing=`CR_Pack_Nodes` 同場上線比；SJF 用 score 的 `f_runtime_short` 近似；加近似上界 |
+| 4 | ~~補多 baseline（實機切換 Slurm 內建）~~ → **已做**；剩已發表 RL scheduler + 近似上界 | IEEE | P2 | **DONE（§4.5）**：FCFS/multifactor/packing 已實機對照,3 seed + run-position 對照 → 全部與 score 統計打平。剩可選:Decima/DeepRM 改編 + 近似上界給 ΔJCT% 絕對尺度 |
 | 5 | Threats to Validity 寫全 | IEEE | P1 | §4.4 已量化「sim 不預測 live」；連同訓練高變異、消費卡干擾正式寫進效度威脅 |
 | 6 | score-residual RDSAC（`final = score + bounded RL_delta`） | ML / IEEE | P1 | 學「何時修正啟發式」、天然 fail-safe；過度集中負結果後優先序升高 |
 | 7 | item-1 sim 速度建模校準 | ML | P1 | 3080≈0.25× 是一階純量；per-workload 量真實 4070-vs-3080 ratio 餵進 sim |

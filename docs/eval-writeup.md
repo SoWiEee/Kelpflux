@@ -467,6 +467,38 @@
 
 > 原始檔 `runs/htab_4arm_s42_20260623-101559/`（seed-42 live,sim-validation 檢驗）
 
+### 4.5 Slurm 原生排程 baseline 對照（R3）
+
+先前實機只比「自家 score 啟發式 vs DRL」,審稿人會問:score 贏不贏得了更單純的排程器?這裡把 score 與三個 **Slurm 原生**排程同場上線比(工程價值=所有排程都真的上線,而非 sim):
+
+- **FCFS**：`SchedulerType=sched/builtin` + `PriorityType=priority/basic`（嚴格 FIFO）
+- **multifactor**：`PriorityType=priority/multifactor`（age/jobsize 加權,chart 既有權重）
+- **packing**：`SelectTypeParameters` 加 `CR_Pack_Nodes`（優先塞滿單節點）
+- **SJF 不另比**：Slurm 無原生 SJF plugin,現有 score 的 `f_runtime_short`+predictor 就是 live 版 SJF 近似。
+
+每臂把 Lua 的 `SCORE_APPLY`/`RL_ENABLED` 關掉(讓 Slurm 原生排程純粹接管),改 ConfigMap + **重啟 slurmctld**(`job_submit.lua`/`slurm.conf` 都是 subPath mount,不能熱載),再跑與 §4.3.1 相同的 heavy-tail CRN workload(philly、n=100、poisson、`--mps-oversub 1.0`、mps-buckets 25/50/75/100、partition `gpu`、**無 RL placement**)。
+
+**陷阱:run-order 漂移。** 單 pass(block design、臂依序跑)的結果是 fcfs **+5.0%**、packing +1.6%、multifactor +1.0% 全顯著「贏」score——但改善幅度與**跑的先後順序完美單調相關**,是叢集隨時間變化(GPU restore 後暖機)的漂移,不是排程器差異。為洗掉它,跑 **3 個 seed × 3 種不同臂順序**,讓每臂在不同 pass 落在不同 run-position:
+
+| arm | seed42 位置 | seed43 位置 | seed44 位置 | ΔJCT% vs score（各 seed）|
+|---|--:|--:|--:|---|
+| fcfs | 4（最後）| 1（最先）| 3 | **+5.0 / +0.5 / −0.4** |
+| packing | 3 | 2 | 1 | +1.6 / +0.8 / −0.6 |
+| multifactor | 2 | 3 | 4 | +1.0 / +0.9 / −0.7 |
+
+fcfs 的「優勢」隨它跑第幾位從 +5.0(跑第4)掉到 −0.4(跑第3、p=0.068 不顯著)——**排名是漂移假象**。位置對照後的 cross-seed 聚合:
+
+| arm | mean JCT | p95 | p99 | CVaR | ΔJCT% vs score |
+|---|--:|--:|--:|--:|--:|
+| score | 182.7±31.7 | 369.1±46.6 | 409.8±37.7 | 349.2±43.0 | — |
+| multifactor | 181.8±30.3 | 364.5±42.7 | 405.9±35.6 | 346.7±39.4 | **+0.4±1.0** |
+| packing | 181.5±30.7 | 365.9±42.1 | 405.2±33.5 | 346.3±38.3 | **+0.6±1.1** |
+| fcfs | 179.7±32.0 | 362.5±37.2 | 402.4±28.2 | 343.2±32.8 | **+1.7±2.9** |
+
+**結論:三個 ΔJCT% 的 mean±std 全部跨過 0 → 真實 2×1 上,生產 score 啟發式與 Slurm 原生 FCFS/multifactor/packing 統計打平,沒有任何排程器有優勢。** 這把「沒人贏 score」放進更大的脈絡:不只 DRL 贏不了 score,**連 score 自己對 trivial baseline 都只是打平**——在此規模,整個排程策略空間是平的,瓶頸不在挑排程器,而在叢集規模/工作負載本身的結構。方法學上這也再次示範 §4.4 的教訓:**單 pass 的排名會被 run-order 漂移污染,必須位置對照 + 多 seed**。
+
+> 原始檔 `runs/baseline_sweep_20260624-010350/`（seed-42 forward）、`runs/baseline_passB_s43_*`、`runs/baseline_passC_s44_*`、聚合 `runs/baseline_confirm_20260624-064343/SUMMARY.md`；切換工具 `eval/scripts/baseline_switch.py`、聚合 `eval/scripts/aggregate_baseline.py`。
+
 ---
 
 ## 5. 結論
