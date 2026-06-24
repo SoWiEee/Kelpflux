@@ -233,6 +233,10 @@ def sim_train(
     colocation: bool = False,
     # SLO-aware reward (aiserve workload; 0 = off): lateness penalty on inference
     slo_penalty: float = 0.0,
+    # Episode length cap = n_jobs × this. 200 is generous; lower (e.g. 40) bounds
+    # the cost of cold-start episodes where an untrained policy fails to schedule
+    # and the episode would otherwise spin to the cap (good episodes are ~n_jobs).
+    max_steps_mult: int = 200,
     # Vectorized rollout (Q2 throughput): >1 runs N parallel envs
     num_envs: int = 1,
     async_envs: bool = True,
@@ -261,7 +265,7 @@ def sim_train(
     env = KubefluxSchedEnv(
         _make_factory(active_n_jobs),
         n_nodes=n_nodes, gpus_per_node=gpus_per_node,
-        max_steps=active_n_jobs * 200,
+        max_steps=active_n_jobs * max_steps_mult,
         reward_mode=reward_mode,
         reward_scale=reward_scale,
         potential_shaping=potential_shaping,
@@ -519,6 +523,9 @@ def main(argv=None) -> int:
     p.add_argument("--slo-penalty",          type=float, default=0.0,
                    help="SLO-aware reward (use with --trace aiserve): lateness "
                         "penalty on inference jobs past their deadline; 0 = off")
+    p.add_argument("--max-steps-mult",       type=int, default=200,
+                   help="episode length cap = n_jobs × this; lower (e.g. 40) "
+                        "truncates cold-start spin episodes fast")
     # Vectorized rollout (Q2 throughput)
     p.add_argument("--num-envs",             type=int, default=1,
                    help="parallel rollout envs; >1 enables the vectorized path "
@@ -573,6 +580,7 @@ def main(argv=None) -> int:
         interference=args.interference,
         colocation=args.colocation,
         slo_penalty=args.slo_penalty,
+        max_steps_mult=args.max_steps_mult,
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
         node_speeds=[float(s) for s in args.node_speeds.split(",") if s.strip()] or None,

@@ -242,6 +242,7 @@ class _RunState:
     jct_sum:          float
     completion_reward: float
     jcts:             list = dataclasses.field(default_factory=list)
+    jct_records:      list = dataclasses.field(default_factory=list)  # (job_id, jct)
 
 
 # ── Environment ───────────────────────────────────────────────────────────
@@ -595,6 +596,7 @@ class KubefluxSchedEnv:
         jct = st.now - j.submit_ts
         st.jct_sum += jct
         st.jcts.append(jct)
+        st.jct_records.append((jid, jct))
         if self.reward_mode == "shaped":
             b_jct, b_slow = self.reward_betas
             runtime  = max(1.0, j.runtime)
@@ -688,6 +690,23 @@ class KubefluxSchedEnv:
     def episode_jcts(self) -> list[float]:
         """Per-job JCTs of completed jobs this episode (for tail metrics)."""
         return [] if self._state is None else list(self._state.jcts)
+
+    def episode_records(self) -> list[dict]:
+        """Per-completed-job records this episode for SLO/per-class analysis:
+        {job_id, jct, slo_s, job_class, gpu_count, mps_req}."""
+        if self._state is None:
+            return []
+        st = self._state
+        out = []
+        for jid, jct in st.jct_records:
+            j = st.by_id[jid]
+            out.append({"job_id": jid, "jct": jct, "slo_s": j.slo_s,
+                        "job_class": j.job_class, "gpu_count": j.gpu_count,
+                        "mps_req": j.mps_req})
+        return out
+
+    def cluster_utilization(self) -> float:
+        return 0.0 if self._state is None else self._state.cluster.utilization()
 
     def render(self):
         return None
