@@ -499,6 +499,36 @@ fcfs 的「優勢」隨它跑第幾位從 +5.0(跑第4)掉到 −0.4(跑第3、p
 
 > 原始檔 `runs/baseline_sweep_20260624-010350/`（seed-42 forward）、`runs/baseline_passB_s43_*`、`runs/baseline_passC_s44_*`、聚合 `runs/baseline_confirm_20260624-064343/SUMMARY.md`；切換工具 `eval/scripts/baseline_switch.py`、聚合 `eval/scripts/aggregate_baseline.py`。
 
+### 4.6 AI-serving workload：SLO-aware 排程能不能分出高下、DRL 能不能贏（P0）
+
+§4.5 發現四方在退化（時長壓到 2s 地板）+ 重飽和的 heavy-tail 上打平。診斷:那兩個條件恰好抹平排程差異。這裡換成貼近 AI 伺服器的 workload,測 2×1 上**真正成立的維度**（時序排序、MPS 共置、SLO-awareness），而非需要規模的 node-packing。
+
+**Workload（`generate_ai_serving`，family=aiserve）**:延遲-SLO 推論（短、MPS 25/50、`slo_s`=runtime×4 的期限）+ best-effort 訓練（長、whole/big-MPS、含 2-GPU 跨節點 gang），`load` 旋鈕控 offered load 在中度（ρ=0.7、不飽和）。指標加 **SLO 違反率**（推論超過期限的比例）與**分類 JCT / 利用率**。
+
+**啟發式對照（sim，8 個 held-out seed）——這個 workload 真的分得開:**
+
+| arm | jct_mean | inf_jct | SLO 違反% | util |
+|---|--:|--:|--:|--:|
+| fcfs | 2199 | 1847 | **66.5** | 0.58 |
+| multifactor | 1108 | 461 | **41.1** | 0.63 |
+| score | 1129 | 520 | 40.7 | 0.63 |
+
+利用率/makespan 相近,但 **SLO 違反 fcfs 66.5% ≫ multifactor 41.1% ≈ score 40.7%**。這是方法學上的**正面結果**:換對 workload + 指標,**size-aware 排序在 2×1 就明顯勝過 FCFS**（對比 §4.5 的打平）——智慧排程的價值（不讓推論卡在長訓練後面）在此規模測得出來,瓶頸在於前面的 workload 選錯了維度,不是排程本身無效。
+
+**DRL 對照（sim，單訓練 seed × 2 種 reward 配置，8 eval seed）——仍輸啟發式:**
+
+| arm | jct_mean | inf_p99 | SLO 違反% | util |
+|---|--:|--:|--:|--:|
+| multifactor（目標） | 1108 | 2222 | **41.1** | 0.63 |
+| DRL（SLO reward） | 1251 | 2393 | 48.2 | 0.30 |
+| DRL（+ no-op 懲罰） | 985 | 2819 | **54.6** | 0.28 |
+
+DRL **大勝 fcfs**（48~55% vs 66%）→ 確實學到「優先短推論」,但**兩版都輸 multifactor/score 的 SLO**。診斷:DRL **util 偏低（~0.30 vs 0.63）**——冷啟動「學會 no-op」讓 GPU 閒置。對症加 no-op 懲罰後,mean JCT 壓到全場最低（985、甚至贏 multifactor）,**但 util 沒拉起來、SLO 反而更差**:它惡化了**推論尾端**（inf_p99 2222→2819），多數推論快、少數被餓死 → SLO 違反更多。**caveat**:單訓練 seed（§4.4 已證訓練 seed 變異大）、務實 hypers（fixed-α 0.05 / utd 1 / episode cap），且 util 在 gym_env（決策點取樣）與 runner（事件取樣）的量法不同,絕對值不宜硬比。
+
+**判定**:2×1 上、在能鑑別的 SLO workload,**size-aware 啟發式（multifactor/score）勝出,DRL 落在 FCFS 與啟發式之間** ——與 §4.2/§4.3 的 placement 結論一致。要 DRL 追上需多訓練 seed + 訓練調校（探索/利用率/尾端-aware reward），屬 open。**因 sim 未過閘,未上實機**（losing 的策略不值得佔實機資源）。
+
+> 原始檔 `runs/aiserve_drl_s42{,_noop}/`（訓練）、`runs/aiserve_eval_s42{,noop}/SUMMARY.md`（eval）;workload `sim/loader.py::generate_ai_serving`、指標 `sim/metrics.py`、eval `eval/scripts/eval_aiserve.py`。
+
 ---
 
 ## 5. 結論
