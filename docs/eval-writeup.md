@@ -529,6 +529,26 @@ DRL **大勝 fcfs**（48~55% vs 66%）→ 確實學到「優先短推論」,但*
 
 > 原始檔 `runs/aiserve_drl_s42{,_noop}/`（訓練）、`runs/aiserve_eval_s42{,noop}/SUMMARY.md`（eval）;workload `sim/loader.py::generate_ai_serving`、指標 `sim/metrics.py`、eval `eval/scripts/eval_aiserve.py`。
 
+#### 4.6.1 真實 BERT 實機驗證:2×1 上排程器分不出高下（含 gang head-of-line blocking）
+
+§4.6 的鑑別是 **sim**。為了用**真實 AI workload**(而非 sgemm proxy)在實機檢驗,建了一個**真實 BERT 測試平台**:`/shared` 上放 portable python + torch cu124 + transformers + bert-base-uncased 權重,掛成 Lmod `pytorch` module(免重建 worker image);job 跑 **BERT 推論(forward)/ 訓練(fine-tune)**,推論=短+MPS 分數+SLO、訓練=長+whole-card,可選 **2-GPU gang**(跨兩節點、需 `MaxNodes=2`)。校準:4070 上 infer ~11 batch/s、train ~3.4 step/s,模型載入僅 ~0.3s。
+
+在真實 2×1 上掃了**三種會製造競爭的機制**,啟發式(score/multifactor/fcfs)的 SLO 違反率:
+
+| 機制 | score | multifactor | fcfs |
+|---|--:|--:|--:|
+| aiserve SLO,低 load | 0% | 0% | 0% |
+| aiserve SLO,高 load(飽和)| ~93% | ~93% | ~93% |
+| **gang head-of-line blocking** | **0%** | **0%** | **9%** |
+
+**判定:真實 BERT 在 2×1 上,排程器幾乎分不出高下。** 低 load 無佇列(都 0%)、高 load 全飽和(都 ~93%),中間沒有 ordering 能施力的穩健 régime。最有理論依據的 **gang(2-GPU 佔住兩卡 → head-of-line blocking,backfill 該贏 no-backfill)**只給出**微弱、不一致**的訊號:一輪 fcfs 9% vs backfill 0%(方向對:fcfs 無 backfill 略差),但另一輪 2-臂是 fcfs 9% vs multifactor 9%(沒差)—— 差距僅 1 個 job、單 seed,落在 run-to-run 雜訊內,**不穩健**。
+
+**踩過的真實保真度陷阱**(本身是發現):(a)live cuBLAS/BERT 有**固定 per-job 開銷**(sgemm ~30s CUDA init;BERT 較小),壓平短推論的訊號;(b)**NFS torch-import 冷/熱快取漂移** —— 第一個 arm 冷讀 ~700MB torch 慢、後面 arm 熱快取快,造成假性排名(用 warmup round 暖快取修掉);(c)**MPS 分數共置吸收負載** —— 小推論(mps:25)總塞得進訓練(mps:75)的縫 → 從不排隊,所以訓練改成 whole-card(mps:100)才有競爭。
+
+**綜合**:sim 乾淨且穩健地分得開(multifactor 41% vs fcfs 67%),但**真實 2×1 太小** —— 叢集清得比佇列堆得快,排程差異在真實快 job 上無法穩健顯現。這把核心訊息收得更緊:**排程策略(啟發式或 DRL)的價值要靠規模才看得出;在此 2×1 測試平台,任何排程器都打平**。要展示智慧排程的高下,路在 sim 放大(需先校準 sim-to-real,§4.4)或更大的真實叢集。DRL 實機臂未跑(gate 已定調打平 + 需 live-obs SLO 接線 + sim 已輸)。
+
+> 原始檔 `runs/aiserve_bert_val*/`、`runs/aiserve_gang_3arm_*/SUMMARY.md`;平台 `/shared/py`+`/shared/scripts/bert_job.py`+Lmod `pytorch`;harness `eval/scripts/run_aiserve_live.py`、`live_ab_heavytail.py::{gen_aiserve_workload,BertWorkloadSpec}`。
+
 ---
 
 ## 5. 結論
