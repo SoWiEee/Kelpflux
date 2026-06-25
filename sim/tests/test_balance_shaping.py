@@ -1,4 +1,8 @@
 """P1: load-balance shaping — φ penalizes uneven free-MPS across nodes."""
+import pytest
+
+pytest.importorskip("gymnasium")  # env construction needs gymnasium
+
 from sim.gym_env import KubefluxSchedEnv
 from sim.loader import generate_by_family
 
