@@ -48,6 +48,8 @@ class LiveJob:
     reported_runtime_s: float # estimate fed to --time and /decide (σ-noisy)
     mps_req: int              # MPS slots in [1, 100]
     gpu_count: int = 1
+    job_class: str = "batch"  # aiserve: inference / training
+    slo_s: float = 0.0        # aiserve: latency-SLO deadline on JCT (>0 = inference)
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,45 @@ class WorkloadSpec:
         return max(2, int(np.ceil(job.true_runtime_s * self.time_factor / 60.0)))
 
 
+@dataclass(frozen=True)
+class BertWorkloadSpec:
+    """Real BERT GPU job (forward inference / fine-tune training) for live eval.
+
+    Same wrap()/time_min() interface as WorkloadSpec, so the harness uses it
+    interchangeably. ``job.job_class`` picks inference (BERT forward, no_grad)
+    vs training (fine-tune: forward+backward+AdamW); n (batches/steps) =
+    true_runtime_s × the calibrated per-mode rate; CRN seed from job_id. Uses the
+    relocatable /shared/py python (torch cu124) by full path — robust in sbatch
+    --wrap without needing the Lmod `module` shell function; bert_job.py loads
+    BERT offline from /shared/hf_cache.
+    """
+    py: str = "/shared/py/bin/python3"
+    script: str = "/shared/scripts/bert_job.py"
+    batch_size: int = 16
+    seq_len: int = 128
+    infer_rate: float = 20.0   # inference batches/sec on idle 4070 (CALIBRATE)
+    train_rate: float = 6.0    # fine-tune steps/sec on idle 4070 (CALIBRATE)
+    time_factor: float = 25.0  # --time margin (slow card + contention)
+    load_overhead_s: float = 45.0  # python+torch import + BERT load, added to --time
+
+    def _mode_n(self, job: "LiveJob") -> tuple[str, int]:
+        mode = "infer" if job.job_class == "inference" else "train"
+        rate = self.infer_rate if mode == "infer" else self.train_rate
+        return mode, max(1, int(round(job.true_runtime_s * rate)))
+
+    def wrap(self, job: "LiveJob") -> str:
+        mode, n = self._mode_n(job)
+        seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
+        # gang (multi-GPU) → srun runs the payload on every allocated task/node.
+        prefix = "srun " if job.gpu_count >= 2 else ""
+        return (f"{prefix}{self.py} {self.script} --mode {mode} --n {n} "
+                f"--batch-size {self.batch_size} --seq-len {self.seq_len} --seed {seed}")
+
+    def time_min(self, job: "LiveJob") -> int:
+        secs = job.true_runtime_s * self.time_factor + self.load_overhead_s
+        return max(2, int(np.ceil(secs / 60.0)))
+
+
 def _job_noise(job_id: str, sigma: float, seed: int = 0) -> float:
     """Mean-preserving lognormal multiplier exp(σZ − σ²/2), E=1.
 
@@ -117,6 +158,65 @@ def peak_concurrent_mps(jobs: List[LiveJob]) -> int:
         cur += d
         peak = max(peak, cur)
     return peak
+
+
+def gen_aiserve_workload(
+    n_jobs: int = 80,
+    *,
+    seed: int = 42,
+    n_gpus: int = 2,
+    load: float = 0.7,
+    inference_frac: float = 0.6,
+    inf_runtime_s: float = 5.0,     # idle-ref median for inference (short)
+    train_runtime_s: float = 40.0,  # idle-ref median for training (long)
+    slo_factor: float = 4.0,
+    inf_slo_s: float = 0.0,         # >0: FIXED inference SLO deadline (s) instead
+                                    # of runtime×slo_factor. Live cuBLAS has a large
+                                    # per-job overhead floor (~30s) that makes the
+                                    # idle-ref×4 deadline unachievable; a fixed,
+                                    # live-calibrated target (e.g. 75) is what an
+                                    # actual latency SLA looks like.
+    gang_frac: float = 0.0,        # >0: fraction of TRAINING jobs that are 2-GPU
+                                    # gang (distributed) jobs spanning BOTH nodes. A
+                                    # gang job at the head of the queue blocks BOTH
+                                    # cards → head-of-line blocking that backfill
+                                    # (multifactor/score) escapes but FCFS cannot;
+                                    # this is where scheduling matters at 2×1.
+) -> List["LiveJob"]:
+    """AI-serving live workload: latency-SLO inference + best-effort training.
+
+    Mirrors ``sim.loader.generate_ai_serving`` but emits LiveJobs with COMPRESSED
+    idle-ref runtimes (inference ~secs, training ~tens of secs) so a full
+    multi-round live run stays tractable while preserving the inference-behind-
+    training contention the SLO metric measures. ``load`` sets offered load ρ via
+    the arrival rate (moderate sweet spot, not saturated). slo_s = runtime ×
+    slo_factor for inference; training is best-effort (slo_s=0).
+    """
+    rng = np.random.default_rng(seed)
+    feats = []  # (class, gpu_count, mps, true_rt, slo)
+    for _ in range(n_jobs):
+        if rng.random() < inference_frac:
+            rt = max(1.0, float(np.exp(np.log(inf_runtime_s) + 0.6 * rng.standard_normal())))
+            mps = int(rng.choice([25, 50]))
+            slo = inf_slo_s if inf_slo_s > 0 else rt * slo_factor
+            feats.append(("inference", 1, mps, rt, slo))
+        else:
+            rt = max(5.0, float(np.exp(np.log(train_runtime_s) + 0.7 * rng.standard_normal())))
+            # whole card so training fully occupies a GPU; a gang_frac of training
+            # jobs are 2-GPU (both nodes) → head-of-line blocking.
+            gpu = 2 if rng.random() < gang_frac else 1
+            feats.append(("training", gpu, 100, rt, 0.0))
+    mean_work = sum(rt * gc * (mps / 100.0) for _c, gc, mps, rt, _s in feats) / max(1, n_jobs)
+    mean_gap = mean_work / max(1e-6, n_gpus * load)
+    jobs: List[LiveJob] = []
+    t = 0.0
+    for i, (cls, gpu, mps, rt, slo) in enumerate(feats):
+        t += float(rng.exponential(mean_gap)) if mean_gap > 0 else 0.0
+        jobs.append(LiveJob(
+            job_id=f"ai{i:04d}", arrival_offset_s=round(t, 3),
+            true_runtime_s=round(rt, 3), reported_runtime_s=round(rt, 3),
+            mps_req=mps, gpu_count=gpu, job_class=cls, slo_s=round(slo, 3)))
+    return jobs
 
 
 def gen_workload(
@@ -258,10 +358,16 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         cmd.append("-H")  # before the job spec → parsed as a submit flag
     if nodelist:
         cmd += ["-w", nodelist]  # submit-time RL node choice
+    # Gang (multi-GPU) job: span gpu_count nodes (1 GPU/node at 2×1), one task per
+    # node. Reserves ALL its cards at once → head-of-line blocking. The workload's
+    # wrap() prefixes `srun` so the payload runs on every task.
+    if job.gpu_count >= 2:
+        cmd += [f"--nodes={job.gpu_count}", f"--ntasks={job.gpu_count}",
+                "--ntasks-per-node=1"]
     # exclusive_gpu: each job takes the WHOLE GPU (mps:100) → one job per GPU,
     # no co-residency. Sidesteps MPS multiplexing (needed because node-2's MPS is
     # broken) while keeping the real-CUDA heterogeneity + queueing placement test.
-    mps = 100 if exclusive_gpu else job.mps_req
+    mps = 100 if (exclusive_gpu or job.gpu_count >= 2) else job.mps_req
     cmd += [
         f"--job-name={job_name(arm, round_idx, job.job_id)}",
         f"--partition={partition}",
@@ -392,6 +498,7 @@ def join_records(jobs: List[LiveJob], parsed: dict, arm: str, round_idx: int) ->
             "true_runtime_s": j.true_runtime_s,
             "reported_runtime_s": j.reported_runtime_s,
             "mps_req": j.mps_req,
+            "job_class": j.job_class, "slo_s": j.slo_s,
             "jct": float(row["jct"]), "wait": float(row["wait"]) if row["wait"] is not None else None,
             "state": row["state"],
             "node": row.get("node", ""),
