@@ -72,6 +72,22 @@ demand rises and falls.
 
 使用者只需要 SSH 進 login node，用熟悉的 `sbatch` 提交工作，不需要知道底層 K8s 的存在。
 
+## 從「平台」到「排程智慧」
+
+把 Slurm 跑在 K8s 上解決的是**機制**問題（卡內共享、彈性、容錯）。但平台只是載具——真正的研究問題是**排程決策本身**：當一張異質 GPU 叢集同時承載兩類性質相反的工作時，誰該先跑、放在哪張卡、和誰共置？
+
+- **低延遲推論**：有 SLO 期限、常只需部分算力（適合 MPS 分片），但對**尾端延遲（p99）**敏感——偶爾的 straggler 就會違反 SLO。
+- **長時間訓練**：吞吐導向、長時間獨佔整卡，對排隊延遲較不敏感。
+
+在異質硬體下（不同世代 GPU 算力可差數倍），這個張力無法用單一靜態規則調好。而雲端原生生態裡的成熟排程器各管一層、卻**都不優化尾端**：Kueue／Volcano 解的是配額與 gang 准入、Kubernetes 1.34 的 DRA 提供的是 GPU 分片**機制**、Kubeflow 管的是工作生命週期——沒有一個是「**學習式、且以尾端延遲為目標的排序／放置策略**」。
+
+本研究就落在這個空隙，並刻意不做「宣稱 DRL 必勝」的研究，而是回答兩個更誠實的問題：
+
+1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）作為 placement 建議者，透過 Slurm `job_submit.lua` 以**非阻塞、失效即回退**的方式整合進生產路徑——任何服務異常都自動退回既有啟發式，slurmctld 永不被阻塞。此學習式策略與 DRA 並非競爭，而是**互補**：它可在 DRA 的分片機制之上驅動裝置選擇與准入排序。
+2. **這套智慧到底什麼時候才真的有用？** 實機評估面臨「一個 step 即一個跑數分鐘的工作、樣本極稀少、量測易受叢集暖機漂移污染」的根本限制。我們提出一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對信賴區間、兼顧平均與尾端（p95／p99／CVaR）及 SLO 違反率——並誠實回報其規模條件：在 2×1 小規模上排程策略統計打平，**智慧排程的價值需要叢集規模與工作負載競爭方能顯現**。
+
+研究細節與評估結果見 [優化排程研究](docs/scheduler.md) 與評估報告；最新一輪的研究審核與改進優先級見 [`docs/review.md`](docs/review.md)。
+
 ---
 
 # 🚀 Getting Started
@@ -333,46 +349,6 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 | `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
 | `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
-| `--balance-coef` | **P1**：potential-based 節點均衡項，反過度集中（§3.6）；~5 起 | 0（關）|
-| `--normalize-reward` | **P2**：running-std 回報正規化，穩定溫度、降 seed 敏感（§3.6） | 關 |
-| `--fixed-alpha` / `--init-alpha` | 釘住溫度 α（不 auto-tune）；本文評估用 `--init-alpha 0.05` | auto-α |
-| `--train-seed` | 訓練 RNG seed（multi-seed 研究的旋鈕，§3.1） | 42 |
-
-### 實機 2-node placement A/B（sleep / 真實 CUDA / 異質 MPS）
-
-`run_heavytail_ab.py` 跑四方（score / SAC / RDSAC-mean / RDSAC-cvar）submit-時 `-w` placement A/B。需要 rl-scheduler 上線（serve checkpoint）+ port-forward 8002。
-
-```bash
-LOGIN=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
-kubectl -n slurm port-forward svc/rl-scheduler 8002:8002 &
-
-# (a) sleep job（§4.1，乾淨可比的負結果 baseline）
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
-  --serve-url http://localhost:8002 --login-pod $LOGIN --controller-pod slurm-controller-0 \
-  --placement --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
-  --partition gpu --family philly --n-jobs 14 --target-max-s 8 \
-  --sigmas 1.0 --rounds 2 --warmup 1 --interleave \
-  --sac-ckpt /models/htab/sac_s42.pt \
-  --rdsac-mean-ckpt /models/htab/rdsac_mean_s42.pt \
-  --rdsac-cvar-ckpt /models/htab/rdsac_cvar_s42.pt \
-  --out-dir runs/live_sleep_$(date +%Y%m%d-%H%M%S)
-
-# (b) 真實 CUDA job + 異質 MPS 需求（§4.2，最有代表性）
-#     gpu_workload.cu 要先在 worker 內編到 /shared/bin（見 docs/intergration.md §12）。
-#     需要 MPS 多工：兩節點都得是 Ubuntu 24.04（§12）。加 --cuda-workload --mps-buckets。
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
-  --serve-url http://localhost:8002 --login-pod $LOGIN --controller-pod slurm-controller-0 \
-  --placement --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
-  --partition gpu --family philly --n-jobs 14 --target-max-s 8 \
-  --sigmas 1.0 --rounds 2 --warmup 1 --interleave \
-  --cuda-workload --mps-buckets 25,50,75,100 \
-  --workload-bin /shared/bin/gpu_workload --workload-dim 4096 --iters-per-sec 145 \
-  --sac-ckpt /models/htab/sac_s42.pt \
-  --rdsac-mean-ckpt /models/htab/rdsac_mean_s42.pt \
-  --rdsac-cvar-ckpt /models/htab/rdsac_cvar_s42.pt \
-  --out-dir runs/live_cuda_$(date +%Y%m%d-%H%M%S)
-# 加 --exclusive-gpu = 整張卡一 job（無共置；數字含並行度 confound，僅供對照）
-```
 
 ### 執行單元測試
 
