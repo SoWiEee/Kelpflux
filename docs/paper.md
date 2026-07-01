@@ -84,7 +84,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ### 3.4 風險敏感深度強化學習（RDSAC）
 
-決策策略為自行整合的 **discrete 分布式 SAC**：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。
+決策策略為自行整合的 **discrete 分布式 SAC**（本文稱 RDSAC）：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。RDSAC「分布式 SAC」之名承襲自 Duan 等人的 Distributional Soft Actor-Critic（DSAC）[16]；惟本研究為**離散動作**、雙頭 IQN 的自組版本，是離散 SAC [6]、IQN 分布式評論家 [7] 與 CVaR 風險量度的組合，**並非** [16] 連續控制版本（將回報建模為單一高斯）的 1:1 重現，兩者不宜逕行對照。
 
 ## 4. 實驗與評估方法
 
@@ -99,9 +99,9 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ### 4.2 主要結果
 
-**模擬環境可區分策略（方法學正面結果）。** 在離散事件模擬中，以對 SLO 敏感的 AI 伺服器工作負載（8 個 held-out seed）評估，具尺寸感知的啟發式相較先到先服務（FCFS）顯著降低 SLO 違反率（表 1），顯示模擬器具備區分排程策略的能力——前提是工作負載與指標選對了維度（時序排序、SLO 感知），而非需要規模的多節點裝箱。
+**模擬環境可區分策略（方法學正面結果）。** 在離散事件模擬中，以對 SLO 敏感的 AI 伺服器工作負載（2×1 拓樸、offered load ρ≈0.7 的中度競爭、8 個 held-out seed）評估，具尺寸感知的啟發式相較先到先服務（FCFS）顯著降低 SLO 違反率（表 1），顯示模擬器具備區分排程策略的能力——前提是工作負載與指標選對了維度（時序排序、SLO 感知），而非需要規模的多節點裝箱。此工作負載的 SLO 定義為：推論工作（短、佔 1 GPU 的 25／50％ MPS）帶有延遲期限 `slo_s` = runtime × 4，訓練工作（長、獨佔或大 MPS，含少量 2-GPU 跨節點 gang）為 best-effort（無期限）；SLO 違反率即帶期限工作中 JCT 超過 `slo_s` 的比例。
 
-表 1. 模擬環境下 AI 伺服器工作負載的排程器區分（8 seed 平均）
+表 1. 模擬環境下 AI 伺服器工作負載的排程器區分（2×1、ρ≈0.7、8 seed 平均）
 
 | 排程器 | 平均 JCT (s) | 推論 JCT (s) | SLO 違反 (%) | 使用率 |
 |---|--:|--:|--:|--:|
@@ -118,6 +118,10 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 | FCFS | 4（最後）| 1（最先）| 3 | +5.0 / +0.5 / −0.4 |
 | packing | 3 | 2 | 1 | +1.6 / +0.8 / −0.6 |
 | multifactor | 2 | 3 | 4 | +1.0 / +0.9 / −0.7 |
+
+![圖 1](figures/fig_drift.png)
+
+圖 1. 將三個啟發式跨 3 seed 的 ΔJCT% 對「跑序位置」作圖：正斜率的趨勢線（+0.62%/位）顯示表面「優勢」隨越晚跑而增大，證實其為叢集暖機漂移的假象、而非排程器本身的效果。
 
 **真實 2×1 叢集：啟發式統計打平。** 以 3 seed × 3 種臂順序校正跑序位置後的 cross-seed 聚合如表 3，三個 ΔJCT% 的 mean±std **全部跨越 0**，即生產 score 與 Slurm 原生 FCFS／multifactor／packing 在真實 2×1 上統計打平，無任何排程器具優勢。
 
@@ -140,6 +144,8 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 | SAC | 174.0 | 432.4 | 379.5 | −3.7 | 3.7e-16 |
 | RDSAC-mean | 174.5 | 435.8 | 379.5 | −4.0 | 2.1e-17 |
 | RDSAC-cvar | 175.5 | 432.8 | 381.6 | −4.6 | 5.3e-12 |
+
+須釐清**統計顯著與實務顯著的區別**：表 4 的 p 值極小（≈1e-12～1e-17）源於 n=246 的大樣本，代表「可偵測地變慢」而非「大幅變慢」；三個學習臂的 ΔJCT% 落在 −3.7～−4.6%，仍位於 §4.5 界定的 ±5% 實務等價帶內（僅偏於其負緣）。換言之，學習型策略在此規模是**可統計偵測地、但非實務顯著地**遜於 score——與後續「排程策略空間近乎是平的」洞見一致，而非與之矛盾。
 
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
@@ -169,9 +175,9 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ### 4.4 與雲端原生 SOTA 基準的對照（強化基準）
 
-§4.2 的區分實驗僅對照自家啟發式，可能招致「未與引用的 SOTA 比較」之質疑。為此，我們將 §2 所述的兩個雲端原生排程器近似納入同一模擬對照——Kueue 式 fair-share（跨使用者 max-min 交錯）與 Volcano 式 binpack（最大需求優先）——在高競爭的 1×1 飽和 regime（util≈0.6，aiserve 工作負載，8 seed）下量測（表 7）。
+§4.2 的區分實驗僅對照自家啟發式，可能招致「未與引用的 SOTA 比較」之質疑。為此，我們將 §2 所述的兩個雲端原生排程器近似納入同一模擬對照——Kueue 式 fair-share（跨使用者 max-min 交錯）與 Volcano 式 binpack（最大需求優先）——在高競爭的 1×1、**佇列飽和** regime（offered load 拉高至系統飽和；GPU 使用率仍約 0.6，屬**佇列**飽和而非**算力**飽和，aiserve 工作負載，8 seed）下量測（表 7）。此處的拓樸（1×1）與競爭度（飽和）皆與表 1（2×1、ρ≈0.7 中度競爭）不同，故 JCT 絕對值明顯較高（如 FCFS 2640 vs 表 1 的 2199、score 1887 vs 1129）；兩表各自檢驗其 regime 內的**相對排名**，跨表的絕對 JCT 不宜直接相減。
 
-表 7. 強化基準：雲端原生 SOTA 近似納入模擬對照（aiserve，8 seed，1×1 飽和）
+表 7. 強化基準：雲端原生 SOTA 近似納入模擬對照（aiserve，8 seed，1×1 佇列飽和）
 
 | 排程器 | 平均 JCT (s) | SLO 違反 (%) | 使用率 |
 |---|--:|--:|--:|
@@ -185,9 +191,15 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ### 4.5 討論
 
-上述結果指向一致的洞見：**在 2×1 規模，整個排程策略空間近乎是平的**——不僅深度強化學習未能穩健勝過啟發式（實機統計打平、模擬多 seed 亦未勝出），連生產 score 對 FCFS 等簡單基準亦僅打平。就實機聚合（表 3）而言，各排程器相對 score 的 ΔJCT% 落在約 ±0.4～1.7%、且信賴區間跨越 0，在 ±5% 的實務等價界（practical-equivalence margin）內可視為**統計等價**（其中 FCFS 因變異較大而區間較寬，等價宣稱較弱）；換言之這是「證實無實務差異」，而非僅「未偵測到差異」。
+上述結果指向一致的洞見：**在 2×1 規模，整個排程策略空間近乎是平的**——不僅深度強化學習未能穩健勝過啟發式（實機統計打平、模擬多 seed 亦未勝出），連生產 score 對 FCFS 等簡單基準亦僅打平。就實機聚合（表 3）而言，各啟發式相對 score 的 ΔJCT% 落在約 ±0.4～1.7%、且信賴區間跨越 0，在 ±5% 的實務等價界（practical-equivalence margin）內可視為**統計等價**（其中 FCFS 因變異較大而區間較寬，等價宣稱較弱）；換言之這是「證實無實務差異」，而非僅「未偵測到差異」。此 ±5% 等價界同樣涵蓋學習型策略：表 4 中三個學習臂的 −3.7～−4.6% 雖因大樣本而**統計顯著**，其幅度仍落在等價帶內，故整個「策略空間近乎是平的」判斷橫跨啟發式與學習式兩類排程器，而非僅指前者。
 
-**關於「規模」的誠實界定。** 本研究據此**推測**排程策略的差異需要更大規模或更高競爭方能顯現，但必須強調：這是**尚未被證實的假設，而非本研究的結果**。我們的初步規模掃描（1×1／2×1／2×2，§4.3 之外的補充實驗）**並未**呈現「效益隨規模上升」的交叉趨勢，且該掃描受限於較低訓練預算與跨尺度觀測空間不可直接比較，尚不足以支持或否證此假設。將「效益隨規模浮現」從斷言降級為 open question，正是本研究誠實立場的一部分。此外，§4.3 揭示了一個方法學教訓：**單 seed 的模擬評估可能報告不可重現的假性優勢**，凸顯多 seed 配對統計的必要性——這與 §4.2 中「單趟平均值會得到錯誤排名」互為印證。
+**關於「規模」的誠實界定。** 本研究據此**推測**排程策略的差異需要更大規模或更高競爭方能顯現，但必須強調：這是**尚未被證實的假設，而非本研究的結果**。我們的初步規模掃描（1×1／2×1／2×2，§4.3 之外的補充實驗）**並未**呈現「效益隨規模上升」的交叉趨勢（圖 2）：學習臂相對 score 的 ΔJCT% 在各規模皆為負、且隨規模非單調（2×1 反而最接近 score，2×2 又拉開），並無朝 0 收斂的跡象；RDSAC-cvar 在 1×1 甚至崩潰為 0% 完成。此掃描受限於較低訓練預算（40k 步）與跨尺度觀測空間不可直接比較，尚不足以支持或否證此假設。
+
+![圖 2](figures/fig_scale.png)
+
+圖 2. 規模掃描（σ=1.0、40k 步）下學習臂相對 score 的 ΔJCT%。若「效益隨規模浮現」成立，曲線應隨規模趨近 0（score 基準）；實測反而全程為負且非單調，故此假設未獲支持（受訓練預算與跨尺度不可比之限制，僅作為 open question 的方向性證據，見 §4.6）。
+
+將「效益隨規模浮現」從斷言降級為 open question，正是本研究誠實立場的一部分。此外，§4.3 揭示了一個方法學教訓：**單 seed 的模擬評估可能報告不可重現的假性優勢**，凸顯多 seed 配對統計的必要性——這與 §4.2 中「單趟平均值會得到錯誤排名」互為印證。
 
 ### 4.6 有效性威脅（Threats to Validity）
 
@@ -242,3 +254,5 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 [14] Kubernetes SIG-Scheduling, "Kueue: Kubernetes-native Job Queueing," https://kueue.sigs.k8s.io, 2024.
 
 [15] Kubernetes Authors, "Dynamic Resource Allocation (DRA)," Kubernetes Documentation (GA in v1.34), https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/, 2025.
+
+[16] J. Duan, Y. Guan, S. E. Li, Y. Ren, Q. Sun, and B. Cheng, "Distributional Soft Actor-Critic: Off-Policy Reinforcement Learning for Addressing Value Estimation Errors," *IEEE Transactions on Neural Networks and Learning Systems*, 2021. arXiv:2004.14547.
