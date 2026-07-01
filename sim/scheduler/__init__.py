@@ -10,13 +10,17 @@ job that does not fit blocks (FCFS / multifactor) or gets skipped over
 (``score`` with ``backfill=True``).
 """
 from .fcfs import FCFSScheduler
+from .kueue_fairshare import KueueFairShareScheduler
 from .multifactor import MultifactorScheduler
 from .score import ScoreScheduler
+from .volcano_binpack import VolcanoBinpackScheduler
 
 REGISTRY = {
     "fcfs": FCFSScheduler,
     "multifactor": MultifactorScheduler,
     "score": ScoreScheduler,
+    "kueue-fairshare": KueueFairShareScheduler,
+    "volcano-binpack": VolcanoBinpackScheduler,
 }
 
 
