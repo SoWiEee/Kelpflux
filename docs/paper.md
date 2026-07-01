@@ -19,13 +19,13 @@ TANET 投稿雛形 — 主題三「網際網路與雲端技術應用」
 
 ## 摘要
 
-異質 GPU 叢集上的 AI 工作負載（推論與訓練混合）排程，直接影響資源使用率、工作完成時間（Job Completion Time, JCT）與服務水準目標（Service Level Objective, SLO）的達成。本研究設計並實作一套**以 Kubernetes（k3s）部署、以 Slurm 為排程核心**的 AI 伺服器 GPU 排程研究平台，整合 NVIDIA Multi-Process Service（MPS）達成卡內細粒度共享，並在 Slurm 的工作提交掛鉤（`job_submit.lua`）中嵌入一個**非阻塞、失效即回退（fail-safe）**的強化學習決策端點：以風險敏感的分散式深度強化學習（RDSAC，結合 discrete SAC 與 Implicit Quantile Network，並以 CVaR 風險量度優化尾端延遲）作為放置（placement）建議者，任何服務異常皆自動退回既有啟發式分數排程，slurmctld 永不被阻塞。為了在「實機樣本稀少、單一節點即一個跑數分鐘的工作」的限制下取得可信的結論，本研究提出一套**模擬到實機（sim-to-real）評估方法學**：離散事件模擬器訓練、實機配對 A/B、抗跑序漂移（drift-robust）的交錯輪轉、多 seed 配對信賴區間，並同時報告平均與尾端指標（p95／p99／CVaR）及 SLO 違反率。在一座雙節點異質叢集（RTX 4070＋RTX 3080）上的實測顯示：**模擬環境可清楚區分排程策略，但在 2×1 規模的真實叢集上，無論啟發式或深度強化學習排程，彼此皆統計打平**；經抗漂移與多 seed 校正後，原本看似的優勢被證實為跑序漂移與小樣本雜訊的假象。本研究的貢獻在於：一套可重現的雲端 GPU 排程平台、一個失效安全的 RL 整合架構，以及一個誠實校正後的 sim-to-real 評估方法學與其規模洞見——智慧排程的價值需要叢集規模方能顯現。
+異質 GPU 叢集上的 AI 工作負載（推論與訓練混合）排程，直接影響資源使用率、工作完成時間（Job Completion Time, JCT）與服務水準目標（Service Level Objective, SLO）的達成。本研究設計並實作一套**以 Kubernetes（k3s）部署、以 Slurm 為排程核心**的 AI 伺服器 GPU 排程研究平台，整合 NVIDIA Multi-Process Service（MPS）達成卡內細粒度共享，並在 Slurm 的工作提交掛鉤（`job_submit.lua`）中嵌入一個**非阻塞、失效即回退（fail-safe）**的強化學習決策端點：以風險敏感的分散式深度強化學習（RDSAC，結合 discrete SAC 與 Implicit Quantile Network，並以 CVaR 風險量度優化尾端延遲）作為放置（placement）建議者，任何服務異常皆自動退回既有啟發式分數排程，slurmctld 永不被阻塞。為了在「實機樣本稀少、單一節點即一個跑數分鐘的工作」的限制下取得可信的結論，本研究提出一套**模擬到實機（sim-to-real）評估方法學**：離散事件模擬器訓練、實機配對 A/B、抗跑序漂移（drift-robust）的交錯輪轉、多 seed 配對信賴區間，並同時報告平均與尾端指標（p95／p99／CVaR）及 SLO 違反率。在一座雙節點異質叢集（RTX 4070＋RTX 3080）上的實測顯示：**模擬環境可清楚區分排程策略，但在 2×1 規模的真實叢集上，無論啟發式或深度強化學習排程，彼此皆統計打平**；經抗漂移與多 seed 校正後，原本看似的優勢被證實為跑序漂移與小樣本雜訊的假象。進一步地，即使在為風險機制注入不確定性的隨機模擬中，風險敏感 DRL 於多 seed 下亦未穩健勝過純量基準，且單 seed 模擬結果被證實會誤導。本研究的貢獻在於：一套可重現的雲端 GPU 排程平台、一個失效安全的 RL 整合架構，以及一個誠實校正後的 sim-to-real 評估方法學與其規模洞見——智慧排程的價值需要叢集規模方能顯現。
 
 **關鍵詞**：GPU 排程、Kubernetes、Slurm、深度強化學習、MPS、邊緣運算、模擬到實機評估
 
 ## Abstract
 
-Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clusters directly affects utilization, Job Completion Time (JCT), and Service Level Objective (SLO) attainment. We design and implement a GPU scheduling research platform that is **deployed on Kubernetes (k3s) with Slurm as the scheduling core**, integrates NVIDIA Multi-Process Service (MPS) for intra-GPU fine-grained sharing, and embeds a **non-blocking, fail-safe** reinforcement-learning decision endpoint into Slurm's job-submit hook (`job_submit.lua`). A risk-sensitive distributional deep RL policy (RDSAC: discrete SAC + Implicit Quantile Network, optimized with a CVaR risk measure for tail latency) acts as a placement advisor; any service fault transparently falls back to the existing score heuristic, so slurmctld is never blocked. Because real-cluster samples are scarce (one node hosts a job running for minutes), we propose a **sim-to-real evaluation methodology**: discrete-event simulation for training, paired live A/B, drift-robust interleaving, multi-seed paired confidence intervals, and joint reporting of mean and tail metrics (p95/p99/CVaR) plus SLO violation. On a two-node heterogeneous cluster (RTX 4070 + RTX 3080), the simulator cleanly separates scheduling policies, **but on the real 2×1 cluster, neither heuristic nor deep-RL schedulers differ statistically**; after drift-robust and multi-seed correction, an apparent advantage is shown to be a run-order-drift and small-sample artifact. Our contributions are a reproducible cloud GPU scheduling platform, a fail-safe RL integration architecture, and an honestly-corrected sim-to-real methodology whose key insight is that the value of intelligent scheduling requires cluster scale to materialize.
+Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clusters directly affects utilization, Job Completion Time (JCT), and Service Level Objective (SLO) attainment. We design and implement a GPU scheduling research platform that is **deployed on Kubernetes (k3s) with Slurm as the scheduling core**, integrates NVIDIA Multi-Process Service (MPS) for intra-GPU fine-grained sharing, and embeds a **non-blocking, fail-safe** reinforcement-learning decision endpoint into Slurm's job-submit hook (`job_submit.lua`). A risk-sensitive distributional deep RL policy (RDSAC: discrete SAC + Implicit Quantile Network, optimized with a CVaR risk measure for tail latency) acts as a placement advisor; any service fault transparently falls back to the existing score heuristic, so slurmctld is never blocked. Because real-cluster samples are scarce (one node hosts a job running for minutes), we propose a **sim-to-real evaluation methodology**: discrete-event simulation for training, paired live A/B, drift-robust interleaving, multi-seed paired confidence intervals, and joint reporting of mean and tail metrics (p95/p99/CVaR) plus SLO violation. On a two-node heterogeneous cluster (RTX 4070 + RTX 3080), the simulator cleanly separates scheduling policies, **but on the real 2×1 cluster, neither heuristic nor deep-RL schedulers differ statistically**; after drift-robust and multi-seed correction, an apparent advantage is shown to be a run-order-drift and small-sample artifact. Moreover, even in a stochastic simulation designed to activate the risk machinery, risk-sensitive DRL does not robustly beat a scalar baseline under multi-seed evaluation, and single-seed simulation results are shown to be misleading. Our contributions are a reproducible cloud GPU scheduling platform, a fail-safe RL integration architecture, and an honestly-corrected sim-to-real methodology whose key insight is that the value of intelligent scheduling requires cluster scale to materialize.
 
 **Keywords**: GPU scheduling, Kubernetes, Slurm, deep reinforcement learning, MPS, edge computing, sim-to-real evaluation
 
@@ -41,8 +41,8 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 1. **雲端 GPU 排程平台**：以 k3s 部署、Slurm 為排程核心、NVIDIA MPS 達成卡內共享，並以 Helm 完整封裝，可重現部署於異質節點。
 2. **失效安全的 RL 整合架構**：於 Slurm 工作提交掛鉤嵌入非阻塞的 RL 決策端點，服務異常即回退啟發式，兼顧研究彈性與生產可靠性。
-3. **風險敏感深度強化學習放置策略**：以分散式 RL（RDSAC）建模回報分布，並以 CVaR 風險量度優化尾端延遲。
-4. **模擬到實機評估方法學與規模洞見**：提出抗漂移、多 seed、配對信賴區間並兼顧尾端指標的評估流程，並誠實呈現「2×1 規模下排程策略統計打平」的校正後結論。
+3. **風險敏感深度強化學習放置策略與其模擬行為分析**：以分散式 RL（RDSAC）建模回報分布並以 CVaR 風險量度；經多 seed 消融誠實揭示其分布式評論家在不確定性下高變異、易崩潰，而 CVaR 風險扭曲的實質作用是**完成率穩定器**而非速度優勢——即使在模擬中亦未穩健勝過純量基準。
+4. **模擬到實機評估方法學與規模洞見**：提出抗漂移、多 seed、配對信賴區間並兼顧尾端指標的評估流程，誠實呈現「2×1 規模下排程策略統計打平」的校正後結論，並指出**單 seed 模擬結果會誤導**這一方法學教訓。
 
 ## 2. 相關研究
 
@@ -141,13 +141,29 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 | RDSAC-mean | 174.5 | 435.8 | 379.5 | −4.0 | 2.1e-17 |
 | RDSAC-cvar | 175.5 | 432.8 | 381.6 | −4.6 | 5.3e-12 |
 
-### 4.3 討論
+### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
-上述結果指向一致的洞見：**在 2×1 規模，整個排程策略空間是平的**——不僅深度強化學習未能穩健勝過啟發式，連生產 score 對 FCFS 等簡單基準亦僅打平。瓶頸不在挑選排程器，而在叢集規模與工作負載結構本身。此一誠實結論的價值在於：它由嚴謹的抗漂移、多 seed、配對統計方法所支撐，並糾正了若僅看單趟平均值會得到的錯誤排名。智慧排程的效益需要更大規模或更高競爭的環境方能顯現。
+§4.2 表 1 顯示模擬能區分**啟發式**，但那並未檢驗**學習式**策略是否有效。為此，我們在注入 mean-preserving 對數常態 runtime 不確定性（σ=1.0，模擬 straggler 與預測誤差）的隨機模擬中，以固定溫度（fixed-α=0.05）、100k 步、3 個訓練 seed（42／43／44）分別訓練三個學習臂——純量 SAC、風險中立 RDSAC-mean、風險敏感 RDSAC-cvar——並以共用隨機數配對評估其相對 score 的 ΔJCT%（表 5）。
+
+表 5. 模擬 σ=1.0 多 seed（3 訓練 seed × 100k 步，fixed-α=0.05）ΔJCT% vs score
+
+| 學習臂 | philly ΔJCT% | ali ΔJCT% | 完成率 | 穩定性 |
+|---|--:|--:|--:|---|
+| SAC（純量 twin-Q） | −8.6±13.4 | −17.2±21.8 | 全 seed 100% | 穩定，學習臂中最佳 |
+| RDSAC-cvar（風險敏感） | −24.2±16.4 | −48.9±43.5 | 全 seed 100% | 穩定，但一致落後 score 與 SAC |
+| RDSAC-mean（分布式） | +70.1† | +89.0† | 0–80%（半數 seed 崩潰） | 雙峰：偶佳，常崩成 0% |
+
+†RDSAC-mean 的正值為**低完成率假象**：ΔJCT% 僅在已完成的工作上配對計算，而該策略於半數 seed 崩潰為 0% 完成（退化為放棄困難工作的 no-op），故其表面優勢並非真實改善。
+
+此結果有三點意涵。第一，**單一 seed 的模擬結果會嚴重誤導**：同一 RDSAC 設定在單 seed 下曾呈現大幅領先 score，但於多 seed 下該領先不可重現——那不過是抽到未崩潰的幸運 seed。第二，**即使在為風險機制量身打造的隨機模擬中，風險敏感 DRL 於多 seed 下亦未穩健勝過純量 SAC 或 score 啟發式**；連此「模擬救援」都失敗，與 §4.2 的實機負結論方向一致。第三，唯一站得住的正面觀察是：**CVaR 風險扭曲買到的是訓練穩定性／完成率，而非速度**——RDSAC-cvar 在所有 seed 皆 100% 完成，而風險中立的 RDSAC-mean 則頻繁崩潰；風險敏感性在此扮演的是對抗分布式評論家退化的穩定器角色。
+
+### 4.4 討論
+
+上述結果指向一致的洞見：**在 2×1 規模，整個排程策略空間是平的**——不僅深度強化學習未能穩健勝過啟發式（實機統計打平、模擬多 seed 亦未勝出），連生產 score 對 FCFS 等簡單基準亦僅打平。瓶頸不在挑選排程器，而在叢集規模與工作負載結構本身。此外，§4.3 揭示了一個方法學教訓：**單 seed 的模擬評估可能報告不可重現的假性優勢**，凸顯多 seed 配對統計的必要性——這與 §4.2 中「單趟平均值會得到錯誤排名」互為印證。此一誠實結論由嚴謹的抗漂移、多 seed、配對統計方法所支撐；智慧排程的效益需要更大規模或更高競爭的環境方能顯現。
 
 ## 5. 結論與未來工作
 
-本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。實測誠實顯示在 2×1 異質叢集上排程策略統計打平，並指出智慧排程的效益需要規模條件。未來工作包含：（1）擴展至更大、更高競爭的叢集以檢驗策略差異是否顯現；（2）強化訓練穩定性與放置策略的退化問題；（3）以線上 RLPD 微調縮小模擬與實機落差。
+本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。實測誠實顯示在 2×1 異質叢集上排程策略統計打平，且風險敏感 DRL 即使在注入不確定性的模擬中、經多 seed 檢驗亦未勝出，並指出智慧排程的效益需要規模條件。未來工作包含：（1）擴展至更大、更高競爭的叢集以檢驗策略差異是否顯現；（2）強化分布式評論家的訓練穩定性、克服其在不確定性下的崩潰／退化問題；（3）以線上 RLPD 微調縮小模擬與實機落差。
 
 ## 致謝
 

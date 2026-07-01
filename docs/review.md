@@ -11,6 +11,8 @@
 
 好消息：補上證據所需的實驗**大多已在 `eval-writeup.md §4.4` 做出**（stochastic sim 下 RDSAC 的風險機制顯著生效），只是（a）尚未折進 TANET `paper.md`，（b）關鍵的 mean-vs-cvar 比較仍有單一訓練 seed 的可信度警訊。真正全新的只有「規模交叉曲線」。
 
+> **更新（2026-07-01）：** P0 的 #1/#2/#3 已全部執行完畢（見 §四）。結果**推翻了 §4.4 的樂觀結論**——多 seed（100k）下 RDSAC 未穩健勝過 SAC 或 score，§4.4 的優勢是單 seed 運氣。此「sim 救援」失敗反而**強化**論文的誠實負結論主軸；已折入 `paper.md` §4.3（表 5）／§4.4 與貢獻 #3。下方 §三仍記錄 review 當下的原始判斷。
+
 ---
 
 ## 一、目前領域已有的做法（state of practice）
@@ -52,30 +54,36 @@
 - **eval ↔ prod placement gap。** 生產路徑 RL 只設**佇列優先權**，但 live 放置實驗用 `live_daemon` 的 explicit `srun` 放置——評估的東西不是部署的東西。需誠實揭露或補上。
 - **K8s maintainer 視角：** Slurm-on-K8s 對 K8s 人是「為何要兩個排程器」，需明確正當化（HPC backfill／gang 成熟度 + 研究載具），否則被當「跟平台對著幹」。最有殺傷力的反向建議：把 RDSAC 做成 kube-scheduler scoring plugin 或 Kueue admission ordering plugin，直接落進生態系。
 
-## 四、與既有研究的關係（已做 / 未做盤點）
+## 四、P0 實驗結果（2026-06-30 ～ 07-01，已執行）
 
-| 改進方向 | 現況 | 仍需 |
+P0 的 #1/#2/#3 已全部跑完（`runs/review_cvar100k_s{42,43,44}`、`runs/review_scale_*`、`runs/review_cvar_s*`），結論一致為**誠實負向**：
+
+| 改進方向 | 狀態 | 結論 |
 |---|---|---|
-| #2 RDSAC 在 stochastic sim 生效 | **已做**（eval §4.4：σ↑ 時 RDSAC−SAC gap 單調、σ=1.0 fixed-α 下 RDSAC 贏 score philly +54%／ali +74%、p99 降 5–9×） | 折進 `paper.md`；多 seed 鞏固 |
-| #3 CVaR ablation（mean vs cvar） | **部分**（eval §4.4.2 三臂，但單 seed 不可信） | 多 train-seed mean±std |
-| #1 規模交叉曲線 | **未做** | 1×1→2×1→2×2 重訓，量 ΔJCT% vs scale |
+| #3 CVaR 多 seed 消融（σ=1.0，100k，3 seed） | ✅ 完成 | **推翻** §4.4 單 seed 主張。多 seed 下無任何 RDSAC 臂穩健勝 SAC 或 score：SAC philly −8.6±13.4／ali −17.2±21.8（最佳學習臂但仍輸 score）；RDSAC-cvar 一致落後（−24／−49）；RDSAC-mean 雙峰、半數 seed 崩潰 0% 完成，其「+70/+89」為低完成率假象。§4.4 的 +54% 是抽到未崩潰的幸運 seed。 |
+| #2 RDSAC 在 stochastic sim 生效 | ✅ 併入 #3 | 由 #3 的 σ=1.0 多 seed 直接檢驗——**未生效**（見上）。 |
+| #1 規模交叉曲線 | ✅ 完成 | **無交叉**。1×1／2×1／2×2 下 ΔJCT% 雜訊且多為負（1×1 rdsac-cvar 甚至崩潰 0%），未見「隨規模上升」趨勢。單 seed + 跨尺度 obs 不可比 + 40k 欠訓練為 confound，但方向明確：此量測不支持該假設。 |
+
+**唯一站得住的正面觀察：** CVaR 風險扭曲買到的是**完成率穩定性**（RDSAC-cvar 全 seed 100% 完成，RDSAC-mean 頻繁崩潰），而非速度——風險敏感性作為對抗分布式評論家退化的穩定器。已折入 `paper.md` §4.3（表 5）與 §4.4，貢獻 #3 亦重新定位。
+
+**方法學收穫（升級為貢獻）：** 單 seed 模擬結果會嚴重誤導——同一 RDSAC 設定單 seed 領先、多 seed 不可重現。這強化了論文「嚴謹統計」主軸。
 
 ---
 
 ## 五、改進優先級表
 
-| # | 改進項目 | 主要角度 | 解決哪個 review 質疑 | 工作量 | 優先級 |
+| # | 改進項目 | 主要角度 | 解決哪個 review 質疑 | 工作量 | 狀態 |
 |--:|---|---|---|:--:|:--:|
-| **1** | **sim 規模交叉曲線**：RDSAC vs 強 baseline 隨叢集規模（1×1→2×1→2×2…）的 ΔJCT%／SLO，證明「value requires scale」有交叉點 | IEEE／AI Infra | 中心論點目前**只是斷言**，未被證明 | 中 | **P0** |
-| **2** | **讓 RDSAC 在某處真的贏**：stochastic sim（注入 runtime σ／straggler）下，CVaR 在 p99／SLO 顯著勝 heuristic 與 mean | IEEE／AI Infra | 貢獻 #3 與 risk-sensitive headline 目前**無證據**（§4.4 已有底，需折入 paper） | 中 | **P0** |
-| **3** | **CVaR ablation 多 seed**：mean vs cvar vs wang，跨 train-seed 求 mean±std，破單 seed 雜訊 | IEEE | risk 量度正當性；§4.4.2 單 seed 不可信 | 低–中 | **P0** |
-| **4** | **補強 baseline**：對照 Slurm `gres/shard`+backfill+multifactor；sim 內加 Kueue-style fair-share／Volcano binpack | HPC／K8s | 「只比自家 heuristic，不比引用的 SOTA」 | 中 | **P1** |
-| **5** | **誠實處理 eval↔prod placement gap**：明寫差異，或讓 prod 也走 explicit placement | DevOps／K8s | 評估非部署路徑 | 低 | **P1** |
-| **6** | **serving 真實度**：bursty／Poisson 推論到達 + SLO 分級，而非固定 `slo_s` | AI Infra | SLO 模型過淺 | 中 | **P1** |
+| **1** | **sim 規模交叉曲線**：RDSAC vs baseline 隨叢集規模的 ΔJCT% | IEEE／AI Infra | 「value requires scale」只是斷言 | 中 | ✅ 完成 → **無交叉**（負向） |
+| **2** | **讓 RDSAC 在某處真的贏**：stochastic sim 下 CVaR 勝 heuristic | IEEE／AI Infra | 貢獻 #3 無證據 | 中 | ✅ 完成 → **未生效**（負向） |
+| **3** | **CVaR ablation 多 seed**：mean vs cvar，跨 seed 求 mean±std | IEEE | §4.4.2 單 seed 不可信 | 低–中 | ✅ 完成 → **推翻 §4.4**（負向） |
+| **4** | **補強 baseline**：對照 Slurm `gres/shard`+backfill+multifactor；sim 內加 Kueue-style fair-share／Volcano binpack | HPC／K8s | 「只比自家 heuristic，不比引用的 SOTA」 | 中 | **P1**（下一輪） |
+| **5** | **誠實處理 eval↔prod placement gap**：明寫差異，或讓 prod 也走 explicit placement | DevOps／K8s | 評估非部署路徑 | 低 | **P1**（下一輪） |
+| **6** | **serving 真實度**：bursty／Poisson 推論到達 + SLO 分級，而非固定 `slo_s` | AI Infra | SLO 模型過淺 | 中 | **P1**（下一輪） |
 | **7** | **DRA／Kueue 互補 PoC**：用 RDSAC 當 Kueue admission ordering 或 DRA device-selection 的 policy | K8s／AI Infra | 把「互補」從論述變 demo，大幅提升 novelty | 高 | **P2** |
-| **8** | **正當化 Slurm-on-K8s 架構選擇**：為何不用 Kueue+DRA+scheduler plugin（HPC backfill／gang 成熟度 + 研究載具），寫進 §3 | K8s maintainer | 「為何兩個排程器」 | 低 | **P2** |
+| **8** | **正當化 Slurm-on-K8s 架構選擇**：為何不用 Kueue+DRA+scheduler plugin，寫進 §3 | K8s maintainer | 「為何兩個排程器」 | 低 | **P2** |
 
-**最小可投版本：** 做完 **#1 #2 #3**（皆 sim 內、純 CPU/單卡即可，不佔多卡硬體），論文即從「誠實負面結果」升級為「負面結果（實機打平）＋ 正面結果（sim 中 risk-sensitive 在尾端有可量化效益）＋ 規模交叉證據」——三者一起，才擋得住「那為什麼要 DRL」這一問。#4–#8 依時間遞補。
+**P0 執行後的定位（2026-07-01）：** #1/#2/#3 全部完成，結果**一致為誠實負向**——「sim 救援」失敗，連模擬多 seed 下 RDSAC 都未勝出。因此論文**不宣稱 RDSAC 優越**，改為全押「方法學 + 誠實負結論」：實機統計打平、模擬多 seed 亦打平/負向、單 seed 會誤導、CVaR 僅提供完成率穩定性。下一輪主攻 **#4（強 baseline）** 與 **#5（placement gap）** 以鞏固負結論的可信度，並視野心考慮 **#7（DRA 互補 PoC）** 提升 novelty。
 
 ---
 
