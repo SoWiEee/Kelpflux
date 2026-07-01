@@ -486,6 +486,10 @@
 | packing | 3 | 2 | 1 | +1.6 / +0.8 / −0.6 |
 | multifactor | 2 | 3 | 4 | +1.0 / +0.9 / −0.7 |
 
+![drift](figures/fig_drift.png)
+
+上圖把三個啟發式跨 3 seed 的 ΔJCT% 對「跑序位置」作圖:趨勢線正斜率(+0.62%/位)顯示表面「優勢」隨越晚跑而增大 → 是暖機漂移,不是排程器效果。(產圖 `eval/scripts/plot_paper_figures.py`)
+
 fcfs 的「優勢」隨它跑第幾位從 +5.0(跑第4)掉到 −0.4(跑第3、p=0.068 不顯著)——**排名是漂移假象**。位置對照後的 cross-seed 聚合:
 
 | arm | mean JCT | p95 | p99 | CVaR | ΔJCT% vs score |
@@ -546,6 +550,12 @@ DRL **大勝 fcfs**（48~55% vs 66%）→ 確實學到「優先短推論」,但*
 **踩過的真實保真度陷阱**(本身是發現):(a)live cuBLAS/BERT 有**固定 per-job 開銷**(sgemm ~30s CUDA init;BERT 較小),壓平短推論的訊號;(b)**NFS torch-import 冷/熱快取漂移** —— 第一個 arm 冷讀 ~700MB torch 慢、後面 arm 熱快取快,造成假性排名(用 warmup round 暖快取修掉);(c)**MPS 分數共置吸收負載** —— 小推論(mps:25)總塞得進訓練(mps:75)的縫 → 從不排隊,所以訓練改成 whole-card(mps:100)才有競爭。
 
 **綜合**:sim 乾淨且穩健地分得開(multifactor 41% vs fcfs 67%),但**真實 2×1 太小** —— 叢集清得比佇列堆得快,排程差異在真實快 job 上無法穩健顯現。這把核心訊息收得更緊:**排程策略(啟發式或 DRL)的價值要靠規模才看得出;在此 2×1 測試平台,任何排程器都打平**。要展示智慧排程的高下,路在 sim 放大(需先校準 sim-to-real,§4.4)或更大的真實叢集。DRL 實機臂未跑(gate 已定調打平 + 需 live-obs SLO 接線 + sim 已輸)。
+
+**但「靠規模」目前只是假設,尚未被證實。** 直接測它的 sim 規模掃描(1×1／2×1／2×2、σ=1.0、40k 步、`runs/review_scale_*`)**未見交叉**:
+
+![scale](figures/fig_scale.png)
+
+學習臂相對 score 的 ΔJCT% 在各規模皆為負、且**非單調**(2×1 反而最接近 score,2×2 又拉開),並無「隨規模趨近 0」的跡象;RDSAC-cvar 在 1×1 甚至崩潰為 0% 完成。此掃描受 40k 欠訓練 + 跨尺度 obs 不可比之限制,只能作為 open question 的**方向性反證**——它不支持「效益隨規模浮現」,故 paper 把該主張從斷言降級為待驗證假設。(產圖 `eval/scripts/plot_paper_figures.py`)
 
 > 原始檔 `runs/aiserve_bert_val*/`、`runs/aiserve_gang_3arm_*/SUMMARY.md`;平台 `/shared/py`+`/shared/scripts/bert_job.py`+Lmod `pytorch`;harness `eval/scripts/run_aiserve_live.py`、`live_ab_heavytail.py::{gen_aiserve_workload,BertWorkloadSpec}`。
 
