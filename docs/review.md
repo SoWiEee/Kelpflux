@@ -77,7 +77,7 @@ P0 的 #1/#2/#3 已全部跑完（`runs/review_cvar100k_s{42,43,44}`、`runs/rev
 | **1** | **sim 規模交叉曲線**：RDSAC vs baseline 隨叢集規模的 ΔJCT% | IEEE／AI Infra | 「value requires scale」只是斷言 | 中 | ✅ 完成 → **無交叉**（負向） |
 | **2** | **讓 RDSAC 在某處真的贏**：stochastic sim 下 CVaR 勝 heuristic | IEEE／AI Infra | 貢獻 #3 無證據 | 中 | ✅ 完成 → **未生效**（負向） |
 | **3** | **CVaR ablation 多 seed**：mean vs cvar，跨 seed 求 mean±std | IEEE | §4.4.2 單 seed 不可信 | 低–中 | ✅ 完成 → **推翻 §4.4**（負向） |
-| **4** | **補強 baseline**：對照 Slurm `gres/shard`+backfill+multifactor；sim 內加 Kueue-style fair-share／Volcano binpack | HPC／K8s | 「只比自家 heuristic，不比引用的 SOTA」 | 中 | **P1**（下一輪） |
+| **4** | **補強 baseline**：對照 Slurm `gres/shard`+backfill+multifactor；sim 內加 Kueue-style fair-share／Volcano binpack | HPC／K8s | 「只比自家 heuristic，不比引用的 SOTA」 | 中 | 🟡 **sim 已做**（表 7：Kueue/Volcano 在帶內、未勝 score）；Slurm `gres/shard` 實機**待跑** |
 | **5** | **誠實處理 eval↔prod placement gap**：明寫差異，或讓 prod 也走 explicit placement | DevOps／K8s | 評估非部署路徑 | 低 | **P1**（下一輪） |
 | **6** | **serving 真實度**：bursty／Poisson 推論到達 + SLO 分級，而非固定 `slo_s` | AI Infra | SLO 模型過淺 | 中 | **P1**（下一輪） |
 | **7** | **DRA／Kueue 互補 PoC**：用 RDSAC 當 Kueue admission ordering 或 DRA device-selection 的 policy | K8s／AI Infra | 把「互補」從論述變 demo，大幅提升 novelty | 高 | **P2** |
