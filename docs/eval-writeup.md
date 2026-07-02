@@ -592,6 +592,16 @@ DRL **大勝 fcfs**（48~55% vs 66%）→ 確實學到「優先短推論」,但*
 - [X] 真實 CUDA job 評估：已把 `sleep N` 換成參數化 cuBLAS workload（`eval/scripts/gpu_workload.cu`）並編譯到 `/shared/bin/gpu_workload`（兩節點），跑出分數 MPS 共置的實機評估 (§4.2)
 - [ ] 補強 baseline：目前只比自家 score + vanilla SAC；補 FCFS / SJF（已有 oracle runtime）/ packing 啟發式與近似上界，讓 ΔJCT% 有尺度感。
 - [~] 完整 PopArt return normalization：已實作（`dsac.py --use-popart`，輸出保值 rescale、誤差 9.5e-7 驗證過），但 **3-seed 反而比 P2 reward-norm 更差（−23~−48% vs −12~−33%）、變異更大** → **否決**，保留關閉、預設仍用 P2。
+- [~] **Duan-style value-clip 穩定器**（`dsac.py --value-clip b`：把 IQN 的 reward-return target 以當前 online value 為錨、clip 在 ±b 的信賴域內，對治 Z_R 高估 → categorical actor 崩潰到 no-op；源自 Ma/Duan 兩篇同名 DSAC 中 Duan 2021 [arXiv:2001.02811] 的 value-error 抑制想法）。1×1／σ=1.0／fixed-α=0.05／**3 train-seed** 消融（`runs/vclip_{off,on}_s{42,43,44}`、b=10、`value_clip_ablation_20260702-021050_TABLES.md`）：
+
+  | 條件 | 臂 | 崩潰率 (<20% done) | 誠實 ΔJCT%（100% 完成臂）|
+  |---|---|--:|--:|
+  | clip-off | rdsac-mean | 2/6 | +19.5/+5.5（低完成假象，非真值）|
+  | clip-off | rdsac-cvar | **0/6** | −41.4/−36.9 |
+  | clip-on b=10 | rdsac-mean | **0/6** ✓ | **−3.5/−12.5** |
+  | clip-on b=10 | rdsac-cvar | 2/6 ✗ | +1.9(67%)/−74.2(67%) |
+
+  **三點結論：**（1）**clip 是 risk-neutral 分布式 critic 的有效穩定器**——把 rdsac-mean 崩潰 2/6→0/6，且誠實 ΔJCT% 從假象/深負拉到 −3.5/−12.5%（100% 完成）。（2）**在完成穩定性上，return-clip 優於 CVaR 風險扭曲**：clip-on-mean 與 clip-off-cvar 同為 0 崩潰、100% 完成，但前者 ΔJCT −3.5/−12.5 遠優於後者 −41/−37 → **clip-on-mean dominate clip-off-cvar**（同穩定性、JCT 好很多、且不需風險機制）；這細化了 §4.3「CVaR 是完成率穩定器」的結論——它穩定完成但**代價是 JCT**，而 clip 是更省、傷 JCT 更少的替代。（3）**但 clip 疊在 CVaR 上互相打架**（0/6→2/6 崩潰），故 return-clip 是 CVaR 的**替代而非疊加**。淨結：找到一個更好的分布式 critic 穩定器，**但仍無任何臂贏過 score**（clip-on-mean −3.5±36.5／−12.5±32、CI 跨 0 = 與 score 統計等價）→ **sim 未過閘，未上實機**（與全案「2×1 策略空間平坦、learned 不勝 score」一致）。實作 `services/rl_scheduler/dsac.py`（`value_clip`）、測試 `test_dsac_distributional.py`、腳本 `eval/scripts/run_value_clip_ablation.sh`。
 - [X] 暴露 GPU 異質性（item-1）：obs 加 per-card `gpu_type`、sim 加 per-node 速度（4070=1.0×/3080≈0.25×）。sim 配對贏 10/12；**實機把 learned 從 §4.2「全輸 −7~−22%」拉到「打平 / 名目 +3.9%」（RDSAC-mean，§4.3）**。seed-43 hetero checkpoint 為目前最佳。
 - [ ] **讓 §4.3 的 +3.9% 達到統計顯著**：目前 p=0.116。三個正交手段——(a) **更多配對樣本**（更多 round / job，n 96→300+ 收緊 SE）；(b) **降低 JCT 變異的 regime**（§4.3 是 slowdown_p99≈460 的極端飽和，巨大尾端淹沒訊號；改用非飽和負載讓效果浮出）；(c) **多 seed checkpoint**（跨 3 個訓練 seed 報 mean±std，排除單 seed 運氣）。
 - [ ] **RLPD 走真實 transition logging（取代 trace-replay）**：`--online-trace`（把 live sacct trace 當 score demonstrations 回放）**在飽和與非飽和兩個 regime 都退化 prior**（seed-43 −19.6%/−4.5% → −97~−174% / −79%），病根是 demonstration 機制本身（拉向 sim-score + reward/scale 不匹配）非資料飽和。正確路線：部署 `live_daemon`（SHADOW_MODE）記**真實 `(obs,act,rew)` transitions** → `rlpd_finetune --online-log` + **保守 offline RL**（大 offline anchor、低 online-ratio、限制更新步數、可加 CQL 式保守項）。**已試 host-side daemon（`kubectl exec` 包 squeue/scontrol）→ 不可行**：每次 poll 透過 kubectl 來回 ~1-2s 太慢,抓不到 job *完成* 的瞬間（transition 在完成時才寫）→ 只記到決策、0 筆 completion-transition → RLPD online buffer 空 → 一樣退化。**已修一個必要 bug**（`live_daemon` 的 `value_abstain` 寫死 -1.0,seed-43 value≈-10 → 全 abstain、0 transition;改成 env `VALUE_ABSTAIN` 可調）。下一步應把 daemon **部署進叢集**（低延遲 squeue/sacct），收滿真實 transitions 再做保守 offline RL。三次嘗試（trace-replay 飽和/非飽和、host-side transition-log）都退化 prior,**seed-43 base 仍為最佳 checkpoint**。
