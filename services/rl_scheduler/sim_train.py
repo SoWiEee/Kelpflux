@@ -224,6 +224,7 @@ def sim_train(
     use_per: bool = True,
     risk_mode: str = "mean",
     risk_beta: float = 0.25,
+    value_clip: float = 0.0,          # Duan et al. 2021 target return-clip (0 = off)
     curriculum: bool = False,
     curriculum_stages: Optional[list] = None,
     # Stochastic execution (opt-in; gives Z_R spread for the distributional critic)
@@ -286,6 +287,7 @@ def sim_train(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
         use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
+        value_clip=value_clip,
         fixed_alpha=fixed_alpha, init_alpha=init_alpha,
         target_entropy_ratio=target_entropy_ratio,
     )
@@ -497,6 +499,8 @@ def main(argv=None) -> int:
     p.add_argument("--risk-mode",            choices=list(RISK_MODES),
                    default="mean",
                    help="risk distortion in the RDSAC actor objective")
+    p.add_argument("--value-clip",           type=float, default=0.0,
+                   help="Duan et al. 2021 target return-clip boundary b (0 = off)")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
     # Temperature (entropy) controls
@@ -582,6 +586,7 @@ def main(argv=None) -> int:
         use_per=not args.no_per,
         risk_mode=args.risk_mode,
         risk_beta=args.risk_beta,
+        value_clip=args.value_clip,
         curriculum=args.curriculum,
         runtime_sigma=args.runtime_sigma,
         interference=args.interference,

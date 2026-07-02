@@ -178,6 +178,7 @@ class DSACAgent:
         risk_mode: str = "mean",
         risk_beta: float = 0.25,
         risk_alpha: float | None = None,   # deprecated alias for risk_beta
+        value_clip: float = 0.0,           # Duan et al. 2021 target return-clip (0 = off)
         device: str = "cpu",
     ) -> None:
         if risk_mode not in RISK_MODES:
@@ -193,6 +194,7 @@ class DSACAgent:
         self.use_iqn = use_iqn
         self.risk_mode = risk_mode
         self.risk_beta = float(risk_beta)
+        self.value_clip = float(value_clip)
         self.target_entropy_ratio = target_entropy_ratio
         self.fixed_alpha = fixed_alpha
         self.device = torch.device(device)
@@ -275,6 +277,21 @@ class DSACAgent:
             g = (gammas * (1.0 - dones)).unsqueeze(1)                  # (B,1)
             target_r = rews.unsqueeze(1) + g * zr_next                # (B,N)
             target_h = g * (zh_next - logp_next.unsqueeze(1))          # (B,N)
+            if self.value_clip > 0.0:
+                # Duan et al. 2021 target return-clip: bound the reward-return
+                # target within ±b of the current online value estimate. A
+                # per-update trust region that curbs Z_R overestimation (and the
+                # ensuing collapse of the categorical actor onto a single/no-op
+                # action). Only Z_R is clipped; the entropy return Z_H is already
+                # bounded by −logπ.
+                taus_o = torch.rand(b, n, device=self.device)
+                zr1o, _ = self.q1.quantile_q(obs, taus_o)
+                zr2o, _ = self.q2.quantile_q(obs, taus_o)
+                a0 = acts.view(b, 1, 1).expand(-1, n, 1)
+                anchor = 0.5 * (zr1o.gather(2, a0).squeeze(2).mean(1, keepdim=True)
+                                + zr2o.gather(2, a0).squeeze(2).mean(1, keepdim=True))
+                target_r = anchor + (target_r - anchor).clamp(
+                    -self.value_clip, self.value_clip)                # (B,N)
 
         loss_critic = obs.new_zeros(())
         td_accum = obs.new_zeros(b)
@@ -463,6 +480,7 @@ class DSACAgent:
             "fixed_alpha": self.fixed_alpha,
             "use_iqn": self.use_iqn,
             "risk_mode": self.risk_mode, "risk_beta": self.risk_beta,
+            "value_clip": self.value_clip,
             "target_entropy_ratio": self.target_entropy_ratio,
             "hidden": list(self.hidden),
             "obs_dim": self.obs_dim, "n_actions": self.n_actions,
@@ -479,6 +497,7 @@ class DSACAgent:
             use_iqn=kwargs.pop("use_iqn", data.get("use_iqn", True)),
             risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
             risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),
+            value_clip=kwargs.pop("value_clip", data.get("value_clip", 0.0)),
             target_entropy_ratio=data.get("target_entropy_ratio", 0.1),
             **kwargs)
         agent.actor.load_state_dict(data["actor"])
