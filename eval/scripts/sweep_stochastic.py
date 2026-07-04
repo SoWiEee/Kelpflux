@@ -108,16 +108,17 @@ def _eval_policy(
     return avg_jcts, per_job
 
 
-def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args) -> DSACAgent:
+def _train(*, use_iqn, risk_mode, risk_beta, sigma, interference, args,
+           crossq: bool = False) -> DSACAgent:
     return sim_train(
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
         trace_family=args.trace_families, n_jobs=args.n_jobs,
         total_steps=args.total_steps, warmup_steps=args.warmup_steps,
-        utd_ratio=args.utd_ratio, batch_size=args.batch_size,
+        utd_ratio=(1 if crossq else args.utd_ratio), batch_size=args.batch_size,
         device=args.device, out_dir=None, log_every=max(5000, args.total_steps // 5),
         use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
-        value_clip=args.value_clip,
+        value_clip=args.value_clip, crossq=crossq,
         curriculum=args.curriculum,
         runtime_sigma=sigma, interference=interference,
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
@@ -162,6 +163,8 @@ def main(argv=None) -> int:
     p.add_argument("--risk-beta", type=float, default=0.25)
     p.add_argument("--value-clip", type=float, default=0.0,
                    help="Duan et al. 2021 target return-clip boundary b (0 = off)")
+    p.add_argument("--crossq", action="store_true",
+                   help="add a CrossQ arm (Bhatt 2024: BN critic, no target, UTD=1)")
     p.add_argument("--curriculum", action="store_true")
     p.add_argument("--fixed-alpha", action="store_true",
                    help="pin the entropy temperature α for both models "
@@ -201,6 +204,12 @@ def main(argv=None) -> int:
             agents[f"rdsac-{m}"] = _train(use_iqn=True, risk_mode=m,
                                           risk_beta=args.risk_beta, sigma=sigma,
                                           interference=args.interference, args=args)
+        if args.crossq:
+            print("[train] CrossQ (BN critic, no target, UTD=1) ...", flush=True)
+            agents["crossq"] = _train(use_iqn=False, risk_mode="mean",
+                                      risk_beta=args.risk_beta, sigma=sigma,
+                                      interference=args.interference, args=args,
+                                      crossq=True)
         print(f"[train] done in {time.time()-t0:.0f}s; evaluating ...", flush=True)
 
         # Persist every arm immediately — a degenerate arm or a crash in the
