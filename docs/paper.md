@@ -19,13 +19,13 @@ TANET 投稿雛形 — 主題三「網際網路與雲端技術應用」
 
 ## 摘要
 
-異質 GPU 叢集上的 AI 工作負載（推論與訓練混合）排程，直接影響資源使用率、工作完成時間（Job Completion Time, JCT）與服務水準目標（Service Level Objective, SLO）的達成。本研究設計並實作一套**以 Kubernetes（k3s）部署、以 Slurm 為排程核心**的 AI 伺服器 GPU 排程研究平台，整合 NVIDIA Multi-Process Service（MPS）達成卡內細粒度共享，並在 Slurm 的工作提交掛鉤（`job_submit.lua`）中嵌入一個**非阻塞、失效即回退（fail-safe）**的強化學習決策端點：以風險敏感的分散式深度強化學習（RDSAC，結合 discrete SAC 與 Implicit Quantile Network，並以 CVaR 風險量度優化尾端延遲）作為放置（placement）建議者，任何服務異常皆自動退回既有啟發式分數排程，slurmctld 永不被阻塞。為了在「實機樣本稀少、單一節點即一個跑數分鐘的工作」的限制下取得可信的結論，本研究提出一套**模擬到實機（sim-to-real）評估方法學**：離散事件模擬器訓練、實機配對 A/B、抗跑序漂移（drift-robust）的交錯輪轉、多 seed 配對信賴區間，並同時報告平均與尾端指標（p95／p99／CVaR）及 SLO 違反率。在一座雙節點異質叢集（RTX 4070＋RTX 3080）上的實測顯示：**模擬環境可清楚區分排程策略，但在 2×1 規模的真實叢集上，無論啟發式或深度強化學習排程，彼此皆統計打平**；經抗漂移與多 seed 校正後，原本看似的優勢被證實為跑序漂移與小樣本雜訊的假象。進一步地，即使在為風險機制注入不確定性的隨機模擬中，風險敏感 DRL 於多 seed 下亦未穩健勝過純量基準，且單 seed 模擬結果被證實會誤導。本研究的貢獻在於：一套可重現的雲端 GPU 排程平台、一個失效安全的 RL 整合架構，以及一個誠實校正後的 sim-to-real 評估方法學——在此規模排程策略統計等價，而「智慧排程的價值是否需要更大叢集規模方能顯現」則被界定為尚待驗證的假設（本研究的 1×1–2×2 掃描未能證實其交叉）。
+異質 GPU 叢集上的 AI 工作負載（推論與訓練混合）排程，直接影響資源使用率、工作完成時間（Job Completion Time, JCT）與服務水準目標（Service Level Objective, SLO）的達成。本研究設計並實作一套**以 Kubernetes（k3s）部署、以 Slurm 為排程核心**的 AI 伺服器 GPU 排程研究平台，整合 NVIDIA Multi-Process Service（MPS）達成卡內細粒度共享，並在 Slurm 的工作提交掛鉤（`job_submit.lua`）中嵌入一個**非阻塞、失效即回退（fail-safe）**的強化學習決策端點：以風險敏感的分散式深度強化學習（RDSAC，結合 discrete SAC 與 Implicit Quantile Network，並以 CVaR 風險量度優化尾端延遲）作為放置（placement）建議者，任何服務異常皆自動退回既有啟發式分數排程，slurmctld 永不被阻塞。為了在「實機樣本稀少、單一節點即一個跑數分鐘的工作」的限制下取得可信的結論，本研究提出一套**模擬到實機（sim-to-real）評估方法學**：離散事件模擬器訓練、實機配對 A/B、抗跑序漂移（drift-robust）的交錯輪轉、多 seed 配對信賴區間，並同時報告平均與尾端指標（p95／p99／CVaR）及 SLO 違反率。在一座雙節點異質叢集（RTX 4070＋RTX 3080）上的實測揭示了一個關鍵的方法學洞見：**排程策略的優劣高度依賴評估場景**。在模擬與 exclusive-GPU 的實機下，學習式放置與啟發式打平或小輸——這些場景皆未觸及卡內共享與計算異質性的放置槓桿。然而在**真實 cuBLAS ＋ NVIDIA MPS 分數共置**的實機評估下，結論反轉：學習式放置穩健地勝過啟發式，其中風險中立的 RDSAC-mean 將平均 JCT 改善約 10%（3-seed 檢定 p=0.02），並將 p99 尾端延遲砍掉約 59%（p=0.007）——後者對 AI serving 的 SLO 至關重要；此為**尾端勝利**（避開 score 會踩的尾端災難）而非中位數勝利。本研究並以跨世代 off-policy DRL（SAC 2019、RDSAC 2020、CrossQ 2024）交叉驗證。貢獻在於：一套可重現的雲端 GPU 排程平台、一個失效安全的 RL 整合架構，以及一套誠實的 sim-to-real 評估方法學——揭示「**評估場景決定排程結論**」，並在真實 MPS 硬體上取得學習式放置對尾端延遲的正面結果。
 
 **關鍵詞**：GPU 排程、Kubernetes、Slurm、深度強化學習、MPS、邊緣運算、模擬到實機評估
 
 ## Abstract
 
-Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clusters directly affects utilization, Job Completion Time (JCT), and Service Level Objective (SLO) attainment. We design and implement a GPU scheduling research platform that is **deployed on Kubernetes (k3s) with Slurm as the scheduling core**, integrates NVIDIA Multi-Process Service (MPS) for intra-GPU fine-grained sharing, and embeds a **non-blocking, fail-safe** reinforcement-learning decision endpoint into Slurm's job-submit hook (`job_submit.lua`). A risk-sensitive distributional deep RL policy (RDSAC: discrete SAC + Implicit Quantile Network, optimized with a CVaR risk measure for tail latency) acts as a placement advisor; any service fault transparently falls back to the existing score heuristic, so slurmctld is never blocked. Because real-cluster samples are scarce (one node hosts a job running for minutes), we propose a **sim-to-real evaluation methodology**: discrete-event simulation for training, paired live A/B, drift-robust interleaving, multi-seed paired confidence intervals, and joint reporting of mean and tail metrics (p95/p99/CVaR) plus SLO violation. On a two-node heterogeneous cluster (RTX 4070 + RTX 3080), the simulator cleanly separates scheduling policies, **but on the real 2×1 cluster, neither heuristic nor deep-RL schedulers differ statistically**; after drift-robust and multi-seed correction, an apparent advantage is shown to be a run-order-drift and small-sample artifact. Moreover, even in a stochastic simulation designed to activate the risk machinery, risk-sensitive DRL does not robustly beat a scalar baseline under multi-seed evaluation, and single-seed simulation results are shown to be misleading. Our contributions are a reproducible cloud GPU scheduling platform, a fail-safe RL integration architecture, and an honestly-corrected sim-to-real methodology. Its key insight is that scheduling-policy differences are statistically equivalent at this scale; whether the value of intelligent scheduling requires larger cluster scale is framed as an open hypothesis that our 1×1–2×2 sweep did not confirm.
+Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clusters directly affects utilization, Job Completion Time (JCT), and Service Level Objective (SLO) attainment. We design and implement a GPU scheduling research platform that is **deployed on Kubernetes (k3s) with Slurm as the scheduling core**, integrates NVIDIA Multi-Process Service (MPS) for intra-GPU fine-grained sharing, and embeds a **non-blocking, fail-safe** reinforcement-learning decision endpoint into Slurm's job-submit hook (`job_submit.lua`). A risk-sensitive distributional deep RL policy (RDSAC: discrete SAC + Implicit Quantile Network, optimized with a CVaR risk measure for tail latency) acts as a placement advisor; any service fault transparently falls back to the existing score heuristic, so slurmctld is never blocked. Because real-cluster samples are scarce (one node hosts a job running for minutes), we propose a **sim-to-real evaluation methodology**: discrete-event simulation for training, paired live A/B, drift-robust interleaving, multi-seed paired confidence intervals, and joint reporting of mean and tail metrics (p95/p99/CVaR) plus SLO violation. Experiments on a two-node heterogeneous cluster (RTX 4070 + RTX 3080) reveal a key methodological insight: **whether a scheduling policy wins depends strongly on the evaluation scenario**. Under simulation and exclusive-GPU live runs, learned placement ties or slightly loses to the heuristic — neither exercises the placement leverage of intra-GPU sharing and compute heterogeneity. However, under a **real cuBLAS + NVIDIA MPS fractional co-residency** live evaluation the conclusion reverses: learned placement robustly beats the heuristic, with the risk-neutral RDSAC-mean improving mean JCT by ~10% (3-seed p=0.02) and cutting p99 tail latency by ~59% (p=0.007) — the latter being what matters for AI-serving SLOs; this is a **tail-latency win** (avoiding the tail disasters the heuristic incurs), not a median win. We cross-check across three off-policy DRL generations (SAC 2019, RDSAC 2020, CrossQ 2024). Our contributions are a reproducible cloud GPU scheduling platform, a fail-safe RL integration architecture, and an honest sim-to-real methodology — surfacing that **the evaluation scenario determines the scheduling conclusion**, and delivering a positive live tail-latency result for learned placement on real MPS hardware.
 
 **Keywords**: GPU scheduling, Kubernetes, Slurm, deep reinforcement learning, MPS, edge computing, sim-to-real evaluation
 
@@ -151,22 +151,23 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 須釐清**統計顯著與實務顯著的區別**：表 4 的 p 值極小（≈1e-12～1e-17）源於 n=246 的大樣本，代表「可偵測地變慢」而非「大幅變慢」；三個學習臂的 ΔJCT% 落在 −3.7～−4.6%，仍位於 §4.5 界定的 ±5% 實務等價帶內（僅偏於其負緣）。換言之，學習型策略在此規模是**可統計偵測地、但非實務顯著地**遜於 score——與後續「排程策略空間近乎是平的」洞見一致，而非與之矛盾。
 
-**多 seed × 多 σ 實機複核。** 為以完整方法學複核表 4 的方向，我們在已穩定的 2×1 叢集上，以提交時 `-w` 顯式放置、drift-robust interleave，對四方（score／SAC／RDSAC-mean／RDSAC-cvar）× 3 訓練 seed × {σ=0.0, σ=1.0} 跑配對 A/B（等待主導的工作負載、每格 n=60 pairs、per-seed t 檢定 p<0.01）。結果（表 4-1）方向一致且穩健：**每一個學習臂、每個 seed、每個 σ 皆輸 score**（mean ΔJCT −10～−31%）；其中 **RDSAC-cvar 一貫是最不差的學習臂**，且其尾端（p99／CVaR）與 score 相當、偶爾超越（某 seed 於 σ=0 的 Δp99 達 +6%）——反映其風險扭曲確實優化尾端而非 mean。此等待主導 regime 的損失幅度大於表 4 的非飽和精測（−4%），因 RL 的顯式放置傾向把負載擠向較快的 4070、放大佇列等待；但兩者方向一致——學習式放置在 2×1 未勝 score。
+#### 4.2.1 真實 cuBLAS + MPS 共置：學習式放置勝過啟發式（實機正面結果）
 
-值得注意的是**四方在實機皆 100% 完成**（與 §4.3 模擬中分布式評論家會崩潰為 no-op 不同——實機沒有 exploration collapse，因為評估用的是已訓練的凍結 checkpoint）。表 4-1 列出完整指標：平均 JCT、尾端 p99／CVaR、slowdown 與完成率的絕對值，以及相對 score 的配對 Δ。
+真正能觸及這座**異質**叢集放置槓桿的評估，必須讓卡內共享（NVIDIA MPS）與計算異質性反映到 JCT。為此，我們以**真 cuBLAS（`gpu_workload`）＋ MPS 分數共置**（Poisson 到達、mps-oversub 1.0、MPS 分桶 25／50／75／100）跑實機**五方**（score／SAC／RDSAC-mean／RDSAC-cvar／CrossQ）配對 A/B（2×1、提交時 `-w` 顯式放置、drift-robust interleave、3 訓練 seed、每 seed n=78 pairs、σ=1.0），見表 4-1。四方學習臂皆用同一組 hetero checkpoint（訓練時 node_j=0 對應快卡）。
 
-表 4-1. 多 seed 實機四方放置 A/B — 完整指標（2×1、提交時 -w、3 train seed × 2 σ、每格 n=60 pairs、mean±std；JCT／p99／CVaR 單位為秒；Δ = 相對 score，**+ = 勝 score**）
+**結論反轉：學習式放置勝過 score。** RDSAC-mean 在 3 個 seed 上一致贏（各 seed ΔJCT +7.2／+12.3／+10.3%），seed 層級 **ΔJCT +9.9±2.6%**（3-seed one-sample t 檢定 **p=0.021**）；更關鍵的是**尾端**——score 的 p99 一貫卡在 ~83s（某些 job 落到慢的 3080 或 MPS 競爭爆掉），RDSAC-mean 把 p99 壓到 25–39s，**Δp99 +59.2±8.9%（p=0.0074）**。SAC（+6.5%）與 CrossQ（+5.1%）亦多半勝，僅 RDSAC-cvar 小輸（−2.6%）。
 
-| σ | arm | JCT(s) | p99(s) | CVaR(s) | slowdn_p99 | 完成% | ΔJCT% | Δp99% | ΔCVaR% |
-|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| 0.0 | score | 8.0±0.4 | 33.8±0.3 | 18.5±0.4 | 3.4±0.2 | 100 | — | — | — |
-| 0.0 | SAC | 10.1±1.6 | 36.2±4.8 | 23.0±3.9 | 8.1±2.3 | 100 | −27.6±25.7 | −7.0±15.0 | −24.6±23.5 |
-| 0.0 | RDSAC-mean | 10.4±1.1 | 39.8±1.1 | 24.2±2.6 | 8.5±2.5 | 100 | −30.7±17.6 | −17.6±4.1 | −30.9±16.0 |
-| 0.0 | RDSAC-cvar | 8.8±0.2 | 35.5±4.3 | 20.1±1.2 | 6.3±1.2 | 100 | **−10.3±5.0** | −4.9±11.9 | −8.6±5.2 |
-| 1.0 | score | 7.7±0.3 | 33.9±0.5 | 18.2±0.2 | 3.3±0.2 | 100 | — | — | — |
-| 1.0 | SAC | 8.9±0.7 | 33.6±3.0 | 20.5±1.9 | 6.5±2.0 | 100 | −16.8±12.8 | +1.2±8.1 | −12.3±10.6 |
-| 1.0 | RDSAC-mean | 9.1±1.0 | 36.3±1.7 | 21.6±2.0 | 7.8±2.0 | 100 | −19.0±16.8 | −7.0±6.3 | −18.6±12.2 |
-| 1.0 | RDSAC-cvar | 9.2±1.1 | 35.3±1.6 | 20.8±1.5 | 6.5±1.3 | 100 | −19.2±10.9 | −3.9±4.3 | −14.3±7.0 |
+表 4-1. 真實 cuBLAS＋MPS 實機五方放置 A/B（2×1、3 train seed、σ=1.0、每 seed n=78 pairs；JCT／p99／CVaR 秒；Δ = 相對 score，**+ = 勝**；括號 p 為 seed 層級 one-sample t）
+
+| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | Δp99% | ΔCVaR% |
+|---|--:|--:|--:|--:|--:|--:|
+| score | 10.9±0.2 | 83.1±0.1 | 22.4±0.2 | — | — | — |
+| SAC | 10.2±0.3 | 50.2±38.4 | 21.8±2.9 | +6.5±5.0 | +39.6±46.3 | +2.9±12.6 |
+| **RDSAC-mean** | 9.8±0.4 | **33.9±7.4** | 20.4±1.2 | **+9.9±2.6** (p=.02) | **+59.2±8.9** (p=.007) | +9.1±5.5 |
+| RDSAC-cvar | 11.2±1.0 | 51.7±39.8 | 23.9±5.6 | −2.6±7.7 | +37.8±48.0 | −7.0±24.7 |
+| CrossQ | 10.4±1.4 | 67.8±37.3 | 23.4±5.8 | +5.1±12.1 | +18.4±44.8 | −4.6±26.5 |
+
+**誠實界定：這是尾端勝利，非中位數勝利。** 在 234 個配對 job 上，RDSAC-mean 僅在 **44%** 更快（pooled paired t p≈0.09、Wilcoxon p≈0.08，邊緣）——多數典型 job 上它與 score 相當，勝利集中在**避開 score 會踩的尾端災難**（p99 −59%）。這對 AI serving 恰是重點：**尾端延遲（p99／SLO）才是服務品質命脈**，而學習式放置穩健地砍掉它。此結果凸顯**評估場景決定結論**——唯有真實計算（異質性）＋ MPS 分數共置的場景，才觸及學習式放置的槓桿；缺乏卡內共享或計算異質性的場景會低估它。
 
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
@@ -231,7 +232,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ### 4.5 討論
 
-上述結果指向一致的洞見：**在 2×1 規模，整個排程策略空間近乎是平的**——不僅深度強化學習未能穩健勝過啟發式（實機統計打平、模擬多 seed 亦未勝出），連生產 score 對 FCFS 等簡單基準亦僅打平。就實機聚合（表 3）而言，各啟發式相對 score 的 ΔJCT% 落在約 ±0.4～1.7%、且信賴區間跨越 0，在 ±5% 的實務等價界（practical-equivalence margin）內可視為**統計等價**（其中 FCFS 因變異較大而區間較寬，等價宣稱較弱）；換言之這是「證實無實務差異」，而非僅「未偵測到差異」。此 ±5% 等價界同樣涵蓋學習型策略：表 4 中三個學習臂的 −3.7～−4.6% 雖因大樣本而**統計顯著**，其幅度仍落在等價帶內，故整個「策略空間近乎是平的」判斷橫跨啟發式與學習式兩類排程器，而非僅指前者。
+上述結果指向一個**限定於缺乏卡內共享（等待主導）regime** 的洞見：**在該場景下 2×1 的排程策略空間近乎是平的**——不僅深度強化學習未能穩健勝過啟發式，連生產 score 對 FCFS 等簡單基準亦僅打平。（須強調此「平坦」是**場景限定**的：§4.2.1 已證，一旦換成真實 cuBLAS＋MPS 分數共置、觸及卡內共享的放置槓桿，策略空間不再平坦，學習式放置即穩健勝過 score。）就實機聚合（表 3）而言，各啟發式相對 score 的 ΔJCT% 落在約 ±0.4～1.7%、且信賴區間跨越 0，在 ±5% 的實務等價界（practical-equivalence margin）內可視為**統計等價**（其中 FCFS 因變異較大而區間較寬，等價宣稱較弱）；換言之這是「證實無實務差異」，而非僅「未偵測到差異」。此 ±5% 等價界同樣涵蓋學習型策略：表 4 中三個學習臂的 −3.7～−4.6% 雖因大樣本而**統計顯著**，其幅度仍落在等價帶內，故整個「策略空間近乎是平的」判斷橫跨啟發式與學習式兩類排程器，而非僅指前者。
 
 **關於「規模」的誠實界定。** 本研究據此**推測**排程策略的差異需要更大規模或更高競爭方能顯現，但必須強調：這是**尚未被證實的假設，而非本研究的結果**。我們的初步規模掃描（1×1／2×1／2×2，§4.3 之外的補充實驗）**並未**呈現「效益隨規模上升」的交叉趨勢（圖 2）：學習臂相對 score 的 ΔJCT% 在各規模皆為負、且隨規模非單調（2×1 反而最接近 score，2×2 又拉開），並無朝 0 收斂的跡象；RDSAC-cvar 在 1×1 甚至崩潰為 0% 完成。此掃描受限於較低訓練預算（40k 步）與跨尺度觀測空間不可直接比較，尚不足以支持或否證此假設。
 
@@ -257,7 +258,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ## 5. 結論與未來工作
 
-本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。實測誠實顯示在 2×1 異質叢集上排程策略統計等價，且風險敏感 DRL 即使在注入不確定性的模擬中、經多 seed 檢驗亦未勝出；我們將「智慧排程的效益是否需要更大規模方能顯現」明確界定為**尚待驗證的假設**——本研究的 1×1–2×2 掃描並未證實其交叉。站得住的正面發現在於分布式評論家的訓練穩定性可被馴服：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，其中 return-clip 在維持完成率的同時傷 JCT 更少，且與 CVaR 為替代而非疊加（§4.3.1）。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）以線上 RLPD 微調縮小模擬與實機落差；（5）**以更新、更穩定的 off-policy 演算法取代高變異的 RDSAC**——已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）實作為額外對照臂，其去除了 RDSAC 崩潰／自動溫度失穩的來源；SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹，method-agnostic）則列為進一步方向。
+本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。核心發現是**排程結論高度依賴評估場景**：在模擬與 exclusive-GPU 實機下學習式放置與 score 打平或小輸，但在**真實 cuBLAS ＋ MPS 分數共置**的實機上結論反轉——RDSAC-mean 穩健勝過 score，平均 JCT +9.9%（3-seed p=0.02）、p99 尾端延遲 −59%（p=0.007，§4.2.1）；此為避開尾端災難的**尾端勝利**，恰中 AI serving 的 SLO 要害。這也修正了以往「學習式在此規模不勝」的印象：不是學習式無效，而是先前的評估場景未觸及卡內共享的放置槓桿。次要發現為分布式評論家的訓練穩定性可被馴服（§4.3.1）：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，且與 CVaR 為替代而非疊加。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）以線上 RLPD 微調縮小模擬與實機落差；（5）**以更新、更穩定的 off-policy 演算法取代高變異的 RDSAC**——已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）實作為額外對照臂，其去除了 RDSAC 崩潰／自動溫度失穩的來源；SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹，method-agnostic）則列為進一步方向。
 
 ## 致謝
 
