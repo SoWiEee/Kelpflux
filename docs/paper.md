@@ -257,7 +257,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ## 5. 結論與未來工作
 
-本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。實測誠實顯示在 2×1 異質叢集上排程策略統計等價，且風險敏感 DRL 即使在注入不確定性的模擬中、經多 seed 檢驗亦未勝出；我們將「智慧排程的效益是否需要更大規模方能顯現」明確界定為**尚待驗證的假設**——本研究的 1×1–2×2 掃描並未證實其交叉。站得住的正面發現在於分布式評論家的訓練穩定性可被馴服：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，其中 return-clip 在維持完成率的同時傷 JCT 更少，且與 CVaR 為替代而非疊加（§4.3.1）。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）以線上 RLPD 微調縮小模擬與實機落差。
+本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。實測誠實顯示在 2×1 異質叢集上排程策略統計等價，且風險敏感 DRL 即使在注入不確定性的模擬中、經多 seed 檢驗亦未勝出；我們將「智慧排程的效益是否需要更大規模方能顯現」明確界定為**尚待驗證的假設**——本研究的 1×1–2×2 掃描並未證實其交叉。站得住的正面發現在於分布式評論家的訓練穩定性可被馴服：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，其中 return-clip 在維持完成率的同時傷 JCT 更少，且與 CVaR 為替代而非疊加（§4.3.1）。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）以線上 RLPD 微調縮小模擬與實機落差；（5）**以更新、更穩定的 off-policy 演算法取代高變異的 RDSAC**——已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）實作為額外對照臂，其去除了 RDSAC 崩潰／自動溫度失穩的來源；SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹，method-agnostic）則列為進一步方向。
 
 ## 致謝
 
@@ -298,3 +298,5 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 [16] X. Ma, J. Chen, L. Xia, J. Yang, Q. Zhao, and Z. Zhou, "DSAC: Distributional Soft Actor-Critic for Risk-Sensitive Reinforcement Learning," *arXiv:2004.14547*, 2020.
 
 [17] J. Duan, Y. Guan, S. E. Li, Y. Ren, and B. Cheng, "Distributional Soft Actor-Critic: Off-Policy Reinforcement Learning for Addressing Value Estimation Errors," *IEEE Transactions on Neural Networks and Learning Systems*, 2021. arXiv:2001.02811.
+
+[18] A. Bhatt, D. Palenicek, B. Belousov, M. Argus, A. Amiranashvili, T. Brox, and J. Peters, "CrossQ: Batch Normalization in Deep Reinforcement Learning for Greater Sample Efficiency and Simplicity," in *ICLR*, 2024.
