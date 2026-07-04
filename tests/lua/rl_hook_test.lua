@@ -109,6 +109,54 @@ it("rl_apply tolerates empty curl response (timeout/network failure)",
   assert(jd.priority == 50, "priority unchanged on error")
 end)
 
+it("rl_call_decide parses node_j from JSON", function()
+  RL_ENABLED = true; RL_URL = "http://x"; RL_TIMEOUT_S = 0.1
+  _rl_io_popen = mock_popen(
+    '{"priority_boost":0,"rl_selected":true,"abstain":false,' ..
+    '"value":0.5,"entropy":0.1,"node_j":1,"gpu_k":0}')
+  local ok, rl = rl_call_decide({job_id=42}, 4, 1, 60)
+  assert(ok, "expected ok")
+  assert(rl.node_j == 1, "node_j=" .. tostring(rl.node_j))
+end)
+
+it("rl_apply sets req_nodes from node_j when RL_PLACEMENT enabled", function()
+  RL_ENABLED = true
+  RL_PLACEMENT = true
+  RL_NODE_NAMES = {"node-a", "node-b"}
+  _rl_io_popen = mock_popen(
+    '{"priority_boost":0,"rl_selected":true,"abstain":false,' ..
+    '"value":0.5,"entropy":0.1,"node_j":1}')
+  local jd = {job_id=10, priority=100}
+  rl_apply(jd, 4, 1, 60)
+  assert(jd.req_nodes == "node-b", "req_nodes=" .. tostring(jd.req_nodes)) -- node_j=1 → NAMES[2]
+  RL_PLACEMENT = false
+end)
+
+it("rl_apply skips placement when RL_PLACEMENT disabled", function()
+  RL_ENABLED = true
+  RL_PLACEMENT = false
+  RL_NODE_NAMES = {"node-a", "node-b"}
+  _rl_io_popen = mock_popen(
+    '{"priority_boost":0,"rl_selected":true,"abstain":false,' ..
+    '"value":0.5,"entropy":0.1,"node_j":1}')
+  local jd = {job_id=11, priority=100}
+  rl_apply(jd, 4, 1, 60)
+  assert(jd.req_nodes == nil, "req_nodes should be nil, got " .. tostring(jd.req_nodes))
+end)
+
+it("rl_apply skips placement when RL did not select this job", function()
+  RL_ENABLED = true
+  RL_PLACEMENT = true
+  RL_NODE_NAMES = {"node-a", "node-b"}
+  _rl_io_popen = mock_popen(
+    '{"priority_boost":0,"rl_selected":false,"abstain":false,' ..
+    '"value":0.5,"entropy":0.1,"node_j":0}')
+  local jd = {job_id=12, priority=100}
+  rl_apply(jd, 4, 1, 60)
+  assert(jd.req_nodes == nil, "req_nodes should be nil when not selected")
+  RL_PLACEMENT = false
+end)
+
 -- ---- summary --------------------------------------------------------------
 print(string.format("\n%d passed, %d failed", PASS, FAILS))
 if FAILS > 0 then os.exit(1) end

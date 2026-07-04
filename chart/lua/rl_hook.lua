@@ -15,6 +15,13 @@
 --   RL_ENABLED    : bool  -- master kill-switch
 --   RL_URL        : str   -- e.g. http://rl-scheduler:8002/decide
 --   RL_TIMEOUT_S  : float -- curl --max-time
+--   RL_PLACEMENT  : bool  -- opt-in: apply submit-time explicit placement
+--                            (set job_desc.req_nodes from /decide's node_j).
+--                            This is the validated production placement path
+--                            (the async slurmrestd placement controller cannot
+--                            re-pin post-submit on Slurm 21.08). Default off.
+--   RL_NODE_NAMES : table -- 1-indexed Slurm node names; node_j (0-indexed) →
+--                            RL_NODE_NAMES[node_j+1]. Required when RL_PLACEMENT.
 --
 -- Globals tests override:
 --   _rl_io_popen  : function(cmd, mode) -> file-like  (mock curl response)
@@ -79,6 +86,7 @@ function rl_call_decide(job_desc, mps_req, gpu_count, runtime_s)
     value              = _num_field(resp, "value") or 0.0,
     entropy            = _num_field(resp, "entropy") or 0.0,
     rl_selected_job_id = _str_field(resp, "rl_selected_job_id"),
+    node_j             = _num_field(resp, "node_j"),   -- placement index (nil when abstain/no-op)
     otel_traceparent   = _str_field(resp, "otel_traceparent"),
   }, nil
 end
@@ -107,6 +115,20 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
   -- can continue the trace when it first sees this job in squeue.
   if rl.otel_traceparent and rl.otel_traceparent ~= "" then
     job_desc.admin_comment = "otel=" .. rl.otel_traceparent
+  end
+  -- Submit-time explicit placement (opt-in via RL_PLACEMENT). When RL selected
+  -- THIS job and returned a node choice, pin it via job_desc.req_nodes. Slurm
+  -- honours submit-time required nodes (unlike a post-submit re-pin, which
+  -- slurmrestd v0.0.37 does not apply), so this is the validated placement
+  -- path — the same node binding the live A/B (§4.2) exercises via `sbatch -w`.
+  -- Fail-safe: unknown node_j / missing mapping → skip, Slurm places normally.
+  if RL_PLACEMENT and rl.rl_selected and rl.node_j ~= nil and rl.node_j >= 0
+     and type(RL_NODE_NAMES) == "table" then
+    local name = RL_NODE_NAMES[rl.node_j + 1]   -- node_j is 0-indexed; Lua is 1-indexed
+    if name and name ~= "" then
+      job_desc.req_nodes = name
+      _log(string.format("[rl] placement node_j=%d → req_nodes=%s", rl.node_j, name))
+    end
   end
   -- Respect an explicit user hold (sbatch -H → job_desc.priority == 0): the
   -- placement controller releases such jobs after pinning required_nodes, so
