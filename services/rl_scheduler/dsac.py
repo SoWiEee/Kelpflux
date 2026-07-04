@@ -123,6 +123,42 @@ class _ScalarCritic(nn.Module):
         return self.head(F.relu(h))
 
 
+class _CrossQCritic(nn.Module):
+    """Scalar Q(s,·) critic with BatchNorm, for CrossQ (Bhatt et al., ICLR 2024).
+
+    CrossQ removes target networks entirely and instead relies on BatchNorm to
+    keep the (s,a) and (s',a') input distributions aligned. The caller forwards
+    the current and next state *jointly* (one batch) so BN sees shared statistics
+    — the "cross" trick that makes dropping the target net stable. BN uses batch
+    stats in train() mode and frozen running stats in eval() mode (inference).
+
+    (The paper uses BatchRenorm + wider nets; we use plain BatchNorm1d + a
+    modest width — a faithful-enough discrete-action adaptation.)
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int,
+                 hidden: Sequence[int] = (512, 512), momentum: float = 0.01,
+                 **_ignore) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [nn.BatchNorm1d(obs_dim, momentum=momentum)]
+        prev = obs_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.BatchNorm1d(h, momentum=momentum))
+            layers.append(nn.ReLU())
+            prev = h
+        layers.append(nn.Linear(prev, n_actions))
+        self.net = nn.Sequential(*layers)
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                nn.init.zeros_(m.bias)
+
+    def q_values(self, obs: torch.Tensor) -> torch.Tensor:
+        """Returns Q(s,·) of shape (B, n_actions). BN mode is the caller's job."""
+        return self.net(obs)
+
+
 class _CategoricalActor(nn.Module):
     """Explicit masked categorical policy π(a|s;φ)."""
 
@@ -179,6 +215,7 @@ class DSACAgent:
         risk_beta: float = 0.25,
         risk_alpha: float | None = None,   # deprecated alias for risk_beta
         value_clip: float = 0.0,           # Duan et al. 2021 target return-clip (0 = off)
+        crossq: bool = False,              # CrossQ (Bhatt 2024): BN critic, no target net
         device: str = "cpu",
     ) -> None:
         if risk_mode not in RISK_MODES:
@@ -186,6 +223,9 @@ class DSACAgent:
         if risk_alpha is not None:          # back-compat: old CVaR tail-mass arg
             risk_beta = risk_alpha
 
+        self.crossq = bool(crossq)
+        if self.crossq:
+            use_iqn = False   # CrossQ is a scalar-critic method (no distributional head)
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.hidden = tuple(hidden)
@@ -200,6 +240,8 @@ class DSACAgent:
         self.device = torch.device(device)
 
         def _critic():
+            if self.crossq:
+                return _CrossQCritic(obs_dim, n_actions).to(self.device)
             cls = _DualIQNCritic if use_iqn else _ScalarCritic
             return cls(obs_dim, n_actions, self.hidden, layer_norm).to(self.device)
 
@@ -207,6 +249,10 @@ class DSACAgent:
         self.q1_target, self.q2_target = _critic(), _critic()
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
+        if self.crossq:
+            # No target networks in CrossQ; keep BN critics in eval() (frozen
+            # running stats) except inside _update_crossq, which flips to train().
+            self.q1.eval(); self.q2.eval()
 
         self.actor = _CategoricalActor(obs_dim, n_actions, self.hidden,
                                        layer_norm).to(self.device)
@@ -218,8 +264,11 @@ class DSACAgent:
             math.log(init_alpha), dtype=torch.float32,
             requires_grad=not fixed_alpha, device=self.device)
 
+        # CrossQ recommends Adam β1=0.5 for the critic (paper §4).
+        _q_betas = (0.5, 0.999) if self.crossq else (0.9, 0.999)
         self.opt_q = torch.optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr_q)
+            list(self.q1.parameters()) + list(self.q2.parameters()),
+            lr=lr_q, betas=_q_betas)
         self.opt_pi = torch.optim.Adam(self.actor.parameters(), lr=lr_pi)
         self.opt_alpha = (None if fixed_alpha
                           else torch.optim.Adam([self.log_alpha], lr=lr_alpha))
@@ -257,6 +306,9 @@ class DSACAgent:
         next_masks = _t("next_masks", torch.bool)
         gammas = _t("gammas") if "gammas" in batch else torch.full_like(rews, self.gamma)
         is_weights = _t("weights") if "weights" in batch else torch.ones_like(rews)
+        if self.crossq:
+            return self._update_crossq(obs, acts, rews, next_obs, dones,
+                                       masks, next_masks, gammas, is_weights)
         if not self.use_iqn:
             return self._update_scalar(obs, acts, rews, next_obs, dones,
                                        masks, next_masks, gammas, is_weights)
@@ -435,6 +487,82 @@ class DSACAgent:
             "td_errors": td_errors,
         }
 
+    def _update_crossq(self, obs, acts, rews, next_obs, dones,
+                       masks, next_masks, gammas, is_weights) -> dict:
+        """CrossQ update (Bhatt 2024): BatchNorm critic, NO target network.
+
+        The current and next state are forwarded *jointly* through the BN critic
+        so BN normalises them with shared batch statistics (the "cross" trick).
+        The next-state Q is stop-gradient for the Bellman target; there is no
+        soft target update. UTD=1 is recommended (set via --utd-ratio 1).
+        """
+        b = obs.shape[0]
+        with torch.no_grad():
+            probs_n, logp_n = self.actor.policy(next_obs, next_masks)  # (B,A)
+
+        # ---- Critic: joint (cross) forward of [obs; next_obs] ----
+        self.q1.train(); self.q2.train()
+        cat = torch.cat([obs, next_obs], dim=0)                        # (2B, obs)
+        q1_all, q2_all = self.q1.q_values(cat), self.q2.q_values(cat)  # (2B, A)
+        q1_s, q1_n = q1_all[:b], q1_all[b:]
+        q2_s, q2_n = q2_all[:b], q2_all[b:]
+
+        min_q_n = torch.minimum(q1_n, q2_n).detach()                   # (B,A) stop-grad target
+        v_next = (probs_n * (min_q_n - self.alpha.detach() * logp_n)).sum(-1)  # (B,)
+        target = (rews + gammas * (1.0 - dones) * v_next).detach()     # (B,)
+
+        aidx = acts.view(b, 1)
+        q1_sa = q1_s.gather(1, aidx).squeeze(1)
+        q2_sa = q2_s.gather(1, aidx).squeeze(1)
+        per1 = F.mse_loss(q1_sa, target, reduction="none")
+        per2 = F.mse_loss(q2_sa, target, reduction="none")
+        loss_critic = (is_weights * (per1 + per2)).mean()
+        td_errors = (0.5 * ((q1_sa - target).abs()
+                            + (q2_sa - target).abs())).detach().cpu().numpy()
+
+        self.opt_q.zero_grad()
+        loss_critic.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
+        self.opt_q.step()
+        self._update_count += 1
+        # No target networks → no soft update.
+        self.q1.eval(); self.q2.eval()
+
+        # ---- Actor: reuse q_s values (critic frozen for the actor grad) ----
+        probs, log_probs = self.actor.policy(obs, masks)
+        min_q_s = torch.minimum(q1_s, q2_s).detach()                   # (B,A)
+        loss_actor = (probs * (self.alpha.detach() * log_probs - min_q_s)).sum(-1).mean()
+        self.opt_pi.zero_grad()
+        loss_actor.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        self.opt_pi.step()
+
+        # ---- Temperature α (shared auto-tune; mirrors _update_scalar) ----
+        with torch.no_grad():
+            entropy = -(probs * log_probs).sum(-1)
+        entropy_val = float(entropy.mean().item())
+        loss_alpha_val = 0.0
+        if not self.fixed_alpha:
+            n_valid = masks.float().sum(-1).clamp(min=1.0)
+            target_entropy = self.target_entropy_ratio * torch.log(n_valid)
+            loss_alpha = (self.log_alpha * (entropy - target_entropy).detach()).mean()
+            self.opt_alpha.zero_grad()
+            loss_alpha.backward()
+            self.opt_alpha.step()
+            with torch.no_grad():
+                self.log_alpha.clamp_(-5.0, 3.0)
+            loss_alpha_val = float(loss_alpha.item())
+
+        return {
+            "loss_critic": float(loss_critic.item()),
+            "loss_actor": float(loss_actor.item()),
+            "loss_alpha": loss_alpha_val,
+            "alpha": float(self.alpha.item()),
+            "entropy": entropy_val,
+            "td_errors": td_errors,
+        }
+
     @torch.no_grad()
     def action_values(self, obs: torch.Tensor) -> torch.Tensor:
         """Per-action value. IQN: ρ[Z_R]+α·E[Z_H]; SAC: min(Q1,Q2). (B,obs)→(B,A)."""
@@ -481,6 +609,7 @@ class DSACAgent:
             "use_iqn": self.use_iqn,
             "risk_mode": self.risk_mode, "risk_beta": self.risk_beta,
             "value_clip": self.value_clip,
+            "crossq": self.crossq,
             "target_entropy_ratio": self.target_entropy_ratio,
             "hidden": list(self.hidden),
             "obs_dim": self.obs_dim, "n_actions": self.n_actions,
@@ -498,6 +627,7 @@ class DSACAgent:
             risk_mode=kwargs.pop("risk_mode", data.get("risk_mode", "mean")),
             risk_beta=kwargs.pop("risk_beta", data.get("risk_beta", 0.25)),
             value_clip=kwargs.pop("value_clip", data.get("value_clip", 0.0)),
+            crossq=kwargs.pop("crossq", data.get("crossq", False)),
             target_entropy_ratio=data.get("target_entropy_ratio", 0.1),
             **kwargs)
         agent.actor.load_state_dict(data["actor"])
