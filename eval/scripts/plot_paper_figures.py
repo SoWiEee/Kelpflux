@@ -121,10 +121,49 @@ def plot_scale() -> None:
     plt.close(fig)
 
 
+def plot_stabilizer() -> None:
+    """value-clip ablation: collapse count (/6 trace×seed) clip-off vs clip-on
+    for the two distributional arms (source: value_clip_ablation TABLES.md)."""
+    arms = ["RDSAC-mean", "RDSAC-cvar"]
+    off = [2, 0]   # collapsed cells (<20% done) out of 6
+    on = [0, 2]
+    # honest ΔJCT% (100%-completing cells only), for annotation
+    honest = {"RDSAC-mean": ("clip-off: artifact", "clip-on: −3.5/−12.5"),
+              "RDSAC-cvar": ("clip-off: −41/−37", "clip-on: degraded")}
+
+    x = list(range(len(arms)))
+    w = 0.36
+    fig, ax = plt.subplots(figsize=(5.4, 3.5))
+    b1 = ax.bar([xi - w / 2 for xi in x], off, w, label="clip-off",
+                color="C0", zorder=3)
+    b2 = ax.bar([xi + w / 2 for xi in x], on, w, label="clip-on (b=10)",
+                color="C3", zorder=3)
+    ax.bar_label(b1, labels=[f"{v}/6" for v in off], padding=2, fontsize=9)
+    ax.bar_label(b2, labels=[f"{v}/6" for v in on], padding=2, fontsize=9)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(arms)
+    ax.set_ylabel("collapsed cells (<20% done, /6)")
+    ax.set_ylim(0, 3)
+    ax.set_title("Return-clip rescues RDSAC-mean, conflicts with CVaR")
+    ax.legend(fontsize=9, loc="upper center")
+    # arrows telling the two opposite stories
+    ax.annotate("", xy=(-w / 2, 0.15), xytext=(-w / 2, 1.9),
+                arrowprops=dict(arrowstyle="->", color="0.3", lw=1.4))
+    ax.text(0, 2.35, "mean: 2→0 ✓", ha="center", fontsize=8, color="0.2")
+    ax.annotate("", xy=(1 + w / 2, 1.9), xytext=(1 + w / 2, 0.15),
+                arrowprops=dict(arrowstyle="->", color="0.3", lw=1.4))
+    ax.text(1, 2.35, "cvar: 0→2 ✗", ha="center", fontsize=8, color="0.2")
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_stabilizer.png")
+    plt.close(fig)
+
+
 def main() -> int:
     plot_drift()
     plot_scale()
-    for f in ("fig_drift.png", "fig_scale.png"):
+    plot_stabilizer()
+    for f in ("fig_drift.png", "fig_scale.png", "fig_stabilizer.png"):
         print(f"[out] {OUT / f}")
     return 0
 
