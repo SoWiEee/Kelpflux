@@ -46,8 +46,8 @@ for SEED in 42 43 44; do
     --rdsac-mean-ckpt "${CK}/rdsac_mean_s${SEED}.pt" \
     --rdsac-cvar-ckpt "${CK}/rdsac_cvar_s${SEED}.pt" \
     --crossq-ckpt "${CK}/crossq_s${SEED}.pt" \
-    --family philly --n-jobs 30 --seed 42 \
-    --sigmas 1.0 --rounds 3 --warmup 1 --interleave \
+    --family philly --n-jobs "${N_JOBS:-30}" --seed 42 \
+    --sigmas 1.0 --rounds "${ROUNDS:-3}" --warmup 1 --interleave \
     --cuda-workload --placement --gpu-nodes "$GPU_NODES" \
     --arrival-mode poisson --mps-oversub 1.0 --target-max-s 20 --mps-buckets 25,50,75,100 \
     --partition gpu --out-dir "$OUT" >>"$LOG" 2>&1
