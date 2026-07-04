@@ -165,6 +165,8 @@ def main(argv=None) -> int:
                    help="Duan et al. 2021 target return-clip boundary b (0 = off)")
     p.add_argument("--crossq", action="store_true",
                    help="add a CrossQ arm (Bhatt 2024: BN critic, no target, UTD=1)")
+    p.add_argument("--no-rdsac", action="store_true",
+                   help="skip the RDSAC arms (e.g. for a CrossQ-only run)")
     p.add_argument("--curriculum", action="store_true")
     p.add_argument("--fixed-alpha", action="store_true",
                    help="pin the entropy temperature α for both models "
@@ -199,11 +201,12 @@ def main(argv=None) -> int:
             agents["sac"] = _train(use_iqn=False, risk_mode="mean",
                                    risk_beta=args.risk_beta, sigma=sigma,
                                    interference=args.interference, args=args)
-        for m in risk_modes:
-            print(f"[train] RDSAC-{m} ...", flush=True)
-            agents[f"rdsac-{m}"] = _train(use_iqn=True, risk_mode=m,
-                                          risk_beta=args.risk_beta, sigma=sigma,
-                                          interference=args.interference, args=args)
+        if not args.no_rdsac:
+            for m in risk_modes:
+                print(f"[train] RDSAC-{m} ...", flush=True)
+                agents[f"rdsac-{m}"] = _train(use_iqn=True, risk_mode=m,
+                                              risk_beta=args.risk_beta, sigma=sigma,
+                                              interference=args.interference, args=args)
         if args.crossq:
             print("[train] CrossQ (BN critic, no target, UTD=1) ...", flush=True)
             agents["crossq"] = _train(use_iqn=False, risk_mode="mean",
