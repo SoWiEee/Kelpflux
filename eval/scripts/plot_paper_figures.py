@@ -127,9 +127,6 @@ def plot_stabilizer() -> None:
     arms = ["RDSAC-mean", "RDSAC-cvar"]
     off = [2, 0]   # collapsed cells (<20% done) out of 6
     on = [0, 2]
-    # honest ΔJCT% (100%-completing cells only), for annotation
-    honest = {"RDSAC-mean": ("clip-off: artifact", "clip-on: −3.5/−12.5"),
-              "RDSAC-cvar": ("clip-off: −41/−37", "clip-on: degraded")}
 
     x = list(range(len(arms)))
     w = 0.36
