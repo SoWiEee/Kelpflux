@@ -351,6 +351,10 @@ data:
     RL_ENABLED   = {{ if $rll.enabled }}true{{ else }}false{{ end }}
     RL_URL       = {{ default "http://rl-scheduler:8002/decide" $rll.url | quote }}
     RL_TIMEOUT_S = {{ default 0.15 $rll.timeoutSeconds }}
+    RL_PLACEMENT = {{ if $rll.placement }}true{{ else }}false{{ end }}
+    -- node_j (0-indexed, snapshot order) → Slurm node name. MUST match the
+    -- snapshot node order the serve builds obs from (currently 3080, 4070).
+    RL_NODE_NAMES = { {{ range $i, $n := $rll.nodeNames }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end }} }
 
 {{ .Files.Get "lua/rl_hook.lua" | indent 4 }}
 

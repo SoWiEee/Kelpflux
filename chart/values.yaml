@@ -558,6 +558,14 @@ rlScheduler:
     enabled: false        # job_submit.lua does NOT call /decide unless true
     url: "http://rl-scheduler:8002/decide"
     timeoutSeconds: 0.15  # curl --max-time
+    placement: false      # opt-in: apply submit-time explicit placement (set
+                          #   job_desc.req_nodes from /decide's node_j). Off by
+                          #   default — the live A/B shows RL placement loses to
+                          #   score (paper §4.2 表4-1), so this is a capability,
+                          #   not a recommended-on default.
+    nodeNames: []         # node_j (0-indexed, SNAPSHOT order) → node name.
+                          #   MUST match the serve snapshot node order (currently
+                          #   [slurm-worker-gpu-rtx3080-0, slurm-worker-gpu-rtx4070-0]).
 
 # -- Weight tuner (M9/M10-F) --------------------------------------------------
 # UCB1 outer-loop bandit that dynamically tunes (α, δ, ε) score weights.
