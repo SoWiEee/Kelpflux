@@ -26,6 +26,7 @@ from typing import Optional
 from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (
+    HybridWorkloadSpec,
     LlmWorkloadSpec,
     WorkloadSpec,
     collect_sacct,
@@ -195,7 +196,11 @@ def run(args) -> int:
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
                     args.login_pod, "--"] if args.login_pod else None)
     # Real-CUDA workload (replaces sleep): same spec across all arms → fair.
-    if args.llm_workload:
+    if args.hybrid_workload:
+        workload = HybridWorkloadSpec(
+            llm=LlmWorkloadSpec(model=args.llm_model, batch_size=args.llm_batch_size,
+                                gen_len=args.llm_gen_len))
+    elif args.llm_workload:
         workload = LlmWorkloadSpec(model=args.llm_model, batch_size=args.llm_batch_size,
                                    gen_len=args.llm_gen_len)
     elif args.cuda_workload:
@@ -309,9 +314,13 @@ def main(argv=None) -> int:
     p.add_argument("--llm-workload", action="store_true",
                    help="run real small-LLM jobs (Qwen2.5-0.5B batched generation / "
                         "fine-tune) instead of sgemm — the 'AI serving' workload")
+    p.add_argument("--hybrid-workload", action="store_true",
+                   help="mps<50 → cuBLAS sgemm, mps>=50 → real LLM generation. Keeps "
+                        "the 25/50/75/100 buckets while fitting the 10GB 3080 (4-way "
+                        "LLM co-residency OOMs / NFS-thrashes)")
     p.add_argument("--llm-model", default="/shared/models/qwen05b",
                    help="model dir on /shared for llm_job.py")
-    p.add_argument("--llm-batch-size", type=int, default=32)
+    p.add_argument("--llm-batch-size", type=int, default=16)
     p.add_argument("--llm-gen-len", type=int, default=8,
                    help="new tokens generated per inference round (prefill-heavy: "
                         "long prompt + short gen so co-resident jobs contend)")

@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.request as _urlreq
 import zlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -151,10 +151,15 @@ class LlmWorkloadSpec:
     # so co-resident jobs actually contend (~2× slowdown at 2×, like the sgemm
     # bench) — decode-heavy generation is launch/bandwidth-bound and barely
     # contends (validated 2026-07-07). This is what gives the MPS-packing lever.
-    batch_size: int = 32
-    prompt_len: int = 2048
+    # Sized to fit the 10GB 3080 under co-residency: batch=16/prompt=1024 runs
+    # 2-way (mps:50) on the 3080 without OOM (validated 2026-07-07); the bigger
+    # 2048/32 config OOMs at 2×. Still prefill-compute-bound → co-resident jobs
+    # contend. For the 4-way mps:25 bucket the harness routes to cuBLAS instead
+    # (HybridWorkloadSpec) — 4 concurrent LLM cold model-loads thrash NFS (~310s).
+    batch_size: int = 16
+    prompt_len: int = 1024
     gen_len: int = 8
-    infer_rate: float = 0.65   # prefill rounds/sec on idle 4070 (calib 2026-07-07)
+    infer_rate: float = 0.9    # prefill rounds/sec on idle 4070 (calib 2026-07-07)
     train_rate: float = 5.0    # fine-tune steps/sec on idle 4070 (calib 2026-07-07)
     time_factor: float = 25.0  # --time margin (slow card + contention)
     load_overhead_s: float = 120.0  # python+torch import + model load; large enough
@@ -182,6 +187,39 @@ class LlmWorkloadSpec:
     def time_min(self, job: "LiveJob") -> int:
         secs = job.true_runtime_s * self.time_factor + self.load_overhead_s
         return max(2, int(np.ceil(secs / 60.0)))
+
+
+@dataclass(frozen=True)
+class HybridWorkloadSpec:
+    """Route each job to a real workload by its MPS request, so the full
+    25/50/75/100 bucket structure runs on the VRAM-constrained 10GB 3080:
+      mps < llm_min_mps (mps 25/50) → cuBLAS sgemm — tiny host+VRAM, no model load;
+      mps >= llm_min_mps (mps 75/100) → real Qwen generation.
+    Same wrap()/time_min() interface, so the harness treats it like any spec.
+
+    Why llm_min_mps=75 (LLM never co-resides with another LLM): node-2 (the 3080
+    box) has only ~7.5 GB HOST RAM, and each LLM job stages ~2-3 GB (torch cu124 +
+    the 954 MB model + NFS cache) into host RAM before the GPU. Two concurrent LLM
+    jobs there exhaust host RAM → OOM-killer → processes wedge in D-state
+    (unkillable) → Slurm "Kill task failed" → node DRAINs. At the 75 threshold any
+    two LLM jobs need mps≥75 each = ≥150 > 100 per card, so they can NEVER
+    co-reside → node-2 stages at most one model at a time (~2.5 GB, fits); an
+    mps:75 LLM job can still pack with an mps:25 cuBLAS job. cuBLAS (self-contained,
+    negligible host RAM) carries the co-resident small buckets. (Validated
+    2026-07-07: 2× LLM on the 3080 OOMs GPU too; 4× thrashes NFS ~310s.)
+    """
+    cublas: WorkloadSpec = field(default_factory=WorkloadSpec)
+    llm: LlmWorkloadSpec = field(default_factory=LlmWorkloadSpec)
+    llm_min_mps: int = 75
+
+    def _pick(self, job: "LiveJob"):
+        return self.llm if job.mps_req >= self.llm_min_mps else self.cublas
+
+    def wrap(self, job: "LiveJob") -> str:
+        return self._pick(job).wrap(job)
+
+    def time_min(self, job: "LiveJob") -> int:
+        return self._pick(job).time_min(job)
 
 
 def _job_noise(job_id: str, sigma: float, seed: int = 0) -> float:
