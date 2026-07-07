@@ -129,6 +129,61 @@ class BertWorkloadSpec:
         return max(2, int(np.ceil(secs / 60.0)))
 
 
+@dataclass(frozen=True)
+class LlmWorkloadSpec:
+    """Real small-LLM GPU job (batched autoregressive generation / fine-tune).
+
+    Same wrap()/time_min() interface as WorkloadSpec, so the harness uses it
+    interchangeably. ``job.job_class`` picks inference (batched generate, the
+    "AI serving" shape) vs training (fine-tune: forward+backward+AdamW).
+    Batched generation is *compute-bound*, so the job's runtime scales with both
+    the MPS thread budget (Slurm --gres=mps:N → CUDA_MPS_ACTIVE_THREAD_PERCENTAGE)
+    and card speed (4070 vs 3080) — the two levers the eval needs. n
+    (rounds/steps) = true_runtime_s × the calibrated per-mode rate; CRN seed from
+    job_id. Uses the relocatable /shared/py python by full path; llm_job.py loads
+    Qwen2.5-0.5B offline from /shared/models/qwen05b.
+    """
+    py: str = "/shared/py/bin/python3"
+    script: str = "/shared/scripts/llm_job.py"
+    model: str = "/shared/models/qwen05b"
+    # Prefill-heavy config: long prompt + short generation makes each round a
+    # big compute-bound prefill matmul (long-context serving: RAG/summarisation),
+    # so co-resident jobs actually contend (~2× slowdown at 2×, like the sgemm
+    # bench) — decode-heavy generation is launch/bandwidth-bound and barely
+    # contends (validated 2026-07-07). This is what gives the MPS-packing lever.
+    batch_size: int = 32
+    prompt_len: int = 2048
+    gen_len: int = 8
+    infer_rate: float = 0.65   # prefill rounds/sec on idle 4070 (calib 2026-07-07)
+    train_rate: float = 5.0    # fine-tune steps/sec on idle 4070 (calib 2026-07-07)
+    time_factor: float = 25.0  # --time margin (slow card + contention)
+    load_overhead_s: float = 120.0  # python+torch import + model load; large enough
+                                     # to cover the 3080's ~88s COLD NFS model read so
+                                     # short jobs there don't TIMEOUT→FAIL→get dropped
+                                     # (join_records keeps only COMPLETED) — the bias
+                                     # that made score look worse in the first LLM run.
+
+    def _mode_n(self, job: "LiveJob") -> tuple[str, int]:
+        # Default to generation (serving): heavytail "batch" jobs become
+        # variable-length generation requests. Only an explicit "training" class
+        # maps to fine-tune (used by the aiserve inference+training mix).
+        mode = "train" if job.job_class == "training" else "infer"
+        rate = self.infer_rate if mode == "infer" else self.train_rate
+        return mode, max(1, int(round(job.true_runtime_s * rate)))
+
+    def wrap(self, job: "LiveJob") -> str:
+        mode, n = self._mode_n(job)
+        seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
+        prefix = "srun " if job.gpu_count >= 2 else ""
+        return (f"{prefix}{self.py} {self.script} --mode {mode} --n {n} "
+                f"--batch-size {self.batch_size} --prompt-len {self.prompt_len} "
+                f"--gen-len {self.gen_len} --model {self.model} --seed {seed}")
+
+    def time_min(self, job: "LiveJob") -> int:
+        secs = job.true_runtime_s * self.time_factor + self.load_overhead_s
+        return max(2, int(np.ceil(secs / 60.0)))
+
+
 def _job_noise(job_id: str, sigma: float, seed: int = 0) -> float:
     """Mean-preserving lognormal multiplier exp(σZ − σ²/2), E=1.
 

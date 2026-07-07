@@ -26,6 +26,7 @@ from typing import Optional
 from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (
+    LlmWorkloadSpec,
     WorkloadSpec,
     collect_sacct,
     decide_node,
@@ -147,13 +148,34 @@ def _query_free_mps(exec_prefix, node_names: list[str]) -> list[int]:
 def _make_place_fn(arm: str, *, serve_url: str, node_names: list[str], exec_prefix,
                    placement: bool, dry_run: bool):
     """RL arms in placement mode → a closure that picks a node per job via /act.
-    score arm, non-placement mode, or dry_run → None (Slurm places)."""
+    score arm, non-placement mode, or dry_run → None (Slurm places).
+
+    Real-time MPS tracking: Slurm's AllocTRES only updates once a job is *scheduled*,
+    which lags the submit burst — so a per-job `scontrol` query keeps showing the
+    fast card as empty and the RL always picks node 0. Instead we query the
+    authoritative free-MPS baseline ONCE at stream start (the previous arm has
+    drained), then maintain a local in-flight tally: each placement holds its
+    mps_req on the chosen node until ~reported_runtime later, so the RL sees the
+    card fill up in real time and spills to the other node when it saturates.
+    """
     if not placement or arm == "score" or dry_run:
         return None
 
+    baseline = _query_free_mps(exec_prefix, node_names)   # once per (arm, round)
+    inflight: dict[str, list[tuple[float, int]]] = {n: [] for n in node_names}
+
     def _place(job):
-        free = _query_free_mps(exec_prefix, node_names)
-        return decide_node(serve_url, job, node_free_mps=free, node_names=node_names)
+        now = time.time()
+        free: list[int] = []
+        for i, n in enumerate(node_names):
+            inflight[n] = [(rel, m) for (rel, m) in inflight[n] if rel > now]  # expire
+            held = sum(m for _, m in inflight[n])
+            free.append(max(0, baseline[i] - held))
+        node = decide_node(serve_url, job, node_free_mps=free, node_names=node_names)
+        if node in inflight:
+            release = now + max(1.0, float(job.reported_runtime_s))
+            inflight[node].append((release, int(job.mps_req)))
+        return node
 
     return _place
 
@@ -173,13 +195,18 @@ def run(args) -> int:
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
                     args.login_pod, "--"] if args.login_pod else None)
     # Real-CUDA workload (replaces sleep): same spec across all arms → fair.
-    workload = (WorkloadSpec(bin_path=args.workload_bin, dim=args.workload_dim,
-                             vram_mb=args.workload_vram_mb,
-                             iters_per_sec=args.iters_per_sec,
-                             time_factor=args.workload_time_factor)
-                if args.cuda_workload else None)
+    if args.llm_workload:
+        workload = LlmWorkloadSpec(model=args.llm_model, batch_size=args.llm_batch_size,
+                                   gen_len=args.llm_gen_len)
+    elif args.cuda_workload:
+        workload = WorkloadSpec(bin_path=args.workload_bin, dim=args.workload_dim,
+                                vram_mb=args.workload_vram_mb,
+                                iters_per_sec=args.iters_per_sec,
+                                time_factor=args.workload_time_factor)
+    else:
+        workload = None
     if workload is not None:
-        print(f"[ab] CUDA workload: {workload}", flush=True)
+        print(f"[ab] workload: {workload}", flush=True)
     gpu_nodes = [n for n in (args.gpu_nodes or "").split(",") if n]
     if args.placement and not gpu_nodes:
         print("error: --placement requires --gpu-nodes node0,node1 (index ↔ RL node_j)",
@@ -279,6 +306,15 @@ def main(argv=None) -> int:
     # MPS interference / VRAM / heterogeneous-card speed surface in JCT.
     p.add_argument("--cuda-workload", action="store_true",
                    help="run real CUDA jobs (gpu_workload sgemm) instead of sleep N")
+    p.add_argument("--llm-workload", action="store_true",
+                   help="run real small-LLM jobs (Qwen2.5-0.5B batched generation / "
+                        "fine-tune) instead of sgemm — the 'AI serving' workload")
+    p.add_argument("--llm-model", default="/shared/models/qwen05b",
+                   help="model dir on /shared for llm_job.py")
+    p.add_argument("--llm-batch-size", type=int, default=32)
+    p.add_argument("--llm-gen-len", type=int, default=8,
+                   help="new tokens generated per inference round (prefill-heavy: "
+                        "long prompt + short gen so co-resident jobs contend)")
     p.add_argument("--exclusive-gpu", action="store_true",
                    help="each job takes the whole GPU (--gres=mps:100, no co-residency); "
                         "sidesteps MPS multiplexing, keeps heterogeneity + queueing")
