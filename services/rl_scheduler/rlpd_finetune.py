@@ -512,12 +512,18 @@ class RLPDAgent:
                  subset: int = 2, hidden=(256, 256), gamma: float = 0.99,
                  tau: float = 0.005, lr: float = 3e-4,
                  target_entropy_ratio: float = 0.5, layer_norm: bool = True,
+                 fixed_alpha: bool = False, init_alpha: float = 0.05,
                  device: str = "cpu") -> None:
         self.device = torch.device(device)
         self.n_actions = n_actions
         self.subset = min(subset, n_critics)
         self.gamma = gamma
         self.tau = tau
+        # Auto-α (SAC/RLPD default) rails to huge values here because the action
+        # mask leaves only ~2-3 legal actions, so max entropy ≪ ratio·log(A) and
+        # the target is unreachable → α→∞ → near-random policy. fixed_alpha pins
+        # it (matches the sim training recipe; robust for masked discrete SAC).
+        self.fixed_alpha = fixed_alpha
         self.actor = _CategoricalActor(obs_dim, n_actions, hidden, layer_norm).to(self.device)
         self.q = _EnsembleCritic(obs_dim, n_actions, n_critics, hidden, layer_norm).to(self.device)
         self.q_targ = _EnsembleCritic(obs_dim, n_actions, n_critics, hidden, layer_norm).to(self.device)
@@ -526,8 +532,10 @@ class RLPDAgent:
             p.requires_grad_(False)
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.opt_q = torch.optim.Adam(self.q.parameters(), lr=lr)
-        self.log_alpha = torch.zeros(1, device=self.device, requires_grad=True)
-        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr)
+        self.log_alpha = torch.full((1,), float(np.log(init_alpha)),
+                                    device=self.device, requires_grad=not fixed_alpha)
+        self.opt_alpha = (None if fixed_alpha
+                          else torch.optim.Adam([self.log_alpha], lr=lr))
         self.target_entropy = target_entropy_ratio * float(np.log(n_actions))
         self.update_count = 0
 
@@ -577,12 +585,13 @@ class RLPDAgent:
         loss_actor.backward()
         self.opt_actor.step()
 
-        # ── temperature: match target entropy ──
+        # ── temperature: match target entropy (skipped when α is pinned) ──
         entropy = -(probs * logp).sum(dim=-1)                               # (B,)
-        loss_alpha = (self.log_alpha * (entropy.detach() - self.target_entropy)).mean()
-        self.opt_alpha.zero_grad(set_to_none=True)
-        loss_alpha.backward()
-        self.opt_alpha.step()
+        if not self.fixed_alpha:
+            loss_alpha = (self.log_alpha * (entropy.detach() - self.target_entropy)).mean()
+            self.opt_alpha.zero_grad(set_to_none=True)
+            loss_alpha.backward()
+            self.opt_alpha.step()
 
         # ── soft target update ──
         with torch.no_grad():
@@ -622,6 +631,7 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                utd_ratio: int, batch_size: int, online_ratio: float,
                out_dir: Path,
                n_critics: int = 10, subset: int = 2,
+               fixed_alpha: bool = False, init_alpha: float = 0.05,
                trace_family: str = "philly", n_jobs: int = 100,
                n_nodes: int = 1, gpus_per_node: int = 1) -> None:
     """Faithful RLPD fine-tune (see RLPDAgent): symmetric 50/50 offline+online
@@ -639,6 +649,7 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
     n_actions = offline.n_actions
 
     agent = RLPDAgent(obs_dim, n_actions, n_critics=n_critics, subset=subset,
+                      fixed_alpha=fixed_alpha, init_alpha=init_alpha,
                       device="cuda" if torch.cuda.is_available() else "cpu")
     # Warm-start the actor from a sim-trained policy if one is given (the sim
     # buffer is still the offline prior via symmetric sampling; only the actor
@@ -746,6 +757,12 @@ def main(argv=None) -> int:
                    help="RLPD LayerNorm critic ensemble size (Ball et al. 2023)")
     p.add_argument("--subset", type=int, default=2,
                    help="random critic subset min-reduced for the target (REDQ)")
+    p.add_argument("--fixed-alpha", action="store_true",
+                   help="pin the entropy temperature α (masked discrete SAC rails "
+                        "auto-α to ∞ since target ratio·log(A) exceeds the max "
+                        "entropy of the ~2-3 legal actions)")
+    p.add_argument("--init-alpha", type=float, default=0.05,
+                   help="α value when --fixed-alpha (else initial α)")
     p.add_argument("--trace-family", default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     # Cluster shape — must match the live deployment.
@@ -811,6 +828,7 @@ def main(argv=None) -> int:
         online_ratio=args.online_ratio if len(online) else 0.0,
         out_dir=Path(args.out_dir),
         n_critics=args.n_critics, subset=args.subset,
+        fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,
         trace_family=args.trace_family,
         n_jobs=args.n_jobs,
         n_nodes=args.n_nodes,
