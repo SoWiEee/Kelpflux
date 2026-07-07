@@ -77,9 +77,18 @@ class LiveCluster:
     mps_per_gpu: int = MPS_PER_GPU
 
 
-def _run(cmd: List[str], timeout: int = 10) -> str:
+# Optional exec prefix so the daemon can run OFF-cluster (e.g. on the dev host
+# where torch lives) and reach slurm via kubectl, e.g.
+#   SLURM_EXEC_PREFIX="kubectl exec -n slurm slurm-controller-0 --"
+# Empty (default) = run in-cluster, unchanged behaviour.
+import shlex as _shlex  # noqa: E402
+_EXEC_PREFIX = _shlex.split(os.environ.get("SLURM_EXEC_PREFIX", ""))
+
+
+def _run(cmd: List[str], timeout: int = 20) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(_EXEC_PREFIX + cmd, capture_output=True, text=True,
+                           timeout=timeout)
         return r.stdout.strip()
     except Exception:
         return ""
@@ -343,100 +352,81 @@ def run_daemon(
           f"shadow={shadow}  poll={poll_interval}s")
     print(f"[daemon] log → {log_path}")
 
-    # Track submitted jobs for reward computation: job_id → (obs, act, mask, submit_ts)
-    in_flight: Dict[str, tuple] = {}
+    # Behaviour-policy observation (valid offline data, shadow-safe). We log the
+    # placement that ACTUALLY happened — which node Slurm/score ran each job on —
+    # paired with its realised reward, NOT a counterfactual RL action whose reward
+    # would not match what ran. RLPD/offline RL learns from any behaviour policy,
+    # so this yields clean (s, a, r, s') without executing anything on the cluster.
+    n_placements = len(node_names) * n_gpus
+    pending_obs: Dict[str, tuple] = {}   # job_id → (obs, mask, top_ids, obs_ts)
+    in_flight:   Dict[str, tuple] = {}    # job_id → (obs, act, mask, obs_ts)
+
+    def _node_j_of(nodelist: str) -> Optional[int]:
+        for k, nm in enumerate(node_names):
+            if nm and nm in (nodelist or ""):
+                return k
+        return None
 
     with open(log_path, "w") as log_fh:
         while True:
-            now     = time.time()
-            pending = query_pending_jobs(runtime_predictor_url)
-            cluster = query_cluster(node_names, n_gpus, mps_per_gpu)
+            now      = time.time()
+            all_jobs = _parse_squeue(_run(["squeue", "--json"]))
+            cluster  = query_cluster(node_names, n_gpus, mps_per_gpu)
+            pending  = [j for j in all_jobs if "PENDING" in str(j.state).upper()]
+            running  = [j for j in all_jobs if "RUNNING" in str(j.state).upper()]
+            live_ids = {j.job_id for j in all_jobs}
 
-            if not pending:
-                time.sleep(poll_interval)
-                continue
+            # (1) Snapshot the decision-state for each currently-pending job (the
+            #     state a scheduler faced just before the job was placed).
+            if pending:
+                obs, mask, top_ids = build_obs_and_mask(
+                    pending, cluster, node_names, n_gpus, now)
+                for jid in top_ids:
+                    if jid:
+                        pending_obs[jid] = (obs.copy(), mask.copy(),
+                                            list(top_ids), now)
 
-            obs, mask, top_ids = build_obs_and_mask(
-                pending, cluster, node_names, n_gpus, now
-            )
+            # (2) A job that STARTED running = the action the behaviour policy took
+            #     (which job, onto which node). Encode it against its decision-obs.
+            for rj in running:
+                jid = rj.job_id
+                if jid in pending_obs and jid not in in_flight:
+                    o, m, tids, ts = pending_obs.pop(jid)
+                    node_j = _node_j_of(rj.nodelist)
+                    job_i  = tids.index(jid) if jid in tids else -1
+                    if node_j is None or job_i < 0:
+                        continue
+                    act = job_i * n_placements + node_j * n_gpus + 0
+                    in_flight[jid] = (o, int(act), m, ts)
 
-            # Safety: wait for warmup if live data is sparse
-            n_legal = int(mask.sum()) - 1  # exclude no-op
-            if n_legal == 0:
-                time.sleep(poll_interval)
-                continue
-
-            should_act = (len(live_buf) >= live_warmup_min)
-            if should_act:
-                action, value, entropy = _agent_select(agent, obs, mask)
-                abstain = (value < value_abstain or entropy > entropy_abstain)
+            # (3) A job that FINISHED = realised reward (−JCT) → log the transition.
+            if pending:
+                next_obs, next_mask, _ = build_obs_and_mask(
+                    pending, cluster, node_names, n_gpus, now)
             else:
-                action  = n_actions - 1  # no-op until warmup
-                value   = 0.0
-                entropy = 0.0
-                abstain = True
-
-            n_placements = len(node_names) * n_gpus
-            no_op        = n_actions - 1
-
-            row = {
-                "ts": now, "action": action, "value": value,
-                "entropy": entropy, "abstain": abstain,
-                "n_pending": len(pending), "live_buf": len(live_buf),
-            }
-
-            if not abstain and action != no_op:
-                job_i  = action // n_placements
-                rem    = action %  n_placements
-                node_j = rem // n_gpus
-                gpu_k  = rem %  n_gpus
-                if job_i < len(top_ids) and top_ids[job_i]:
-                    sel_job_id = top_ids[job_i]
-                    node_name  = node_names[node_j]
-                    sel_job    = next(j for j in pending if j.job_id == sel_job_id)
-                    ok = execute_placement(sel_job, node_name, gpu_k, shadow=shadow)
-                    if ok:
-                        in_flight[sel_job_id] = (obs.copy(), action, mask.copy(), now)
-                        row["selected_job"] = sel_job_id
-                        row["node"] = node_name
-                        row["gpu_k"] = gpu_k
-                        decisions_made += 1
-
-            log_fh.write(json.dumps(row) + "\n")
-            log_fh.flush()
-
-            # Check for completed jobs and log transitions
-            all_jobs = _run(["squeue", "--json"])
-            current_ids = {j.job_id for j in _parse_squeue(all_jobs)}
-            for jid, (prev_obs, prev_act, prev_mask, start_ts) in list(in_flight.items()):
-                if jid not in current_ids:
-                    # Job finished — compute reward as –JCT/scale
-                    jct   = now - start_ts
-                    rew   = -jct / 1000.0
-                    # next obs is current state (after job completed)
-                    next_obs, next_mask, _ = build_obs_and_mask(
-                        pending, cluster, node_names, n_gpus, now
-                    )
-                    t = Transition(
-                        obs=prev_obs, act=prev_act, rew=float(rew),
+                next_obs  = np.zeros(obs_dim, dtype=np.float32)
+                next_mask = np.zeros(n_actions, dtype=bool); next_mask[-1] = True
+            for jid in list(in_flight):
+                if jid not in live_ids:
+                    o, act, m, ts = in_flight.pop(jid)
+                    jct = max(1.0, now - ts)
+                    rew = -jct / 1000.0
+                    live_buf.add(Transition(
+                        obs=o, act=int(act), rew=float(rew),
                         next_obs=next_obs, done=False,
-                        mask=prev_mask, next_mask=next_mask,
-                    )
-                    live_buf.add(t)
-                    # Log to JSONL for RLPD
+                        mask=m, next_mask=next_mask))
                     log_fh.write(json.dumps({
-                        "obs": prev_obs.tolist(), "act": prev_act,
-                        "rew": float(rew), "next_obs": next_obs.tolist(),
-                        "done": False,
-                        "mask": prev_mask.tolist(),
-                        "next_mask": next_mask.tolist(),
+                        "obs": o.tolist(), "act": int(act), "rew": float(rew),
+                        "next_obs": next_obs.tolist(), "done": False,
+                        "mask": m.tolist(), "next_mask": next_mask.tolist(),
                         "jct_s": jct,
                     }) + "\n")
-                    del in_flight[jid]
+                    log_fh.flush()
+                    decisions_made += 1
 
-            print(f"[daemon] {time.strftime('%H:%M:%S')}  "
-                  f"pending={len(pending)}  decisions={decisions_made}  "
-                  f"live_buf={len(live_buf)}  abstain={abstain}")
+            print(f"[daemon] {time.strftime('%H:%M:%S')}  pending={len(pending)} "
+                  f"running={len(running)}  in_flight={len(in_flight)}  "
+                  f"logged={decisions_made}  buf={len(live_buf)}")
             time.sleep(poll_interval)
 
 

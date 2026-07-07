@@ -29,10 +29,13 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from sim.gym_env import KubefluxSchedEnv
 from sim.loader import load_auto
 from sim.scheduler.score import ScoreScheduler
+from services.rl_scheduler.dsac import _CategoricalActor, _build_mlp
 
 
 class SumTree:
@@ -467,16 +470,165 @@ def mixed_batch(*, offline: ReplayBuffer, online: ReplayBuffer,
     return out
 
 
+class _EnsembleCritic(torch.nn.Module):
+    """N independent discrete Q-nets, each a LayerNorm MLP obs→[n_actions].
+
+    The LayerNorm (in ``_build_mlp``) and the ensemble are the two ingredients
+    RLPD (Ball et al. 2023) identifies as essential for learning from offline
+    data without value divergence / overestimation.
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int, n_critics: int = 10,
+                 hidden=(256, 256), layer_norm: bool = True) -> None:
+        super().__init__()
+        self.q = torch.nn.ModuleList(
+            [_build_mlp(obs_dim, hidden, n_actions, layer_norm)
+             for _ in range(n_critics)])
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:   # → (N, B, A)
+        return torch.stack([c(obs) for c in self.q], dim=0)
+
+
+class RLPDAgent:
+    """Faithful RLPD (Ball, Smith, Kostrikov, Levine 2023, arXiv:2302.02948),
+    adapted to discrete masked actions (discrete SAC, Christodoulou 2019):
+
+      • symmetric sampling — every gradient batch is 50 % offline (sim prior) +
+        50 % online (real), regardless of buffer sizes (done by ``mixed_batch``);
+      • LayerNorm critics in a large ENSEMBLE (default 10);
+      • random subset of ``subset`` critics (default 2) min-reduced for the
+        target → clipped-double-Q / REDQ-style pessimism that curbs the
+        offline-data overestimation RLPD warns about;
+      • SAC max-entropy backup with automatic temperature α;
+      • high UTD (the caller loops ``utd_ratio`` updates per env step).
+
+    Not a warm-started copy of a pretrained net: RLPD's premise is online RL
+    *with* offline data, so the ensemble/critics train from scratch while the
+    sim buffer supplies the prior via symmetric sampling. The actor may be
+    warm-started from the sim policy (same _CategoricalActor architecture).
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int, *, n_critics: int = 10,
+                 subset: int = 2, hidden=(256, 256), gamma: float = 0.99,
+                 tau: float = 0.005, lr: float = 3e-4,
+                 target_entropy_ratio: float = 0.5, layer_norm: bool = True,
+                 device: str = "cpu") -> None:
+        self.device = torch.device(device)
+        self.n_actions = n_actions
+        self.subset = min(subset, n_critics)
+        self.gamma = gamma
+        self.tau = tau
+        self.actor = _CategoricalActor(obs_dim, n_actions, hidden, layer_norm).to(self.device)
+        self.q = _EnsembleCritic(obs_dim, n_actions, n_critics, hidden, layer_norm).to(self.device)
+        self.q_targ = _EnsembleCritic(obs_dim, n_actions, n_critics, hidden, layer_norm).to(self.device)
+        self.q_targ.load_state_dict(self.q.state_dict())
+        for p in self.q_targ.parameters():
+            p.requires_grad_(False)
+        self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.opt_q = torch.optim.Adam(self.q.parameters(), lr=lr)
+        self.log_alpha = torch.zeros(1, device=self.device, requires_grad=True)
+        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr)
+        self.target_entropy = target_entropy_ratio * float(np.log(n_actions))
+        self.update_count = 0
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp().detach()
+
+    def _t(self, x, dtype=torch.float32) -> torch.Tensor:
+        return torch.as_tensor(x, dtype=dtype, device=self.device)
+
+    def update(self, batch: dict) -> dict:
+        obs        = self._t(batch["obs"])
+        next_obs   = self._t(batch["next_obs"])
+        act        = self._t(batch["acts"], torch.long).view(-1)
+        rew        = self._t(batch["rews"]).view(-1)
+        done       = self._t(batch["dones"]).view(-1)
+        mask       = self._t(batch["masks"], torch.bool)
+        next_mask  = self._t(batch["next_masks"], torch.bool)
+        gammas     = self._t(batch["gammas"]).view(-1) if "gammas" in batch \
+            else torch.full_like(rew, self.gamma)
+        B = obs.shape[0]
+        alpha = self.alpha
+
+        # ── critic: target = r + γ·V(s'), V from a RANDOM SUBSET min (REDQ) ──
+        with torch.no_grad():
+            probs_n, logp_n = self.actor.policy(next_obs, next_mask)          # (B, A)
+            qt = self.q_targ(next_obs)                                        # (N, B, A)
+            idx = torch.randperm(qt.shape[0], device=self.device)[:self.subset]
+            qt_min = qt[idx].min(dim=0).values                               # (B, A)
+            v_next = (probs_n * (qt_min - alpha * logp_n)).sum(dim=-1)        # (B,)
+            y = rew + (1.0 - done) * gammas * v_next                         # (B,)
+
+        q_all = self.q(obs)                                                  # (N, B, A)
+        a_idx = act.view(1, B, 1).expand(q_all.shape[0], B, 1)
+        q_taken = q_all.gather(-1, a_idx).squeeze(-1)                        # (N, B)
+        loss_q = F.mse_loss(q_taken, y.unsqueeze(0).expand_as(q_taken))
+        self.opt_q.zero_grad(set_to_none=True)
+        loss_q.backward()
+        self.opt_q.step()
+
+        # ── actor: minimise E_a π(α·logπ − Q̄) (Q̄ = ensemble mean) ──
+        probs, logp = self.actor.policy(obs, mask)                          # (B, A)
+        with torch.no_grad():
+            q_mean = self.q(obs).mean(dim=0)                                 # (B, A)
+        loss_actor = (probs * (alpha * logp - q_mean)).sum(dim=-1).mean()
+        self.opt_actor.zero_grad(set_to_none=True)
+        loss_actor.backward()
+        self.opt_actor.step()
+
+        # ── temperature: match target entropy ──
+        entropy = -(probs * logp).sum(dim=-1)                               # (B,)
+        loss_alpha = (self.log_alpha * (entropy.detach() - self.target_entropy)).mean()
+        self.opt_alpha.zero_grad(set_to_none=True)
+        loss_alpha.backward()
+        self.opt_alpha.step()
+
+        # ── soft target update ──
+        with torch.no_grad():
+            for p, pt in zip(self.q.parameters(), self.q_targ.parameters()):
+                pt.mul_(1.0 - self.tau).add_(self.tau * p)
+        self.update_count += 1
+        return {"loss_critic": float(loss_q.item()),
+                "loss_actor": float(loss_actor.item()),
+                "alpha": float(alpha.item()),
+                "entropy": float(entropy.mean().item())}
+
+    def warm_start_actor(self, actor_state: dict) -> None:
+        """Load a sim-trained _CategoricalActor's weights (same architecture)."""
+        try:
+            self.actor.load_state_dict(actor_state)
+            print("[rlpd] warm-started actor from sim policy")
+        except Exception as e:  # architecture mismatch → train actor from scratch
+            print(f"[rlpd] actor warm-start skipped ({e})")
+
+    def select_action(self, obs, mask, greedy: bool = True) -> int:
+        with torch.no_grad():
+            o = self._t(obs).unsqueeze(0)
+            m = self._t(mask, torch.bool).unsqueeze(0)
+            probs, _ = self.actor.policy(o, m)
+            if greedy:
+                return int(probs.argmax(dim=-1).item())
+            return int(torch.multinomial(probs, 1).item())
+
+    def save(self, path) -> None:
+        torch.save({"actor": self.actor.state_dict(), "q": self.q.state_dict(),
+                    "log_alpha": self.log_alpha.detach().cpu(),
+                    "n_actions": self.n_actions, "rlpd": True}, path)
+
+
 def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                online: ReplayBuffer, n_updates: int,
                utd_ratio: int, batch_size: int, online_ratio: float,
                out_dir: Path,
+               n_critics: int = 10, subset: int = 2,
                trace_family: str = "philly", n_jobs: int = 100,
                n_nodes: int = 1, gpus_per_node: int = 1) -> None:
-    """DSAC RLPD fine-tune: 50/50 offline+online batch, UTD gradient steps.
+    """Faithful RLPD fine-tune (see RLPDAgent): symmetric 50/50 offline+online
+    batches, LayerNorm critic ensemble + random-subset target, high UTD.
 
-    Each gradient step draws a mixed batch: online_ratio from live data,
-    rest from sim offline buffer. High UTD closes the sim-to-real gap.
+    Each gradient step draws a mixed batch: online_ratio from live data, rest
+    from the sim offline prior. High UTD closes the sim-to-real gap.
     """
     from .dsac import DSACAgent
     from sim.runner import run as sim_run
@@ -486,12 +638,18 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
     obs_dim   = offline.obs_dim
     n_actions = offline.n_actions
 
+    agent = RLPDAgent(obs_dim, n_actions, n_critics=n_critics, subset=subset,
+                      device="cuda" if torch.cuda.is_available() else "cpu")
+    # Warm-start the actor from a sim-trained policy if one is given (the sim
+    # buffer is still the offline prior via symmetric sampling; only the actor
+    # weights are copied — the RLPD critic ensemble always trains from scratch).
+    base_ckpt = Path(base_policy_dir) / "dsac.pt" if base_policy_dir else None
+    if base_ckpt and base_ckpt.exists():
+        print(f"[rlpd] warm-starting actor from {base_ckpt}")
+        sd = torch.load(base_ckpt, map_location="cpu", weights_only=False)
+        if isinstance(sd, dict) and "actor" in sd:
+            agent.warm_start_actor(sd["actor"])
     warm_start = out_dir / "dsac.pt"
-    if warm_start.exists():
-        print(f"[rlpd] warm-starting from {warm_start}")
-        agent = DSACAgent.load(warm_start)
-    else:
-        agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions, device="cpu")
 
     rng      = np.random.default_rng(0)
     log_path = out_dir / "rlpd_train.jsonl"
@@ -584,6 +742,10 @@ def main(argv=None) -> int:
     p.add_argument("--utd-ratio", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--online-ratio", type=float, default=0.5)
+    p.add_argument("--n-critics", type=int, default=10,
+                   help="RLPD LayerNorm critic ensemble size (Ball et al. 2023)")
+    p.add_argument("--subset", type=int, default=2,
+                   help="random critic subset min-reduced for the target (REDQ)")
     p.add_argument("--trace-family", default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     # Cluster shape — must match the live deployment.
@@ -648,6 +810,7 @@ def main(argv=None) -> int:
         batch_size=args.batch_size,
         online_ratio=args.online_ratio if len(online) else 0.0,
         out_dir=Path(args.out_dir),
+        n_critics=args.n_critics, subset=args.subset,
         trace_family=args.trace_family,
         n_jobs=args.n_jobs,
         n_nodes=args.n_nodes,
