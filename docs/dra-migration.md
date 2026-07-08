@@ -253,8 +253,25 @@ slurm-worker-gpu-rtx4070 --replicas=0`（釋放 claim → DRA 拆 MPS）→ `nvi
 玩畢 `--replicas=1`。（gpu-toggle.sh 待更新以配合 DRA。）
 
 **永久化狀態**：worker DRA 已進 chart（`values-2x1.yaml` + `workers.yaml` + `dra-resourceclaim.yaml`），
-跨 `helm upgrade` 存活。待補：(a) gpu-operator release 設 `devicePlugin.enabled=false` 使 operands 停用
-永久化（目前靠手動 label）；(b) 更新 `gpu-toggle.sh` 支援 DRA 遊戲流程；(c) `deploy-2.sh` 加裝 DRA driver。
+跨 `helm upgrade` 存活。
+
+## 6.3 永久化收尾（2026-07-08，✅ 完成）
+
+三項待補全數落地：
+1. **gpu-operator `devicePlugin.enabled=false`**（`deploy-2.sh` install_gpu_operator 已加 flag +
+   live `helm upgrade` REV 4）→ device-plugin/mps-control-daemon 永久停用（含那個一直 panic 的
+   config-manager sidecar）。**operands=false 手動 label 已移除**，改由 config 驅動；移除後 device-plugin
+   仍為 0，DRA workers 照常。
+2. **`scripts/gpu-toggle.sh` 改寫為 DRA 版**：release = `kubectl cordon` node + 逐出 worker pod
+   （pod 轉 Pending → 釋放 DRA claim → DRA 拆 MPS）+ `nvidia-smi -c 0`；restore = uncordon + 等 pod
+   ready + Slurm resume。（舊版切 operands label 在 DRA 下無效。）
+3. **`deploy-2.sh` 新增 `install_dra_driver`**（helm OCI chart，`gpuResourcesEnabledOverride=true`、
+   `featureGates.MPSSupport=true`、`resources.computeDomains.enabled=false`、`nvidiaDriverRoot=/`）
+   並在主流程 gpu-operator 之後呼叫；`SKIP_DRA=1` 可退回 device-plugin 路徑。
+
+**至此全新叢集 `bash scripts/deploy-2.sh` 即可一鍵部署為純-DRA。** device-plugin 脆弱性
+（[[project-mps-recovery-after-gaming]] 的雙-plugin 搶 socket、config-manager panic、CDI 注入 race）
+已完全根除。
 
 ## 參考
 - Repo：https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu （v0.4.x，NVIDIA 已捐給 k8s SIG）

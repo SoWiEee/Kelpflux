@@ -40,6 +40,11 @@ DEVICE_PLUGIN_CONFIG="${DEVICE_PLUGIN_CONFIG:-slurm-platform-device-plugin-confi
 DEFAULT_CONFIG_KEY="${DEFAULT_CONFIG_KEY:-default}"
 MPS_ROOT="${MPS_ROOT:-/run/nvidia/mps}"
 
+# NVIDIA DRA driver (docs/dra-migration.md) — replaces the device-plugin for
+# GPU/MPS on pools with useDra=true. Set SKIP_DRA=1 to opt out (device-plugin path).
+DRA_DRIVER_VERSION="${DRA_DRIVER_VERSION:-0.4.1}"
+SKIP_DRA="${SKIP_DRA:-0}"
+
 log() { printf '[%(%Y-%m-%dT%H:%M:%S%z)T] [deploy-2] %s\n' -1 "$*"; }
 warn() { printf '[%(%Y-%m-%dT%H:%M:%S%z)T] [deploy-2][WARN] %s\n' -1 "$*" >&2; }
 fail() { printf '[%(%Y-%m-%dT%H:%M:%S%z)T] [deploy-2][ERROR] %s\n' -1 "$*" >&2; exit 1; }
@@ -142,7 +147,28 @@ install_gpu_operator() {
   run kubectl label ns "$GPU_OPERATOR_NAMESPACE"     pod-security.kubernetes.io/enforce=privileged     pod-security.kubernetes.io/audit=privileged     pod-security.kubernetes.io/warn=privileged     --overwrite
 
   log "converging NVIDIA GPU Operator $GPU_OPERATOR_VERSION"
-  run helm upgrade --install "$GPU_OPERATOR_RELEASE" nvidia/gpu-operator     -n "$GPU_OPERATOR_NAMESPACE"     --version "$GPU_OPERATOR_VERSION"     --timeout "$HELM_TIMEOUT"     --wait     --set driver.enabled=false     --set toolkit.enabled=false     --set devicePlugin.config.name="$DEVICE_PLUGIN_CONFIG"     --set devicePlugin.config.default="$DEFAULT_CONFIG_KEY"     --set mps.root="$MPS_ROOT"     --set dcgmExporter.enabled=true     --set dcgmExporter.serviceMonitor.enabled=false     --set migManager.enabled=false     --set nodeStatusExporter.enabled=false     --set-string 'validator.plugin.env[0].name=WITH_WORKLOAD'     --set-string 'validator.plugin.env[0].value=true'
+  run helm upgrade --install "$GPU_OPERATOR_RELEASE" nvidia/gpu-operator     -n "$GPU_OPERATOR_NAMESPACE"     --version "$GPU_OPERATOR_VERSION"     --timeout "$HELM_TIMEOUT"     --wait     --set driver.enabled=false     --set toolkit.enabled=false     --set devicePlugin.enabled=false     --set devicePlugin.config.name="$DEVICE_PLUGIN_CONFIG"     --set devicePlugin.config.default="$DEFAULT_CONFIG_KEY"     --set mps.root="$MPS_ROOT"     --set dcgmExporter.enabled=true     --set dcgmExporter.serviceMonitor.enabled=false     --set migManager.enabled=false     --set nodeStatusExporter.enabled=false     --set-string 'validator.plugin.env[0].name=WITH_WORKLOAD'     --set-string 'validator.plugin.env[0].value=true'
+}
+
+# NVIDIA DRA driver — replaces the device-plugin for GPU/MPS allocation on both
+# GPU nodes (docs/dra-migration.md). GPU pools with useDra=true claim the GPU via
+# gpu.nvidia.com ResourceClaims instead of nvidia.com/gpu. MPSSupport is gated
+# and must be enabled explicitly; ComputeDomains (multi-node NVLink) is off.
+install_dra_driver() {
+  if [[ "$SKIP_DRA" == "1" ]]; then
+    warn "SKIP_DRA=1; skipping NVIDIA DRA driver deployment"
+    return
+  fi
+  log "converging NVIDIA DRA driver $DRA_DRIVER_VERSION"
+  run helm upgrade --install dra-driver-nvidia-gpu \
+    oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu \
+    --version "$DRA_DRIVER_VERSION" \
+    --create-namespace --namespace dra-driver-nvidia-gpu \
+    --timeout "$HELM_TIMEOUT" --wait \
+    --set gpuResourcesEnabledOverride=true \
+    --set resources.computeDomains.enabled=false \
+    --set nvidiaDriverRoot=/ \
+    --set featureGates.MPSSupport=true
 }
 
 wait_for_final_state() {
@@ -181,6 +207,7 @@ main() {
   import_rl_image
   deploy_platform
   install_gpu_operator
+  install_dra_driver
   wait_for_final_state
   summary
 }
