@@ -226,6 +226,36 @@ FAILED（與 MPS 無關）。(2) pod 重啟後 slurmd 暫態 `NOT_RESPONDING` �
 slurm-platform 會還原）——正式落地需把 DRA claim 寫進 slurm-platform chart 的 worker template。
 **回滾**：`kubectl apply -f /tmp/sts-rtx4070-backup.yaml` + 刪 pod。
 
+## 6.2 Stage B：node-2 遷移 + 全叢集純 DRA + 移除 device-plugin（2026-07-08，✅ 完成）
+
+**兩節點皆已遷至 DRA，device-plugin 全數移除。**
+
+1. **DRA driver 擴到 node-2**：`helm upgrade dra-driver-nvidia-gpu`（移除 node-1-only
+   `kubeletPlugin.nodeSelector`）→ kubelet-plugin 在兩節點皆 Running；node-2 advertise
+   ResourceSlice（gpu-0, Ampere = 3080）。node-2 前置同樣滿足（containerd 2.2.2、k3s 1.34.6、driver 580）。
+2. **chart-ify rtx3080**：`values-2x1.yaml` rtx3080 pool `useDra: true` + `draMpsMemLimit: 9Gi`
+   （3080=10GB VRAM）。keepalive 保留——實測 host RSS 極小（worker pod 總記憶體 265Mi），node-2 的
+   7.5GB 扛得住。`helm upgrade slurm-platform`（REV 64）。
+3. **關 node-2 device-plugin MPS**（避免與 DRA 搶 Exclusive context）：`kubectl label node
+   nutnadmin... nvidia.com/gpu.deploy.operands=false` → 逐出 gpu-operator device-plugin/mps；
+   清 node-2 host 殘留 MPS + `nvidia-smi -c 0`。
+4. **重建 rtx3080 pod**：經 DRA 取得 GPU + `/dev/nvidia0` + `/tmp/nvidia-mps`；Slurm 節點
+   `idle gpu:rtx3080:1,mps:rtx3080:100`；**4×mps:25 併發多工**（node-2 host nvidia-smi 4 個 gpu_workload）。
+5. **移除不必要元件**：
+   - 刪除孤兒 `kube-system/nvidia-device-plugin-daemonset`（72 天、無 owner、無 Helm 管理，
+     正是雙-plugin 搶 socket 的元兇；無來源 manifest，不會被 deploy 重建）。
+   - gpu-operator device-plugin/mps-control-daemon：兩節點 `operands=false` → 不再部署（NFD/dcgm 保留給 DRA 用）。
+   - 結果：兩節點 `nvidia.com/gpu` allocatable=0，全部 GPU 存取走 `resource.k8s.io` DRA。
+
+**⚠️ 運維變更 — 遊戲流程**：`scripts/gpu-toggle.sh` 在 DRA 下**已失效**（它切 gpu-operator operands，
+但現在 GPU 由 worker pod 的 DRA claim + keepalive 持有）。DRA 下要玩遊戲需：`kubectl scale sts
+slurm-worker-gpu-rtx4070 --replicas=0`（釋放 claim → DRA 拆 MPS）→ `nvidia-smi -c 0` → 玩 →
+玩畢 `--replicas=1`。（gpu-toggle.sh 待更新以配合 DRA。）
+
+**永久化狀態**：worker DRA 已進 chart（`values-2x1.yaml` + `workers.yaml` + `dra-resourceclaim.yaml`），
+跨 `helm upgrade` 存活。待補：(a) gpu-operator release 設 `devicePlugin.enabled=false` 使 operands 停用
+永久化（目前靠手動 label）；(b) 更新 `gpu-toggle.sh` 支援 DRA 遊戲流程；(c) `deploy-2.sh` 加裝 DRA driver。
+
 ## 參考
 - Repo：https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu （v0.4.x，NVIDIA 已捐給 k8s SIG）
 - 安裝文件：https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/install/

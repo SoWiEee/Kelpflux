@@ -140,6 +140,12 @@ pools:
         count: 100          # same 4-slot split as the 4070 (jobs request mps:25)
     matchGres: ["gpu:rtx3080", "mps"]
     devicePluginConfig: rtx3080-mps
+    # DRA migration Stage B (2026-07-08). draMpsMemLimit=9Gi ≤ 3080 VRAM (10GB).
+    # node-2 host RAM is only 7.5GB but the MPS keepalive is GPU-side (~265Mi host,
+    # measured) so it stays on. Requires gpu-operator device-plugin operands OFF on
+    # this node (nvidia.com/gpu.deploy.operands=false) so DRA owns the GPU's MPS.
+    useDra: true
+    draMpsMemLimit: 9Gi
 
 # --- GPU device-plugin: 4 MPS slots per card, per type -----------------------
 gpu:
