@@ -39,7 +39,7 @@ from eval.scripts.live_ab_heavytail import (
 )
 from eval.scripts.tail_metrics import paired_delta, summarize
 
-ARMS = ("score", "SAC", "RDSAC-mean", "RDSAC-cvar", "CrossQ")  # score first = paired baseline
+ARMS = ("score", "SAC", "RDSAC-mean", "RDSAC-cvar", "CrossQ", "RLPD")  # score first = paired baseline
 
 
 # ── pure report builder (unit-tested) ─────────────────────────────────────────
@@ -183,7 +183,8 @@ def _make_place_fn(arm: str, *, serve_url: str, node_names: list[str], exec_pref
 
 def run(args) -> int:
     ckpts = {"SAC": args.sac_ckpt, "RDSAC-mean": args.rdsac_mean_ckpt,
-             "RDSAC-cvar": args.rdsac_cvar_ckpt, "CrossQ": args.crossq_ckpt}
+             "RDSAC-cvar": args.rdsac_cvar_ckpt, "CrossQ": args.crossq_ckpt,
+             "RLPD": args.rlpd_ckpt}
     arms = [a for a in ARMS if a == "score" or ckpts.get(a)]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -291,6 +292,8 @@ def main(argv=None) -> int:
     p.add_argument("--rdsac-cvar-ckpt", default=None)
     p.add_argument("--crossq-ckpt", default=None,
                    help="CrossQ checkpoint (adds a CrossQ live arm)")
+    p.add_argument("--rlpd-ckpt", default=None,
+                   help="RLPD checkpoint (adds an RLPD live arm; real-data fine-tuned policy)")
     p.add_argument("--family", choices=["philly", "ali"], default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)

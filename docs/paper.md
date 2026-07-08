@@ -171,6 +171,49 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **限制與尾端，須誠實界定。** 效果幅度溫和（+3.6～+5.8%），且除 RDSAC-cvar 外個別臂未達 seed 層級顯著；能穩健宣稱的是「四臂方向一致改善平均 JCT，而風險敏感的 RDSAC-cvar 在正確層級（seed，n=8）達顯著」。尾端方面，本 n=8 run 的學習臂 p99 反而優於 score（RDSAC-cvar Δp99 +41.6%、ΔCVaR +4.3%），但這與先前較小 run 的 p99 較差方向相反——score 自身的 p99 在兩 run 間即由 37s 擺盪到 64s，顯示在 2-node 小叢集上「誰踩到尾端災難」由排程運氣主導，故我們**仍不宣稱尾端優勢**，穩健結論限於平均／中央 JCT。此結果亦凸顯**評估場景決定結論**：唯有真實計算（異質性）＋ MPS 分數共置的場景才觸及學習式放置的槓桿；缺乏卡內共享或計算異質性的場景（模擬、exclusive-GPU）會低估它。
 
+#### 4.2.2 真實 LLM serving＋高負載：乾淨比較下學習式放置顯著落後
+
+§4.2.1 的 workload 是合成 sgemm。為以**真實 AI-serving** job 檢驗，我們把 payload 換成 Qwen2.5-0.5B 的批次自迴歸生成（長 prompt、prefill-compute-bound，對應 RAG／摘要類長 context 服務），並將 offered load 由 oversub 1.0 拉高至 **2.0**（超過單卡容量，迫使放置器必須動用兩張卡）。此處揭露一個真實部署的硬體約束：慢卡節點（3080 機）**host RAM 僅 7.5GB**，而每個 LLM job 需先把 torch＋約 954MB 模型載入 host RAM（約 2–3GB），兩個並發 LLM job 即耗盡 host RAM → OOM → 進程卡死無法終止 → Slurm 將該節點 drain。因此採 **hybrid workload**：mps 25／50 的小 job 走 cuBLAS（自包含、host／VRAM 佔用極低、可 4-way 共置），mps 75／100 的大 job 走真實 LLM（門檻 75 保證任兩個 LLM 需求相加 >100，永不在同卡共置，慢卡節點最多同時載入一個模型）。
+
+**在消除偏差的乾淨比較下，結論與 §4.2.1 相反：學習式放置顯著落後 score。** 見表 4-2（2×1、8 train seed、每 seed 每臂完成 **22 個 job（完全對等，無存活者偏差）**、兩節點皆重度使用）。四個學習臂的平均 JCT 皆較 score 差 **9.8～16.3%**，且在正確的 seed 層級高度顯著（p≤0.003）、方向極一致（0–1／8 個 seed 為正）。
+
+表 4-2. 真實 LLM hybrid serving 實機五方放置 A/B（2×1、8 train seed、oversub 2.0、mps 25／50→cuBLAS、75／100→LLM；每 seed 每臂 n=22 完成 job；JCT 秒；seed-t = seed 層級 one-sample t，**＋ = 勝過 score**）
+
+| arm | JCT(s) | ΔJCT% | seed 為正 | seed-t p |
+|---|--:|--:|:--:|--:|
+| score | 12.0±0.3 | — | — | — |
+| SAC | 13.9±0.8 | −15.6±8.6 | 1/8 | 0.001 |
+| RDSAC-mean | 13.9±0.5 | −16.1±5.1 | 0/8 | <0.001 |
+| RDSAC-cvar | 13.2±0.6 | −9.8±6.3 | 0/8 | 0.003 |
+| CrossQ | 14.0±0.8 | −16.3±5.3 | 0/8 | <0.001 |
+
+**機制可解釋。** 學習臂把只 **35–39%** 的 job 放到慢卡 3080，而 score 放 **47%**——學習式較貪心地偏好快卡 4070。在 oversub 2.0 的高負載下，這種過度集中反而**把 4070 塞爆、排隊變長**，總體 JCT 更差；score 更均衡地把慢卡也用起來，反而較快。這與 §4.5 觀察到的「學習式易在快卡過度集中」一致。
+
+**方法學註記：正確設計消除了一個會誤導的假象。** 此配對 A/B 的第一版曾量到學習臂大幅**領先**（+46%），但那是**存活者偏差**：score 無顯式放置，其被 Slurm 分到慢卡的 job 會因慢卡 host RAM OOM／冷載入超時而 FAILED，而 join 只計 COMPLETED → score 的完成集被截斷。三項修正還原了公平比較：(1) 提交時 free-MPS 快照改為**本地即時追蹤**（Slurm 的 MPS 帳目落後於 burst 提交，否則放置器永遠只見快卡有空位而不 spill）；(2) hybrid workload 讓慢卡節點不再 OOM／drain（消除失敗-丟棄）；(3) 確認每臂完成數對等。修正後兩臂完成數皆 22／seed，結論方向即反轉。
+
+**綜合 §4.2.1 與 §4.2.2**，兩個真實-硬體場景給出相反結論——低負載分數-cuBLAS 共置下學習式小勝（cvar +4.5%），高負載真實-LLM serving 下學習式顯著落後（−10～−16%）——**這強化而非削弱本文核心命題：排程結論高度依賴評估場景**，並誠實界定了 §4.2.1 那個正面結果的適用範圍（窄、低負載、特定 workload），提醒學習式放置的實機效益遠比單一場景所暗示的脆弱。
+
+#### 4.2.3 線上 RLPD 微調與全模型 workload-seed 穩健性檢驗：真實資料微調未能翻盤
+
+§4.2.2 顯示學習式放置在高負載真實-LLM serving 下顯著落後 score。一個自然的補救假設是**用實機資料做線上微調以縮小 sim-to-real 落差**（本文原列為未來工作）。我們直接檢驗此假設。
+
+**行為觀測式資料收集（shadow-safe）。** `live_daemon` 以旁觀模式輪詢 `squeue`，對每個 job 記錄**決策時的觀測狀態**、Slurm **實際落點**（哪個節點）與**實現的 −JCT**——即記錄行為策略（Slurm＋score）的真實 transition，而非 RL 的反事實動作，故完全不干擾生產、且產出有效的 off-policy 離線資料。共收集 **181 筆真實 transition**。**忠於原始 RLPD（Ball 等人 2023）之實作**：對稱 50／50 離線／線上取樣、LayerNorm 集成評論家（N=10、隨機子集 M=2 取 target min，REDQ 式）、離散 SAC actor、固定溫度（fixed-α=0.05；被遮罩的離散 SAC 自動-α 會因合法動作數遠小於 log(A) 而向上發散，故釘死）。以此微調 RDSAC-cvar 的 sim 策略得 **RLPD-v3**。
+
+**評估設計（誠實的變異軸）。** RLPD-v3 是**單一**策略，無 per-train-seed 版本；為與 sim 臂公平配對，我們改變 **workload seed**（8 條獨立 job 串流）而固定各學習臂的 checkpoint（sim 臂用其對應 train-seed 的 ckpt、RLPD 用單一 v3）。此變異軸（workload seed）與表 4-2（train seed、固定 workload）**不同**，故兩表的**絕對 JCT 不可直接相比**，各自檢驗其軸內的相對排名。表 4-3 為全六臂結果。
+
+表 4-3. 全模型 workload-seed 實機 A/B（2×1、8 workload seed、oversub 2.0、hybrid；sim 臂＝對應 train-seed ckpt，RLPD＝單一 v3；JCT 秒；seed-t = seed 層級 one-sample t，**＋ = 勝過 score**）
+
+| arm | JCT(s) | ΔJCT% | ΔCVaR% | seed 為正 | seed-t p |
+|---|--:|--:|--:|:--:|--:|
+| score | 39.9±8.9 | — | — | — | — |
+| SAC | 42.8±7.8 | −8.3±8.2 | −9.6 | 0/8 | 0.025 |
+| RDSAC-mean | 43.0±8.4 | −8.7±7.5 | −10.8 | 0/8 | 0.013 |
+| RDSAC-cvar | 41.5±10.2 | **−3.5±7.5** | −4.4 | 2/8 | **0.225** |
+| CrossQ | 42.9±7.4 | −8.9±8.9 | −10.7 | 1/8 | 0.025 |
+| RLPD | 42.1±7.9 | −6.5±8.4 | −7.4 | 0/8 | 0.064 |
+
+**三點結論。** 第一，**線上 RLPD 微調在此資料規模下未能翻盤**：RLPD-v3 仍落後 score（ΔJCT −6.5%，seed-t p=0.064 邊緣、0／8 seed 為正），僅略優於未微調的 SAC／RDSAC-mean／CrossQ（−8～−9%），且**不如 per-train-seed 的 RDSAC-cvar**（−3.5%）。一個聚焦的三臂對照（固定 RDSAC-cvar-s45 vs RLPD-v3 vs score、同樣跨 8 workload seed）給出一致圖像：RDSAC-cvar −7.5%（p=0.016）、RLPD −7.2%（p=0.043），兩者統計上無區別。**181 筆真實 transition 不足以彌合 sim-to-real 落差**——這是對「線上微調可救援」假設的誠實**否定**結果。第二，**風險敏感（cvar）在高負載下最穩健**：RDSAC-cvar 是唯一未達 seed 顯著的學習臂（p=0.225、2／8 為正、最接近打平），與 §4.2.2 中 cvar 為「最不差」一致——CVaR 的低變異在高負載過度集中風險下轉為可靠性優勢。第三，**§4.2.2 的結論對變異軸的選擇穩健**：換到 workload-seed 軸後，六臂相對 score 的排名與方向（全數為負）保持不變，僅幅度較溫和（−3.5～−8.9% vs 表 4-2 的 −9.8～−16.3%），交叉驗證了「高負載下學習式放置落後」並非 train-seed 抽樣的假象。綜言之，縮小 sim-to-real 落差恐需遠多於 181 筆的實機資料量、或加入 on-policy 修正，而非單靠小樣本離線 RLPD。
+
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
 §4.2 表 1 顯示模擬能區分**啟發式**，但那並未檢驗**學習式**策略是否有效。為此，我們在注入 mean-preserving 對數常態 runtime 不確定性（σ=1.0，模擬 straggler 與預測誤差）的隨機模擬中，以固定溫度（fixed-α=0.05）、100k 步、3 個訓練 seed（42／43／44）分別訓練三個學習臂——純量 SAC、風險中立 RDSAC-mean、風險敏感 RDSAC-cvar——並以共用隨機數配對評估其相對 score 的 ΔJCT%（表 5）。
@@ -260,7 +303,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 ## 5. 結論與未來工作
 
-本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。核心發現是**排程結論高度依賴評估場景**：在模擬與 exclusive-GPU 實機下學習式放置與 score 打平或小輸，但在**真實 cuBLAS ＋ MPS 分數共置**的實機上結論反轉——四個學習臂皆改善平均 JCT（8 訓練 seed 平均 +3.6～+5.8%、每臂 6–7／8 個 seed 為正），且風險敏感的 RDSAC-cvar 在正確分析層級（seed，n=8）達統計顯著（+4.5%，one-sample t p=0.023，§4.2.1）；其顯著源於 CVaR 的低變異（可靠性）而非最大平均增益。此為溫和但方向一致的平均／中央改善（研究目標為整體更好的排程，非最佳化特定指標；尾端 p99／SLO 僅作附帶診斷、在小叢集不作宣稱）。須誠實指出，先前較小的 3-seed run 曾量到 RDSAC-mean +15.2%，但擴至 n=8 後同一策略僅 +3.6%——先前的大數是小樣本假象，n=8 的 seed 層級估計才可靠。這也修正了以往「學習式在此規模不勝」的印象：不是學習式無效，而是先前的評估場景未觸及卡內共享的放置槓桿。次要發現為分布式評論家的訓練穩定性可被馴服（§4.3.1）：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，且與 CVaR 為替代而非疊加。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）以線上 RLPD 微調縮小模擬與實機落差；（5）**以更新、更穩定的 off-policy 演算法取代高變異的 RDSAC**：已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）實作為額外對照臂，其去除了 RDSAC 崩潰／自動溫度失穩的來源；SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹，method-agnostic）則列為進一步方向。
+本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計與尾端指標的模擬到實機評估方法學。核心發現是**排程結論高度依賴評估場景**：在模擬與 exclusive-GPU 實機下學習式放置與 score 打平或小輸，但在**真實 cuBLAS ＋ MPS 分數共置**的實機上結論反轉——四個學習臂皆改善平均 JCT（8 訓練 seed 平均 +3.6～+5.8%、每臂 6–7／8 個 seed 為正），且風險敏感的 RDSAC-cvar 在正確分析層級（seed，n=8）達統計顯著（+4.5%，one-sample t p=0.023，§4.2.1）；其顯著源於 CVaR 的低變異（可靠性）而非最大平均增益。此為溫和但方向一致的平均／中央改善（研究目標為整體更好的排程，非最佳化特定指標；尾端 p99／SLO 僅作附帶診斷、在小叢集不作宣稱）。須誠實指出，先前較小的 3-seed run 曾量到 RDSAC-mean +15.2%，但擴至 n=8 後同一策略僅 +3.6%——先前的大數是小樣本假象，n=8 的 seed 層級估計才可靠。這也修正了以往「學習式在此規模不勝」的印象：不是學習式無效，而是先前的評估場景未觸及卡內共享的放置槓桿。次要發現為分布式評論家的訓練穩定性可被馴服（§4.3.1）：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰，且與 CVaR 為替代而非疊加。未來工作包含：（1）對照更強的基準——Slurm 原生 `gres/shard`＋backfill＋multifactor，以及模擬中的 Kueue 式 fair-share／Volcano 式 binpack——以鞏固「等價」結論；（2）擴展至更大、更高競爭的叢集以檢驗規模假設；（3）延伸 return-clip 穩定器（掃描信賴域 b、與 balance-shaping／reward-norm 組合），續攻分布式評論家在不確定性下的崩潰／退化；（4）**擴大實機微調的資料規模**——§4.2.3 已直接檢驗以忠於原論文的線上 RLPD（Ball 等人 2023）微調來縮小 sim-to-real 落差，惟 181 筆真實 transition 不足以翻盤（RLPD-v3 仍 −6.5%、seed-t p=0.064），故後續需收集遠更大量的實機資料、或加入 on-policy 修正，方能檢驗微調救援的上限；（5）**以更新、更穩定的 off-policy 演算法取代高變異的 RDSAC**：已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）實作為額外對照臂，其去除了 RDSAC 崩潰／自動溫度失穩的來源；SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹，method-agnostic）則列為進一步方向。
 
 ## 致謝
 
