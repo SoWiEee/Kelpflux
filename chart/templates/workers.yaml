@@ -26,7 +26,12 @@ The startup script is preserved verbatim from scripts/render-core.py.
     {{- if ne .name "mps" -}}{{- $isGpuPool = true -}}{{- end -}}
   {{- end -}}
 {{- end -}}
-{{- $useNvidiaRuntime := and $isGpuPool (eq $.Values.cluster.runtime "k3s") }}
+{{/* DRA (Dynamic Resource Allocation) opt-in per pool: the GPU is claimed via a
+     ResourceClaimTemplate (gpu.nvidia.com, MPS sharing) instead of the classic
+     device-plugin nvidia.com/gpu resource + runtimeClassName=nvidia. Verified on
+     node-1 / rtx4070 — see docs/dra-migration.md §6.1. */}}
+{{- $useDra := and $isGpuPool (default false $pool.useDra) }}
+{{- $useNvidiaRuntime := and $isGpuPool (eq $.Values.cluster.runtime "k3s") (not $useDra) }}
 {{- $gpuCount := "1" }}
 {{- if $useNvidiaRuntime -}}
   {{- range $pool.gres -}}
@@ -90,6 +95,11 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $useDra }}
+      resourceClaims:
+        - name: gpu
+          resourceClaimTemplateName: {{ $pool.statefulset }}-mps
+      {{- end }}
       containers:
         - name: slurm-worker
           image: {{ $.Values.image.worker }}
@@ -112,6 +122,10 @@ spec:
               {{- if $useNvidiaRuntime }}
               nvidia.com/gpu: {{ $gpuCount | quote }}
               {{- end }}
+            {{- if $useDra }}
+            claims:
+              - name: gpu
+            {{- end }}
           command:
             - /bin/bash
             - -lc
@@ -135,6 +149,15 @@ spec:
               # state and blocks new jobs. ReturnToService=2 clears DOWN but not
               # DRAIN, so we clear it explicitly here while munge is already up.
               scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
+              {{- if $useDra }}
+              # DRA MPS cold-start mitigation: the per-pod MPS server (started by the
+              # DRA driver) exits when it has no clients, so a burst of jobs racing a
+              # cold server hits "CUDA-capable device busy". Hold one persistent MPS
+              # client to keep the server warm. Backgrounded + retry, best-effort —
+              # never blocks slurmd. (~500MB persistent GPU context.) See
+              # docs/dra-migration.md §6.1.
+              ( while true; do CUDA_MPS_ACTIVE_THREAD_PERCENTAGE= /shared/py/bin/python3 -c "import torch,time; torch.cuda.init(); torch.zeros(1, device='cuda'); time.sleep(10**9)" >/dev/null 2>&1 || true; sleep 10; done ) &
+              {{- end }}
               # Daemon log level is driven by SlurmdDebug in slurm.conf (R12 fix);
               # -D keeps slurmd in foreground so PID 1 doesn't exit.
               exec slurmd -D -N "$(hostname)"

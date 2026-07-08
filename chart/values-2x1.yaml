@@ -102,6 +102,13 @@ pools:
         count: 100          # 100 MPS units; jobs request mps:25 → 4 slots
     matchGres: ["gpu:rtx4070", "mps"]
     devicePluginConfig: rtx4070-mps
+    # DRA migration (2026-07-08, verified — docs/dra-migration.md §6.1): claim the
+    # GPU via the NVIDIA DRA driver (gpu.nvidia.com, MPS) instead of the device-plugin
+    # nvidia.com/gpu + runtimeClassName=nvidia. Slurm still subdivides via gres/mps:N
+    # inside the pod. Requires the DRA driver installed on this node with
+    # featureGates.MPSSupport=true. draMpsMemLimit ≤ card VRAM (4070 = 12GB).
+    useDra: true
+    draMpsMemLimit: 11Gi
 
   - id: gpu-rtx3080
     statefulset: slurm-worker-gpu-rtx3080

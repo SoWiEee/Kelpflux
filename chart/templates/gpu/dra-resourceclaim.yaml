@@ -1,0 +1,43 @@
+{{/*
+DRA ResourceClaimTemplate per GPU pool that opts into DRA (pool.useDra=true).
+Requests one gpu.nvidia.com device shared via MPS. thread%=100 (uncapped) so that
+Slurm's per-job CUDA_MPS_ACTIVE_THREAD_PERCENTAGE (derived from gres/mps:N) controls
+the actual split inside the long-lived worker pod — the device-plugin behaviour is
+preserved, just sourced via DRA instead of nvidia.com/gpu + runtimeClassName=nvidia.
+
+Requires the NVIDIA DRA driver installed with featureGates.MPSSupport=true and the
+gpu-kubelet-plugin scheduled on the pool's node(s). See docs/dra-migration.md §6.
+*/}}
+{{- range .Values.pools }}
+{{- $pool := . }}
+{{- if default false $pool.useDra }}
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: {{ $pool.statefulset }}-mps
+  namespace: {{ $.Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" $ | nindent 4 }}
+    pool-id: {{ $pool.id }}
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly:
+            deviceClassName: gpu.nvidia.com
+      config:
+        - requests: ["gpu"]
+          opaque:
+            driver: gpu.nvidia.com
+            parameters:
+              apiVersion: resource.nvidia.com/v1beta1
+              kind: GpuConfig
+              sharing:
+                strategy: MPS
+                mpsConfig:
+                  defaultActiveThreadPercentage: 100
+                  defaultPinnedDeviceMemoryLimit: {{ default "10Gi" $pool.draMpsMemLimit }}
+{{- end }}
+{{- end }}
