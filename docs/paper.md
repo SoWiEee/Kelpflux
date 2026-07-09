@@ -214,6 +214,27 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **三點結論。** 第一，**線上 RLPD 微調在此資料規模下未能翻盤**：RLPD-v3 仍落後 score（ΔJCT −6.5%，seed-t p=0.064 邊緣、0／8 seed 為正），僅略優於未微調的 SAC／RDSAC-mean／CrossQ（−8～−9%），且**不如 per-train-seed 的 RDSAC-cvar**（−3.5%）。一個聚焦的三臂對照（固定 RDSAC-cvar-s45 vs RLPD-v3 vs score、同樣跨 8 workload seed）給出一致圖像：RDSAC-cvar −7.5%（p=0.016）、RLPD −7.2%（p=0.043），兩者統計上無區別。**181 筆真實 transition 不足以彌合 sim-to-real 落差**——這是對「線上微調可救援」假設的誠實**否定**結果。第二，**風險敏感（cvar）在高負載下最穩健**：RDSAC-cvar 是唯一未達 seed 顯著的學習臂（p=0.225、2／8 為正、最接近打平），與 §4.2.2 中 cvar 為「最不差」一致——CVaR 的低變異在高負載過度集中風險下轉為可靠性優勢。第三，**§4.2.2 的結論對變異軸的選擇穩健**：換到 workload-seed 軸後，六臂相對 score 的排名與方向（全數為負）保持不變，僅幅度較溫和（−3.5～−8.9% vs 表 4-2 的 −9.8～−16.3%），交叉驗證了「高負載下學習式放置落後」並非 train-seed 抽樣的假象。綜言之，縮小 sim-to-real 落差恐需遠多於 181 筆的實機資料量、或加入 on-policy 修正，而非單靠小樣本離線 RLPD。
 
+#### 4.2.4 加入 Slurm 原生排程 baseline：統一 DRA 重測下 score 亦勝過 naive Slurm
+
+前述比較皆為「學習式放置 vs score 啟發式」，尚缺一個問題：**score／學習式相對於 Slurm 內建排程器**孰優？為此加入兩個 Slurm 原生 baseline——**FCFS**（`sched/builtin` + `priority/basic`，關閉 job_submit Lua，嚴格 FIFO 無回填）與 **backfill**（`sched/backfill` + `priority/basic`，關閉 Lua，Slurm 現代預設）——皆**不做提交時綁定**（無 `-w`，由 `select/cons_tres` 自行選節點），代表「不加任何智慧放置的 vanilla Slurm」。
+
+**方法學要點：統一後端重測消除混淆。** 本平台於此期間由 device-plugin 遷移至 **Kubernetes DRA**（`gpu.nvidia.com` ResourceClaim + MPS，見 `docs/dra-migration.md`）；實測 DRA MPS 使**絕對 JCT 約減半**（同一 score 基準：device-plugin 39.9s → DRA 18.4s）。因此若把新 baseline（DRA）與 §4.2.3 的 score（device-plugin）相比會得到假象（一度量到 FCFS「快 score 54%」，純屬後端差異）。為此**將全部八個臂於同一天、同一 DRA 後端重測**（表 4-4），使所有 ΔJCT% 對齊同一個 DRA-score 基準；跨後端的絕對 JCT 不可比，但**同後端內的相對 ΔJCT% 才是有效指標**，且其排名與 §4.2.3 一致。
+
+表 4-4. 統一全方法實機 A/B（2×1、DRA MPS、8 workload seed、oversub 2.0、hybrid；score 基準 JCT=**18.4±3.4s**；ΔJCT% vs score，**＋ = 勝過 score**；seed-t = seed 層級 one-sample t）
+
+| arm | ΔJCT% vs score | seed 為正 | seed-t p |
+|---|--:|:--:|--:|
+| score | —（基準，最佳） | — | — |
+| RDSAC-cvar | −3.9±10.7 | 3/8 | 0.344 |
+| backfill | −4.9±6.6 | 2/8 | 0.076 |
+| CrossQ | −8.4±10.6 | 2/8 | 0.062 |
+| SAC | −9.7±15.9 | 3/8 | 0.128 |
+| fcfs | −10.8±7.3 | 0/8 | 0.004 |
+| RDSAC-mean | −11.0±11.6 | 1/8 | 0.031 |
+| RLPD | −11.9±11.1 | 1/8 | 0.019 |
+
+**兩點結論。** 第一，**score 啟發式在高負載下勝過 vanilla Slurm**：FCFS 顯著落後 score（−10.8%、p=0.004、0／8），backfill 亦邊緣落後（−4.9%、p=0.076）——證明 score 的 bin-pack／SJF 因子相對於「數 GPU」式的 cons_tres 放置確有加值，而非只是與學習式互比的空殼基準。第二，**排名跨後端一致、鞏固核心命題**：在乾淨的統一 DRA 重測下，**沒有任何學習臂勝過 score**（全數為負），RDSAC-cvar（−3.9%、p=0.344 不顯著）仍為最接近打平者、與 backfill（−4.9%）同屬「最不差」一檔，而 fcfs／RDSAC-mean／RLPD 顯著最差——此與 §4.2.2／§4.2.3 的方向完全吻合，交叉驗證「高負載真實-serving 下學習式放置未勝過調校過的 score，naive Slurm 更差」並非後端或抽樣假象。
+
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
 §4.2 表 1 顯示模擬能區分**啟發式**，但那並未檢驗**學習式**策略是否有效。為此，我們在注入 mean-preserving 對數常態 runtime 不確定性（σ=1.0，模擬 straggler 與預測誤差）的隨機模擬中，以固定溫度（fixed-α=0.05）、100k 步、3 個訓練 seed（42／43／44）分別訓練三個學習臂——純量 SAC、風險中立 RDSAC-mean、風險敏感 RDSAC-cvar——並以共用隨機數配對評估其相對 score 的 ΔJCT%（表 5）。
