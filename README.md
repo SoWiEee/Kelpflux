@@ -233,11 +233,11 @@ SKIP_STORAGE=1 SKIP_GPU=1 bash scripts/verify-live.sh
 SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 ```
 
-## 5. DSAC 訓練與評估
+## 5. 訓練與評估
 
-> 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
+> 需要 `.venv-m11`（含 PyTorch），並從 repo 根目錄以 `PYTHONPATH=.` 執行（確保 `sim/`、`services/`、`eval/` 可被找到）。以下為目前的最終工作流。
 
-### 快速訓練（目前拓樸 = 2×1，obs_dim=166 / n_actions=33）
+### 5.1 模擬訓練（目前拓樸 = 2×1，obs_dim=166 / n_actions=33，預設 RDSAC）
 
 ```bash
 # 目前生產拓樸：2 nodes × 1 GPU。預設 PER + potential shaping + IQN/RDSAC critic。
@@ -251,96 +251,57 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --risk-mode cvar \
     --out-dir runs/dsac_2x1_$(date +%Y%m%d)
 
-# vanilla SAC（scalar twin-Q）：加 --no-iqn
-# 1×1（舊單卡）：--n-nodes 1 --gpus-per-node 1（obs_dim=160 / n_actions=17）
+# vanilla SAC（scalar twin-Q）：加 --no-iqn；風險中立 RDSAC：--risk-mode mean
 ```
 
-### Multi-seed σ-sweep（三方 score / SAC / RDSAC，跨訓練 seed 求 mean±std）
+### 5.2 實機微調（RLPD，忠於 Ball et al. 2023）
+
+以 shadow-safe 的 `live_daemon` 旁觀收集真實 transition（記錄 Slurm 實際落點 + 實現 JCT，不干擾生產），再做 RLPD 微調（對稱 50/50 offline/online、LayerNorm 集成 critic、fixed-α 避免離散 SAC 溫度發散）。
 
 ```bash
-# 對每個 (σ, arm) 用多個 --train-seed 重跑，得 mean±std（打掉單 seed 雜訊，§3.1）
-for SEED in 42 43 44; do
-  PYTHONPATH=. .venv-m11/bin/python eval/scripts/sweep_stochastic.py \
-    --sigmas 0.5 1.0 --total-steps 100000 --warmup-steps 2000 --n-jobs 50 \
-    --seeds 42 43 44 45 46 --trace-families philly ali --risk-modes mean cvar \
-    --n-nodes 2 --gpus-per-node 1 --curriculum --fixed-alpha --init-alpha 0.05 \
-    --balance-coef 5.0 --normalize-reward \
-    --train-seed $SEED --device cuda \
-    --out-dir runs/sweep_2x1_s${SEED}
-done
-```
+# 1) 旁觀收集真實 transition（off-cluster 時用 SLURM_EXEC_PREFIX 包 squeue）
+SLURM_EXEC_PREFIX="kubectl exec -n slurm slurm-controller-0 -- " \
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.live_daemon \
+    --policy-dir /tmp/lckpts \
+    --node-name slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0 \
+    --gpus-per-node 1 --mps-per-gpu 100 --poll-interval 2 --log-dir shadow_logs
 
-### 快速 benchmark：DSAC/SAC vs heuristic score
-
-這個 benchmark 固定同一批 synthetic trace seed，分別跑 DSAC policy 與啟發式 `score` scheduler，並用 paired difference 報告 `score - DSAC`。正值代表 DSAC/SAC 比 score 好；負值代表 score baseline 較好。
-
-```bash
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --ckpt runs/eval_mlp_20260514-210824/train/dsac.pt \
-    --no-train \
-    --n-nodes 1 --gpus-per-node 1 \
-    --n-jobs 50 \
-    --trace-families philly ali \
-    --seeds 42 43 44 45 46 \
-    --out-dir runs/bench_dsac_vs_score_$(date +%Y%m%d-%H%M%S)
-```
-
-若要比較新訓練的 checkpoint，把 `--ckpt` 換成新的 `dsac.pt`；若要先訓練再評估，拿掉 `--no-train` 並設定 `--total-steps`。
-
-
-### Live trace RLPD fine-tune
-
-先從 live Slurm accounting 收集最近 7 天的 normalized trace，再把它作為 score demonstration replay 混入 RLPD fine-tune。這個流程會使用真實 submit/start/end、MPS request、node placement 與 wait time，降低只靠 synthetic simulator 訓練的落差。
-
-```bash
-PYTHONPATH=. python3 scripts/collect-live-trace.py \
-    --kubectl "sudo kubectl" \
-    --since now-7days \
-    --completed-only \
-    --output runs/live/live-trace.json \
-    --latency-summary runs/live/live-latency.json
-
+# 2) RLPD 微調（從 sim 母體 checkpoint 起，混入真實 transition JSONL）
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
-    --online-trace runs/live/live-trace.json \
-    --offline-steps 50000 \
-    --n-updates 200 \
-    --utd-ratio 20 \
-    --n-nodes 1 --gpus-per-node 1 \
-    --out-dir runs/rlpd_live_$(date +%Y%m%d-%H%M%S)
+    --base-policy /tmp/lckpts/rdsac_cvar_s45.pt \
+    --online-log 'shadow_logs/transitions_*.jsonl' \
+    --n-critics 10 --subset 2 --fixed-alpha --init-alpha 0.05 \
+    --n-nodes 2 --gpus-per-node 1 \
+    --out-dir runs/rlpd_$(date +%Y%m%d-%H%M%S)
 ```
 
-也可以同時混入 shadow-mode JSONL transition logs：加上 `--online-log 'runs/shadow/*.jsonl'`。
+### 5.3 實機 live A/B 評估（統一全方法 + Slurm 原生 baseline，§4.2.4）
 
-### 完整評估（2 families × 5 seeds，對比 score baseline）
+在 DRA MPS + hybrid Qwen serving workload（oversub 2.0）下，於**同一天同一後端**統一比較 **score / SAC / RDSAC-mean / RDSAC-cvar / CrossQ / RLPD** 與 **Slurm 原生 FCFS / backfill**，跨 8 workload seed，輸出 ΔJCT%／Δp99%／ΔCVaR% 與 seed 層級配對 t 檢定。
+
+前置：本地 serve（`:8003`，policy-dir 為含 per-train-seed checkpoint（`sac_s*`／`rdsac_*_s*`／`crossq_s*`）與 `rlpd_v3.pt` 的目錄，如 `/tmp/lckpts`）。
 
 ```bash
-# 完整評估（所有改進開啟，CUDA）
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --n-nodes 1 --gpus-per-node 1 \
-    --total-steps 500000 \
-    --trace-families philly ali \
-    --seeds 42 43 44 45 46 \
-    --device cuda \
-    --curriculum \
-    --out-dir runs/eval_dsac_$(date +%Y%m%d-%H%M%S)
+# 統一全方法（含 Slurm baseline；自動 reconfig slurmctld 並在結束以 trap 還原）
+SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
+    bash eval/scripts/run_full8_slurm_baselines.sh
+# → runs/full8_<stamp>_TABLES.md（表 4-4）
 
-# Ablation baseline（停用 shaping/PER）
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --no-per --no-potential-shaping \
-    --total-steps 200000 --device cuda \
-    --out-dir runs/eval_ablation_$(date +%Y%m%d-%H%M%S)
-
-# Vanilla SAC（scalar twin-Q critic；--no-iqn 關掉預設的 IQN/RDSAC）
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --no-iqn --device cuda \
-    --out-dir runs/eval_sac_$(date +%Y%m%d-%H%M%S)
-
-# 載入已有 checkpoint，跳過訓練直接評估
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --ckpt runs/dsac_sim/dsac.pt --no-train
+# 底層單次 A/B（只給哪個 --*-ckpt 就跑哪臂 + score；不給 ckpt 則只跑 score baseline）
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
+    --serve-url http://localhost:8003 --login-pod slurm-login-<hash> \
+    --namespace slurm --controller-pod slurm-controller-0 \
+    --sac-ckpt /tmp/lckpts/sac_s42.pt --rdsac-mean-ckpt /tmp/lckpts/rdsac_mean_s42.pt \
+    --rdsac-cvar-ckpt /tmp/lckpts/rdsac_cvar_s42.pt --crossq-ckpt /tmp/lckpts/crossq_s42.pt \
+    --rlpd-ckpt /tmp/lckpts/rlpd_v3.pt \
+    --family philly --n-jobs 30 --seed 42 --sigmas 1.0 --rounds 3 --warmup 1 --interleave \
+    --hybrid-workload --llm-model /shared/models/qwen05b --placement \
+    --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
+    --arrival-mode poisson --mps-oversub 2.0 --target-max-s 20 --mps-buckets 25,50,75,100 \
+    --partition gpu --out-dir runs/ab_$(date +%Y%m%d-%H%M%S)
 ```
 
-### 架構與改進 flags 對照
+### 5.4 訓練 flags 對照
 
 | Flag | 說明 | 預設 |
 |------|------|------|
@@ -350,10 +311,10 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
 | `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
 
-### 執行單元測試
+### 5.5 執行單元測試
 
 ```bash
-.venv-m11/bin/python -m pytest sim/tests/ -q
+PYTHONPATH=. .venv-m11/bin/python -m pytest sim/tests/ -q
 ```
 
 ---
