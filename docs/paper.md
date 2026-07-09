@@ -220,20 +220,20 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **方法學要點：統一後端重測消除混淆。** 本平台於此期間由 device-plugin 遷移至 **Kubernetes DRA**（`gpu.nvidia.com` ResourceClaim + MPS，見 `docs/dra-migration.md`）；實測 DRA MPS 使**絕對 JCT 約減半**（同一 score 基準：device-plugin 39.9s → DRA 18.4s）。因此若把新 baseline（DRA）與 §4.2.3 的 score（device-plugin）相比會得到假象（一度量到 FCFS「快 score 54%」，純屬後端差異）。為此**將全部八個臂於同一天、同一 DRA 後端重測**（表 4-4），使所有 ΔJCT% 對齊同一個 DRA-score 基準；跨後端的絕對 JCT 不可比，但**同後端內的相對 ΔJCT% 才是有效指標**，且其排名與 §4.2.3 一致。
 
-表 4-4. 統一全方法實機 A/B（2×1、DRA MPS、8 workload seed、oversub 2.0、hybrid；score 基準 JCT=**18.4±3.4s**；ΔJCT% vs score，**＋ = 勝過 score**；seed-t = seed 層級 one-sample t）
+表 4-4. 統一全方法實機 A/B（2×1、DRA MPS、8 workload seed、oversub 2.0、hybrid；JCT／p99／CVaR 為秒；Δ 為相對 score 的百分比，**＋ = 勝過 score**；seed 為正 = 8 個 seed 中 ΔJCT%>0 的個數；seed-t = ΔJCT% 的 seed 層級 one-sample t）
 
-| arm | ΔJCT% vs score | seed 為正 | seed-t p |
-|---|--:|:--:|--:|
-| score | —（基準，最佳） | — | — |
-| RDSAC-cvar | −3.9±10.7 | 3/8 | 0.344 |
-| backfill | −4.9±6.6 | 2/8 | 0.076 |
-| CrossQ | −8.4±10.6 | 2/8 | 0.062 |
-| SAC | −9.7±15.9 | 3/8 | 0.128 |
-| fcfs | −10.8±7.3 | 0/8 | 0.004 |
-| RDSAC-mean | −11.0±11.6 | 1/8 | 0.031 |
-| RLPD | −11.9±11.1 | 1/8 | 0.019 |
+| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | Δp99% | ΔCVaR% | seed 為正 | seed-t p |
+|---|--:|--:|--:|--:|--:|--:|:--:|--:|
+| score | 18.4±3.4 | 44.5±14.0 | 32.3±10.1 | —（基準） | — | — | — | — |
+| RDSAC-cvar | 19.2±4.4 | 51.5±19.9 | 33.6±10.8 | −3.9±10.7 | −17.4±41.2 | −4.7±13.6 | 3/8 | 0.344 |
+| backfill | 19.3±3.5 | 34.1±8.1 | 29.1±6.1 | −4.9±6.6 | +19.7±20.7 | +6.8±15.5 | 2/8 | 0.076 |
+| CrossQ | 19.8±3.2 | 49.8±15.1 | 36.1±9.4 | −8.4±10.6 | −13.1±18.4 | −14.0±14.5 | 2/8 | 0.062 |
+| SAC | 20.0±3.3 | 55.7±22.2 | 37.1±10.3 | −9.7±15.9 | −30.9±53.0 | −19.6±35.5 | 3/8 | 0.128 |
+| fcfs | 20.4±3.5 | 35.7±8.1 | 30.8±5.7 | −10.8±7.3 | +16.0±21.0 | +1.1±16.5 | 0/8 | 0.004 |
+| RDSAC-mean | 20.5±4.4 | 53.2±18.0 | 35.9±10.1 | −11.0±11.6 | −21.1±33.0 | −13.0±14.9 | 1/8 | 0.031 |
+| RLPD | 20.4±2.7 | 54.1±14.7 | 37.6±7.9 | −11.9±11.1 | −26.3±33.4 | −21.7±30.7 | 1/8 | 0.019 |
 
-**兩點結論。** 第一，**score 啟發式在高負載下勝過 vanilla Slurm**：FCFS 顯著落後 score（−10.8%、p=0.004、0／8），backfill 亦邊緣落後（−4.9%、p=0.076）——證明 score 的 bin-pack／SJF 因子相對於「數 GPU」式的 cons_tres 放置確有加值，而非只是與學習式互比的空殼基準。第二，**排名跨後端一致、鞏固核心命題**：在乾淨的統一 DRA 重測下，**沒有任何學習臂勝過 score**（全數為負），RDSAC-cvar（−3.9%、p=0.344 不顯著）仍為最接近打平者、與 backfill（−4.9%）同屬「最不差」一檔，而 fcfs／RDSAC-mean／RLPD 顯著最差——此與 §4.2.2／§4.2.3 的方向完全吻合，交叉驗證「高負載真實-serving 下學習式放置未勝過調校過的 score，naive Slurm 更差」並非後端或抽樣假象。
+**三點結論。** 第一，**score 啟發式在高負載下（平均 JCT）勝過 vanilla Slurm**：FCFS 顯著落後 score（ΔJCT −10.8%、p=0.004、0／8），backfill 亦邊緣落後（−4.9%、p=0.076）——證明 score 的 bin-pack／SJF 因子相對於「數 GPU」式的 cons_tres 放置確有加值，而非只是與學習式互比的空殼基準。第二，**排名跨後端一致、鞏固核心命題**：在乾淨的統一 DRA 重測下，**沒有任何學習臂勝過 score 的平均 JCT**（全數為負），RDSAC-cvar（−3.9%、p=0.344 不顯著）仍為最接近打平者、與 backfill（−4.9%）同屬「最不差」一檔，而 fcfs／RDSAC-mean／RLPD 顯著最差——此與 §4.2.2／§4.2.3 的方向完全吻合，交叉驗證「高負載真實-serving 下學習式放置未勝過調校過的 score、naive Slurm 更差」並非後端或抽樣假象。第三，**尾端呈相反權衡（附帶觀察，不作宣稱）**：naive Slurm（backfill／fcfs）雖平均較差，其 p99／CVaR 反而優於 score（backfill Δp99 +19.7%、ΔCVaR +6.8%；fcfs Δp99 +16.0%）——即 score 以較緊的平均換取較長的尾；惟此處 p99／CVaR 為每 seed 20–30 個完成 job 的估計、變異極大（Δp99 標準差達 ±20～53%），僅作尾端行為的定性觀察，在此小叢集不作統計宣稱。
 
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
