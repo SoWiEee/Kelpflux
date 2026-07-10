@@ -5,6 +5,8 @@
 > 部署來源由 `manifests/core/slurm-static.yaml` 改為 `chart/`（Helm chart）；
 > `bootstrap.sh` / `render-core.py` 已退役。
 > 第二台 GPU 節點的加入流程記錄於 `docs/intergration.md`。
+> GPU/MPS 分配走 **NVIDIA DRA driver**（`resource.k8s.io/v1`），取代傳統
+> device-plugin + mps-control-daemon；遷移過程與驗證記錄於 `docs/dra-migration.md`。
 
 ---
 
@@ -19,7 +21,9 @@
    - [3.4 Secrets](#34-secrets)
    - [3.5 PVC / 持久化儲存](#35-pvc--持久化儲存)
 4. [Elastic Operator](#4-elastic-operator)
-5. [GPU Operator + MPS（gpu-operator namespace）](#5-gpu-operator--mpsgpu-operator-namespace)
+5. [GPU 資源管理：GPU Operator + NVIDIA DRA Driver](#5-gpu-資源管理gpu-operator--nvidia-dra-driver)
+   - [5.1 GPU Operator（NFD + dcgm-exporter）](#51-gpu-operatornfd--dcgm-exporter)
+   - [5.2 NVIDIA DRA Driver（GPU/MPS 分配）](#52-nvidia-dra-drivergpumps-分配)
 6. [共享 NFS 儲存（nfs-provisioner namespace）](#6-共享-nfs-儲存nfs-provisioner-namespace)
 7. [監控堆疊（monitoring namespace）](#7-監控堆疊monitoring-namespace)
 8. [NetworkPolicy](#8-networkpolicy)
@@ -45,7 +49,8 @@
 - **Slurm**：HPC 排程器，靜態預宣告所有節點到 `maxNodes`；scaling 只改 K8s replicas，不重新生成 `slurm.conf`
 - **Kubernetes (k3s)**：管理 Pod 生命週期、Service DNS、Volume、NetworkPolicy
 - **Elastic Operator**：Python 控制迴圈，輪詢 slurmrestd 並 patch worker StatefulSet replicas
-- **GPU Operator + MPS Control Daemon**：NVIDIA 官方 operator 提供 device-plugin、driver validator 與 MPS sharing；**兩張卡都可用 MPS** 各自切成 4 個 `nvidia.com/gpu` slot（由 gpu-operator 的 `mps-control-daemon` 管理）
+- **NVIDIA DRA Driver（`dra-driver-nvidia-gpu` namespace）**：以 Kubernetes DRA（`resource.k8s.io/v1`，v1.34 GA）取代 device-plugin。`DeviceClass gpu.nvidia.com` + `ResourceClaimTemplate`（`GpuConfig` sharing=MPS）把整張 GPU 以 MPS 共享模式配給長壽 worker pod；`gpu-kubelet-plugin` DaemonSet 跑在兩個 GPU 節點，各自 advertise 一張 GPU 的 `ResourceSlice`，並由 CDI 注入 `/dev/nvidia0` + `/tmp/nvidia-mps`
+- **GPU Operator**：device-plugin／mps-control-daemon 已停用移除，只保留 **NFD**（節點特徵標籤，DRA 用其 PCI/GPU 型別 label）與 **dcgm-exporter**
 - **NFS subdir provisioner**：把 host 上 `/srv/nfs/k8s` 動態 provision 為 RWX PVC，所有 Slurm pod 共享 `/shared`
 - **Prometheus + Grafana + Alertmanager + DCGM/node-exporter + Tempo/OTel**：scrape slurm-exporter、operator、kube-state-metrics、per-node DCGM 與 node-exporter
 
@@ -57,7 +62,7 @@
 | GPU | **RTX 4070**，12 GB（12282 MiB） | **RTX 3080**，10 GB（10240 MiB） |
 | GPU 架構 / compute cap | Ada Lovelace / 8.9 | Ampere / 8.6 |
 | `gpu-host-class` label | `rtx4070` | `rtx3080` |
-| device-plugin config | `rtx4070-mps`（4 slot） | `rtx3080-mps`（4 slot） |
+| GPU 分配路徑 | DRA `ResourceClaim`（`gpu.nvidia.com`, MPS, thread%=100） | DRA `ResourceClaim`（`gpu.nvidia.com`, MPS, thread%=100） |
 | logical CPU | 16 | 20 |
 | RAM | ~62.6 GiB（65677412 Ki） | ~7.4 GiB（7718660 Ki） |
 | OS | Ubuntu 24.04.4 LTS | Ubuntu 24.04.4 LTS（由 22.04 升級） |
@@ -69,8 +74,11 @@
 | InternalIP | 192.168.0.111 | 192.168.0.104 |
 | sim 相對速度 | 1.0×（基準） | ~0.25× |
 
-> 兩台都帶 `nvidia.com/mps.capable=true`、`nvidia.com/gpu.sharing-strategy=mps`、`nvidia.com/gpu.replicas=4`，
-> 因此各自把 1 張實體 GPU 廣告成 4 個 `nvidia.com/gpu` share slot（型別 label 為 `...-SHARED`）。
+> 兩台的 GPU 存取皆已改走 DRA：`gpu-kubelet-plugin` 各自 advertise 一份 `ResourceSlice`（`gpu.nvidia.com`），
+> worker pod 透過 `ResourceClaimTemplate` 取得整張 GPU 的 MPS 共享存取（`defaultActiveThreadPercentage=100`
+> 不設限），實際 SM 比例切分交給 Slurm 的每-job `gres/mps:N`。device-plugin 已移除，兩節點
+> `nvidia.com/gpu` allocatable 皆為 0；NFD 仍上報 `nvidia.com/gpu.family`、`nvidia.com/gpu.memory`、
+> `nvidia.com/cuda.driver-version.full` 等型別 label 供 DRA 與監控使用。
 
 ```mermaid
 graph TD
@@ -101,9 +109,12 @@ graph TD
         end
 
         subgraph GO["gpu-operator namespace"]
-            DP["nvidia-device-plugin<br/>DaemonSet"]
-            MPS["nvidia-device-plugin-mps-control-daemon<br/>DaemonSet"]
             NFD["NFD master/worker<br/>+ gpu-feature-discovery"]
+            DCGM2["dcgm-exporter<br/>DaemonSet (per-node)"]
+        end
+
+        subgraph DRA["dra-driver-nvidia-gpu namespace"]
+            KP["gpu-kubelet-plugin<br/>DaemonSet (both nodes)"]
         end
 
         subgraph MON["monitoring namespace"]
@@ -145,14 +156,16 @@ graph TD
     OP -- "patch replicas" --> R80
     EXP -- "HTTP :6820" --> CTL
 
-    DP -- "advertise nvidia.com/gpu x 4" --> R70
-    DP -- "advertise nvidia.com/gpu x 4" --> R80
-    MPS -- "manage MPS daemon (both nodes)" --> GPU0
-    MPS -- "manage MPS daemon (both nodes)" --> GPU1
-    R70 -- "use GPU + MPS" --> GPU0
-    R80 -- "use GPU + MPS" --> GPU1
+    R70 -- "ResourceClaim(gpu.nvidia.com, MPS)" --> KP
+    R80 -- "ResourceClaim(gpu.nvidia.com, MPS)" --> KP
+    KP -- "advertise ResourceSlice" --> GPU0
+    KP -- "advertise ResourceSlice" --> GPU1
+    KP -- "CDI: /dev/nvidia0 + /tmp/nvidia-mps" --> R70
+    KP -- "CDI: /dev/nvidia0 + /tmp/nvidia-mps" --> R80
     NVDR --> GPU0
     NVDR2 --> GPU1
+    DCGM2 -- "scrape SM%/VRAM" --> GPU0
+    DCGM2 -- "scrape SM%/VRAM" --> GPU1
 
     PROV -- "NFS mount" --> NFSH
     PROV -- "dynamic PV (RWX)" --> CTL
@@ -169,7 +182,7 @@ graph TD
 | 0. 系統 / GPU driver | `bash scripts/setup-linux-gpu.sh` | 安裝 nvidia-driver + container-toolkit + 設 k3s default runtime |
 | 1. NFS server | `sudo bash scripts/setup-nfs-server.sh` | host 上 export `/srv/nfs/k8s` |
 | 2. Secrets | `bash scripts/deploy-1.sh` | munge / ssh / jwt / mysql Secret |
-| 3. 平台 + GPU Operator + DSAC | `bash scripts/deploy-2.sh` | 一次收斂 Helm chart、GPU Operator 與 live DSAC scheduler |
+| 3. 平台 + GPU Operator + DRA driver + DSAC | `bash scripts/deploy-2.sh` | 一次收斂 Helm chart、GPU Operator（device-plugin 停用）、NVIDIA DRA driver 與 live DSAC scheduler；`SKIP_DRA=1` 可退回 device-plugin 路徑 |
 | 4. Slurm 平台 | `helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm` | 一鍵部署 controller / workers / login / operator / exporter / monitoring / storage |
 | 5. Accounting（暫時保留） | `kubectl apply -f manifests/core/slurm-accounting.yaml` | slurmdbd + mysql + 對應 Secret，尚未併入 chart |
 | 6. Lmod | `bash scripts/verify-live.sh` | Lmod 已由 chart 整合，live 驗證會檢查 module load/purge |
@@ -181,14 +194,17 @@ graph TD
 | Namespace | 用途 | PSS Enforce | 建立者 |
 |-----------|------|------------|--------|
 | `slurm` | Slurm 控制平面 + workers + login + operator + exporter + slurmdbd + mysql | `baseline` | chart `templates/namespace.yaml`（`resource-policy: keep`） |
-| `gpu-operator` | NVIDIA GPU Operator 全套元件（device-plugin、MPS daemon、NFD、validators） | `privileged` | chart `templates/gpu/gpu-operator-namespace.yaml`（與 GPU Operator helm release 共享） |
+| `gpu-operator` | NVIDIA GPU Operator（僅 NFD + dcgm-exporter + validators；device-plugin/mps-control-daemon 已停用） | `privileged` | chart `templates/gpu/gpu-operator-namespace.yaml`（與 GPU Operator helm release 共享） |
+| `dra-driver-nvidia-gpu` | NVIDIA DRA driver（`gpu-kubelet-plugin` DaemonSet，兩 GPU 節點各一份） | `privileged` | `scripts/deploy-2.sh` 的 `install_dra_driver`（Helm OCI chart，獨立 release） |
 | `monitoring` | Prometheus、Grafana、Alertmanager、kube-state-metrics | （未強制） | chart `templates/monitoring/namespace.yaml` |
 | `nfs-provisioner` | NFS subdir external provisioner Deployment | （未強制） | chart `templates/storage.yaml`（同樣 `keep`） |
 
 > **為何 `slurm` 用 baseline 而非 restricted？**
-> Worker pod 在 k3s 模式會掛 `runtimeClassName: nvidia`，這需要 baseline。將
-> 監控堆疊 / provisioner / GPU operator 各自拆 namespace 是為了 NetworkPolicy
-> 與 RBAC 邊界更乾淨。
+> Worker pod 的 GPU 存取現在完全透過 DRA `ResourceClaim` + CDI 完成，不再需要
+> `runtimeClassName: nvidia` 或特權模式；`slurm` namespace 維持 baseline 是因為
+> controller/worker/login pod 需要以特定能力執行 `sshd`／`munged` 等系統服務，
+> 不滿足 restricted profile 的限制。監控堆疊 / provisioner / GPU operator / DRA
+> driver 各自拆 namespace 是為了 NetworkPolicy 與 RBAC 邊界更乾淨。
 
 > **為何 namespace 不掛 helm hook？**
 > 之前的版本曾在 namespace 上掛 `helm.sh/hook: pre-install`，搭配預設
@@ -234,12 +250,12 @@ graph TD
 | 項目 | 值 |
 |------|-----|
 | Image | `slurm-worker:latest` |
-| `runtimeClassName` | `nvidia`（k3s 模式自動加上） |
+| GPU 存取 | DRA `resourceClaims: [{name: gpu}]` → `ResourceClaimTemplate slurm-worker-gpu-rtx4070-mps`（無 `runtimeClassName`，無 `nvidia.com/gpu` resource limit） |
 | `nodeSelector` | `gpu-host-class: rtx4070`（釘到 Node 1 `acane`） |
-| Resource limits | `nvidia.com/gpu: 1` |
 | Features | `gpu, gpu-rtx4070, topology-2x1` |
-| Gres | `gpu:rtx4070:1`, `mps:100`（單卡切成 4 slot，單 slot 25%） |
-| 對應 device-plugin config key | `rtx4070-mps`（節點 label `nvidia.com/device-plugin.config=rtx4070-mps` 觸發） |
+| Gres | `gpu:rtx4070:1`, `mps:100`（Slurm 內部細分，單 job `mps:25` 對應一個邏輯 slot） |
+| DRA claim 參數 | `GpuConfig` sharing=MPS，`defaultActiveThreadPercentage=100`（不設限）、`defaultPinnedDeviceMemoryLimit=11Gi` |
+| MPS keepalive | 常駐 torch CUDA context，讓 per-pod MPS server 保持熱，避免 burst 冷啟動 `CUDA-capable device busy` |
 | Partition | `gpu-rtx4070`（並同時為共享 `gpu` partition 成員，供 2-node A/B placement） |
 
 #### StatefulSet `slurm-worker-gpu-rtx3080`（replicas=1，固定，釘 node-2）
@@ -249,17 +265,20 @@ graph TD
 | 項目 | 值 |
 |------|-----|
 | Image | `slurm-worker:latest` |
-| `runtimeClassName` | `nvidia` |
+| GPU 存取 | DRA `resourceClaims: [{name: gpu}]` → `ResourceClaimTemplate slurm-worker-gpu-rtx3080-mps` |
 | `nodeSelector` | `gpu-host-class: rtx3080`（釘到 Node 2 `nutnadmin-e500-g9-ws760t`） |
-| Resource limits | `nvidia.com/gpu: 1` |
 | Features | `gpu, gpu-rtx3080, topology-2x1` |
-| Gres | `gpu:rtx3080:1`, `mps:100`（同樣切 4 slot，單 slot 25%） |
-| 對應 device-plugin config key | `rtx3080-mps`（由 `values-2x1.yaml` 的 `nfdRules` 依 PCI device id 自動套用） |
+| Gres | `gpu:rtx3080:1`, `mps:100`（同樣由 Slurm 內部細分） |
+| DRA claim 參數 | `GpuConfig` sharing=MPS，`defaultActiveThreadPercentage=100`（不設限）、`defaultPinnedDeviceMemoryLimit=9Gi`（≤ 3080 10GB VRAM） |
+| MPS keepalive | 同 rtx4070；host RSS 極小（實測 pod 總記憶體 265Mi），node-2 的 7.5GB RAM 扛得住 |
 | Partition | `gpu-rtx3080`（並同時為共享 `gpu` partition 成員） |
 
 > 兩個 GPU pool 都 `minReplicas=1 / maxReplicas=1`（warm pool，永不 scale-to-0），各用
 > `nodeSelector: gpu-host-class` 釘到對應實體機，避免 4070/3080 的 job 混卡錯置。
 > 舊的 `rtx4080` 預留 pool（demo 占位）已由真實的 `rtx3080` pool 取代。
+> GPU 存取由 device-plugin + `runtimeClassName: nvidia` 全面遷移為 DRA
+> `ResourceClaimTemplate`（`chart/templates/gpu/dra-resourceclaim.yaml`，由 `pool.useDra: true` 開啟），
+> 兩節點的 `nvidia.com/gpu` allocatable 皆為 0；詳見 `docs/dra-migration.md` §6–§6.3。
 
 #### Deployment `slurm-login`（replicas=1）
 
@@ -324,7 +343,7 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 關鍵欄位（皆來自 `values.yaml::slurm`）：
 
 - `SelectType=select/cons_tres` / `SelectTypeParameters=CR_Core`：CPU 以 core 為單位可消耗
-- `TaskPlugin=task/none`、`ProctrackType=proctrack/linuxproc`：Slurm 21.08（Ubuntu 22.04 image）對 cgroup v2 支援不完整，GPU 隔離由 NVIDIA runtime + device-plugin 處理
+- `TaskPlugin=task/none`、`ProctrackType=proctrack/linuxproc`：Slurm 21.08（Ubuntu 22.04 image）對 cgroup v2 支援不完整，GPU 隔離改由 DRA `ResourceClaim` + CDI 處理
 - `AuthAltTypes=auth/jwt`、`AuthAltParameters=jwt_key=/slurm-secrets/jwt_hs256.key`：slurmrestd 認證
 - `AccountingStorageType=accounting_storage/slurmdbd` + `AccountingStorageTRES=gres/gpu,gres/mps`：把 GPU / MPS 用量記入 sacct
 - `CompleteWait=0`：避免 worker pod 在 epilog 期間被驅逐後 job 卡在 COMPLETING
@@ -332,7 +351,7 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 #### `slurm-config-nodes`（chart `_helpers.tpl::slurmConfNodes` + `gresConf`）
 
 - `slurm.nodes.conf`：依 `values.pools` 順序展開，從 `<statefulset>-0` 到 `<statefulset>-(maxNodes-1)`，並輸出 `PartitionName=...`（GPU 空 partition 會被略過）
-- `gres.conf`：每個 GPU 節點依其型別輸出 `NodeName=... Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0`（3080 pool 為 `Type=rtx3080`）；MPS 節點輸出 `NodeName=... Name=mps Type=<rtx4070|rtx3080> Count=100`（由 device-plugin 接管）
+- `gres.conf`：每個 GPU 節點依其型別輸出 `NodeName=... Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0`（3080 pool 為 `Type=rtx3080`）；MPS 節點輸出 `NodeName=... Name=mps Type=<rtx4070|rtx3080> Count=100`。`File=/dev/nvidia0` 由 DRA driver 透過 CDI 注入滿足，而非 device-plugin
 
 > **靜態預宣告**：每個 GPU pool 從一開始就把全部 `maxReplicas` 節點寫進 `slurm.nodes.conf`（2×1 下 `gpu-rtx4070-0` 與 `gpu-rtx3080-0` 各一）。Operator 縮放只動 K8s replicas，slurmctld 看到的節點名單永遠不變，避免 scale event 期間引發大量 DNS 解析失敗。
 
@@ -454,15 +473,23 @@ operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operat
 
 ---
 
-## 5. GPU Operator + MPS（gpu-operator namespace）
+## 5. GPU 資源管理：GPU Operator + NVIDIA DRA Driver
 
-由 `scripts/deploy-2.sh` 透過 NVIDIA 官方 helm chart `nvidia/gpu-operator` 安裝（**獨立 helm release，不在 slurm-platform chart 內**），但 chart 仍負責：
+GPU/MPS 的分配已從傳統 device-plugin 全面遷移為 **Kubernetes DRA**（`resource.k8s.io/v1`，
+v1.34 GA）+ **NVIDIA DRA driver**（`kubernetes-sigs/dra-driver-nvidia-gpu`）。device-plugin
+與 `mps-control-daemon` 已停用移除；GPU Operator 只保留 NFD 與 dcgm-exporter。遷移過程、
+go/no-go 驗證與踩過的雷完整記錄在 `docs/dra-migration.md`（§6–§6.3 為最終落地狀態）。
+
+### 5.1 GPU Operator（NFD + dcgm-exporter）
+
+由 `scripts/deploy-2.sh` 透過 NVIDIA 官方 helm chart `nvidia/gpu-operator` 安裝（**獨立 helm
+release，不在 slurm-platform chart 內**，`devicePlugin.enabled=false`），chart 仍負責：
 
 - 建立 `gpu-operator` namespace（`pod-security.kubernetes.io/enforce: privileged`），加上 `helm.sh/resource-policy: keep`
-- 寫入 device-plugin 設定 ConfigMap `slurm-platform-device-plugin-config`（key: `default`、`rtx4070-mps`、`rtx3080-mps`、`rtx4080-exclusive`）
-- 由 `values-2x1.yaml` 的 `gpu.nfdRules` 依 **PCI device id 自動**把 `rtx4070-mps` / `rtx3080-mps` 套到對應節點（node 重建 / k3s 重裝後自動收斂）；post-install Job `slurm-platform-gpu-labeler` 仍依 `values.gpu.nodeAssignments` 作為 fallback 貼 `nvidia.com/device-plugin.config=<key>`
+- 由 `values-2x1.yaml` 的 `gpu.nfdRules` 依 **PCI device id 自動**把節點標成 `rtx4070-class` / `rtx3080-class`（node 重建 / k3s 重裝後自動收斂），供 DRA driver 與監控 dashboard 使用
+- device-plugin 設定 ConfigMap（`slurm-platform-device-plugin-config`）與 post-install labeler Job 仍保留於 chart，但 `devicePlugin.enabled=false` 下不再部署對應 DaemonSet（保留是為了 `SKIP_DRA=1` 可回滾）
 
-**GPU Operator 部署的物件（DaemonSet 在 acane 與 node-2 兩台都各跑一份）：**
+**GPU Operator 目前實際跑的物件（DaemonSet 在 acane 與 node-2 兩台都各跑一份；device-plugin / mps-control-daemon 已停用，不在此列）：**
 
 | 物件 | Kind | 說明 |
 |------|------|------|
@@ -471,51 +498,108 @@ operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operat
 | `gpu-operator-node-feature-discovery-gc` | Deployment | NFD garbage collector |
 | `gpu-operator-node-feature-discovery-worker` | DaemonSet | 偵測 PCI/CPU 特徵並上 label |
 | `gpu-feature-discovery` | DaemonSet | 偵測 GPU 規格（model、memory、compute capability） |
-| `nvidia-device-plugin-daemonset` | DaemonSet | 廣告 `nvidia.com/gpu`；讀 `slurm-platform-device-plugin-config[<label-key>]` 決定 sharing 策略 |
-| `nvidia-device-plugin-mps-control-daemon` | DaemonSet | 啟動 MPS control daemon（前景模式 -f）；只在 `nvidia.com/mps.capable=true` 節點上跑 |
-| `nvidia-operator-validator` | DaemonSet | toolkit/runtime/cuda/plugin/mps 全套 validator |
-| `nvidia-cuda-validator` / `nvidia-device-plugin-validator` | Job | 一次性 sanity check |
+| `nvidia-dcgm-exporter` | DaemonSet | per-GPU SM%/VRAM/溫度 metrics（Prometheus scrape，見 §7） |
+| `nvidia-operator-validator` | DaemonSet | toolkit/runtime/cuda validator（plugin/mps validator 隨 device-plugin 停用） |
 
-**MPS sharing 設定（`values.yaml::gpu.deviceConfigs.rtx4070-mps` + `values-2x1.yaml::...rtx3080-mps`）：**
-
-```yaml
-# values.yaml（4070）與 values-2x1.yaml（3080）各一份，replicas 都是 4：
-rtx4070-mps:        # rtx3080-mps 結構相同
-  version: v1
-  sharing:
-    mps:
-      resources:
-        - name: nvidia.com/gpu
-          replicas: 4
-```
-
-device-plugin 在**兩台節點**上都把 1 張實體 GPU 廣告為 4 個 `nvidia.com/gpu` slot（4070 與 3080 各 4 slot）。
-Slurm 配合 `Gres=gpu:<type>:1,mps:100` + `--gres=mps:N` 旗標切 SM 比例（每 25 對應一個 MPS slot）。
-
-**節點 label 連動（acane / node-2 各自）：**
+**節點 label（acane / node-2，皆由 NFD 自動維護，不再需要 `nvidia.com/device-plugin.config`）：**
 
 ```
 acane（Node 1）：
-  nvidia.com/device-plugin.config=rtx4070-mps
   gpu-host-class=rtx4070
-  nvidia.com/gpu.product=NVIDIA-GeForce-RTX-4070-SHARED
+  nvidia.com/gpu.product=NVIDIA-GeForce-RTX-4070
   nvidia.com/gpu.family=ada-lovelace   nvidia.com/gpu.memory=12282
   nvidia.com/cuda.driver-version.full=580.167.08
 
 node-2（Node 2）：
-  nvidia.com/device-plugin.config=rtx3080-mps
   gpu-host-class=rtx3080
-  nvidia.com/gpu.product=NVIDIA-GeForce-RTX-3080-SHARED
+  nvidia.com/gpu.product=NVIDIA-GeForce-RTX-3080
   nvidia.com/gpu.family=ampere         nvidia.com/gpu.memory=10240
   nvidia.com/cuda.driver-version.full=580.159.03
 
-兩台共同（GPU Operator NFD 自動補）：
-  nvidia.com/gpu.replicas=4
-  nvidia.com/gpu.sharing-strategy=mps
-  nvidia.com/mps.capable=true
+兩台共同：
+  nvidia.com/gpu.count=1
   nvidia.com/cuda.runtime-version.full=13.0
-  ...
+  # nvidia.com/gpu allocatable = 0（device-plugin 已移除；GPU 存取全部走 resource.k8s.io DRA）
 ```
+
+### 5.2 NVIDIA DRA Driver（GPU/MPS 分配）
+
+由 `scripts/deploy-2.sh` 的 `install_dra_driver` 透過 Helm OCI chart 安裝（獨立 release，
+namespace `dra-driver-nvidia-gpu`）：
+
+```bash
+helm install dra-driver-nvidia-gpu \
+  oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu \
+  --create-namespace --namespace dra-driver-nvidia-gpu \
+  --set gpuResourcesEnabledOverride=true \
+  --set resources.computeDomains.enabled=false \
+  --set nvidiaDriverRoot=/ \
+  --set featureGates.MPSSupport=true
+```
+
+`featureGates.MPSSupport=true` 是必要條件——關閉時 claim 分配會直接
+`FailedPrepareDynamicResources`。`resources.computeDomains.enabled=false` 因為此叢集不需要
+跨節點 GPU 互連的 ComputeDomain 功能。
+
+**DRA driver 部署的物件（兩個 GPU 節點各一份 `gpu-kubelet-plugin`）：**
+
+| 物件 | Kind | 說明 |
+|------|------|------|
+| `gpu-kubelet-plugin` | DaemonSet | 跑在兩個 GPU 節點；準備/釋放 `ResourceClaim`，管理 per-pod MPS server 生命週期 |
+| `DeviceClass gpu.nvidia.com` | 叢集級資源 | DRA 排程器用來匹配 `ResourceClaim` 的裝置類別 |
+| `ResourceSlice`（每 GPU 節點一份） | 叢集級資源 | 各節點 advertise 自己那張實體 GPU（型別、架構等 metadata） |
+
+**`ResourceClaimTemplate`（`chart/templates/gpu/dra-resourceclaim.yaml`，每個 `pool.useDra: true`
+的 GPU pool 各一份，如 `slurm-worker-gpu-rtx4070-mps`）：**
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: slurm-worker-gpu-rtx4070-mps
+  namespace: slurm
+spec:
+  spec:
+    devices:
+      requests:
+        - name: gpu
+          exactly: { deviceClassName: gpu.nvidia.com }
+      config:
+        - requests: ["gpu"]
+          opaque:
+            driver: gpu.nvidia.com
+            parameters:
+              apiVersion: resource.nvidia.com/v1beta1
+              kind: GpuConfig
+              sharing:
+                strategy: MPS
+                mpsConfig:
+                  defaultActiveThreadPercentage: 100   # 不設限 → 讓 Slurm 的每-job
+                  defaultPinnedDeviceMemoryLimit: 11Gi  #   CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 生效
+```
+
+關鍵設計：**DRA claim 本身不對 MPS 算力設上限**（`defaultActiveThreadPercentage=100`），把
+實際的 SM 比例切分完全交給 Slurm 的 `gres/mps:N`（job 請求 `mps:25/50/75/100`，Slurm 據此設定
+每-job 的 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）。worker StatefulSet 對應改為
+`resourceClaims: [{name: gpu, resourceClaimTemplateName: <pool>-mps}]` +
+`resources.claims: [{name: gpu}]`（`chart/templates/workers.yaml`），拿掉舊的
+`runtimeClassName: nvidia` 與 `nvidia.com/gpu` resource limit。
+
+**Pod 內實際拿到什麼：** DRA driver 透過 CDI 注入 `/dev/nvidia0` 與
+`CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps`（含 control/pid/log 檔的完整 pipe 目錄，取代
+device-plugin 時代的 `/mps/nvidia.com/gpu/pipe`）。claim 分配時 DRA 自動把 GPU
+compute mode 設為 `Exclusive_Process` 並啟動該 pod 專屬的 MPS server；claim 釋放時拆除
+MPS server（compute mode 維持 `Exclusive_Process`）。
+
+**已知運維細節（非阻礙，已緩解）：**
+
+- **MPS server 冷啟動競爭**：per-pod MPS server 在無 client 時會關閉；一次丟多個 job 同時
+  連、server 還沒起會出現 `CUDA-capable device busy`。worker pod 內常駐的 **MPS keepalive**
+  （見 §3.1）持續持有一個 CUDA context，讓 server 保持熱，徹底消除此競爭。
+- **遊戲流程改變**：`scripts/gpu-toggle.sh` 已改寫為 DRA 版——release 路徑改為
+  `kubectl cordon` + 逐出 worker pod（釋放 DRA claim → 拆 MPS）+ `nvidia-smi -c 0`；restore
+  為 uncordon + 等 pod ready + Slurm resume。舊版切 `nvidia.com/gpu.deploy.operands` label
+  在 DRA 下已無效。
 
 ---
 
@@ -730,11 +814,11 @@ flowchart TD
     LOGIN -. "/shared RWX" .- NFS
     CTL -. "/shared RWX" .- NFS
 
-    R70 -- "request nvidia.com/gpu × 1\n(MPS slot)" --> DP[nvidia-device-plugin]
-    R80 -- "request nvidia.com/gpu × 1\n(MPS slot)" --> DP
-    DP -- "advertise 4 slots / GPU\n(4070 on acane, 3080 on node-2)" --> KUBELET[kubelet]
-    R70 -- "CUDA → MPS pipe" --> MPSD[nvidia-mps-control-daemon]
-    R80 -- "CUDA → MPS pipe" --> MPSD
+    R70 -- "ResourceClaim(gpu.nvidia.com, MPS)" --> KP[gpu-kubelet-plugin]
+    R80 -- "ResourceClaim(gpu.nvidia.com, MPS)" --> KP
+    KP -- "advertise ResourceSlice\n(4070 on acane, 3080 on node-2)" --> KUBELET[kubelet]
+    KP -- "CDI: /dev/nvidia0 + /tmp/nvidia-mps" --> R70
+    KP -- "CDI: /dev/nvidia0 + /tmp/nvidia-mps" --> R80
 ```
 
 關鍵 port 速查：
@@ -795,10 +879,15 @@ sudo kubectl -n slurm logs deployment/slurm-elastic-operator -f | jq .
 sudo kubectl -n slurm get statefulset slurm-worker-gpu-rtx4070 \
   -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'
 
-# GPU 資源
+# GPU 資源（GPU Operator：NFD + dcgm 只；device-plugin 已移除，nvidia.com/gpu allocatable=0）
 sudo kubectl -n gpu-operator get pods,daemonset
-sudo kubectl get nodes -o jsonpath='{.items[*].status.allocatable}{"\n"}' | tr , '\n' | grep nvidia
 sudo kubectl get nodes -o jsonpath='{.items[*].metadata.labels}{"\n"}' | tr , '\n' | grep -E "nvidia|gpu-host"
+
+# DRA：GPU 實際分配走這裡
+sudo kubectl -n dra-driver-nvidia-gpu get pods,daemonset
+sudo kubectl get deviceclass
+sudo kubectl get resourceslice -o wide
+sudo kubectl -n slurm get resourceclaims
 
 # 監控
 sudo kubectl -n monitoring port-forward svc/grafana 3000:3000
@@ -830,7 +919,7 @@ sudo helm uninstall slurm-platform -n slurm
 
 ## 12. 2×2 DRL 實驗叢集設定
 
-`chart/values-2x2.yaml` 是給 DRL evaluation 用的 overlay，目標是讓 live topology 對齊 simulator 的 `--n-nodes 2 --gpus-per-node 2`。它不是單張 RTX 4070 demo 的預設值；只有在 Kubernetes 叢集確實能提供兩個 GPU worker pod、且每個 pod 可取得兩張 GPU 時才套用。
+`chart/values-2x2.yaml` 是給 DRL evaluation 用的 overlay，目標是讓 live topology 對齊 simulator 的 `--n-nodes 2 --gpus-per-node 2`。它不是單張 RTX 4070 demo 的預設值；只有在 Kubernetes 叢集確實能提供兩個 GPU worker pod、且每個 pod 可取得兩張 GPU 時才套用。目前實際硬體是 2×1（每節點一張physical GPU，見 §1/§5），本節描述的雙 GPU-per-node 拓樸尚未有對應硬體，仍沿用 device-plugin 世代的指令示例；若日後要接上兩張 GPU 的機器，GPU 分配應改走 §5.2 的 DRA `ResourceClaimTemplate` 模式。
 
 ### 12.1 第二台機器加入 k3s
 
@@ -923,8 +1012,9 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 |------|------|------|------|
 | `slurm-controller` | StatefulSet | chart | slurmctld + slurmrestd（同 pod） |
 | `slurm-worker-cpu` | StatefulSet | chart | CPU pool（1–4 replicas） |
-| `slurm-worker-gpu-rtx4070` | StatefulSet | chart | RTX 4070 pool（釘 acane，replicas=1，MPS 4 slot） |
-| `slurm-worker-gpu-rtx3080` | StatefulSet | chart + values-2x1 | RTX 3080 pool（釘 node-2，replicas=1，MPS 4 slot） |
+| `slurm-worker-gpu-rtx4070` | StatefulSet | chart | RTX 4070 pool（釘 acane，replicas=1，DRA `ResourceClaim` + MPS） |
+| `slurm-worker-gpu-rtx3080` | StatefulSet | chart + values-2x1 | RTX 3080 pool（釘 node-2，replicas=1，DRA `ResourceClaim` + MPS） |
+| `slurm-worker-gpu-rtx4070-mps` / `-rtx3080-mps` | ResourceClaimTemplate（`resource.k8s.io/v1`） | chart `gpu/dra-resourceclaim.yaml` | 每個 `useDra: true` GPU pool 一份；`GpuConfig` sharing=MPS thread%=100 |
 | `slurm-login` | Deployment | chart | 使用者入口 |
 | `slurm-elastic-operator` | Deployment | chart | 自動縮放 |
 | `slurm-exporter` | Deployment | chart | Prometheus metrics exporter |
@@ -945,20 +1035,28 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | 16 條 NetworkPolicy | NetworkPolicy | chart | 詳見 §8 |
 | `slurm-ctld-state` / `slurm-shared-rwx` / `mysql-data-mysql-0` | PVC | chart + accounting | 控制器狀態 / 共享 / DB |
 
-### `gpu-operator` namespace（chart + GPU Operator helm release 共享）
+### `gpu-operator` namespace（chart + GPU Operator helm release 共享；device-plugin 已停用）
 
 | 名稱 | Kind | 來源 | 說明 |
 |------|------|------|------|
 | `gpu-operator` | Namespace | chart `gpu/gpu-operator-namespace.yaml` | PSS=privileged, resource-policy=keep |
-| `slurm-platform-device-plugin-config` | ConfigMap | chart `gpu/device-plugin-config.yaml` + values-2x1 | sharing 策略：`default` / `rtx4070-mps` / `rtx3080-mps` / `rtx4080-exclusive` |
-| `slurm-platform-gpu-labeler` | Job + SA + ClusterRole + Binding | chart `gpu/node-labeler-job.yaml`（post-install hook） | 把 `nvidia.com/device-plugin.config` 標到節點 |
+| `slurm-platform-device-plugin-config` | ConfigMap | chart `gpu/device-plugin-config.yaml` + values-2x1 | 保留供 `SKIP_DRA=1` 回滾用；`devicePlugin.enabled=false` 下不生效 |
+| `slurm-platform-gpu-labeler` | Job + SA + ClusterRole + Binding | chart `gpu/node-labeler-job.yaml`（post-install hook） | fallback 節點標籤（DRA 主要靠 NFD `nfdRules` PCI-id 規則） |
 | `gpu-operator` | Deployment | GPU Operator helm | operator 本體 |
 | `gpu-operator-node-feature-discovery-master/gc` | Deployment | GPU Operator helm | NFD master + GC |
 | `gpu-operator-node-feature-discovery-worker` | DaemonSet | GPU Operator helm | NFD worker |
 | `gpu-feature-discovery` | DaemonSet | GPU Operator helm | GPU label discovery |
-| `nvidia-device-plugin-daemonset` | DaemonSet | GPU Operator helm | 廣告 nvidia.com/gpu |
-| `nvidia-device-plugin-mps-control-daemon` | DaemonSet | GPU Operator helm | MPS daemon |
-| `nvidia-operator-validator` | DaemonSet | GPU Operator helm | runtime/toolkit/cuda/plugin/mps validator |
+| `nvidia-dcgm-exporter` | DaemonSet | GPU Operator helm | per-GPU metrics（Prometheus scrape，見 §7） |
+| `nvidia-operator-validator` | DaemonSet | GPU Operator helm | runtime/toolkit/cuda validator |
+
+### `dra-driver-nvidia-gpu` namespace（獨立 Helm OCI release，`scripts/deploy-2.sh::install_dra_driver`）
+
+| 名稱 | Kind | 說明 |
+|------|------|------|
+| `dra-driver-nvidia-gpu` | Namespace | PSS=privileged, resource-policy=keep |
+| `gpu-kubelet-plugin` | DaemonSet | 跑在兩個 GPU 節點；準備/釋放 `ResourceClaim`、管理 per-pod MPS server |
+| `DeviceClass gpu.nvidia.com` | 叢集級資源（`resource.k8s.io/v1`） | DRA 排程用的裝置類別 |
+| `ResourceSlice`（每 GPU 節點一份） | 叢集級資源 | 各節點 advertise 自己那張實體 GPU |
 
 ### `monitoring` namespace（chart `templates/monitoring/`）
 
