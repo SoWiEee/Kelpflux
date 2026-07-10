@@ -15,6 +15,54 @@
 
 ---
 
+## 再次審核（2026-07-10）
+
+> **評估快照：** main @ `956b154`（§4.2.1–4.2.4 實機評估、RLPD 負結論、DRA 遷移、live Slurm 原生 baseline 之後）
+> **範圍：** 2026-07-01 P0 之後的新進展、DRA 遷移對論文的影響、目前最深的結構性問題與下一輪改進。
+
+### 執行摘要（2026-07-10）
+
+實機評估線大幅充實：§4.2.1（低負載 cuBLAS，學習式小勝 cvar +4.5%）、§4.2.2（高負載 LLM serving，學習式顯著落後 −10～16%）、§4.2.3（RLPD 微調未翻盤）、§4.2.4（統一 DRA 重測 + Slurm 原生 baseline）；平台亦完整遷移至 K8s DRA。**上次審核最大缺口 #4（強 baseline）已在 live 層級補上**，並產出一個更鋒利的正面觀察：**score 啟發式連 naive Slurm（FCFS/backfill）都贏**。
+
+但同一批數據把上次的「最致命問題」推到更尖銳的位置——**在乾淨的統一 DRA 重測（§4.2.4）下沒有任何學習臂勝過 score，唯一穩定的正面結果來自 score 這個手調啟發式**。並帶出兩個新問題：（a）**尾端反轉**——naive backfill/fcfs 的 p99/CVaR 反而優於 score 與所有學習臂，直接侵蝕「風險敏感學習式優化尾端」這條最鋒利的差異軸；（b）**DRA 後端混淆**——DRA MPS 使絕對 JCT 減半（39.9→18.4s），§4.2.1/4.2.2（device-plugin）與 §4.2.4（DRA）不同後端、不可並比。
+
+### 一、自上次審核以來已解決／推進
+
+| 上次項目 | 現況 |
+|---|---|
+| #4 強 baseline | ✅ **live 層級完成**：§4.2.4 加入 Slurm 原生 FCFS/backfill 實機臂（reconfig slurmctld + restore-trap），統一 DRA 8 seed。發現 score 亦勝 naive Slurm。 |
+| #5 eval↔prod placement gap | ✅ **大致解決**：生產與評估皆走提交時 `-w`/ReqNodeList 顯式放置（§3.2/§4.6）。 |
+| #6 serving 真實度 | 🟡 **部分**：§4.2.2 用真實 Qwen LLM serving + Poisson 到達 + MPS buckets；SLO 分級仍未做。 |
+| #7 DRA 互補 | 🟡 **平台已在 DRA 上**（GPU 分配全走 `gpu.nvidia.com` ResourceClaim），但 RDSAC 仍只驅動提交時放置，未接成 DRA device-selection／Kueue admission-ordering 的 policy plugin。 |
+| RLPD 微調救援 | ✅ **已檢驗、負結論**（§4.2.3，181 筆 transition 不足）。 |
+
+### 二、目前最深的問題
+
+1. **（致命，未解）學習式仍從未穩健勝出；唯一正面是手調啟發式。** 統一 DRA 重測下 score 最佳、所有學習臂為負；唯一穩定勝 baseline 的是 **score 啟發式贏 naive Slurm**——贏的是 **bin-pack/SJF 啟發式，不是 RDSAC/RL**。§4.2.1 的 +4.5% cvar 是低負載 cuBLAS、且在已被 DRA 取代的**舊後端**。→ 寫作上須明確重定位：**貢獻是「方法學 + 誠實的場景依賴負結論 + score 相對 vanilla Slurm 的加值」，RDSAC/RL 是被嚴謹研究後在此規模/場景發現未勝的對象**，非賣點。
+
+2. **（新，對主打差異軸有殺傷力）尾端反轉。** §4.2.4 表 4-4：naive backfill Δp99 **+19.7%**、ΔCVaR **+6.8%**；fcfs Δp99 +16.0%——**naive Slurm 尾端比 score 與所有學習臂都好**。上次審核把「學習式 + 風險敏感（CVaR 優化尾端）」列為最鋒利差異軸；但實機顯示 **score 是以較緊的平均換較長的尾，而尾端最好的其實是最笨的 backfill**。→ 兩條路：(a) 誠實把 risk-sensitive 降為「完成率穩定器」（§4.3 已部分如此）、不再宣稱優化 serving 尾端；(b) 深究 backfill 尾端優勢、檢驗 risk-sensitive RL 能否在尾端真的勝 backfill。尾端估計變異極大（±20~53%），任一宣稱都需更多 seed。
+
+3. **（新，威脅有效性）DRA 後端混淆未入 §4.6。** §4.2.1/4.2.2（device-plugin）與 §4.2.4（DRA，JCT 減半）不同後端；§4.6 未提，且 §5 開頭仍以 §4.2.1 的 +4.5% 起頭，與 §4.2.4 的「無臂勝出」並列讀來矛盾。→ (a) §4.6 立即補一條 threats；(b) 理想上把 §4.2.1/4.2.2 也在 DRA 下重測，使全篇同後端。
+
+4. **（承上）§5 與未來工作已 stale。** §5 仍以 +4.5% 正面結果開頭；未來工作仍列 `gres/shard`（本叢集用 gres/mps、N/A）與「補強 baseline」（§4.2.4 已做）。→ 重寫 §5 以場景依賴 + 誠實負結論為主軸，正面結果界定為「窄、低負載、舊後端」，並更新未來工作清單。
+
+### 三、更新後的改進優先級（2026-07-10）
+
+| # | 改進 | 解決的質疑 | 工作量 | 優先 |
+|--:|---|---|:--:|:--:|
+| A | **重定位貢獻與 §5**：主軸＝方法學 + 場景依賴負結論 + score 啟發式加值；正面結果界定範圍；未來工作去 stale | 「學習式從不贏，複雜度正當性？」 | 低（寫作） | **P0** |
+| B | **§4.6 補 DRA 後端 threats + 理想重測 §4.2.1/4.2.2 於 DRA** | 「跨後端不可比、§5 開頭與 §4.2.4 矛盾」 | 中 | **P0** |
+| C | **處理尾端反轉**：降 risk-sensitive 為穩定器，或深究 backfill 尾端優勢並檢驗 RL 能否在尾端勝 backfill | 「主打優化尾端，但最笨的 backfill 尾端最好」 | 中 | **P1** |
+| D | **RDSAC 接成 DRA/Kueue policy plugin PoC**（platform 已在 DRA、可行性大增）：把「策略層 × DRA 機制層互補」從論述變 demo | novelty 不足、「為何不落進生態系」 | 高 | **P1（最高 novelty 槓桿）** |
+| E | **serving SLO 分級**（延續 §4.2.2）：多層 SLO + tail-aware 目標 | SLO 模型仍淺 | 中 | P2 |
+| F | **更大叢集**（scale 交叉，硬體受限） | 「value at scale 仍是斷言」 | 高 | P2 |
+
+**定位（2026-07-10）：** 負結論主軸更穩、baseline 缺口已補（連 naive Slurm 都納入且 score 贏它）。下一輪最高價值＝ **A/B（寫作重定位 + DRA 後端一致性）** 鞏固可信度，以及 **D（RDSAC 接 DRA/Kueue policy PoC）** 把「平台已在 DRA 上」的事實轉成 novelty。**C（尾端反轉）** 是對主打差異軸的新威脅，必須誠實處理。
+
+---
+
+> 以下為 **2026-06-29／07-01 版**審查（P0 前後），保留為對照。
+
 ## 一、目前領域已有的做法（state of practice）
 
 | 系統 | 所在層 | 機制形態 | 學習式 | 尾端／SLO 目標 | GPU 分片 |
