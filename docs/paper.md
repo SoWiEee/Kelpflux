@@ -151,76 +151,38 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 須釐清**統計顯著與實務顯著的區別**：表 4 的 p 值極小（≈1e-12～1e-17）源於 n=246 的大樣本，代表「可偵測地變慢」而非「大幅變慢」；三個學習臂的 ΔJCT% 落在 −3.7～−4.6%，仍位於 §4.5 界定的 ±5% 實務等價帶內（僅偏於其負緣）。換言之，學習型策略在此規模是**可統計偵測地、但非實務顯著地**遜於 score，與後續「排程策略空間近乎是平的」洞見一致，而非與之矛盾。
 
-#### 4.2.1 真實 cuBLAS + MPS 共置：學習式放置改善平均 JCT（實機正面結果）
+#### 4.2.1 實機 DRA cuBLAS 評估（低負載共置：策略空間平坦）
 
-真正能觸及這座**異質**叢集放置槓桿的評估，必須讓卡內共享（NVIDIA MPS）與計算異質性反映到 JCT。為此，我們以**真 cuBLAS（`gpu_workload`）＋ MPS 分數共置**（Poisson 到達、mps-oversub 1.0、MPS 分桶 25／50／75／100）跑實機**五方**（score／SAC／RDSAC-mean／RDSAC-cvar／CrossQ）配對 A/B（2×1、提交時 `-w` 顯式放置、drift-robust interleave、**8 訓練 seed**、每 seed n_jobs=30×3 rounds、σ=1.0），見表 4-1。四方學習臂皆用同一 hetero recipe 的 checkpoint（訓練時 node_j=0 對應快卡）。以往評估把 job 當獨立單位而有偽重複（pseudoreplication）之虞；此處改以**正確分析層級——seed**——的 one-sample t 檢定每臂 ΔJCT% 是否顯著異於 score。
+真正能觸及這座**異質**叢集放置槓桿的評估，必須讓卡內共享（NVIDIA MPS）與計算異質性反映到 JCT。為此以**真 cuBLAS（`gpu_workload`）＋ MPS 分數共置**（Poisson 到達、mps-oversub **1.0** 的低負載、MPS 分桶 25／50／75／100）跑實機配對 A/B（2×1、提交時 `-w` 顯式放置、drift-robust interleave、**8 seed**、每 seed n_jobs=30×3 rounds、σ=1.0），並以**正確分析層級——seed**——的 one-sample t 檢定每臂 ΔJCT% 是否顯著異於 score，避免把 job 當獨立單位的偽重複。全部臂於**同一 DRA MPS 後端**量測（見下方「後端混淆」）：六個學習／啟發式臂（score／SAC／RDSAC-mean／RDSAC-cvar／CrossQ／**RLPD**）加兩個 **Slurm 原生 baseline**（**fcfs** = `sched/builtin`+`priority/basic`、關 Lua、嚴格 FIFO；**backfill** = `sched/backfill`+`priority/basic`、關 Lua、Slurm 現代預設；皆無 `-w`、由 `select/cons_tres` 選節點），代表「不加智慧放置的 vanilla Slurm」。
 
-**四方學習臂在真實計算＋MPS 共置下皆改善平均 JCT，但幅度溫和，且只有風險敏感臂在正確層級達顯著。** 表 4-1（n=8）顯示四臂 ΔJCT% 皆為正（+3.6～+5.8%）、每臂 6–7／8 個 seed 為正，方向一致。但在 **seed 層級 one-sample t** 下，只有 **RDSAC-cvar 達顯著（+4.5±4.4%，p=0.023）**；CrossQ 邊際（+5.8±7.3%，p=0.060）；SAC 與 RDSAC-mean 方向為正但個別未達顯著（p≈0.32，seed 間變異達 ±9～10%）。關鍵洞見是：RDSAC-cvar 的顯著並非來自最大平均增益（CrossQ 的平均更大），而是風險敏感讓它的 seed 間變異最低（±4.4，對比其餘 ±7～10），因此那個溫和的 +4.5% 才最穩健、可複現。這印證了 CVaR 的價值在「可靠性」而非「更大的平均效果」，與 §4.3 把 CVaR 定位為穩定器的發現一致。
+**RLPD 臂（實機資料微調）。** 為檢驗「用實機資料線上微調能否縮小 sim-to-real 落差」，以 `live_daemon` **旁觀模式**收集真實 transition（記錄決策時觀測、Slurm 實際落點、實現 −JCT，不干擾生產、產出有效 off-policy 資料），共 **181 筆**；再以**忠於原始 RLPD（Ball 等人 2023）**之實作微調（對稱 50／50 離線／線上取樣、LayerNorm 集成評論家 N=10／隨機子集 M=2 取 target min、離散 SAC actor、固定溫度 α=0.05——被遮罩的離散 SAC 自動-α 會因合法動作數遠小於 log(A) 而發散，故釘死）RDSAC-cvar 的 sim 策略得 **RLPD-v3**，作為第八臂。
 
-**這也修正了先前 3-seed 的膨脹估計。** 同一批 s42–44 checkpoint，先前較小的 3-seed run 曾量到 RDSAC-mean +15.2%，擴至 n=8 後同一策略只剩 +3.6%，先前的大數是抽到少數幸運 seed 的小樣本假象。實機量測本身雜訊也大：同一 checkpoint 的 ΔJCT% 在兩 run 間可由 +15% 擺盪到 +3.6%，故我們以 n=8 的 seed 層級估計為準，也僅就其宣稱。
+**結果：低負載下策略空間近乎平坦，無臂勝出。** 表 4-1（n=8）：**score ≈ fcfs ≈ backfill**（皆 6.8s、ΔJCT ±0.1%、p≈0.88，統計打平），八臂中的六個學習臂則**一致略差**（−1.7～−5.7%），其中 CrossQ／RDSAC-cvar 達 seed 顯著（p=0.011／0.033）但幅度僅 −3～−5%、落在 §4.5 界定的 ±5% 實務等價帶內。**RLPD 微調亦未翻盤**（−3.6%、p=0.071），與未微調的學習臂同屬略差一檔——181 筆真實 transition 不足以彌合落差，「線上微調可救援」在此資料規模為誠實**否定**結果。換言之，**在低負載真實 cuBLAS＋MPS 共置下，無論學習式（含實機微調）或 vanilla Slurm 都未勝過 score，且彼此皆落在 ±5% 內**：此 regime 的排程策略空間近乎是平的。
 
-表 4-1. 真實 cuBLAS＋MPS 實機五方放置 A/B（2×1、**8 train seed**、σ=1.0；JCT／p99／CVaR 為秒；ΔJCT% 為 seed 平均±std、**+ = 勝**；seed 為正 = 8 個 seed 中 ΔJCT%>0 的數目；seed-t = seed 層級 one-sample t 檢定 p）
+表 4-1. 實機 DRA cuBLAS 放置 A/B（2×1、DRA MPS、oversub 1.0、8 seed；JCT／p99／CVaR 為秒；Δ 為相對 score 的百分比，**＋ = 勝過 score**；seed 為正 = 8 個 seed 中 ΔJCT%>0 的個數；seed-t = ΔJCT% 的 seed 層級 one-sample t）
 
-| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | seed為正 | seed-t p |
-|---|--:|--:|--:|--:|:--:|--:|
-| score | 11.0±0.1 | 64.2±25.9 | 22.0±1.1 | — | — | — |
-| SAC | 10.6±1.1 | 45.7±31.4 | 22.1±4.3 | +3.9±10.3 | 6/8 | 0.321 |
-| RDSAC-mean | 10.6±1.0 | 40.1±24.0 | 22.4±3.9 | +3.6±9.4 | 6/8 | 0.318 |
-| **RDSAC-cvar** | **10.5±0.4** | 33.6±20.3 | **21.0±2.0** | **+4.5±4.4** | 6/8 | **0.023** |
-| CrossQ | 10.4±0.8 | 33.3±7.4 | 21.1±2.4 | +5.8±7.3 | 7/8 | 0.060 |
+| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | Δp99% | ΔCVaR% | seed 為正 | seed-t p |
+|---|--:|--:|--:|--:|--:|--:|:--:|--:|
+| score | 6.8±0.7 | 22.1±1.3 | 14.9±1.7 | —（基準） | — | — | — | — |
+| fcfs | 6.8±0.6 | 21.9±1.4 | 14.8±1.8 | −0.1±3.0 | +1.3±2.0 | +0.9±2.1 | 2/8 | 0.891 |
+| backfill | 6.8±0.6 | 22.2±1.3 | 14.8±1.8 | −0.1±2.1 | −0.4±3.8 | +0.8±1.8 | 3/8 | 0.876 |
+| RDSAC-mean | 7.0±0.8 | 24.0±3.7 | 15.8±2.5 | −1.7±3.0 | −8.4±16.1 | −5.6±8.3 | 1/8 | 0.168 |
+| CrossQ | 7.1±0.8 | 23.9±3.6 | 15.7±2.4 | −3.1±2.5 | −8.0±15.5 | −5.4±8.4 | 1/8 | 0.011 |
+| RLPD | 7.1±0.9 | 23.9±3.8 | 15.9±2.4 | −3.6±4.8 | −8.1±16.9 | −7.0±9.3 | 2/8 | 0.071 |
+| RDSAC-cvar | 7.2±0.8 | 25.2±4.5 | 16.2±2.9 | −4.6±4.9 | −14.1±19.5 | −8.3±11.2 | 1/8 | 0.033 |
+| SAC | 7.2±0.7 | 24.3±3.6 | 16.1±2.2 | −5.7±7.1 | −10.1±15.9 | −8.7±11.6 | 2/8 | 0.058 |
 
-**限制與尾端，須誠實界定。** 效果幅度溫和（+3.6～+5.8%），且除 RDSAC-cvar 外個別臂未達 seed 層級顯著；能穩健宣稱的是「四臂方向一致改善平均 JCT，而風險敏感的 RDSAC-cvar 在正確層級（seed，n=8）達顯著」。尾端方面，本 n=8 run 的學習臂 p99 反而優於 score（RDSAC-cvar Δp99 +41.6%、ΔCVaR +4.3%），但這與先前較小 run 的 p99 較差方向相反——score 自身的 p99 在兩 run 間即由 37s 擺盪到 64s，顯示在 2-node 小叢集上「誰踩到尾端災難」由排程運氣主導，故我們**仍不宣稱尾端優勢**，穩健結論限於平均／中央 JCT。此結果亦凸顯**評估場景決定結論**：唯有真實計算（異質性）＋ MPS 分數共置的場景才觸及學習式放置的槓桿；缺乏卡內共享或計算異質性的場景（模擬、exclusive-GPU）會低估它。
+**方法學要點一：GPU 分配後端會混淆結論——「正面結果」不跨後端重現。** 本平台於評估期間由 device-plugin 遷移至 **Kubernetes DRA**（`gpu.nvidia.com` ResourceClaim + MPS，見 `docs/dra-migration.md`）。**先前於 device-plugin 後端**、同樣真實 cuBLAS 低負載共置，曾量到學習式**小勝** score（RDSAC-cvar +4.5±4.4%、seed-t p=0.023，n=8）；但**換到乾淨的 DRA 後端後，同一 recipe、同一分析層級反轉為略輸**（cvar −4.6%）。實測 DRA MPS 亦使絕對 JCT 大幅改變（同一 hybrid score 基準由 device-plugin 的 39.9s 降至 DRA 的 18.4s，見 §4.2.2）。**結論：那個 +4.5% 的正面結果是後端相關的、不穩健**；跨後端的絕對數字與方向皆不可直接沿用。此為本文評估方法學的一項重要教訓——**排程結論不僅依賴 workload／負載，也依賴底層 GPU 分配後端**，凸顯「同一後端統一重測」的必要，也是本文將全部臂於同一 DRA 後端重跑（表 4-1、表 4-2）的原因。
 
-#### 4.2.2 真實 LLM serving＋高負載：乾淨比較下學習式放置顯著落後
+**方法學要點二：seed 層級與小樣本雜訊。** 實機量測雜訊大：同一 checkpoint 的 ΔJCT% 在不同 run 間可大幅擺盪（先前一組 3-seed run 曾量到某臂 +15%，擴至 n=8 後僅剩 +3.6%，為抽到幸運 seed 的小樣本假象）。故一律以 n=8 的 seed 層級估計為準、僅就其宣稱，不採單 seed 或小樣本大數。
 
-§4.2.1 的 workload 是合成 sgemm。為以**真實 AI-serving** job 檢驗，我們把 payload 換成 Qwen2.5-0.5B 的批次自迴歸生成（長 prompt、prefill-compute-bound，對應 RAG／摘要類長 context 服務），並將 offered load 由 oversub 1.0 拉高至 **2.0**（超過單卡容量，迫使放置器必須動用兩張卡）。此處揭露一個真實部署的硬體約束：慢卡節點（3080 機）**host RAM 僅 7.5GB**，而每個 LLM job 需先把 torch＋約 954MB 模型載入 host RAM（約 2–3GB），兩個並發 LLM job 即耗盡 host RAM → OOM → 進程卡死無法終止 → Slurm 將該節點 drain。因此採 **hybrid workload**：mps 25／50 的小 job 走 cuBLAS（自包含、host／VRAM 佔用極低、可 4-way 共置），mps 75／100 的大 job 走真實 LLM（門檻 75 保證任兩個 LLM 需求相加 >100，永不在同卡共置，慢卡節點最多同時載入一個模型）。
+#### 4.2.2 實機 DRA Hybrid 評估（高負載真實 LLM serving：score 最佳）
 
-**在消除偏差的乾淨比較下，結論與 §4.2.1 相反：學習式放置顯著落後 score。** 見表 4-2（2×1、8 train seed、每 seed 每臂完成 **22 個 job（完全對等，無存活者偏差）**、兩節點皆重度使用）。四個學習臂的平均 JCT 皆較 score 差 **9.8～16.3%**，且在正確的 seed 層級高度顯著（p≤0.003）、方向極一致（0–1／8 個 seed 為正）。
+§4.2.1 為合成 cuBLAS、低負載。為以**真實 AI-serving** job＋高負載檢驗，把 payload 換成 Qwen2.5-0.5B 的批次自迴歸生成（長 prompt、prefill-compute-bound，對應 RAG／摘要類長 context 服務），offered load 拉到 **oversub 2.0**（超過單卡容量、迫使動用兩張卡）。此處揭露一個真實硬體約束：慢卡節點（3080）**host RAM 僅 7.5GB**，每個 LLM job 需先把 torch＋約 954MB 模型載入 host RAM（約 2–3GB），兩個並發即 OOM → 進程卡死 → Slurm drain 該節點。故採 **hybrid workload**：mps 25／50 小 job 走 cuBLAS（自包含、可 4-way 共置），mps 75／100 大 job 走真實 LLM（門檻 75 保證任兩 LLM 需求相加 >100，永不同卡共置、慢卡最多同時載入一個模型）。全部八臂（六學習／啟發式 + fcfs／backfill）於**同一 DRA 後端**、8 workload seed 統一量測。
 
-表 4-2. 真實 LLM hybrid serving 實機五方放置 A/B（2×1、8 train seed、oversub 2.0、mps 25／50→cuBLAS、75／100→LLM；每 seed 每臂 n=22 完成 job；JCT 秒；seed-t = seed 層級 one-sample t，**＋ = 勝過 score**）
+**結果與 §4.2.1 相反：高負載下 score 最佳，學習式與 naive Slurm 皆較差。** 見表 4-2（score 基準 JCT=18.4s）。**沒有任何學習臂勝過 score**（ΔJCT −3.9～−11.9%），RDSAC-cvar（−3.9%、p=0.344 不顯著）為最接近打平者、與 backfill（−4.9%、p=0.076）同屬「最不差」一檔；fcfs／RDSAC-mean／RLPD 顯著最差（p≤0.031）。**且 score 亦勝過 vanilla Slurm**：fcfs 顯著落後（−10.8%、p=0.004、0／8）、backfill 邊緣落後（−4.9%、p=0.076）——證明 score 的 bin-pack／SJF 因子相對「數 GPU」式的 cons_tres 放置確有加值，而非只是與學習式互比的空殼基準。
 
-| arm | JCT(s) | ΔJCT% | seed 為正 | seed-t p |
-|---|--:|--:|:--:|--:|
-| score | 12.0±0.3 | — | — | — |
-| SAC | 13.9±0.8 | −15.6±8.6 | 1/8 | 0.001 |
-| RDSAC-mean | 13.9±0.5 | −16.1±5.1 | 0/8 | <0.001 |
-| RDSAC-cvar | 13.2±0.6 | −9.8±6.3 | 0/8 | 0.003 |
-| CrossQ | 14.0±0.8 | −16.3±5.3 | 0/8 | <0.001 |
-
-**機制可解釋。** 學習臂把只 **35–39%** 的 job 放到慢卡 3080，而 score 放 **47%**——學習式較貪心地偏好快卡 4070。在 oversub 2.0 的高負載下，這種過度集中反而**把 4070 塞爆、排隊變長**，總體 JCT 更差；score 更均衡地把慢卡也用起來，反而較快。這與 §4.5 觀察到的「學習式易在快卡過度集中」一致。
-
-**方法學註記：正確設計消除了一個會誤導的假象。** 此配對 A/B 的第一版曾量到學習臂大幅**領先**（+46%），但那是**存活者偏差**：score 無顯式放置，其被 Slurm 分到慢卡的 job 會因慢卡 host RAM OOM／冷載入超時而 FAILED，而 join 只計 COMPLETED → score 的完成集被截斷。三項修正還原了公平比較：(1) 提交時 free-MPS 快照改為**本地即時追蹤**（Slurm 的 MPS 帳目落後於 burst 提交，否則放置器永遠只見快卡有空位而不 spill）；(2) hybrid workload 讓慢卡節點不再 OOM／drain（消除失敗-丟棄）；(3) 確認每臂完成數對等。修正後兩臂完成數皆 22／seed，結論方向即反轉。
-
-**綜合 §4.2.1 與 §4.2.2**，兩個真實-硬體場景給出相反結論——低負載分數-cuBLAS 共置下學習式小勝（cvar +4.5%），高負載真實-LLM serving 下學習式顯著落後（−10～−16%）——**這強化而非削弱本文核心命題：排程結論高度依賴評估場景**，並誠實界定了 §4.2.1 那個正面結果的適用範圍（窄、低負載、特定 workload），提醒學習式放置的實機效益遠比單一場景所暗示的脆弱。
-
-#### 4.2.3 線上 RLPD 微調與全模型 workload-seed 穩健性檢驗：真實資料微調未能翻盤
-
-§4.2.2 顯示學習式放置在高負載真實-LLM serving 下顯著落後 score。一個自然的補救假設是**用實機資料做線上微調以縮小 sim-to-real 落差**（本文原列為未來工作）。我們直接檢驗此假設。
-
-**行為觀測式資料收集（shadow-safe）。** `live_daemon` 以旁觀模式輪詢 `squeue`，對每個 job 記錄**決策時的觀測狀態**、Slurm **實際落點**（哪個節點）與**實現的 −JCT**——即記錄行為策略（Slurm＋score）的真實 transition，而非 RL 的反事實動作，故完全不干擾生產、且產出有效的 off-policy 離線資料。共收集 **181 筆真實 transition**。**忠於原始 RLPD（Ball 等人 2023）之實作**：對稱 50／50 離線／線上取樣、LayerNorm 集成評論家（N=10、隨機子集 M=2 取 target min，REDQ 式）、離散 SAC actor、固定溫度（fixed-α=0.05；被遮罩的離散 SAC 自動-α 會因合法動作數遠小於 log(A) 而向上發散，故釘死）。以此微調 RDSAC-cvar 的 sim 策略得 **RLPD-v3**。
-
-**評估設計（誠實的變異軸）。** RLPD-v3 是**單一**策略，無 per-train-seed 版本；為與 sim 臂公平配對，我們改變 **workload seed**（8 條獨立 job 串流）而固定各學習臂的 checkpoint（sim 臂用其對應 train-seed 的 ckpt、RLPD 用單一 v3）。此變異軸（workload seed）與表 4-2（train seed、固定 workload）**不同**，故兩表的**絕對 JCT 不可直接相比**，各自檢驗其軸內的相對排名。表 4-3 為全六臂結果。
-
-表 4-3. 全模型 workload-seed 實機 A/B（2×1、8 workload seed、oversub 2.0、hybrid；sim 臂＝對應 train-seed ckpt，RLPD＝單一 v3；JCT 秒；seed-t = seed 層級 one-sample t，**＋ = 勝過 score**）
-
-| arm | JCT(s) | ΔJCT% | ΔCVaR% | seed 為正 | seed-t p |
-|---|--:|--:|--:|:--:|--:|
-| score | 39.9±8.9 | — | — | — | — |
-| SAC | 42.8±7.8 | −8.3±8.2 | −9.6 | 0/8 | 0.025 |
-| RDSAC-mean | 43.0±8.4 | −8.7±7.5 | −10.8 | 0/8 | 0.013 |
-| RDSAC-cvar | 41.5±10.2 | **−3.5±7.5** | −4.4 | 2/8 | **0.225** |
-| CrossQ | 42.9±7.4 | −8.9±8.9 | −10.7 | 1/8 | 0.025 |
-| RLPD | 42.1±7.9 | −6.5±8.4 | −7.4 | 0/8 | 0.064 |
-
-**三點結論。** 第一，**線上 RLPD 微調在此資料規模下未能翻盤**：RLPD-v3 仍落後 score（ΔJCT −6.5%，seed-t p=0.064 邊緣、0／8 seed 為正），僅略優於未微調的 SAC／RDSAC-mean／CrossQ（−8～−9%），且**不如 per-train-seed 的 RDSAC-cvar**（−3.5%）。一個聚焦的三臂對照（固定 RDSAC-cvar-s45 vs RLPD-v3 vs score、同樣跨 8 workload seed）給出一致圖像：RDSAC-cvar −7.5%（p=0.016）、RLPD −7.2%（p=0.043），兩者統計上無區別。**181 筆真實 transition 不足以彌合 sim-to-real 落差**——這是對「線上微調可救援」假設的誠實**否定**結果。第二，**風險敏感（cvar）在高負載下最穩健**：RDSAC-cvar 是唯一未達 seed 顯著的學習臂（p=0.225、2／8 為正、最接近打平），與 §4.2.2 中 cvar 為「最不差」一致——CVaR 的低變異在高負載過度集中風險下轉為可靠性優勢。第三，**§4.2.2 的結論對變異軸的選擇穩健**：換到 workload-seed 軸後，六臂相對 score 的排名與方向（全數為負）保持不變，僅幅度較溫和（−3.5～−8.9% vs 表 4-2 的 −9.8～−16.3%），交叉驗證了「高負載下學習式放置落後」並非 train-seed 抽樣的假象。綜言之，縮小 sim-to-real 落差恐需遠多於 181 筆的實機資料量、或加入 on-policy 修正，而非單靠小樣本離線 RLPD。
-
-#### 4.2.4 加入 Slurm 原生排程 baseline：統一 DRA 重測下 score 亦勝過 naive Slurm
-
-前述比較皆為「學習式放置 vs score 啟發式」，尚缺一個問題：**score／學習式相對於 Slurm 內建排程器**孰優？為此加入兩個 Slurm 原生 baseline——**FCFS**（`sched/builtin` + `priority/basic`，關閉 job_submit Lua，嚴格 FIFO 無回填）與 **backfill**（`sched/backfill` + `priority/basic`，關閉 Lua，Slurm 現代預設）——皆**不做提交時綁定**（無 `-w`，由 `select/cons_tres` 自行選節點），代表「不加任何智慧放置的 vanilla Slurm」。
-
-**方法學要點：統一後端重測消除混淆。** 本平台於此期間由 device-plugin 遷移至 **Kubernetes DRA**（`gpu.nvidia.com` ResourceClaim + MPS，見 `docs/dra-migration.md`）；實測 DRA MPS 使**絕對 JCT 約減半**（同一 score 基準：device-plugin 39.9s → DRA 18.4s）。因此若把新 baseline（DRA）與 §4.2.3 的 score（device-plugin）相比會得到假象（一度量到 FCFS「快 score 54%」，純屬後端差異）。為此**將全部八個臂於同一天、同一 DRA 後端重測**（表 4-4），使所有 ΔJCT% 對齊同一個 DRA-score 基準；跨後端的絕對 JCT 不可比，但**同後端內的相對 ΔJCT% 才是有效指標**，且其排名與 §4.2.3 一致。
-
-表 4-4. 統一全方法實機 A/B（2×1、DRA MPS、8 workload seed、oversub 2.0、hybrid；JCT／p99／CVaR 為秒；Δ 為相對 score 的百分比，**＋ = 勝過 score**；seed 為正 = 8 個 seed 中 ΔJCT%>0 的個數；seed-t = ΔJCT% 的 seed 層級 one-sample t）
+表 4-2. 實機 DRA Hybrid 放置 A/B（2×1、DRA MPS、oversub 2.0、8 workload seed、mps 25／50→cuBLAS、75／100→真實 LLM；JCT／p99／CVaR 為秒；Δ 為相對 score 的百分比，**＋ = 勝過 score**；seed 為正 = 8 個 seed 中 ΔJCT%>0 的個數；seed-t = ΔJCT% 的 seed 層級 one-sample t）
 
 | arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% | Δp99% | ΔCVaR% | seed 為正 | seed-t p |
 |---|--:|--:|--:|--:|--:|--:|:--:|--:|
@@ -233,7 +195,13 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 | RDSAC-mean | 20.5±4.4 | 53.2±18.0 | 35.9±10.1 | −11.0±11.6 | −21.1±33.0 | −13.0±14.9 | 1/8 | 0.031 |
 | RLPD | 20.4±2.7 | 54.1±14.7 | 37.6±7.9 | −11.9±11.1 | −26.3±33.4 | −21.7±30.7 | 1/8 | 0.019 |
 
-**三點結論。** 第一，**score 啟發式在高負載下（平均 JCT）勝過 vanilla Slurm**：FCFS 顯著落後 score（ΔJCT −10.8%、p=0.004、0／8），backfill 亦邊緣落後（−4.9%、p=0.076）——證明 score 的 bin-pack／SJF 因子相對於「數 GPU」式的 cons_tres 放置確有加值，而非只是與學習式互比的空殼基準。第二，**排名跨後端一致、鞏固核心命題**：在乾淨的統一 DRA 重測下，**沒有任何學習臂勝過 score 的平均 JCT**（全數為負），RDSAC-cvar（−3.9%、p=0.344 不顯著）仍為最接近打平者、與 backfill（−4.9%）同屬「最不差」一檔，而 fcfs／RDSAC-mean／RLPD 顯著最差——此與 §4.2.2／§4.2.3 的方向完全吻合，交叉驗證「高負載真實-serving 下學習式放置未勝過調校過的 score、naive Slurm 更差」並非後端或抽樣假象。第三，**尾端呈相反權衡（附帶觀察，不作宣稱）**：naive Slurm（backfill／fcfs）雖平均較差，其 p99／CVaR 反而優於 score（backfill Δp99 +19.7%、ΔCVaR +6.8%；fcfs Δp99 +16.0%）——即 score 以較緊的平均換取較長的尾；惟此處 p99／CVaR 為每 seed 20–30 個完成 job 的估計、變異極大（Δp99 標準差達 ±20～53%），僅作尾端行為的定性觀察，在此小叢集不作統計宣稱。
+**機制可解釋。** 學習臂把只 **35–39%** 的 job 放到慢卡 3080，而 score 放 **47%**——學習式較貪心地偏好快卡 4070。在 oversub 2.0 的高負載下，這種過度集中反而**把 4070 塞爆、排隊變長**，總體 JCT 更差；score 更均衡地把慢卡也用起來，反而較快（與 §4.5「學習式易在快卡過度集中」一致）。
+
+**方法學要點三：存活者偏差。** 此 A/B 的第一版曾量到學習臂大幅**領先**（+46%），但那是**存活者偏差**：score 無顯式放置，其被 Slurm 分到慢卡的 job 會因慢卡 host RAM OOM／冷載入超時而 FAILED，而 join 只計 COMPLETED → score 的完成集被截斷。三項修正還原公平比較：(1) 提交時 free-MPS 快照改為**本地即時追蹤**（Slurm 的 MPS 帳目落後於 burst 提交，否則放置器永遠只見快卡有空位而不 spill）；(2) hybrid workload 讓慢卡節點不再 OOM／drain；(3) 確認每臂完成數對等。修正後結論方向即反轉。
+
+**方法學要點四：尾端呈相反權衡（附帶觀察，不作宣稱）。** naive Slurm（backfill／fcfs）雖平均較差，其 p99／CVaR 反而優於 score（backfill Δp99 +19.7%、ΔCVaR +6.8%；fcfs Δp99 +16.0%）——即 score 以較緊的平均換取較長的尾；惟此處 p99／CVaR 為每 seed 20–30 個完成 job 的估計、變異極大（Δp99 標準差達 ±20～53%），僅作尾端行為的定性觀察，在此小叢集不作統計宣稱。
+
+**綜合 §4.2.1 與 §4.2.2（皆同一 DRA 後端）。** 兩個真實-硬體場景在乾淨統一後端下給出一致的誠實圖像：**低負載 cuBLAS 策略空間平坦**（score／naive Slurm／學習式全在 ±5% 內、學習式略差），**高負載 hybrid 則 score 最佳**（學習式與 naive Slurm 皆較差）。**在乾淨統一後端下，學習式放置在兩個場景皆未勝過 score、亦未勝過 naive Slurm**；先前 device-plugin 後端量到的 cuBLAS 小勝（+4.5%）不跨後端重現、屬後端假象；線上 RLPD 微調（181 筆真實 transition）亦未翻盤。這強化本文核心命題：**排程結論高度依賴評估場景與 GPU 分配後端**，而學習式放置的實機效益遠比單一場景所暗示的脆弱。本文據此**不宣稱學習式優越**，改以方法學（抗漂移、多 seed、seed 層級配對、同後端統一重測、存活者偏差消除）與誠實的場景／後端依賴負結論為主要貢獻。
 
 ### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
 
