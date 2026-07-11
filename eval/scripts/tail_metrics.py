@@ -45,8 +45,13 @@ def summarize(
     true_runtimes: Optional[Sequence[float]] = None,
     *,
     beta: float = 0.25,
+    slo_factor: float = 4.0,
 ) -> dict:
-    """Metric panel for one (arm, round). mean/tail JCT + slowdown + CVaR."""
+    """Metric panel for one (arm, round). mean/tail JCT + slowdown + CVaR + SLO.
+
+    ``slo_viol`` = fraction of requests whose JCT exceeds its deadline
+    ``slo_s = true_runtime × slo_factor`` (i.e. slowdown > slo_factor). This is the
+    serving SLO-violation rate; only populated when ``true_runtimes`` is given."""
     j = np.asarray(jcts, dtype=float)
     out: dict = {
         "n": int(j.size),
@@ -62,6 +67,7 @@ def summarize(
         slow = j / t
         out["slowdown_mean"] = float(slow.mean())
         out["slowdown_p99"] = _pct(slow, 99)
+        out["slo_viol"] = float((slow > slo_factor).mean())
     return out
 
 
