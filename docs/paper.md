@@ -1,48 +1,47 @@
-<!--
-TANET 投稿雛形 — 主題三「網際網路與雲端技術應用」
-子題：雲端運算、邊緣運算、雲霧整合運算 ／ 分散式系統
-格式對齊：TANET 全文 4–6 頁、定稿 PDF；本檔為 Markdown 雛形，
-定稿時請套用大會 Word/odt/LaTeX 範本（字體字級依範本：標題標楷體、
-內文新細明體/Times New Roman，雙欄，勿編頁碼）。
-作者與單位欄位請自行填入。
--->
+# 基於 Slurm 與 Kubernetes 架構下 AI 伺服器 GPU 工作負載智慧排程技術之研究
 
-# 基於 Slurm 與 Kubernetes 的 AI 伺服器 GPU 工作負載智慧排程：風險敏感深度強化學習與模擬到實機評估
-
-### Intelligent GPU Workload Scheduling for AI Servers on Slurm-over-Kubernetes: Risk-Sensitive Deep Reinforcement Learning and a Sim-to-Real Evaluation
+### Intelligent GPU Workload Scheduling Techniques for AI Servers under a Slurm-on-Kubernetes Architecture
 
 **作者一¹、作者二²**
 ¹○○大學 ○○系　²○○大學 ○○系
-{author1, author2}@example.edu.tw
+{author1, author2}@stumail.nutn.edu.tw
 
 ---
 
 ## 摘要
 
-異質 GPU 叢集上的 AI 工作負載（推論與訓練混合）排程，直接影響資源使用率、工作完成時間（Job Completion Time, JCT）與服務水準目標（Service Level Objective, SLO）的達成。本研究設計並實作一套**以 Kubernetes（k3s）部署、以 Slurm 為排程核心**的 AI 伺服器 GPU 排程研究平台，整合 NVIDIA Multi-Process Service（MPS）達成卡內細粒度共享，並在 Slurm 的工作提交掛鉤（`job_submit.lua`）中嵌入一個**非阻塞、失效即回退（fail-safe）**的強化學習決策端點：以風險敏感的分散式深度強化學習（RDSAC，結合 discrete SAC 與 Implicit Quantile Network，並以 CVaR 風險量度優化尾端延遲）作為放置（placement）建議者，任何服務異常皆自動退回既有啟發式分數排程，slurmctld 永不被阻塞。為了在「實機樣本稀少、單一節點即一個跑數分鐘的工作」的限制下取得可信的結論，本研究提出一套**模擬到實機（sim-to-real）評估方法學**：離散事件模擬器訓練、實機配對 A/B、抗跑序漂移（drift-robust）的交錯輪轉、多 seed 配對信賴區間，並同時報告平均與尾端指標（p95／p99／CVaR）及 SLO 違反率。在一座雙節點異質叢集（RTX 4070＋RTX 3080）上的實測揭示：**排程結論高度依賴評估場景，也依賴底層 GPU 分配後端**。於同一乾淨的 Kubernetes DRA（Dynamic Resource Allocation）後端統一重測全部策略後，兩個真實-硬體場景給出一致的誠實圖像：在**低負載真實 cuBLAS ＋ MPS 分數共置**下，排程策略空間近乎平坦——生產 score、Slurm 原生 FCFS／backfill 與學習式（含以 181 筆真實 transition 微調的 RLPD）全部落在 ±5% 實務等價帶內、學習式略差；在**高負載真實 LLM serving** 下則 score 最佳，學習式與 naive Slurm 皆較差。**在乾淨統一後端下，學習式放置在兩個場景皆未穩健勝過 score，亦未勝過 naive Slurm。** 一項重要的方法學教訓是：先前於 device-plugin 後端量到的 cuBLAS 小勝（RDSAC-cvar +4.5%）在 DRA 後端不重現（反轉為略輸），凸顯排程結論會被 GPU 分配後端混淆、必須在單一一致後端上統一重測。唯一穩健的正面觀察是：**score 啟發式的 bin-pack／SJF 因子在高負載下勝過 vanilla Slurm 的 cons_tres 放置**。研究目標為以學習式達成整體更好的排程，而非最佳化任一特定指標；除平均 JCT 外亦以 serving SLO 違反率為獨立指標軸重測，score 於兩軸皆最佳、學習式未勝出（即使在風險敏感 CVaR 的尾端「主場」指標上亦然），極端尾 p99 因 per-seed 樣本小僅作附帶診斷、在此 2-node 小叢集不作宣稱。貢獻在於：一套可重現的雲端 GPU 排程平台、一個失效安全的 RL 整合架構，以及一套誠實、兼顧後端一致性與存活者偏差消除的 sim-to-real 評估方法學，揭示「**評估場景與後端決定排程結論**」，並誠實界定學習式放置在此規模／場景的效益邊界。
+本研究以一般大學實驗室共享 GPU 主機常見的資源閒置、GPU 利用率不足與批次工作管理困難為背景，探討如何在容器化環境中建立兼具彈性與穩定性的 AI 工作負載排程平台。旨在整合 Slurm 的批次排程能力與 Kubernetes 的容器編排及彈性擴縮能力，讓使用者能以熟悉流程提交工作，同時由系統自動完成資源啟動、分配與監控。本專題提出以 Slurm-on-Kubernetes 為核心的共享 GPU 排程架構，並導入 MPS硬體資源切分、節點自動擴縮、監控介面與深度強化學習排程插件等策略，以支援多工作共享 GPU 及智慧化資源放置。
 
-**關鍵詞**：GPU 排程、Kubernetes、Slurm、深度強化學習、MPS、邊緣運算、模擬到實機評估
+**關鍵詞**：GPU 資源排程、Kubernetes、Slurm、深度強化學習、邊緣運算。
 
 ## Abstract
 
-Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clusters directly affects utilization, Job Completion Time (JCT), and Service Level Objective (SLO) attainment. We design and implement a GPU scheduling research platform that is **deployed on Kubernetes (k3s) with Slurm as the scheduling core**, integrates NVIDIA Multi-Process Service (MPS) for intra-GPU fine-grained sharing, and embeds a **non-blocking, fail-safe** reinforcement-learning decision endpoint into Slurm's job-submit hook (`job_submit.lua`). A risk-sensitive distributional deep RL policy (RDSAC: discrete SAC + Implicit Quantile Network, optimized with a CVaR risk measure for tail latency) acts as a placement advisor; any service fault transparently falls back to the existing score heuristic, so slurmctld is never blocked. Because real-cluster samples are scarce (one node hosts a job running for minutes), we propose a **sim-to-real evaluation methodology**: discrete-event simulation for training, paired live A/B, drift-robust interleaving, multi-seed paired confidence intervals, and joint reporting of mean and tail metrics (p95/p99/CVaR) plus SLO violation. Experiments on a two-node heterogeneous cluster (RTX 4070 + RTX 3080) reveal that scheduling conclusions depend strongly on both the evaluation scenario and the underlying GPU allocation backend. Re-measuring all policies on a single clean Kubernetes DRA (Dynamic Resource Allocation) backend yields a consistent, honest picture across two real-hardware scenarios: under **low-load real cuBLAS + MPS fractional co-residency** the policy space is nearly flat — production score, Slurm-native FCFS/backfill, and the learned arms (including RLPD fine-tuned on 181 real transitions) all fall within a ±5% practical-equivalence band, with the learned arms slightly worse; under **high-load real LLM serving**, score is best and both learned placement and naive Slurm are worse. **Under the clean unified backend, learned placement never robustly beats score nor naive Slurm in either scenario.** A key methodological lesson: a cuBLAS improvement (RDSAC-cvar +4.5%) previously measured on the device-plugin backend does not reproduce under DRA (it reverses to a slight loss), showing that scheduling conclusions can be confounded by the GPU allocation backend and must be re-measured on one consistent backend. The one robust positive observation is that the score heuristic's bin-pack/SJF factors beat vanilla Slurm's cons_tres placement under high load. Our objective is generally better scheduling rather than optimizing any single metric; beyond mean JCT we also re-measure on an independent serving SLO-violation axis, on which score is again best and no learned arm wins (even on the risk-sensitive CVaR's "home-turf" tail metric), while the extreme-tail p99 is reported only as an auxiliary diagnostic and not claimed on this small cluster. Our contributions are a reproducible cloud GPU scheduling platform, a fail-safe RL integration architecture, and an honest sim-to-real methodology (with backend consistency and survivorship-bias elimination) that surfaces **the evaluation scenario and backend determine the scheduling conclusion**, while honestly bounding the benefit of learned placement at this scale.
-
-**Keywords**: GPU scheduling, Kubernetes, Slurm, deep reinforcement learning, MPS, edge computing, sim-to-real evaluation
+> TBA
 
 ---
 
-## 1. 前言
+## 1. 緒論
 
 生成式 AI 與深度學習的普及，使學術與企業的 GPU 叢集需同時承載**低延遲推論**與**長時間訓練**兩類性質迥異的工作負載：前者須在服務水準目標（SLO）期限內完成、且常僅需部分 GPU 算力，後者則長時間獨佔整張卡。當底層硬體有限且**異質**——不同世代 GPU 的算力差異可達數倍——如何將兩類工作妥善排程與放置，以兼顧工作完成時間（JCT）、資源使用率與 SLO 達成，已成為雲端與邊緣運算基礎設施的核心議題 [1][4]。
 
 傳統 HPC 排程器（如 Slurm）以靜態優先權與回填（backfill）為主，對 GPU 卡內共享與工作負載特性的感知有限。學界雖已提出多種以強化學習（RL）優化叢集排程的方法 [2][3]，但多數僅止於模擬評估，**鮮少在真實叢集上以嚴謹的統計方法檢驗其效益是否成立**；尤其「模擬中可區分的策略差異能否轉移到實機」這一 sim-to-real 問題，至今缺乏系統性的探討。實機評估之所以困難，在於單一節點即承載一個跑數分鐘至數小時的工作，使可用樣本極度稀少，且量測易受叢集暖機等時變因素干擾而產生假性排名。
 
-針對上述缺口，本研究以一座雙節點異質叢集（RTX 4070＋RTX 3080，配備 NVIDIA MPS）為實驗平台，建構從模擬訓練到實機驗證的完整流程，並以抗漂移、多 seed 配對統計的方法學誠實檢驗排程策略的真實效益。本研究的目標與貢獻如下：
+針對上述缺口，本研究以一座雙節點異質叢集（RTX 4070＋RTX 3080）為實驗平台，建構從模擬訓練到實機驗證的完整流程，並以抗漂移、多 seed 配對統計的方法學誠實檢驗排程策略的真實效益。
 
-1. **雲端 GPU 排程平台**：以 k3s 部署、Slurm 為排程核心、NVIDIA MPS 達成卡內共享，並以 Helm 完整封裝，可重現部署於異質節點。
-2. **失效安全的 RL 整合架構**：於 Slurm 工作提交掛鉤嵌入非阻塞的 RL 決策端點，服務異常即回退啟發式，兼顧研究彈性與生產可靠性。
-3. **風險敏感深度強化學習放置策略與其模擬行為分析**：以分散式 RL（RDSAC）建模回報分布並以 CVaR 風險量度；經多 seed 消融誠實揭示其分布式評論家在不確定性下高變異、易崩潰，而 CVaR 風險扭曲的實質作用是**完成率穩定器**而非速度優勢；並進一步發現 Duan 式 target return-clip 是**更省、傷 JCT 更少的替代穩定器**（§4.3.1），惟兩者皆未使任何學習臂在模擬中穩健勝過純量基準。
-4. **模擬到實機評估方法學與場景／後端洞見**：提出抗漂移、多 seed、seed 層級配對統計、兼顧尾端指標、並強調**同一 GPU 分配後端統一重測**的評估流程，揭示**排程結論高度依賴評估場景與底層後端**——於同一乾淨 DRA 後端下，低負載真實 cuBLAS 共置的策略空間近乎平坦（score／naive Slurm／學習式含實機微調 RLPD 全在 ±5% 內、學習式略差），高負載真實 LLM serving 則 score 最佳、學習式與 naive Slurm 皆較差（§4.2.1–4.2.2），且**改以 serving SLO 違反率為指標軸重測、score 於 JCT 與 SLO 兩軸皆最佳、學習式未勝出**（§4.2.3，即使在 CVaR 主場的尾端指標上 cvar 仍僅為最不差的學習臂）；並指出兩項方法學教訓——**先前於 device-plugin 後端量到的學習式小勝（+4.5%）不跨後端重現**（後端混淆），以及**單 seed／小樣本結果會誤導**（3-seed 曾量到 +15%，n=8 下不復存在）。
+### 1.1 高效能運算排程器 Slurm
+
+Slurm Workload Manager 是目前高效能運算（HPC）叢集最廣泛使用的工作排程系統之一。它提供完整的工作提交、佇列管理、資源限額與帳務管理功能，並支援 GPU 資源分配。其以「節點」為基礎的資源模型非常適合研究工作環境，且已有廣泛的使用者社群與文件支援。然而 Slurm 原生設計以固定實體節點為主，對彈性擴縮與容器化整合的支援相對有限。
+
+### 1.2 容器化與 Kubernetes
+
+Kubernetes 是目前最主流的容器編排平台，能夠自動管理容器的部署、擴縮與健康監控。Kubernetes 的 Cluster Autoscaler 可根據工作負載自動增減節點，非常適合需要彈性資源的場景。然而 Kubernetes 原生的排程器 (kube-scheduler) 以服務導向設計為主，對批次工作、GPU 共享與研究工作特有的排程需求支援不足。因此有多項研究嘗試將 Slurm 與 Kubernetes 整合，以結合兩者優點。在 Slurm 與 Kubernetes 整合方面，既有研究已指出高效能運算與雲端原生系統的匯流可以同時取得批次排程語意與雲端彈性管理能力；實作層面也有 Slinky 等 Slurm-on-Kubernetes 方向的工具，以及 AWS ParallelCluster 等雲端 HPC 叢集部署方案，顯示此類架構已具有實務需求與發展基礎。
+
+### 1.3	GPU 資源共享技術
+
+NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process Service (MPS) 以及 Multi-Instance GPU (MIG)。MPS 允許多個 CUDA 程式同時共享一張 GPU 的運算資源；MIG 則在硬體層面將 GPU 切分成獨立的分區，提供更強的隔離性。本系統目前採用基於 MPS 的方式，讓多個較小的工作共享同一張 GPU，以提升整體使用效率。
+
+除了本系統採用的 MPS 之外，近年也有研究探討在 MIG 等機制上進行動態重新分割與能源效率最佳化；這類方法能提供較強隔離性，但也需要額外硬體支援、分割粒度與工作遷移成本，因此本專題目前先以部署門檻較低的 MPS 作為共享 GPU 的主要實作方式
+
 
 ## 2. 相關研究
 
@@ -66,9 +65,26 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **與既有工作的差異。** 上述系統皆為**規則式或約束求解**：Kueue／Volcano 解的是配額與 gang 准入、DRA 提供的是分片**機制**、Kubeflow 管的是生命週期；沒有任何一個是「**學習式、且以尾端延遲（tail latency）為目標的排序／放置策略**」。本研究正落於此空隙：RDSAC 對回報分布以 CVaR 優化 p99／SLO 尾端，是生產系統皆未優化的量。要強調的是，DRA 提供的是「如何表達要 0.25 張 GPU」的*機制*，而非「該把哪些工作打包、用什麼順序以壓低尾端」的*策略*——因此本研究的學習式策略與 DRA 並非競爭，而是**互補**：一個尾端敏感的策略可在 DRA 之上驅動裝置選擇與准入排序。既有 RL 排程研究多止於模擬；本研究的重點不在宣稱 RL 必勝，而在**建立一套能在真實異質叢集上、以統計嚴謹方式檢驗排程策略效益的方法學**，並誠實回報其規模條件。
 
-## 3. 實驗目的與系統架構
+### 2.3 Soft Actor Critic (SAC)
 
-### 3.1 整體架構
+> TBA。原始論文的簡介。
+
+
+### 2.4 風險敏感深度強化學習 (RDSAC)
+
+決策策略為自行整合的 **discrete 分布式 SAC**（本文稱 RDSAC）：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。RDSAC「風險敏感分布式 SAC」之名承襲自 Ma 等人以回報分布做風險敏感優化的 DSAC [16]；惟本研究為**離散動作**、雙頭 IQN 的自組版本，是離散 SAC [6]、IQN 分布式評論家 [7] 與 CVaR 風險量度的組合，非 [16] 連續控制版本的 1:1 重現。須留意另有**同名但不同**的 Duan 等人 DSAC [17]（將回報建模為單一高斯、以抑制 Q 值高估為目標、風險中立、連續控制），與本研究的風險敏感取向不同，不宜混淆。
+
+## 3. 研究目的與系統架構
+
+### 3.1 研究目的
+
+本研究主要探討以下幾個問題：
+
+- 如何讓多個較小的 GPU 工作共享同一張顯示卡，以提升使用效率。
+- 如何利用深度強化學習模型，協助系統決定哪些工作應優先執行，以及應使用哪些硬體資源。
+- 如何在模型判斷不可靠時，讓系統自動回到較穩定的基本排程方式。
+
+### 3.2 整體架構
 
 平台分為兩個鬆耦合層：**基礎設施層**（Slurm on Kubernetes）與**排程研究層**（模擬器＋深度強化學習）。
 
@@ -76,32 +92,56 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **為何 Slurm-on-Kubernetes（而非純 K8s 排程器）。** 一個合理的質疑是「既然已在 K8s 上，為何不直接用 Kueue＋DRA＋自訂 kube-scheduler plugin，而要疊一層 Slurm？」本研究選擇 Slurm-on-K8s 有三個理由：（1）**成熟的 HPC 排程語意**——backfill、multifactor 優先權、gang、`gres/mps` 卡內分片皆是 Slurm 開箱即用且經生產驗證的一等公民；在 K8s 側要湊齊等價能力需 Kueue＋Volcano＋DRA 多元件拼裝，且 DRA 於本研究進行時甫 GA（K8s 1.34），生態未穩。（2）**K8s 提供部署與生命週期、Slurm 提供排程核心**，兩層鬆耦合、各司其職：k3s 負責容器化、網路、儲存（NFS RWX）、可觀測性，Slurm 負責佇列與放置決策；這讓平台既可攜（Helm 一鍵部署於異質節點）又保有 HPC 級排程。（3）**研究載具**——`job_submit.lua`／slurmrestd 是穩定、非侵入的策略注入點（§3.2），可在**不 fork slurmctld、不改 kube-scheduler** 的前提下熱插拔學習式策略並失效即回退；相較於維護一個自訂 scheduler plugin，這大幅降低了研究迭代成本。與生態的關係上，本研究的學習式策略與 K8s DRA **互補**（§2）：DRA 給的是分片*機制*，本研究給的是尾端敏感的排序／放置*策略*，未來可在 DRA 之上驅動裝置選擇（§5）。
 
-### 3.2 失效安全的 RL 整合
+### 3.3 失效安全的 RL 整合
 
 整合點為 Slurm 的 `job_submit.lua`：工作提交時，掛鉤 `rl_hook.lua` 以 HTTP 呼叫 RL 推論服務的 `POST /decide`，取得放置／優先權建議；若服務逾時或異常，掛鉤**靜默回退**至既有啟發式分數排程（以 MPS 適配、VRAM 適配、短工作優先三因子加權）。此設計確保 slurmctld 永不被第三方服務阻塞，使研究用的 RL 元件可安全運行於生產路徑。
 
 生產部署的 RL 作動有兩條路徑，皆為失效安全（fail-safe）：（1）**優先權微調**——`job_submit.lua` 呼叫 `/decide`，僅提升被選中工作的佇列優先權（`select/cons_tres` 與 GRES 仍決定實際落點）；（2）**顯式節點綁定（explicit placement）**——`/act` 回傳節點選擇 `(node_j, gpu_k)`，於**提交時**將該節點寫入工作的必要節點（`ReqNodeList`），Slurm 遂將工作排到 RL 選定節點、MPS 由 GRES 強制。本研究的實機放置實驗（§4.2）即以路徑 (2) 為對象——由評估 harness 呼叫 `/act` 後以 `sbatch -w` 提交——並於本平台 2×1 叢集驗證其正確釘選（`sbatch -w` 與 `scontrol update ReqNodeList` 皆能把 held／pending 工作釘到指定節點）。將此提交時綁定接入 `job_submit.lua`（呼叫 `/act` 後設 `job_desc.req_nodes`）即為 RL 顯式放置的生產路徑。平台另實作一個非同步 **placement controller**（`services/rl_scheduler/placement_controller.py`，以 slurmrestd hold→pin→release 對已提交 held 工作事後釘節點）作為不需改提交端的替代，惟其經 slurmrestd v0.0.37 job-update 寫入節點約束之實際生效仍在硬化中（實機測試觀察到該 REST 欄位未被套用），故**目前評估與生產皆以提交時節點綁定為準**。`/act` 若 abstain（如 checkpoint 拓樸 ≠ 實機）則 no-op，退回 Slurm 原生放置。
 
-### 3.3 模擬器與強化學習環境
+### 3.4 模擬器與強化學習環境
 
 離散事件模擬器以「提交／結束」事件驅動，建模 Node → GPU → MPS 槽的階層資源與異質算力。其上以 Gymnasium 介面封裝為 RL 環境：觀測為佇列前 K 個工作的特徵（GPU 數、MPS 需求、等待時間、SLO 緊迫度、工作類別、GPU 型別 one-hot 等），於 2×1 拓樸下維度為 166；動作為「放置於某節點某 MPS 槽」或「暫不放置」。
 
-### 3.4 風險敏感深度強化學習（RDSAC）
+## 4. 排程技術
 
-決策策略為自行整合的 **discrete 分布式 SAC**（本文稱 RDSAC）：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。RDSAC「風險敏感分布式 SAC」之名承襲自 Ma 等人以回報分布做風險敏感優化的 DSAC [16]；惟本研究為**離散動作**、雙頭 IQN 的自組版本，是離散 SAC [6]、IQN 分布式評論家 [7] 與 CVaR 風險量度的組合，非 [16] 連續控制版本的 1:1 重現。須留意另有**同名但不同**的 Duan 等人 DSAC [17]（將回報建模為單一高斯、以抑制 Q 值高估為目標、風險中立、連續控制），與本研究的風險敏感取向不同，不宜混淆。
+### 4.1 Slurm 內建排程演算法
 
-## 4. 實驗與評估方法
+> TBA
 
-### 4.1 評估方法學
+### 4.2	啟發式排程策略
 
-實機評估面臨「一個 step 即一個跑數分鐘的工作、湊滿樣本需時甚久」的根本限制，故採用 sim-to-real 流程：模擬器訓練 → 凍結 checkpoint → 實機配對 A/B。為取得可信結論，方法學包含四項要件：
+以加權線性組合公式計算工作優先級，分數越高代表該工作越值得優先排程。三個因子及對應權重說明如下表：
 
-- **抗跑序漂移（drift-robust）**：GPU 隨運行暖機、快取轉熱會使「越晚跑的越快」。若各方法依序整段跑完，跑序會與方法混淆。本研究以交錯輪轉（interleave）讓每個方法跨多輪輪過各個跑序位置，並丟棄暖機輪，將漂移誤差平均化。
-- **多 seed 配對信賴區間**：以共用隨機數（CRN）讓各方法跑相同工作負載並配對相減，再以多個訓練 seed 重複，以配對 t 檢定回報 95% 信賴區間與 p 值。
-- **尾端與 SLO 指標**：除平均 JCT 外，同時報告 p95／p99／CVaR 與 SLO 違反率，以捕捉飢餓與 straggler。
-- **真實工作負載**：除合成負載外，建置可攜式 PyTorch 環境於共享儲存，以真實 BERT 推論／微調作為實機工作。
+> TBA
 
-### 4.2 主要結果
+### 4.3 深度強化學習策略
+
+> TBA
+
+## 5. 實驗與評估方法
+
+### 5.1 訓練與評估管線
+
+直接在實際環境從頭訓練的話，強化學習需要數十萬到數百萬個 transition，真實叢集一個編排決策對應一個跑數分鐘至數小時的任務，湊滿樣本要等數月，因此採 sim-to-real 兩段式：
+
+1. 在模擬環境大量訓練，產出基本模型
+2. 上線部署，記錄真實叢集 (observation, action, reward) 資料
+3. RLPD (Reinforcement Learning with Prior Data) 用真實資料把基本模型微調成真實環境策略
+
+為取得可信結論，添加以下方法來讓結果穩固：
+
+- 抗跑序飄移：GPU 隨運行暖機、快取轉熱會使「越晚跑的越快」。若各方法依序整段跑完，跑序會與方法混淆。本研究以交錯輪轉（interleave）讓每個方法跨多輪輪過各個跑序位置，並丟棄暖機輪，將漂移誤差平均化。
+- 多 seed 配對信賴區間：以共用隨機數（CRN）讓各方法跑相同工作負載並配對相減，再以多個訓練 seed 重複，以配對 t 檢定回報 95% 信賴區間與 p 值。
+- 尾端與 SLO 指標：除平均 JCT 外，同時報告 p95／p99／CVaR 與 SLO 違反率，以捕捉飢餓與 straggler。
+- 真實工作負載：除合成負載外，建置可攜式 PyTorch 環境於共享儲存，以真實 BERT 推論／微調作為實機工作。
+
+
+### 5.2	評估指標說明
+
+在評估一個排程策略時都有主要指標平均工作完成時間(mean JCT)和尾部延遲指標 p95/p99 JCT、CVaR(0.25)。因為從 mean JCT 難以看出把 straggler、queue starvation、head-of-line blocking 等問題，即「多數 job 正常、少數被拖很慢」的情況。這些慢 job 幾乎不影響 mean JCT，但主導使用者體感。而 p95/p99 指標專門抓「最差 5%/1% 有多慢」，正是 mean 結構上看不到的那段。此外，RDSAC-cvar 的設計目標就是優化回報下尾（= JCT 上尾）；只測量 mean 等於拿不會動的尺去量專門改尾部的方法，結構上必然測不出差異。
+
+
+### 5.3 主要結果
 
 **模擬環境可區分策略（方法學正面結果）。** 在離散事件模擬中，以對 SLO 敏感的 AI 伺服器工作負載（2×1 拓樸、offered load ρ≈0.7 的中度競爭、8 個 held-out seed）評估，具尺寸感知的啟發式相較先到先服務（FCFS）顯著降低 SLO 違反率（表 1），顯示模擬器具備區分排程策略的能力——前提是工作負載與指標選對了維度（時序排序、SLO 感知），而非需要規模的多節點裝箱。此工作負載的 SLO 定義為：推論工作（短、佔 1 GPU 的 25／50％ MPS）帶有延遲期限 `slo_s` = runtime × 4，訓練工作（長、獨佔或大 MPS，含少量 2-GPU 跨節點 gang）為 best-effort（無期限）；SLO 違反率即帶期限工作中 JCT 超過 `slo_s` 的比例。
 
@@ -151,7 +191,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 須釐清**統計顯著與實務顯著的區別**：表 4 的 p 值極小（≈1e-12～1e-17）源於 n=246 的大樣本，代表「可偵測地變慢」而非「大幅變慢」；三個學習臂的 ΔJCT% 落在 −3.7～−4.6%，仍位於 §4.5 界定的 ±5% 實務等價帶內（僅偏於其負緣）。換言之，學習型策略在此規模是**可統計偵測地、但非實務顯著地**遜於 score，與後續「排程策略空間近乎是平的」洞見一致，而非與之矛盾。
 
-#### 4.2.1 實機 DRA cuBLAS 評估（低負載共置：策略空間平坦）
+#### 5.2.1 實機 DRA cuBLAS 評估（低負載共置：策略空間平坦）
 
 真正能觸及這座**異質**叢集放置槓桿的評估，必須讓卡內共享（NVIDIA MPS）與計算異質性反映到 JCT。為此以**真 cuBLAS（`gpu_workload`）＋ MPS 分數共置**（Poisson 到達、mps-oversub **1.0** 的低負載、MPS 分桶 25／50／75／100）跑實機配對 A/B（2×1、提交時 `-w` 顯式放置、drift-robust interleave、**8 seed**、每 seed n_jobs=30×3 rounds、σ=1.0），並以**正確分析層級——seed**——的 one-sample t 檢定每臂 ΔJCT% 是否顯著異於 score，避免把 job 當獨立單位的偽重複。全部臂於**同一 DRA MPS 後端**量測（見下方「後端混淆」）：六個學習／啟發式臂（score／SAC／RDSAC-mean／RDSAC-cvar／CrossQ／**RLPD**）加兩個 **Slurm 原生 baseline**（**fcfs** = `sched/builtin`+`priority/basic`、關 Lua、嚴格 FIFO；**backfill** = `sched/backfill`+`priority/basic`、關 Lua、Slurm 現代預設；皆無 `-w`、由 `select/cons_tres` 選節點），代表「不加智慧放置的 vanilla Slurm」。
 
@@ -176,7 +216,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **方法學要點二：seed 層級與小樣本雜訊。** 實機量測雜訊大：同一 checkpoint 的 ΔJCT% 在不同 run 間可大幅擺盪（先前一組 3-seed run 曾量到某臂 +15%，擴至 n=8 後僅剩 +3.6%，為抽到幸運 seed 的小樣本假象）。故一律以 n=8 的 seed 層級估計為準、僅就其宣稱，不採單 seed 或小樣本大數。
 
-#### 4.2.2 實機 DRA Hybrid 評估（高負載真實 LLM serving：score 最佳）
+#### 5.2.2 實機 DRA Hybrid 評估（高負載真實 LLM serving：score 最佳）
 
 §4.2.1 為合成 cuBLAS、低負載。為以**真實 AI-serving** job＋高負載檢驗，把 payload 換成 Qwen2.5-0.5B 的批次自迴歸生成（長 prompt、prefill-compute-bound，對應 RAG／摘要類長 context 服務），offered load 拉到 **oversub 2.0**（超過單卡容量、迫使動用兩張卡）。此處揭露一個真實硬體約束：慢卡節點（3080）**host RAM 僅 7.5GB**，每個 LLM job 需先把 torch＋約 954MB 模型載入 host RAM（約 2–3GB），兩個並發即 OOM → 進程卡死 → Slurm drain 該節點。故採 **hybrid workload**：mps 25／50 小 job 走 cuBLAS（自包含、可 4-way 共置），mps 75／100 大 job 走真實 LLM（門檻 75 保證任兩 LLM 需求相加 >100，永不同卡共置、慢卡最多同時載入一個模型）。全部八臂（六學習／啟發式 + fcfs／backfill）於**同一 DRA 後端**、8 workload seed 統一量測。
 
@@ -197,11 +237,9 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 **機制可解釋。** 學習臂把只 **35–39%** 的 job 放到慢卡 3080，而 score 放 **47%**——學習式較貪心地偏好快卡 4070。在 oversub 2.0 的高負載下，這種過度集中反而**把 4070 塞爆、排隊變長**，總體 JCT 更差；score 更均衡地把慢卡也用起來，反而較快（與 §4.5「學習式易在快卡過度集中」一致）。
 
-**方法學要點三：存活者偏差。** 此 A/B 的第一版曾量到學習臂大幅**領先**（+46%），但那是**存活者偏差**：score 無顯式放置，其被 Slurm 分到慢卡的 job 會因慢卡 host RAM OOM／冷載入超時而 FAILED，而 join 只計 COMPLETED → score 的完成集被截斷。三項修正還原公平比較：(1) 提交時 free-MPS 快照改為**本地即時追蹤**（Slurm 的 MPS 帳目落後於 burst 提交，否則放置器永遠只見快卡有空位而不 spill）；(2) hybrid workload 讓慢卡節點不再 OOM／drain；(3) 確認每臂完成數對等。修正後結論方向即反轉。
-
 **方法學要點四：尾端呈相反權衡（附帶觀察，不作宣稱）。** naive Slurm（backfill／fcfs）雖平均較差，其 p99／CVaR 反而優於 score（backfill Δp99 +19.7%、ΔCVaR +6.8%；fcfs Δp99 +16.0%）——即 score 以較緊的平均換取較長的尾；惟此處 p99／CVaR 為每 seed 20–30 個完成 job 的估計、變異極大（Δp99 標準差達 ±20～53%），僅作尾端行為的定性觀察，在此小叢集不作統計宣稱。
 
-#### 4.2.3 實機 DRA SLO serving 評估（尾端／SLO 指標：score 亦最佳）
+#### 5.2.3 實機 DRA SLO serving 評估（尾端／SLO 指標：score 亦最佳）
 
 §4.2.1／4.2.2 以 JCT 為主軸。但本平台是 **Slurm-on-Kubernetes 的 AI serving**，最貼合其部署情境的服務指標是**每請求 SLO 違反率**；且風險敏感的 RDSAC-cvar 其 CVaR 目標**正是為壓低尾端而設**——若學習式放置有任何優勢會顯現的地方，理應是 SLO／尾端這個「主場」指標。為給尾端估計足夠的統計檢力（§4.2.2 每 seed 僅 20–30 個完成 job、p99 變異極大），本評估改用 **serving-realistic 高-QPS 工作負載**：120 個短 cuBLAS 請求 ×2 輪、Poisson 到達、oversub 2.0、DRA MPS；每請求帶延遲期限 `slo_s = runtime × 4`，**SLO 違反率 = slowdown > 4 的請求比例**。全部八臂於同一 DRA 後端、8 seed 統一量測（表 4-3、runner `eval/scripts/run_slo8.sh`）。
 
@@ -220,58 +258,12 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 | fcfs | 29.7±20.1 | 18.9 | 8.5 | 8.4 | −12.0 | 0.063 |
 | backfill | 30.0±19.6 | 41.0 | 19.9 | 10.8 | −12.3 | 0.052 |
 
-**方法學要點五：小樣本再度誤導。** 本評估的 3-seed 初步曾顯示 RDSAC-cvar **領先** score（SLO 違反 21% vs 26%、+5.6pp、看似為唯一贏家），但變異極大（score ±21%）；擴至 n=8 後**翻盤為 −4.4pp**——與 §4.3、§4.2.2（3-seed 曾量到 +15%，n=8 下不復存在）同屬「單／小樣本呈現不可重現假性優勢」的又一例證，再次凸顯 seed 層級配對統計的必要。
 
 **尾端呈相反權衡（附帶觀察，不作宣稱）。** 與 §4.2.2 呼應：score 雖 SLO 違反「率」最低，其**極端尾** p99／slowdown_p99 反而較重（p99 41s、slowdown_p99 19），而 SAC／CrossQ／尤其 fcfs 的最壞情況有界（fcfs p99 僅 18.9s、slowdown_p99 8.5）——即「違反次數少」與「最壞延遲有界」是**兩個不同、甚至相反**的目標：score 把多數請求壓在期限內、卻容忍少數更長的 straggler；FCFS 順序執行使任一請求最壞情況有界、卻有更多請求輕微逾期。此為尾端行為的定性觀察，per-seed 樣本仍小、不作統計宣稱。
 
 **綜合 §4.2.1–§4.2.3（皆同一 DRA 後端）。** 三個真實-硬體場景、跨 JCT 與 SLO 兩類指標，在乾淨統一後端下給出一致的誠實圖像：**低負載 cuBLAS 策略空間平坦**（§4.2.1，全在 ±5% 內、學習式略差）、**高負載 hybrid LLM serving 則 score 最佳**（§4.2.2，學習式與 naive Slurm 皆較差）、**serving SLO／尾端指標 score 亦最佳**（§4.2.3，即使在 CVaR 主場的 SLO 指標上，cvar 仍僅為最不差的學習臂）。**在乾淨統一後端下，學習式放置在三個場景、跨 JCT 與 SLO 兩類指標皆未穩健勝過 score、亦未勝過 naive Slurm**；先前 device-plugin 後端量到的 cuBLAS 小勝（+4.5%）不跨後端重現、屬後端假象；線上 RLPD 微調（181 筆真實 transition）亦未翻盤。這強化本文核心命題：**排程結論高度依賴評估場景與 GPU 分配後端**，而學習式放置的實機效益遠比單一場景所暗示的脆弱。本文據此**不宣稱學習式優越**，改以方法學（抗漂移、多 seed、seed 層級配對、同後端統一重測、存活者偏差消除）與誠實的場景／後端依賴負結論為主要貢獻。
 
-### 4.3 模擬多 seed 消融：風險敏感 DRL 在模擬中亦未勝出
-
-§4.2 表 1 顯示模擬能區分**啟發式**，但那並未檢驗**學習式**策略是否有效。為此，我們在注入 mean-preserving 對數常態 runtime 不確定性（σ=1.0，模擬 straggler 與預測誤差）的隨機模擬中，以固定溫度（fixed-α=0.05）、100k 步、3 個訓練 seed（42／43／44）分別訓練三個學習臂——純量 SAC、風險中立 RDSAC-mean、風險敏感 RDSAC-cvar——並以共用隨機數配對評估其相對 score 的 ΔJCT%（表 5）。
-
-表 5. 模擬 σ=1.0 多 seed（3 訓練 seed × 100k 步，fixed-α=0.05）ΔJCT% vs score
-
-| 學習臂 | philly ΔJCT% | ali ΔJCT% | 完成率 | 穩定性 |
-|---|--:|--:|--:|---|
-| SAC（純量 twin-Q） | −8.6±13.4 | −17.2±21.8 | 全 seed 100% | 穩定，學習臂中最佳 |
-| RDSAC-cvar（風險敏感） | −24.2±16.4 | −48.9±43.5 | 全 seed 100% | 穩定，但一致落後 score 與 SAC |
-| RDSAC-mean（分布式） | +70.1† | +89.0† | 0–80%（半數 seed 崩潰） | 雙峰：偶佳，常崩成 0% |
-
-†RDSAC-mean 的正值為**低完成率假象**：ΔJCT% 僅在已完成的工作上配對計算，而該策略於半數 seed 崩潰為 0% 完成（退化為放棄困難工作的 no-op），故其表面優勢並非真實改善。
-
-此結果有三點意涵。第一，**單一 seed 的模擬結果會嚴重誤導**：同一 RDSAC 設定在單 seed 下曾呈現大幅領先 score，但於多 seed 下該領先不可重現，那不過是抽到未崩潰的幸運 seed。第二，**即使在為風險機制量身打造的隨機模擬中，風險敏感 DRL 於多 seed 下亦未穩健勝過純量 SAC 或 score 啟發式**；連此「模擬救援」都失敗，與 §4.2 的實機負結論方向一致（三個訓練 seed 的 RDSAC-cvar ΔJCT% 在兩個 trace 上**一致為負**，非隨機雜訊）。
-
-第三，也是本消融唯一站得住的**正面**發現：**CVaR 風險扭曲的實質作用是穩定訓練／完成率，而非提升速度**。表 6 逐格列出兩個分布式臂的完成率：風險中立的 RDSAC-mean 在 6 個（trace×seed）格中有 4 格崩潰（完成率 ≤20%，退化為 no-op），而加了 CVaR 尾端扭曲的 RDSAC-cvar **6 格全部 100% 完成、無一崩潰**。這指向一個可推廣的觀察：**風險敏感性可作為分布式評論家在環境隨機性下對抗策略崩潰的穩定器**，即使它並未帶來 JCT 上的優勢。
-
-表 6. 兩個分布式臂各 (trace×seed) 完成率——CVaR 消除崩潰
-
-| 訓練 seed | RDSAC-mean（philly／ali） | RDSAC-cvar（philly／ali） |
-|---|--:|--:|
-| 42 | 80%／100% | 100%／100% |
-| 43 | 0%／0% | 100%／100% |
-| 44 | 0%／20% | 100%／100% |
-
-#### 4.3.1 穩定器的本質：return-clip 是比 CVaR 更省的替代
-
-§4.3 把 CVaR 定位為完成率穩定器，但它是唯一的穩定機制嗎？為釐清崩潰的病根——分布式評論家對回報 $Z_R$ 的高估使 categorical actor 退化到 no-op——我們移植 Duan 等人 [17] 的 target 回報 clip：把 reward-return 的 bootstrap target 以當前 online value 為錨、clip 在 ±b 的信賴域內（只 clip $Z_R$；$Z_H$ 已由 $-\log\pi$ 界定），作為與 CVaR **正交**的穩定器，在同一 1×1／σ=1.0／fixed-α=0.05／3 train-seed 設定下（b=10）消融（表 6-1、圖 3）。
-
-表 6-1. value-clip 消融（崩潰＝完成率<20%，共 6 個 trace×seed 格；誠實 ΔJCT% 僅取 100% 完成格）
-
-| 條件 | 臂 | 崩潰格數 | 誠實 ΔJCT% |
-|---|---|--:|--:|
-| clip-off | RDSAC-mean | 2/6 | +19.5／+5.5（低完成假象）|
-| clip-off | RDSAC-cvar | 0/6 | −41.4／−36.9 |
-| clip-on b=10 | RDSAC-mean | **0/6** | **−3.5／−12.5** |
-| clip-on b=10 | RDSAC-cvar | 2/6 | （退化）|
-
-三點意涵。（1）**return-clip 有效穩定 risk-neutral 分布式臂**——把 RDSAC-mean 崩潰 2/6→0/6。（2）**在完成穩定性上 clip 優於 CVaR**：clip-on-mean 與 clip-off-cvar 同為 0 崩潰、100% 完成，但誠實 ΔJCT% −3.5／−12.5 遠優於 −41／−37，即 clip-on-mean **dominate** clip-off-cvar。這細化了 §4.3 的結論：CVaR 穩定完成是**以 JCT 為代價**，而 return-clip 是更省、傷 JCT 更少的替代。（3）但 clip 疊在 CVaR 上兩穩定機制互相打架（cvar 0/6→2/6），故 return-clip 是 CVaR 的**替代而非疊加**。淨結：找到一個更好的分布式評論家穩定器，**但仍無任何臂贏過 score**（clip-on-mean −3.5±36.5／−12.5±32、CI 跨 0＝與 score 統計等價），與全文「2×1 策略空間平坦」一致。
-
-![圖 3](figures/fig_stabilizer.png)
-
-圖 3. value-clip 消融的崩潰格數（/6）：return-clip 讓 RDSAC-mean 崩潰 2→0（救回），卻讓 RDSAC-cvar 0→2（兩穩定機制衝突）——穩定器與風險扭曲是替代而非疊加。
-
-### 4.4 與雲端原生 SOTA 基準的對照（強化基準）
+### 5.3 與雲端原生 SOTA 基準的對照（強化基準）
 
 §4.2 的區分實驗僅對照自家啟發式，可能招致「未與引用的 SOTA 比較」之質疑。為此，我們將 §2 所述的兩個雲端原生排程器近似納入同一模擬對照——Kueue 式 fair-share（跨使用者 max-min 交錯）與 Volcano 式 binpack（最大需求優先）——在高競爭的 1×1、**佇列飽和** regime（offered load 拉高至系統飽和；GPU 使用率仍約 0.6，屬**佇列**飽和而非**算力**飽和，aiserve 工作負載，8 seed）下量測（表 7）。此處的拓樸（1×1）與競爭度（飽和）皆與表 1（2×1、ρ≈0.7 中度競爭）不同，故 JCT 絕對值明顯較高（如 FCFS 2640 vs 表 1 的 2199、score 1887 vs 1129）；兩表各自檢驗其 regime 內的**相對排名**，跨表的絕對 JCT 不宜直接相減。
 
@@ -287,7 +279,7 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 此結果有兩點意涵。第一，**區分確實存在但邊界清楚**：FCFS 與純 binpack（優先塞入大型訓練工作、延誤延遲敏感的推論）明顯較差，而 fair-share／multifactor／score 三者叢聚於同一最佳帶（SLO 違反約 39–40%）。第二，**引用的 SOTA 近似並未勝過生產 score**——Kueue-fairshare 與 multifactor 打平、score 落在同帶。這把「合理排程策略空間狹窄」的結論從自家啟發式延伸到雲端原生 SOTA，回應了「只比自家 heuristic」的質疑（實作為 sim 內排序近似，非完整 Kueue 准入控制器／Volcano 節點評分外掛，見 §4.6 威脅）。
 
-### 4.5 討論
+### 5.5 結果討論
 
 上述結果指向一個**限定於缺乏卡內共享（等待主導）regime** 的洞見：**在該場景下 2×1 的排程策略空間近乎是平的**——不僅深度強化學習未能穩健勝過啟發式，連生產 score 對 FCFS 等簡單基準亦僅打平。（須強調此「平坦」是**場景限定**的：§4.2.1 已證，一旦換成真實 cuBLAS＋MPS 分數共置、觸及卡內共享的放置槓桿，策略空間不再平坦，學習式放置即在多數工作上更佳於 score。）就實機聚合（表 3）而言，各啟發式相對 score 的 ΔJCT% 落在約 ±0.4～1.7%、且信賴區間跨越 0，在 ±5% 的實務等價界（practical-equivalence margin）內可視為**統計等價**（其中 FCFS 因變異較大而區間較寬，等價宣稱較弱）；換言之這是「證實無實務差異」，而非僅「未偵測到差異」。此 ±5% 等價界同樣涵蓋學習型策略：表 4 中三個學習臂的 −3.7～−4.6% 雖因大樣本而**統計顯著**，其幅度仍落在等價帶內，故整個「策略空間近乎是平的」判斷橫跨啟發式與學習式兩類排程器，而非僅指前者。
 
@@ -299,22 +291,8 @@ Scheduling mixed AI workloads (inference and training) on heterogeneous GPU clus
 
 將「效益隨規模浮現」從斷言降級為 open question，正是本研究誠實立場的一部分。§4.3 也帶出一個方法學教訓：**單 seed 的模擬評估可能報告不可重現的假性優勢**，凸顯多 seed 配對統計的必要性，這與 §4.2 中「單趟平均值會得到錯誤排名」互為印證。
 
-### 4.6 有效性威脅（Threats to Validity）
 
-作為一篇以方法學與誠實負結論為主軸的研究，本節明列可能削弱結論的因素及其處置：
-
-- **單 seed 脆弱性（已處置）：** 早期單 seed 結果曾呈現 RDSAC 大幅領先，經 3 訓練 seed 重跑後被推翻（§4.3）。所有學習型結論均以多 seed mean±std 呈現。
-- **GPU 分配後端混淆（已處置）：** 平台由 device-plugin 遷移至 Kubernetes DRA 後，實測 MPS 後端會顯著改變絕對 JCT 甚至相對排名——先前於 device-plugin 量到的 cuBLAS 學習式小勝（+4.5%）在 DRA 下反轉為略輸（§4.2.1）。故本文將**全部策略於同一乾淨 DRA 後端統一重測**，所有 ΔJCT% 對齊同一 score 基準；跨後端的絕對數字與方向皆不予沿用。此為 sim-to-real 之外的另一層可比性威脅：**同一實機在不同 GPU 分配後端下亦不可直接相比**。
-- **訓練預算 confound（部分處置）：** 決定性的 CVaR 消融已用 100k 步（§4.3）；但規模掃描仍為 40k 步，較複雜的 IQN 評論家可能欠訓練，故規模結論僅作為 open question，不作定論。
-- **跨尺度不可比：** 1×1／2×1／2×2 的觀測維度與動作空間不同，checkpoint 不相容、須各自重訓，跨尺度的絕對數值不宜直接相減。
-- **合成 trace：** 訓練與模擬工作負載為依 Philly／Alibaba 公開統計特性合成（非原始逐筆），且其 runtime 與特徵獨立，屬預測性最差的保守情境。
-- **模擬與實機落差：** 模擬以離散事件近似 MPS 干擾與 runtime 不確定性，未完整建模快取、記憶體頻寬與 kernel 級競爭。
-- **評估與部署路徑一致（顯式節點綁定）：** 實機放置實驗與建議的生產路徑皆以**提交時**將 RL 選定節點寫入工作的必要節點（`-w`／`ReqNodeList`）達成顯式放置，故評估忠實反映部署（§3.2）。平台另有一個非同步 placement controller 作為替代，惟其 slurmrestd 事後釘節點之生效仍在硬化中；此不影響 §4.2 之結論（該實驗走已驗證的提交時綁定）。
-- **小樣本：** 實機單一工作即耗時數分鐘，樣本稀少；已以配對 CRN、抗漂移輪轉與多 seed 盡量降低變異，但統計檢力仍受限。
-- **規模上限：** 最大僅測至 2×2，結論不宜外推至數十至數百 GPU 的生產叢集。
-- **SOTA 近似（§4.4）：** Kueue／Volcano 對照為**排序層級**的近似（fair-share max-min／binpack 最大需求優先），非完整的 Kueue 准入控制器或 Volcano 節點評分外掛；等價結論限於排序策略層級，未涵蓋配額借還、gang 准入等機制。
-
-## 5. 結論與未來工作
+## 6. 結論與未來工作
 
 本研究設計並實作了一套以 Kubernetes 部署、Slurm 為核心、整合 MPS 與失效安全 RL 決策的 AI 伺服器 GPU 排程平台，並提出一套兼顧抗漂移、多 seed 配對統計、尾端指標與**同後端統一重測**的模擬到實機評估方法學。核心發現是**排程結論高度依賴評估場景與底層 GPU 分配後端**：於同一乾淨的 Kubernetes DRA 後端統一重測全部策略後，**低負載真實 cuBLAS ＋ MPS 共置的排程策略空間近乎平坦**（生產 score、Slurm 原生 FCFS／backfill 與學習式含實機微調 RLPD 全落在 ±5% 內、學習式略差），**高負載真實 LLM serving 則 score 最佳**（學習式與 naive Slurm 皆較差），且**改以 serving SLO 違反率為指標軸重測、score 於 JCT 與 SLO 兩軸皆最佳**（§4.2.3，即使在 CVaR 主場的尾端指標上學習式仍未勝出）——在乾淨統一後端下，學習式放置在三個場景、跨兩類指標皆未穩健勝過 score、亦未勝過 naive Slurm（§4.2.1–4.2.3）。一項重要的方法學教訓是：先前於 device-plugin 後端量到的 cuBLAS 小勝（RDSAC-cvar +4.5%）在 DRA 後端不重現（反轉為略輸），凸顯排程結論會被 GPU 分配後端混淆、須以單一一致後端統一重測；另一教訓是單 seed／小樣本會誤導（3-seed 曾量到 +15%，n=8 下不復存在）。唯一穩健的正面觀察是 **score 啟發式的 bin-pack／SJF 因子在高負載下勝過 vanilla Slurm 的 cons_tres 放置**（§4.2.2），顯示手調啟發式相對「數 GPU」式放置確有加值。次要發現為分布式評論家的訓練穩定性可被馴服（§4.3.1）：CVaR 風險扭曲與（更省的）Duan 式 target return-clip 皆能消除其崩潰、且互為替代，惟兩者皆未使任何學習臂穩健勝過基準。未來工作包含：（1）**擴展至更大、更高競爭的叢集**以檢驗「價值隨規模浮現」假設；（2）**將 RDSAC 接成 Kubernetes 原生排程 policy**——Kueue admission-ordering 或 kube-scheduler／DRA device-selection plugin，把「學習式策略層 × DRA 機制層互補」從論述變為 PoC，並直接落進雲端原生生態系；（3）**擴大實機微調的資料規模**——§4.2.1 已直接檢驗以忠於原論文的線上 RLPD（Ball 等人 2023）微調來縮小 sim-to-real 落差，惟 181 筆真實 transition 不足以翻盤，故後續需收集遠更大量的實機資料或加入 on-policy 修正；（4）延伸 return-clip 穩定器並以更新、更穩定的 off-policy 演算法續攻分布式評論家的崩潰／退化——已將 CrossQ（Bhatt 等人 2024 [18]：BatchNorm 評論家、移除 target network、UTD=1）納入為對照臂，SimbaV2 式的 RL 縮放架構（正規化 + 殘差骨幹）列為進一步方向。
 
