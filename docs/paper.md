@@ -52,16 +52,24 @@ Kubernetes 是目前最主流的容器編排平台，能夠自動管理容器的
 
 NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process Service (MPS) 以及 Multi-Instance GPU (MIG)。MPS 允許多個 CUDA 程式同時共享一張 GPU 的運算資源；MIG 則在硬體層面將 GPU 切分成獨立的分區，提供更強的隔離性。本系統目前採用基於 MPS 的方式，讓多個較小的工作共享同一張 GPU，以提升整體使用效率。
 
-除了本系統採用的 MPS 之外，近年也有研究探討在 MIG 等機制上進行動態重新分割與能源效率最佳化；這類方法能提供較強隔離性，但也需要額外硬體支援、分割粒度與工作遷移成本，因此本專題目前先以部署門檻較低的 MPS 作為共享 GPU 的主要實作方式
+除了本系統採用的 MPS 之外，近年也有研究探討在 MIG 等機制上進行動態重新分割與能源效率最佳化 [21]；這類方法能提供較強隔離性，但也需要額外硬體支援、分割粒度與工作遷移成本，因此本專題目前先以部署門檻較低的 MPS 作為共享 GPU 的主要實作方式
 
 
 ## 2. 相關研究
 
 **GPU 叢集排程與分析。** Jeon 等人對微軟 Philly 叢集的大規模多租戶 GPU 工作負載進行分析 [1]，揭示了排隊延遲與資源碎裂問題。Gandiva [2] 與 Tiresias [3] 分別利用 DL 工作的可遷移性與分布感知排程降低 JCT。Weng 等人對阿里巴巴 PAI 叢集的研究 [4] 指出生產 MLaaS 工作高度分片化、以單卡短工作為主。本研究的合成工作負載即以 [1][4] 的統計特性為依據。
 
-**GPU 共享。** NVIDIA MPS [5] 允許多個行程共享單張 GPU 的計算資源，是在小型叢集上提升使用率的關鍵機制；本研究以 MPS 槽（每卡 4 槽，對應 25／50／75／100％）建模卡內共享。
+近期研究則更聚焦於單節點內或單一叢集模型上的動態資源調度本身。Wang 等人的 DCUDA [19] 針對單節點多 GPU 情境，設計了一套輕量級核心／記憶體使用率監控機制，搭配近乎零開銷的「執行中」CUDA 應用即時遷移，將 GPU 過載時間平均降低 78.3%、一般工作執行時間降低 42.1%（記憶體密集型工作最高 67%）。Sedighi 等人 [20] 則在 Alibaba 的 cluster-trace-gpu 生產工作負載軌跡之上，提出結合硬體與軟體分割的公平且需求感知動態資源配置演算法，於模擬環境中將 GPU 資源使用量降低達 88%。這兩項工作皆聚焦「資源配置本身如何隨工作負載動態調整」（即時遷移／再分割），評估分別侷限於單一多 GPU 節點與純模擬 trace 重放，並未涉及與批次排程器（如 Slurm）的整合或真實異質叢集上的統計驗證；本研究的排程決策則作用於 Slurm 的工作提交路徑之上、決定「哪個工作該去哪張卡的哪個 MPS 槽」，並在真實異質叢集上以失效安全與抗漂移統計方法落地檢驗，兩者的問題設定屬於不同但互補的抽象層次。
+
+**GPU 共享。** NVIDIA MPS [5] 允許多個行程共享單張 GPU 的計算資源，是在小型叢集上提升使用率的關鍵機制；本研究以 MPS 槽（每卡 4 槽，對應 25／50／75／100％）建模卡內共享。另一條路線聚焦硬體隔離式的 MIG 動態重分割：Lipe 等人 [21] 針對單張 A100 GPU 的 MIG 切片，先以 Earliest-Deadline-First–Slowest-Slice（EDF-SS）演算法處理切片內的工作排程，再以強化學習（DQN）決定何時、要重分割成 12 種切片組態中的哪一種，於「能耗＋延誤」的多目標指標上優於雙日重分割（26%）、靜態分割（31%）與完全不分割（68%）。相較於 MIG 的硬體級隔離與較高的重分割／遷移成本，本研究採用 MPS 的理由正是部署門檻更低——無需重新配置硬體分區，即可在既有消費級 GPU（RTX 4070／3080，皆不支援 MIG）上即時生效卡內共享，這也是本研究能以校園實驗室既有異質硬體直接驗證的前提。
 
 **強化學習排程。** 以 RL 進行資源排程的研究多採用 actor–critic 或值函數方法。本研究的決策核心 RDSAC 為三項技術的整合：離散動作 Soft Actor-Critic [6]、Implicit Quantile Network 分布式評論家 [7]，以及以 CVaR 為風險量度的尾端敏感優化 [7]。為弭平模擬與實機落差，亦採用離線到線上的 RLPD 微調概念 [8]。獎勵塑形採用保證最優策略不變的位能塑形 [9]。
+
+以 RL 排程 AI 服務型任務的研究路線與本研究最為鄰近。Lin 等人 [23] 提出 UXP-RL：一個以 DQN 為核心、涵蓋前處理／訓練／推論三類任務、可部署為集中式或分散式排程器、並跨雲／邊／霧三層架構運作的 CPU-GPU 任務排程演算法。其於模擬環境中，集中式排程器將平均週轉時間相較 SJF／FCFS 與 TYPE 啟發式（依 GPU 需求高低分類任務）分別降低 57.81％、57.28％與 27.66％；分散式排程器則因能將長訓練工作卸載至雲端而釋放邊／霧資源，把推論任務週轉時間相較集中式再降低 89.07%。同屬 2025 年的近作中，Zhang 等人的 KIS-S [25] 以 PPO 訓練一個 GPU-aware 的 Kubernetes 推論自動擴縮策略（KIScaler），完全於自建模擬器（KISim）中訓練後即零樣本部署，於多種流量情境下平均獎勵提升 75.2%、p95 延遲相較 CPU 基準降低最多 6.7 倍；其問題設定是**調整副本數**的自動擴縮，而非本研究的**工作放置**排程。Wu 等人的 DRR [26]（ACM SoCC ’25）則針對 GPU 共享叢集因分享機制、工作異質性與非同步生命週期造成的碎片化問題，以模仿學習（imitation learning）從既有啟發式暖啟動一個深度強化學習去碎片化排程器，並輔以多尺度策略最佳化平衡探索與利用；其同時於實體 Kubernetes 測試床與大規模模擬叢集上驗證，平均碎片率降低 50%——是本節所列文獻中少數同時涉及真實 Kubernetes 部署的學習式排程器。
+
+**與 [23]（RL for AIaaS）的定位差異。** [23] 與本研究同屬「以強化學習排程 AI 服務型任務」的問題設定，是最貼近本研究、也最可能被質疑「novelty 重疊」的對照組，值得正面處理其區隔：（1）**評估場所與統計嚴謹性**——[23] 完全於自建模擬環境中，以合成任務到達率與 17 個 DNN 模型的離線量測執行時間為輸入評估，並未涉及真實叢集部署，也未處理 sim-to-real 落差、叢集暖機漂移等真實硬體量測特有的混淆因子；本研究的核心方法學貢獻正是把「模擬中可分辨的策略差異能否轉移到實機」系統性地檢驗——以抗漂移交錯輪轉、多 seed 配對統計（seed 層級 one-sample t 檢定）、同一 GPU 分配後端統一重測，並誠實回報「差異不轉移」與「後端本身混淆結論」兩項負結果（§5.3）。（2）**目標函數**——UXP-RL 以最小化平均週轉時間（排隊＋執行）為單一目標；本研究的 RDSAC 是**風險敏感**的：雙頭 IQN 評論家對回報分布套用 CVaR 扭曲，直接優化 p95／p99／SLO 違反率等尾端量，因為 AI serving 情境下「多數請求正常、少數被拖很慢」的尾端體感往往比平均值更貼近使用者實際感受（§5.2）。（3）**失效安全的生產整合**——[23] 的 RL 排程器是排程決策的唯一來源；本研究將 RL 決策整合進 Slurm 既有的 `job_submit.lua` 提交路徑，服務逾時或異常時**靜默回退**至既有 score 啟發式，確保排程核心（slurmctld）永不被研究用元件阻塞——這是把學習式排程放進生產路徑必須解決、但 [23] 未觸及的工程問題（§3.3）。（4）**誠實的負結論**——本研究誠實揭露：在乾淨統一的 DRA 後端上，RDSAC／SAC 等學習式放置在三個真實硬體場景（低負載共置、高負載真實 LLM serving、SLO serving）皆未穩健勝過生產 score 啟發式（§5.3），這與 [23] 及多數既有 RL 排程文獻報告的正面結果形成對比。本文將此差異本身視為方法學貢獻的一部分：RL 排程效益高度依賴評估場景與統計嚴謹程度，一個只在模擬中量測、未做多 seed 配對顯著性檢定的正面結果，未必能在真實部署中複現。DRR [26] 雖已跨出模擬、於真實 Kubernetes 測試床驗證，但其目標仍是聚合碎片率而非尾端 SLO，亦未見多 seed 配對統計或抗漂移設計；本研究的貢獻正補上這塊空缺——把「學習式排程在真實叢集上是否穩健勝過生產基準」的問題，以統計嚴謹的方法學正面回答（即使答案是誠實的「尚未」）。
+
+**異質／邊緣 GPU 排程。** 本研究的叢集本身即異質且非資料中心等級（RTX 4070＋RTX 3080，皆不支援 MIG／vGPU），這使邊緣與異質 GPU 排程文獻格外相關。Tsenos 與 Kalogeraki [22] 針對缺乏原生虛擬化支援的邊緣 GPU（如 RTX 4090、GTX 1080Ti 等消費級卡）提出一套硬體無關的時空共享機制：為每個行程建立 cgroup、動態調整其「duty cycle」（週期性凍結／解凍佔用 GPU 的時間比例）來實現優先權式與截止期限（laxity）式排程，且無需修改工作負載原始碼即可整合進 TensorFlow、PyTorch、FFmpeg 等既有框架。此工作與本研究處境相近——皆是非資料中心等級、不支援硬體分片的消費級 GPU——但其排程單位是**單節點**上的行程級 duty cycle 調整，不涉及叢集級的佇列、backfill 或跨節點放置決策，亦未整合學習式策略，可視為與本研究互補的節點內機制。Majeed 等人 [24] 則以系統性文獻回顧整理 NVIDIA Jetson AGX 系列邊緣 SoC（CPU＋GPU＋深度學習加速器 DLA＋可程式視覺加速器 PVA＋視訊影像合成器 VIC）上的 DNN 排程器，區分規則式（如 Jedi、CP-CNN、Herald、H2H、HaX-CoNN）與最佳化式（線性規劃、AxoNN、遺傳演算法、以 Z3 SMT 求解器動態重排的 D-HaX-CoNN）兩大類，並整理其記憶體競爭、跨加速器轉移成本與靜態／動態排程的權衡。其排程粒度是**單一 DNN 模型內的層級**（將個別網路層指派給不同硬體加速器），與本研究**工作／任務級**的叢集放置決策不在同一抽象層次，可作為異質邊緣排程景觀（landscape）的引用，界定本研究「叢集批次排程」與此類「模型內加速器排程」研究之間的分工。
 
 **雲端原生 GPU 排程生態系。** 在 Kubernetes 生態中，數個成熟系統處理 GPU／批次工作負載，但分屬不同抽象層：Kubeflow [12] 負責 ML 工作的生命週期（分散式訓練、超參數搜尋、模型服務），其本身不做排程，而將決策**委派**給批次排程器；Volcano [13] 提供 pod 群組的 gang 排程與 DRF／binpack 等規則式外掛；Kueue [14] 實作 job 級佇列、配額借還（ClusterQueue／ResourceFlavor／Cohort）、fair-share 與 gang 准入，但以暫停（suspend）控制准入、**不負責 pod 放置**；Kubernetes 1.34 起正式釋出（GA）的動態資源分配（Dynamic Resource Allocation, DRA）[15] 則將 GPU 分片、MIG、time-slicing 等以 ResourceClaim／ResourceSlice／DeviceClass **宣告式**地納入 API，成為一等公民。表 1 依抽象層整理這些系統與本研究的定位。
 
@@ -76,6 +84,8 @@ NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process
 | **本研究（RDSAC）** | 排序／放置**策略** | **學習式＋風險敏感（CVaR）** | ✓ | ✓（直接優化尾端） | MPS-aware 策略 |
 
 **與既有工作的差異。** 上述系統皆為**規則式或約束求解**：Kueue／Volcano 解的是配額與 gang 准入、DRA 提供的是分片**機制**、Kubeflow 管的是生命週期；沒有任何一個是「**學習式、且以尾端延遲（tail latency）為目標的排序／放置策略**」。本研究正落於此空隙：RDSAC 對回報分布以 CVaR 優化 p99／SLO 尾端，是生產系統皆未優化的量。要強調的是，DRA 提供的是「如何表達要 0.25 張 GPU」的*機制*，而非「該把哪些工作打包、用什麼順序以壓低尾端」的*策略*——因此本研究的學習式策略與 DRA 並非競爭，而是**互補**：一個尾端敏感的策略可在 DRA 之上驅動裝置選擇與准入排序。既有 RL 排程研究多止於模擬；本研究的重點不在宣稱 RL 必勝，而在**建立一套能在真實異質叢集上、以統計嚴謹方式檢驗排程策略效益的方法學**，並誠實回報其規模條件。
+
+值得一提，本節所引 6 篇 IEEE 相關研究中，多數（DCUDA [19]、Sedighi 等人 [20]、MIG 動態重分割 [21]、邊緣 duty-cycle 排程 [22]、UXP-RL [23]、Jetson 排程回顧 [24]）皆作用於單節點執行期、或評估侷限於未與 Kubernetes 整合的獨立模擬環境；僅 KIS-S [25] 與 DRR [26] 是 Kubernetes 原生系統，但分別位於**自動擴縮**（依流量調整推論副本數）與**去碎片化重排程**這兩個子層，皆非表 1 所比較的「排序／放置策略」層級。這進一步凸顯本研究在雲端原生 GPU 排程生態系中的定位空隙：一個作用於 Slurm-on-Kubernetes 排程／放置層、以學習式策略直接優化尾端 SLO 的失效安全整合，其鄰近文獻或止步於單節點／純模擬（[19]–[24]），或雖已部署於 Kubernetes 但作用於相鄰子層（[25][26]），未見與本研究直接重疊者。
 
 ### 2.3 Soft Actor Critic (SAC)
 
@@ -393,3 +403,19 @@ RDSAC 的策略輸出經兩條生產路徑之一作動：（1）**優先權微�
 [17] J. Duan, Y. Guan, S. E. Li, Y. Ren, and B. Cheng, "Distributional Soft Actor-Critic: Off-Policy Reinforcement Learning for Addressing Value Estimation Errors," *IEEE Transactions on Neural Networks and Learning Systems*, 2021. arXiv:2001.02811.
 
 [18] A. Bhatt, D. Palenicek, B. Belousov, M. Argus, A. Amiranashvili, T. Brox, and J. Peters, "CrossQ: Batch Normalization in Deep Reinforcement Learning for Greater Sample Efficiency and Simplicity," in *ICLR*, 2024.
+
+[19] X. Wang, Y. Li, F. Guo, Y. Xu, and J. C. S. Lui, "Dynamic GPU Scheduling With Multi-Resource Awareness and Live Migration Support," *IEEE Transactions on Cloud Computing*, vol. 11, no. 3, 2023.
+
+[20] H. Sedighi, F. Wuhib, and R. H. Glitho, "Dynamic Task Scheduling and Adaptive GPU Resource Allocation in the Cloud," *IEEE Transactions on Network and Service Management*, vol. 23, 2026.
+
+[21] E. Lipe, N. Karia, C. Espenshade, C. Stein, A. Tantawi, and O. Tardieu, "Energy Efficient Scheduling of AI/ML Workloads on Multi Instance GPUs with Dynamic Repartitioning," in *IEEE 25th International Symposium on Cluster, Cloud and Internet Computing (CCGrid)*, 2025.
+
+[22] M. Tsenos and V. Kalogeraki, "Exploring GPU-Based Workload Scheduling Techniques for Edge Computing," in *IEEE International Conference on Cloud Engineering (IC2E)*, 2025.
+
+[23] Y.-D. Lin, Y.-T. Ling, Y.-C. Lai, and D. Sudyana, "Reinforcement Learning for AI as a Service: CPU-GPU Task Scheduling for Preprocessing, Training, and Inference Tasks," *IEEE Transactions on Network and Service Management*, vol. 22, no. 4, 2025.
+
+[24] A. A. Majeed, M. Meribout, and S. M. Sali, "Scheduling Techniques of AI Models on Modern Heterogeneous Edge GPU—A Critical Review," *IEEE Transactions on Industrial Informatics*, vol. 22, no. 4, 2026.
+
+[25] G. Zhang, W. Guo, Z. Tan, Q. Guan, and H. Jiang, "KIS-S: A GPU-Aware Kubernetes Inference Simulator with RL-Based Auto-Scaling," *arXiv:2507.07932*, 2025.
+
+[26] Q. Wu, P. Chen, and Y. Wang, "Defragmentation Scheduling with Deep Reinforcement Learning in Shared GPU Clusters," in *Proceedings of the 2025 ACM Symposium on Cloud Computing (SoCC)*, 2025.
