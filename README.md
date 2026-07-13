@@ -21,7 +21,7 @@ and full Prometheus observability.
 [叢集規格](docs/cluster.md) ·
 [系統架構圖](assets/architecture.html) ·
 [優化排程研究](docs/scheduler.md) ·
-[採坑紀錄和實作筆記](docs/note.md)
+[論文初稿](docs/paper.md)
  
 </div>
  
