@@ -1,12 +1,16 @@
 __pycache__/
 .claude/
+.codegraph/
+_docx_unpack/
 .pytest_cache/
 .ruff_cache/
 CLAUDE.md
+.mcp.json
 sim/data/out/
 sim/data/philly_subsample.json
-.venv-m5/
 .venv*/
 services/runtime-predictor/models/
 eval/results/
 runs/
+superpowers/
+shadow_logs/
