@@ -57,11 +57,15 @@ NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process
 
 ## 2. 相關研究
 
+### 2.1 GPU 叢集排程、分析與資源共享
+
 **GPU 叢集排程與分析。** Jeon 等人對微軟 Philly 叢集的大規模多租戶 GPU 工作負載進行分析 [1]，揭示了排隊延遲與資源碎裂問題。Gandiva [2] 與 Tiresias [3] 分別利用 DL 工作的可遷移性與分布感知排程降低 JCT。Weng 等人對阿里巴巴 PAI 叢集的研究 [4] 指出生產 MLaaS 工作高度分片化、以單卡短工作為主。本研究的合成工作負載即以 [1][4] 的統計特性為依據。
 
 近期研究則更聚焦於單節點內或單一叢集模型上的動態資源調度本身。Wang 等人的 DCUDA [19] 針對單節點多 GPU 情境，設計了一套輕量級核心／記憶體使用率監控機制，搭配近乎零開銷的「執行中」CUDA 應用即時遷移，將 GPU 過載時間平均降低 78.3%、一般工作執行時間降低 42.1%（記憶體密集型工作最高 67%）。Sedighi 等人 [20] 則在 Alibaba 的 cluster-trace-gpu 生產工作負載軌跡之上，提出結合硬體與軟體分割的公平且需求感知動態資源配置演算法，於模擬環境中將 GPU 資源使用量降低達 88%。這兩項工作皆聚焦「資源配置本身如何隨工作負載動態調整」（即時遷移／再分割），評估分別侷限於單一多 GPU 節點與純模擬 trace 重放，並未涉及與批次排程器（如 Slurm）的整合或真實異質叢集上的統計驗證；本研究的排程決策則作用於 Slurm 的工作提交路徑之上、決定「哪個工作該去哪張卡的哪個 MPS 槽」，並在真實異質叢集上以失效安全與抗漂移統計方法落地檢驗，兩者的問題設定屬於不同但互補的抽象層次。
 
 **GPU 共享。** NVIDIA MPS [5] 允許多個行程共享單張 GPU 的計算資源，是在小型叢集上提升使用率的關鍵機制；本研究以 MPS 槽（每卡 4 槽，對應 25／50／75／100％）建模卡內共享。另一條路線聚焦硬體隔離式的 MIG 動態重分割：Lipe 等人 [21] 針對單張 A100 GPU 的 MIG 切片，先以 Earliest-Deadline-First–Slowest-Slice（EDF-SS）演算法處理切片內的工作排程，再以強化學習（DQN）決定何時、要重分割成 12 種切片組態中的哪一種，於「能耗＋延誤」的多目標指標上優於雙日重分割（26%）、靜態分割（31%）與完全不分割（68%）。相較於 MIG 的硬體級隔離與較高的重分割／遷移成本，本研究採用 MPS 的理由正是部署門檻更低——無需重新配置硬體分區，即可在既有消費級 GPU（RTX 4070／3080，皆不支援 MIG）上即時生效卡內共享，這也是本研究能以校園實驗室既有異質硬體直接驗證的前提。
+
+### 2.2 強化學習排程
 
 **強化學習排程。** 以 RL 進行資源排程的研究多採用 actor–critic 或值函數方法。本研究的決策核心 RDSAC 為三項技術的整合：離散動作 Soft Actor-Critic [6]、Implicit Quantile Network 分布式評論家 [7]，以及以 CVaR 為風險量度的尾端敏感優化 [7]。為弭平模擬與實機落差，亦採用離線到線上的 RLPD 微調概念 [8]。獎勵塑形採用保證最優策略不變的位能塑形 [9]。
 
@@ -69,7 +73,11 @@ NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process
 
 **與 [23]（RL for AIaaS）的定位差異。** [23] 與本研究同屬「以強化學習排程 AI 服務型任務」的問題設定，是最貼近本研究、也最可能被質疑「novelty 重疊」的對照組，值得正面處理其區隔：（1）**評估場所與統計嚴謹性**——[23] 完全於自建模擬環境中，以合成任務到達率與 17 個 DNN 模型的離線量測執行時間為輸入評估，並未涉及真實叢集部署，也未處理 sim-to-real 落差、叢集暖機漂移等真實硬體量測特有的混淆因子；本研究的核心方法學貢獻正是把「模擬中可分辨的策略差異能否轉移到實機」系統性地檢驗——以抗漂移交錯輪轉、多 seed 配對統計（seed 層級 one-sample t 檢定）、同一 GPU 分配後端統一重測，並誠實回報「差異不轉移」與「後端本身混淆結論」兩項負結果（§5.3）。（2）**目標函數**——UXP-RL 以最小化平均週轉時間（排隊＋執行）為單一目標；本研究的 RDSAC 是**風險敏感**的：雙頭 IQN 評論家對回報分布套用 CVaR 扭曲，直接優化 p95／p99／SLO 違反率等尾端量，因為 AI serving 情境下「多數請求正常、少數被拖很慢」的尾端體感往往比平均值更貼近使用者實際感受（§5.2）。（3）**失效安全的生產整合**——[23] 的 RL 排程器是排程決策的唯一來源；本研究將 RL 決策整合進 Slurm 既有的 `job_submit.lua` 提交路徑，服務逾時或異常時**靜默回退**至既有 score 啟發式，確保排程核心（slurmctld）永不被研究用元件阻塞——這是把學習式排程放進生產路徑必須解決、但 [23] 未觸及的工程問題（§3.3）。（4）**誠實的負結論**——本研究誠實揭露：在乾淨統一的 DRA 後端上，RDSAC／SAC 等學習式放置在三個真實硬體場景（低負載共置、高負載真實 LLM serving、SLO serving）皆未穩健勝過生產 score 啟發式（§5.3），這與 [23] 及多數既有 RL 排程文獻報告的正面結果形成對比。本文將此差異本身視為方法學貢獻的一部分：RL 排程效益高度依賴評估場景與統計嚴謹程度，一個只在模擬中量測、未做多 seed 配對顯著性檢定的正面結果，未必能在真實部署中複現。DRR [26] 雖已跨出模擬、於真實 Kubernetes 測試床驗證，但其目標仍是聚合碎片率而非尾端 SLO，亦未見多 seed 配對統計或抗漂移設計；本研究的貢獻正補上這塊空缺——把「學習式排程在真實叢集上是否穩健勝過生產基準」的問題，以統計嚴謹的方法學正面回答（即使答案是誠實的「尚未」）。
 
+### 2.3 異質／邊緣 GPU 排程
+
 **異質／邊緣 GPU 排程。** 本研究的叢集本身即異質且非資料中心等級（RTX 4070＋RTX 3080，皆不支援 MIG／vGPU），這使邊緣與異質 GPU 排程文獻格外相關。Tsenos 與 Kalogeraki [22] 針對缺乏原生虛擬化支援的邊緣 GPU（如 RTX 4090、GTX 1080Ti 等消費級卡）提出一套硬體無關的時空共享機制：為每個行程建立 cgroup、動態調整其「duty cycle」（週期性凍結／解凍佔用 GPU 的時間比例）來實現優先權式與截止期限（laxity）式排程，且無需修改工作負載原始碼即可整合進 TensorFlow、PyTorch、FFmpeg 等既有框架。此工作與本研究處境相近——皆是非資料中心等級、不支援硬體分片的消費級 GPU——但其排程單位是**單節點**上的行程級 duty cycle 調整，不涉及叢集級的佇列、backfill 或跨節點放置決策，亦未整合學習式策略，可視為與本研究互補的節點內機制。Majeed 等人 [24] 則以系統性文獻回顧整理 NVIDIA Jetson AGX 系列邊緣 SoC（CPU＋GPU＋深度學習加速器 DLA＋可程式視覺加速器 PVA＋視訊影像合成器 VIC）上的 DNN 排程器，區分規則式（如 Jedi、CP-CNN、Herald、H2H、HaX-CoNN）與最佳化式（線性規劃、AxoNN、遺傳演算法、以 Z3 SMT 求解器動態重排的 D-HaX-CoNN）兩大類，並整理其記憶體競爭、跨加速器轉移成本與靜態／動態排程的權衡。其排程粒度是**單一 DNN 模型內的層級**（將個別網路層指派給不同硬體加速器），與本研究**工作／任務級**的叢集放置決策不在同一抽象層次，可作為異質邊緣排程景觀（landscape）的引用，界定本研究「叢集批次排程」與此類「模型內加速器排程」研究之間的分工。
+
+### 2.4 雲端原生 GPU 排程生態系
 
 **雲端原生 GPU 排程生態系。** 在 Kubernetes 生態中，數個成熟系統處理 GPU／批次工作負載，但分屬不同抽象層：Kubeflow [12] 負責 ML 工作的生命週期（分散式訓練、超參數搜尋、模型服務），其本身不做排程，而將決策**委派**給批次排程器；Volcano [13] 提供 pod 群組的 gang 排程與 DRF／binpack 等規則式外掛；Kueue [14] 實作 job 級佇列、配額借還（ClusterQueue／ResourceFlavor／Cohort）、fair-share 與 gang 准入，但以暫停（suspend）控制准入、**不負責 pod 放置**；Kubernetes 1.34 起正式釋出（GA）的動態資源分配（Dynamic Resource Allocation, DRA）[15] 則將 GPU 分片、MIG、time-slicing 等以 ResourceClaim／ResourceSlice／DeviceClass **宣告式**地納入 API，成為一等公民。表 1 依抽象層整理這些系統與本研究的定位。
 
@@ -87,15 +95,6 @@ NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process
 
 值得一提，本節所引 6 篇 IEEE 相關研究中，多數（DCUDA [19]、Sedighi 等人 [20]、MIG 動態重分割 [21]、邊緣 duty-cycle 排程 [22]、UXP-RL [23]、Jetson 排程回顧 [24]）皆作用於單節點執行期、或評估侷限於未與 Kubernetes 整合的獨立模擬環境；僅 KIS-S [25] 與 DRR [26] 是 Kubernetes 原生系統，但分別位於**自動擴縮**（依流量調整推論副本數）與**去碎片化重排程**這兩個子層，皆非表 1 所比較的「排序／放置策略」層級。這進一步凸顯本研究在雲端原生 GPU 排程生態系中的定位空隙：一個作用於 Slurm-on-Kubernetes 排程／放置層、以學習式策略直接優化尾端 SLO 的失效安全整合，其鄰近文獻或止步於單節點／純模擬（[19]–[24]），或雖已部署於 Kubernetes 但作用於相鄰子層（[25][26]），未見與本研究直接重疊者。
 
-### 2.3 Soft Actor Critic (SAC)
-
-> TBA。原始論文的簡介。
-
-
-### 2.4 風險敏感深度強化學習 (RDSAC)
-
-決策策略為自行整合的 **discrete 分布式 SAC**（本文稱 RDSAC）：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。RDSAC「風險敏感分布式 SAC」之名承襲自 Ma 等人以回報分布做風險敏感優化的 DSAC [16]；惟本研究為**離散動作**、雙頭 IQN 的自組版本，是離散 SAC [6]、IQN 分布式評論家 [7] 與 CVaR 風險量度的組合，非 [16] 連續控制版本的 1:1 重現。須留意另有**同名但不同**的 Duan 等人 DSAC [17]（將回報建模為單一高斯、以抑制 Q 值高估為目標、風險中立、連續控制），與本研究的風險敏感取向不同，不宜混淆。
-
 ## 3. 研究目的與系統架構
 
 ### 3.1 研究目的
@@ -112,7 +111,7 @@ NVIDIA 提供多種 GPU 資源共享技術，包括 Time-Slicing、Multi-Process
 
 叢集以 k3s 部署，控制節點（RTX 4070）兼任 control-plane，工作節點（RTX 3080，算力約前者 0.25×）為異質 GPU 來源。Slurm 控制器、登入節點與 GPU 工作節點皆以容器化 StatefulSet 部署，GPU 經 NVIDIA device plugin 與 MPS control daemon 暴露為可分片資源。
 
-**為何 Slurm-on-Kubernetes（而非純 K8s 排程器）。** 一個合理的質疑是「既然已在 K8s 上，為何不直接用 Kueue＋DRA＋自訂 kube-scheduler plugin，而要疊一層 Slurm？」本研究選擇 Slurm-on-K8s 有三個理由：（1）**成熟的 HPC 排程語意**——backfill、multifactor 優先權、gang、`gres/mps` 卡內分片皆是 Slurm 開箱即用且經生產驗證的一等公民；在 K8s 側要湊齊等價能力需 Kueue＋Volcano＋DRA 多元件拼裝，且 DRA 於本研究進行時甫 GA（K8s 1.34），生態未穩。（2）**K8s 提供部署與生命週期、Slurm 提供排程核心**，兩層鬆耦合、各司其職：k3s 負責容器化、網路、儲存（NFS RWX）、可觀測性，Slurm 負責佇列與放置決策；這讓平台既可攜（Helm 一鍵部署於異質節點）又保有 HPC 級排程。（3）**研究載具**——`job_submit.lua`／slurmrestd 是穩定、非侵入的策略注入點（§3.2），可在**不 fork slurmctld、不改 kube-scheduler** 的前提下熱插拔學習式策略並失效即回退；相較於維護一個自訂 scheduler plugin，這大幅降低了研究迭代成本。與生態的關係上，本研究的學習式策略與 K8s DRA **互補**（§2）：DRA 給的是分片*機制*，本研究給的是尾端敏感的排序／放置*策略*，未來可在 DRA 之上驅動裝置選擇（§6）。
+**為何 Slurm-on-Kubernetes（而非純 K8s 排程器）。** 一個合理的質疑是「既然已在 K8s 上，為何不直接用 Kueue＋DRA＋自訂 kube-scheduler plugin，而要疊一層 Slurm？」本研究選擇 Slurm-on-K8s 有三個理由：（1）**成熟的 HPC 排程語意**——backfill、multifactor 優先權、gang、`gres/mps` 卡內分片皆是 Slurm 開箱即用且經生產驗證的一等公民；在 K8s 側要湊齊等價能力需 Kueue＋Volcano＋DRA 多元件拼裝，且 DRA 於本研究進行時甫 GA（K8s 1.34），生態未穩。（2）**K8s 提供部署與生命週期、Slurm 提供排程核心**，兩層鬆耦合、各司其職：k3s 負責容器化、網路、儲存（NFS RWX）、可觀測性，Slurm 負責佇列與放置決策；這讓平台既可攜（Helm 一鍵部署於異質節點）又保有 HPC 級排程。（3）**研究載具**——`job_submit.lua`／slurmrestd 是穩定、非侵入的策略注入點（§3.2），可在**不 fork slurmctld、不改 kube-scheduler** 的前提下熱插拔學習式策略並失效即回退；相較於維護一個自訂 scheduler plugin，這大幅降低了研究迭代成本。與生態的關係上，本研究的學習式策略與 K8s DRA **互補**（§2.4）：DRA 給的是分片*機制*，本研究給的是尾端敏感的排序／放置*策略*，未來可在 DRA 之上驅動裝置選擇（§6）。
 
 ### 3.3 失效安全的 RL 整合
 
@@ -160,9 +159,17 @@ priority_delta = round(scoreGain × score)
 
 ### 4.3 深度強化學習策略（RDSAC）
 
-RDSAC 的演算法設計已於 §2.4 詳述——discrete 分布式 SAC：雙頭 IQN 評論家（reward 回報 $Z_R$／entropy 回報 $Z_H$）+ CVaR 風險扭曲 + 遮罩式 categorical actor，訓練搭配 PER、n-step 回報、分數暖啟動與位能獎勵塑形。本節聚焦其輸出如何具體轉化為排程動作，並嵌入 §3.3 所述的失效安全整合架構，避免與 §2.4 重複演算法細節。
+#### 4.3.1 SAC 背景
 
-RDSAC 的策略輸出經兩條生產路徑之一作動：（1）**優先權微調**——`job_submit.lua` 呼叫推論服務的 `POST /decide`，將建議轉為 Slurm 佇列優先權加成，實際落點仍由 `select/cons_tres` 與 GRES 決定；（2）**顯式節點綁定**——評估／部署 harness 呼叫 `POST /act` 取得節點選擇 `(node_j, gpu_k)`，於提交時寫入工作的 `ReqNodeList`（`sbatch -w`），使 Slurm 直接排到指定節點與 MPS 槽。任一路徑下，若推論服務逾時、異常，或（路徑 2）checkpoint 觀測拓樸與實機不符而 abstain，皆靜默回退至 §4.2 的 score 排程，確保 slurmctld 不被研究用元件阻塞。
+Soft Actor-Critic（SAC）是一種最大熵（maximum entropy）off-policy actor-critic 演算法：除了最大化期望回報外，目標函數額外納入策略熵 $\mathcal{H}(\pi(\cdot|s))$ 作為正則項，鼓勵策略在維持高回報的同時保留探索所需的隨機性，避免過早收斂到次佳的確定性策略，並提升對超參數與初始化的穩健性。原始 SAC 設計於連續動作空間，以高斯策略搭配 reparameterization trick 取樣；Christodoulou [6] 提出的離散動作變體則以 categorical 策略取代高斯策略、以期望而非取樣估計熵項，使最大熵框架得以套用於本研究「選擇節點／MPS 槽」這類離散動作排程問題。RDSAC 即以此離散 SAC 為基礎，進一步將評論家由純量 Q 值擴展為分布式評論家（§4.3.2）。
+
+#### 4.3.2 RDSAC 演算法
+
+決策策略為自行整合的 **discrete 分布式 SAC**（本文稱 RDSAC）：雙頭 IQN 評論家分別建模回報分布（reward 回報 $Z_R$ 與 entropy 回報 $Z_H$），以 quantile Huber loss 學習，搭配 twin-Q、軟更新（τ=0.005）與遮罩式 categorical actor。風險敏感性透過在 actor 目標與動作價值上對回報分布套用 CVaR 扭曲 $\rho[Z_R]$ 達成，對應排程中的長尾 runtime／慢節點（straggler）風險。訓練採優先經驗回放（PER）、n-step 回報、分數暖啟動與位能獎勵塑形。RDSAC「風險敏感分布式 SAC」之名承襲自 Ma 等人以回報分布做風險敏感優化的 DSAC [16]；惟本研究為**離散動作**、雙頭 IQN 的自組版本，是離散 SAC [6]、IQN 分布式評論家 [7] 與 CVaR 風險量度的組合，非 [16] 連續控制版本的 1:1 重現。須留意另有**同名但不同**的 Duan 等人 DSAC [17]（將回報建模為單一高斯、以抑制 Q 值高估為目標、風險中立、連續控制），與本研究的風險敏感取向不同，不宜混淆。
+
+#### 4.3.3 排程管線中的作動與失效安全整合
+
+RDSAC 的策略輸出經兩條生產路徑之一作動，並嵌入 §3.3 所述的失效安全整合架構：（1）**優先權微調**——`job_submit.lua` 呼叫推論服務的 `POST /decide`，將建議轉為 Slurm 佇列優先權加成，實際落點仍由 `select/cons_tres` 與 GRES 決定；（2）**顯式節點綁定**——評估／部署 harness 呼叫 `POST /act` 取得節點選擇 `(node_j, gpu_k)`，於提交時寫入工作的 `ReqNodeList`（`sbatch -w`），使 Slurm 直接排到指定節點與 MPS 槽。任一路徑下，若推論服務逾時、異常，或（路徑 2）checkpoint 觀測拓樸與實機不符而 abstain，皆靜默回退至 §4.2 的 score 排程，確保 slurmctld 不被研究用元件阻塞。
 
 訓練採 sim-to-real 兩段式：先在離散事件模擬器中以 PER、n-step 回報與分數暖啟動大量訓練出基本模型；再以 `live_daemon` 旁觀模式收集真實叢集的 (observation, action, reward) transition，以 RLPD（Reinforcement Learning with Prior Data）微調成貼合實機分布的策略，細節見 §5.1、§5.3.1。
 
@@ -313,7 +320,7 @@ RDSAC 的策略輸出經兩條生產路徑之一作動：（1）**優先權微�
 
 ### 5.4 與雲端原生 SOTA 基準的對照（強化基準）
 
-§5.3 的區分實驗僅對照自家啟發式，可能招致「未與引用的 SOTA 比較」之質疑。為此，我們將 §2 所述的兩個雲端原生排程器近似納入同一模擬對照——Kueue 式 fair-share（跨使用者 max-min 交錯）與 Volcano 式 binpack（最大需求優先）——在高競爭的 1×1、**佇列飽和** regime（offered load 拉高至系統飽和；GPU 使用率仍約 0.6，屬**佇列**飽和而非**算力**飽和，aiserve 工作負載，8 seed）下量測（表 9）。此處的拓樸（1×1）與競爭度（飽和）皆與表 2（2×1、ρ≈0.7 中度競爭）不同，故 JCT 絕對值明顯較高（如 FCFS 2640 vs 表 2 的 2199、score 1887 vs 1129）；兩表各自檢驗其 regime 內的**相對排名**，跨表的絕對 JCT 不宜直接相減。
+§5.3 的區分實驗僅對照自家啟發式，可能招致「未與引用的 SOTA 比較」之質疑。為此，我們將 §2.4 所述的兩個雲端原生排程器近似納入同一模擬對照——Kueue 式 fair-share（跨使用者 max-min 交錯）與 Volcano 式 binpack（最大需求優先）——在高競爭的 1×1、**佇列飽和** regime（offered load 拉高至系統飽和；GPU 使用率仍約 0.6，屬**佇列**飽和而非**算力**飽和，aiserve 工作負載，8 seed）下量測（表 9）。此處的拓樸（1×1）與競爭度（飽和）皆與表 2（2×1、ρ≈0.7 中度競爭）不同，故 JCT 絕對值明顯較高（如 FCFS 2640 vs 表 2 的 2199、score 1887 vs 1129）；兩表各自檢驗其 regime 內的**相對排名**，跨表的絕對 JCT 不宜直接相減。
 
 表 9. 強化基準：雲端原生 SOTA 近似納入模擬對照（aiserve，8 seed，1×1 佇列飽和）
 
