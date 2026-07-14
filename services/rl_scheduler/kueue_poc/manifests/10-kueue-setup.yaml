@@ -1,0 +1,48 @@
+# Kueue PoC — minimal setup to demonstrate RDSAC-driven admission ordering.
+#
+# Design: the ClusterQueue's cpu quota is deliberately SMALL (1 core) so that a
+# burst of Jobs cannot all be admitted at once — a queue forms, and the ORDER in
+# which Kueue admits the pending Workloads becomes observable. That admission
+# order is exactly the lever the RDSAC priority controller drives (by patching
+# each pending Workload's spec.priority). Kueue admits highest-priority first.
+#
+# This is the K8s-native analogue of the Slurm `job_submit.lua` priority path:
+# there RDSAC nudges Slurm's multifactor priority; here it sets Kueue's Workload
+# priority. Same fail-safe property — if the controller is down, Kueue falls back
+# to its default (priority+timestamp FIFO) ordering; nothing blocks.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kueue-poc
+---
+# One flavor; the PoC gates on cpu (not GPU) so the ordering mechanism can be
+# validated independently of DRA-GPU quota accounting (that is increment 2).
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: poc-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: poc-cq
+spec:
+  namespaceSelector: {}          # all namespaces may target it via a LocalQueue
+  queueingStrategy: StrictFIFO   # admit strictly by (priority, creationTimestamp)
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: poc-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"      # tiny on purpose → forces a queue to form
+            - name: "memory"
+              nominalQuota: "2Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  namespace: kueue-poc
+  name: poc-lq
+spec:
+  clusterQueue: poc-cq
