@@ -71,30 +71,53 @@ Kueue's default `manageJobsWithoutQueueName: false` means it only touches Jobs
 carrying the queue-name label — the `slurm` namespace and the running platform
 are untouched.
 
-## From PoC to research-grade (increments)
+## Increment 1 (DONE): real RDSAC ordering + multi-method eval
 
-This prototype proves the **control loop**. To make it a paper result:
+`rdsac_order.py` turns the RDSAC placement policy into a queue ordering by rolling
+out `/act` over the pending batch (pick next job → debit that GPU's free MPS →
+repeat; no-op/abstain → FIFO). `controller.py --scorer serve` uses it live;
+`eval_ab.py` uses it offline to compare **fifo / sjf / rdsac** over the same
+per-seed job stream on a real Kueue queue, seed-level aggregated (Δ mean-JCT vs
+FIFO), matching the paper's methodology.
 
-1. **Wire `/decide`** — replace the sjf stub with the RDSAC `/decide` call
-   (`--scorer serve`). Needs the Job → 166-dim observation mapping (MPS/VRAM
-   request, wait time, SLO urgency, GPU-type one-hot). The fail-safe fallback is
-   already in `score_serve`.
-2. **Gate on GPU/MPS, not cpu** — model the contended resource as the DRA GPU /
-   MPS slot (ResourceClaim + Kueue quota on the device) so the ordering decision
-   is over the actual scarce resource, matching §5.3.
-3. **Real workload** — swap the `sleep` container for the cuBLAS `gpu_workload`
-   (and the LLM hybrid) with a DRA GPU claim, on the same DRA MPS backend as
-   §5.3 (no backend confound).
-4. **Seed-level paired A/B** — compare **Kueue-native FIFO vs RDSAC-ordered** on
-   the same workload seeds, with the drift-robust interleave + seed-level
-   one-sample t methodology from §5.1. This upgrades §5.4's SOTA comparison from
-   a *sim approximation* of Kueue to the *real* Kueue admission controller,
-   removing a §6.1 validity threat.
-5. **Watch for a positive** — Kueue's native ordering (FIFO/priority) is weaker
-   than Slurm's score+backfill, so "learned beats Kueue FIFO" is a plausible new
-   positive result in the ecosystem-relevant setting (analogue of the paper's one
-   robust positive, "score beats naive Slurm cons_tres"). A tie is still a fine,
-   honest-consistent result — the value is the artifact + the stronger baseline.
+```bash
+# serve must be running on :8003 (RDSAC checkpoint loaded)
+PYTHONPATH=. .venv-m11/bin/python services/rl_scheduler/kueue_poc/eval_ab.py \
+    --seeds 1 2 3 4 5 6 --n-jobs 8 --concurrency 2 --scale 0.25 --out runs/kueue_eval.json
+```
+
+## Finding: DRA claims are exclusive → no native GPU lane beside the Slurm workers
+
+The Slurm platform holds **each GPU in a long-lived worker pod via an exclusive
+DRA ResourceClaim** (`allocated,reserved`). A second claim on the same GPU is
+`Unschedulable` — *"0/2 nodes: cannot allocate all claims"*. MPS sharing in this
+deployment happens **inside** the worker pod (among Slurm jobs via `gres/mps`),
+**not across separate K8s pods**. So a native-K8s GPU-job lane cannot co-reside
+with the Slurm workers on the same GPUs. Consequences:
+
+- The eval executes each job as a **runtime-faithful proxy** (a pod that sleeps
+  `runtime * --scale`) carrying the real GPU/MPS features (mps_req, gpu_type,
+  runtime) the policy reasons over. This measures **ordering quality** (effect on
+  wait time → JCT) on real pods + real Kueue admission + real wall-clock — honest
+  that the *compute* is a proxy, not GPU co-location.
+- **Real GPU co-location** needs a worker **evicted** for an isolated eval window
+  (the gpu-toggle pattern), freeing that GPU's claim; then eval pods run real
+  cuBLAS via their own claim. Even then, whether two eval pods can *share* one
+  freed GPU via MPS across two claims must be verified empirically (the driver
+  may still allocate the device exclusively). Parked as a scoped follow-up.
+
+## Remaining increments
+
+- **Real GPU execution** — evict a worker, run cuBLAS `gpu_workload` pods (§5.3
+  backend); measure real JCT under MPS co-location.
+- **Seed-level paired A/B vs real Kueue FIFO** — already the shape of `eval_ab.py`;
+  scale seeds + add the drift-robust interleave to upgrade §5.4 from a *sim
+  approximation* of Kueue to the *real* Kueue admission controller (removes a
+  §6.1 threat).
+- **Watch for a positive** — Kueue's native ordering (FIFO/priority) is weaker
+  than Slurm's score+backfill, so "learned (or sjf) beats Kueue FIFO" is a
+  plausible new positive in the ecosystem-relevant setting (analogue of "score
+  beats naive Slurm cons_tres"). A tie is still honest-consistent.
 
 > Note: the K8s-native lane runs jobs as native pods, a different execution path
 > than the Slurm lane, so absolute JCT is **not** comparable across lanes (same

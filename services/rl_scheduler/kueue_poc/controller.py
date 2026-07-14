@@ -29,11 +29,15 @@ import json
 import subprocess
 import sys
 import time
-import urllib.request
 
-# The declared-runtime annotation the Job generator stamps on each Job; the sjf
-# scorer reads it. Absent => treated as an unknown/large runtime (low priority).
+from rdsac_order import rank_via_act
+
+# Annotations the Job generator stamps on each Job; the scorers read them. The
+# sjf scorer needs only runtime; the serve (RDSAC /act) scorer uses the full
+# GPU/MPS feature set the policy was trained on.
 RUNTIME_ANNOTATION = "poc.kelpflux/runtime-s"
+MPS_ANNOTATION = "poc.kelpflux/mps-req"
+GPUTYPE_ANNOTATION = "poc.kelpflux/gpu-type"
 # Marks Workloads this controller has already prioritised, so we patch once and
 # don't fight Kueue on every poll.
 DONE_ANNOTATION = "poc.kelpflux/prioritised"
@@ -49,17 +53,23 @@ def kubectl_json(args: list[str]) -> dict:
     return json.loads(out.stdout)
 
 
-def get_job_runtime(namespace: str, job_name: str) -> float | None:
-    """Read the declared runtime (seconds) off the owning Job's annotation."""
+def get_job_features(namespace: str, job_name: str) -> dict:
+    """Read the declared GPU/MPS features off the owning Job's annotations."""
     try:
         job = kubectl_json(["get", "job", job_name, "-n", namespace])
     except Exception:
-        return None
-    ann = (job.get("metadata", {}).get("annotations") or {}).get(RUNTIME_ANNOTATION)
-    try:
-        return float(ann) if ann is not None else None
-    except ValueError:
-        return None
+        return {}
+    ann = job.get("metadata", {}).get("annotations") or {}
+    def _f(key, cast, default):
+        try:
+            return cast(ann[key])
+        except (KeyError, ValueError, TypeError):
+            return default
+    return {
+        "runtime": _f(RUNTIME_ANNOTATION, float, None),
+        "mps_req": _f(MPS_ANNOTATION, int, 1),
+        "gpu_type": ann.get(GPUTYPE_ANNOTATION, "rtx4070"),
+    }
 
 
 def score_sjf(runtime_s: float | None) -> int:
@@ -69,28 +79,9 @@ def score_sjf(runtime_s: float | None) -> int:
     return max(1, int(PRIORITY_CEILING - runtime_s))
 
 
-def score_serve(serve_url: str, runtime_s: float | None, features: dict) -> int:
-    """Best-effort RDSAC /decide call. Falls back to sjf on any error (fail-safe).
-
-    NOTE: the faithful Job -> RDSAC observation mapping (166-dim obs, MPS/VRAM/
-    wait-time/SLO-urgency features) is the next increment; this stub sends the
-    minimal features it has and, crucially, never lets a serve fault block
-    admission — it degrades to the heuristic score.
-    """
-    try:
-        payload = json.dumps({"runtime_s": runtime_s, **features}).encode()
-        req = urllib.request.Request(
-            f"{serve_url.rstrip('/')}/decide",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            body = json.loads(resp.read())
-        # Expect a scalar priority/score; adapt to the serve schema when wired.
-        return int(body.get("priority", score_sjf(runtime_s)))
-    except Exception as exc:  # fail-safe: never propagate
-        print(f"[ctrl] serve scorer fell back to sjf ({exc})", file=sys.stderr)
-        return score_sjf(runtime_s)
+def priorities_from_order(order: list[str]) -> dict[str, int]:
+    """Map a ranked job_id list (rank 0 = first) to descending priorities."""
+    return {jid: PRIORITY_CEILING - rank for rank, jid in enumerate(order)}
 
 
 def pending_workloads(namespace: str) -> list[dict]:
@@ -131,21 +122,44 @@ def patch_priority(namespace: str, wl_name: str, priority: int) -> None:
 
 
 def reconcile_once(namespace: str, scorer: str, serve_url: str) -> int:
-    n = 0
-    for wl in pending_workloads(namespace):
-        wl_name = wl["metadata"]["name"]
+    pending = pending_workloads(namespace)
+    if not pending:
+        return 0
+    # Gather each pending Workload with its owning Job's declared features.
+    items = []
+    for wl in pending:
         job = owning_job(wl)
-        runtime = get_job_runtime(namespace, job) if job else None
-        if scorer == "serve":
-            prio = score_serve(serve_url, runtime, {"job": job})
-        else:
-            prio = score_sjf(runtime)
+        feats = get_job_features(namespace, job) if job else {}
+        items.append({"wl": wl["metadata"]["name"], "job_id": job or wl["metadata"]["name"], **feats})
+
+    if scorer == "serve":
+        # Roll the RDSAC /act policy out over the pending batch to get an order,
+        # then map rank -> priority. rank_via_act falls back to FIFO for any job
+        # the policy abstains on, and on total serve failure we fall back to sjf.
         try:
-            patch_priority(namespace, wl_name, prio)
-            print(f"[ctrl] {wl_name} (job={job}, runtime={runtime}s) -> priority {prio}")
+            order = rank_via_act(serve_url, [
+                {"job_id": it["job_id"], "mps_req": it.get("mps_req", 1),
+                 "gpu_type": it.get("gpu_type", "rtx4070"),
+                 "runtime": it.get("runtime") or 60.0, "submit_ts": 0}
+                for it in items
+            ])
+            prio_by_job = priorities_from_order(order)
+        except Exception as exc:  # fail-safe: whole serve path degrades to sjf
+            print(f"[ctrl] serve path fell back to sjf ({exc})", file=sys.stderr)
+            prio_by_job = {it["job_id"]: score_sjf(it.get("runtime")) for it in items}
+    else:  # sjf
+        prio_by_job = {it["job_id"]: score_sjf(it.get("runtime")) for it in items}
+
+    n = 0
+    for it in items:
+        prio = prio_by_job.get(it["job_id"], 1)
+        try:
+            patch_priority(namespace, it["wl"], prio)
+            print(f"[ctrl] {it['wl']} (job={it['job_id']}, mps={it.get('mps_req')}, "
+                  f"runtime={it.get('runtime')}s) -> priority {prio}")
             n += 1
         except Exception as exc:  # fail-safe: leave default order, keep going
-            print(f"[ctrl] skip {wl_name}: {exc}", file=sys.stderr)
+            print(f"[ctrl] skip {it['wl']}: {exc}", file=sys.stderr)
     return n
 
 
