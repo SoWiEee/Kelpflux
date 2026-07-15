@@ -48,6 +48,15 @@ from sim.gym_env import (
     env_dims,
 )
 from services.rl_scheduler.dsac import DSACAgent
+from services.rl_scheduler.uxprl import UXPRLAgent
+
+
+def _load_agent(ckpt: Path):
+    """Load the right agent family from a checkpoint. UXP-RL checkpoints carry an
+    ``algo="uxprl"`` marker; everything else is a DSAC-family (SAC/RDSAC) model."""
+    if UXPRLAgent.is_uxprl_checkpoint(ckpt):
+        return UXPRLAgent.load(str(ckpt))
+    return DSACAgent.load(str(ckpt))
 
 
 # ── Request / response schemas ─────────────────────────────────────────────
@@ -262,9 +271,9 @@ class _AgentHolder:
         ckpt = policy_dir / "dsac.pt"
         if not ckpt.exists():
             raise FileNotFoundError(f"no dsac.pt under {policy_dir}")
-        self.agent = DSACAgent.load(str(ckpt))
+        self.agent = _load_agent(ckpt)
         self.policy_dir = policy_dir
-        print(f"[serve] loaded DSACAgent obs_dim={self.agent.obs_dim} "
+        print(f"[serve] loaded {type(self.agent).__name__} obs_dim={self.agent.obs_dim} "
               f"n_actions={self.agent.n_actions} from {ckpt}")
 
     @classmethod
@@ -272,9 +281,9 @@ class _AgentHolder:
         """Build a holder from an explicit .pt file (used by POST /reload to swap
         arms in the heavy-tail live A/B without restarting the pod)."""
         self = cls.__new__(cls)
-        self.agent = DSACAgent.load(str(ckpt))
+        self.agent = _load_agent(ckpt)
         self.policy_dir = ckpt.parent
-        print(f"[serve] reloaded DSACAgent obs_dim={self.agent.obs_dim} "
+        print(f"[serve] reloaded {type(self.agent).__name__} obs_dim={self.agent.obs_dim} "
               f"n_actions={self.agent.n_actions} from {ckpt}")
         return self
 
@@ -283,6 +292,17 @@ class _AgentHolder:
     ) -> tuple[int, float, float]:
         """Return (action, value, entropy)."""
         import torch
+        # UXP-RL (DQN) has no stochastic actor — masked-greedy over Q(s,·).
+        if not hasattr(self.agent, "actor"):
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+                q = self.agent.action_values(obs_t).squeeze(0).cpu().numpy()
+            q_masked = np.where(mask.astype(bool), q, -np.inf)
+            legal = np.flatnonzero(mask)
+            if legal.size == 0:
+                return 0, 0.0, 0.0
+            action = int(np.argmax(q_masked))
+            return action, float(q_masked[action]), 0.0
         with torch.no_grad():
             obs_t  = torch.as_tensor(obs,  dtype=torch.float32).unsqueeze(0)
             mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
@@ -426,11 +446,7 @@ def healthz():
         RL_SNAPSHOT_AGE.set(snap_age)
     variant = None
     if _holder is not None:
-        agent = _holder.agent
-        if getattr(agent, "use_iqn", True):
-            variant = f"RDSAC:{getattr(agent, 'risk_mode', 'mean')}"
-        else:
-            variant = "SAC"
+        variant = _variant_of(_holder.agent)
     return {
         "ready": _holder is not None,
         "variant": variant,
@@ -446,6 +462,8 @@ class ReloadRequest(BaseModel):
 
 
 def _variant_of(agent) -> str:
+    if isinstance(agent, UXPRLAgent):
+        return "UXP-RL"
     if getattr(agent, "use_iqn", True):
         return f"RDSAC:{getattr(agent, 'risk_mode', 'mean')}"
     return "SAC"

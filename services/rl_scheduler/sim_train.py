@@ -225,7 +225,6 @@ def sim_train(
     risk_mode: str = "mean",
     risk_beta: float = 0.25,
     value_clip: float = 0.0,          # Duan et al. 2021 target return-clip (0 = off)
-    crossq: bool = False,             # CrossQ (Bhatt 2024): BN critic, no target net
     curriculum: bool = False,
     curriculum_stages: Optional[list] = None,
     # Stochastic execution (opt-in; gives Z_R spread for the distributional critic)
@@ -288,7 +287,7 @@ def sim_train(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
         use_iqn=use_iqn,
         risk_mode=risk_mode, risk_beta=risk_beta,
-        value_clip=value_clip, crossq=crossq,
+        value_clip=value_clip,
         fixed_alpha=fixed_alpha, init_alpha=init_alpha,
         target_entropy_ratio=target_entropy_ratio,
     )
@@ -502,9 +501,15 @@ def main(argv=None) -> int:
                    help="risk distortion in the RDSAC actor objective")
     p.add_argument("--value-clip",           type=float, default=0.0,
                    help="Duan et al. 2021 target return-clip boundary b (0 = off)")
-    p.add_argument("--crossq",               action="store_true",
-                   help="CrossQ (Bhatt 2024): BatchNorm critic, no target net "
-                        "(use with --utd-ratio 1); overrides IQN/risk.")
+    p.add_argument("--uxprl",                action="store_true",
+                   help="UXP-RL (Lin et al. 2025): faithful value-based DQN with "
+                        "ε-greedy + inference-weighted reward. Uses its own lean "
+                        "training loop (no score-warmup/n-step/PER); most other "
+                        "flags are ignored.")
+    p.add_argument("--uxprl-c1",             type=float, default=1.0,
+                   help="UXP-RL reward weight for non-inference tasks")
+    p.add_argument("--uxprl-c2",             type=float, default=2.0,
+                   help="UXP-RL reward weight for inference tasks (c2 > c1)")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
     # Temperature (entropy) controls
@@ -564,9 +569,29 @@ def main(argv=None) -> int:
         device = "cpu"
 
     traces = args.trace if len(args.trace) > 1 else args.trace[0]
-    use_iqn = not args.no_iqn and not args.crossq
-    family = "CrossQ" if args.crossq else ("RDSAC" if use_iqn else "SAC")
-    arch = f"{family}+{'BN' if args.crossq else 'MLP'}"
+
+    # ── UXP-RL (Lin et al. 2025): faithful DQN path with its own lean loop ──
+    if args.uxprl:
+        from services.rl_scheduler.uxprl import train_uxprl
+        node_speeds = [float(s) for s in args.node_speeds.split(",") if s.strip()] or None
+        print(f"[sim_train] arch=UXP-RL(DQN)  n={args.n_nodes}×{args.gpus_per_node}  "
+              f"trace={traces}  steps={args.total_steps:,}  n_jobs={args.n_jobs}  "
+              f"c1={args.uxprl_c1} c2={args.uxprl_c2}  "
+              f"curriculum={args.curriculum}  device={device}")
+        train_uxprl(
+            n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
+            trace_family=traces, n_jobs=args.n_jobs,
+            total_steps=args.total_steps, warmup_steps=args.warmup_steps,
+            seed=args.seed, out_dir=Path(args.out_dir), device=device,
+            uxprl_c1=args.uxprl_c1, uxprl_c2=args.uxprl_c2,
+            curriculum=args.curriculum, node_speeds=node_speeds,
+            max_steps_mult=args.max_steps_mult,
+        )
+        return 0
+
+    use_iqn = not args.no_iqn
+    family = "RDSAC" if use_iqn else "SAC"
+    arch = f"{family}+MLP"
     risk_str = f"risk={args.risk_mode}:{args.risk_beta}  " if use_iqn else ""
     print(f"[sim_train] arch={arch}  n={args.n_nodes}×{args.gpus_per_node}  "
           f"trace={traces}  steps={args.total_steps:,}  "
@@ -591,7 +616,6 @@ def main(argv=None) -> int:
         risk_mode=args.risk_mode,
         risk_beta=args.risk_beta,
         value_clip=args.value_clip,
-        crossq=args.crossq,
         curriculum=args.curriculum,
         runtime_sigma=args.runtime_sigma,
         interference=args.interference,

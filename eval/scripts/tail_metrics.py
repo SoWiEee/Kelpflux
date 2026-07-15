@@ -71,6 +71,24 @@ def summarize(
     return out
 
 
+def mean_makespan(records: Sequence[dict]) -> float:
+    """Mean per-round makespan = max(end) − min(submit) over each round's jobs.
+
+    Averaged across rounds so it is comparable to the pooled per-job JCT stats.
+    Records missing submit/end timestamps are skipped; a round with none yields no
+    makespan. Returns nan if no round has usable timestamps.
+    """
+    by_round: dict = {}
+    for r in records:
+        s, e = r.get("submit_ts"), r.get("end_ts")
+        if s is None or e is None:
+            continue
+        by_round.setdefault(r["round"], []).append((s, e))
+    spans = [max(e for _, e in v) - min(s for s, _ in v)
+             for v in by_round.values() if v]
+    return float(np.mean(spans)) if spans else float("nan")
+
+
 def _impr_pct(score_stat: float, model_stat: float) -> float:
     """(score - model)/score * 100. Positive = model better (lower JCT)."""
     if not np.isfinite(score_stat) or score_stat == 0:

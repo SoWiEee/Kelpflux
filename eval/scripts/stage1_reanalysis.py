@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 
-LEARNED_ARMS = ["SAC", "RDSAC-mean", "RDSAC-cvar", "CrossQ", "RLPD"]
+LEARNED_ARMS = ["SAC", "RDSAC-mean", "RDSAC-cvar", "UXP-RL", "RLPD"]
 SLURM_ARMS = ["fcfs", "backfill"]
 SEEDS = [42, 43, 44, 45, 46, 47, 48, 49]
 MARGIN = 5.0   # ±5% practical-equivalence band (§5.5)

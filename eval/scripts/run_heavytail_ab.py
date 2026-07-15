@@ -37,9 +37,11 @@ from eval.scripts.live_ab_heavytail import (
     submit_stream,
     wait_drain,
 )
-from eval.scripts.tail_metrics import paired_delta, summarize
+from eval.scripts.tail_metrics import mean_makespan, paired_delta, summarize
 
-ARMS = ("score", "SAC", "RDSAC-mean", "RDSAC-cvar", "CrossQ", "RLPD")  # score first = paired baseline
+# score first = paired baseline. RLPD kept as an optional arm (gated on --rlpd-ckpt)
+# pending its removal; UXP-RL (Lin et al. 2025) replaces the retired CrossQ arm.
+ARMS = ("score", "SAC", "RDSAC-mean", "RDSAC-cvar", "UXP-RL", "RLPD")
 
 
 # ── pure report builder (unit-tested) ─────────────────────────────────────────
@@ -59,6 +61,7 @@ def build_report(records_by_arm: dict, *, sigma: float, family: str, beta: float
         trues = [r["true_runtime_s"] for r in recs]
         panels[arm] = summarize(jcts, true_runtimes=trues, beta=beta)
         panels[arm]["completed"] = len(recs)
+        panels[arm]["makespan"] = mean_makespan(recs)
 
     report: dict = {"sigma": sigma, "family": family, "beta": beta,
                     "panels": panels, "paired_vs_score": {}}
@@ -82,21 +85,22 @@ def render_summary(reports: list[dict]) -> str:
     for rep in reports:
         lines.append(f"## σ={rep['sigma']}  family={rep['family']}")
         lines.append("")
-        lines.append("| arm | n | mean | p95 | p99 | CVaR | slowdown_p99 |")
-        lines.append("|---|--:|--:|--:|--:|--:|--:|")
+        # Metrics: 平均周轉時間 (= mean JCT), Makespan, Tail Latency (P95, P99).
+        lines.append("| arm | n | 平均周轉(s) | Makespan(s) | P95(s) | P99(s) |")
+        lines.append("|---|--:|--:|--:|--:|--:|")
         for arm, pan in rep["panels"].items():
             lines.append(
                 f"| {arm} | {pan.get('completed', pan['n'])} | {pan['mean']:.1f} | "
-                f"{pan['p95']:.1f} | {pan['p99']:.1f} | {pan['cvar']:.1f} | "
-                f"{pan.get('slowdown_p99', float('nan')):.2f} |")
+                f"{pan.get('makespan', float('nan')):.1f} | "
+                f"{pan['p95']:.1f} | {pan['p99']:.1f} |")
         lines.append("")
         if rep["paired_vs_score"]:
-            lines.append("| arm vs score | ΔJCT% | Δp99% | ΔCVaR% | t-test p |")
-            lines.append("|---|--:|--:|--:|--:|")
+            lines.append("| arm vs score | Δ平均周轉% | t-test p |")
+            lines.append("|---|--:|--:|")
             for arm, d in rep["paired_vs_score"].items():
                 lines.append(
-                    f"| {arm} | {d['djct_pct']:+.1f} | {d['dp99_pct']:+.1f} | "
-                    f"{d['dcvar_pct']:+.1f} | {d.get('ttest_p', float('nan')):.3g} |")
+                    f"| {arm} | {d['djct_pct']:+.1f} | "
+                    f"{d.get('ttest_p', float('nan')):.3g} |")
             lines.append("")
     return "\n".join(lines)
 
@@ -183,7 +187,7 @@ def _make_place_fn(arm: str, *, serve_url: str, node_names: list[str], exec_pref
 
 def run(args) -> int:
     ckpts = {"SAC": args.sac_ckpt, "RDSAC-mean": args.rdsac_mean_ckpt,
-             "RDSAC-cvar": args.rdsac_cvar_ckpt, "CrossQ": args.crossq_ckpt,
+             "RDSAC-cvar": args.rdsac_cvar_ckpt, "UXP-RL": args.uxprl_ckpt,
              "RLPD": args.rlpd_ckpt}
     arms = [a for a in ARMS if a == "score" or ckpts.get(a)]
     out_dir = Path(args.out_dir)
@@ -290,8 +294,8 @@ def main(argv=None) -> int:
     p.add_argument("--sac-ckpt", default=None)
     p.add_argument("--rdsac-mean-ckpt", default=None)
     p.add_argument("--rdsac-cvar-ckpt", default=None)
-    p.add_argument("--crossq-ckpt", default=None,
-                   help="CrossQ checkpoint (adds a CrossQ live arm)")
+    p.add_argument("--uxprl-ckpt", default=None,
+                   help="UXP-RL (Lin et al. 2025) checkpoint (adds a UXP-RL live arm)")
     p.add_argument("--rlpd-ckpt", default=None,
                    help="RLPD checkpoint (adds an RLPD live arm; real-data fine-tuned policy)")
     p.add_argument("--family", choices=["philly", "ali"], default="philly")

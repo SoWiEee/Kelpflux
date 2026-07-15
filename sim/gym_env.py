@@ -227,6 +227,29 @@ def decode_action(a: int) -> Tuple[int, int, int]:
     return job_i, node_j, gpu_k
 
 
+def uxprl_task_reward(jct: float, job_class: str, slo_s: float,
+                      c1: float = 1.0, c2: float = 2.0) -> float:
+    """UXP-RL per-task reward (Lin et al. 2025, IEEE TNSM §IV-B.3).
+
+        r = c1 / T_T                                if non-inference
+        r = c2 / T_T                                if inference, T_T ≤ Δ^I
+        r = c2 / T_T · 1/(T_T − Δ^I + 1)            if inference, T_T > Δ^I
+
+    T_T is the task turnaround (= jct here); inference tasks (``job_class ==
+    "inference"``, the paper's Z=3) earn c2 > c1, and turnaround past the Δ^I
+    deadline (``slo_s``) is damped. An inference task with ``slo_s <= 0`` is
+    treated as having no deadline (Δ^I = ∞ → no penalty).
+    """
+    t_t = max(1e-6, jct)
+    if job_class == "inference":
+        delta = slo_s if slo_s > 0.0 else float("inf")
+        r = c2 / t_t
+        if t_t > delta:
+            r *= 1.0 / (t_t - delta + 1.0)
+        return r
+    return c1 / t_t
+
+
 # ── Run state ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -265,9 +288,11 @@ class KubefluxSchedEnv:
         mps_per_gpu: int = MPS_PER_GPU,
         top_k: int = TOP_K,
         max_steps: int = 50_000,
-        reward_mode: str = "jct_aligned",   # "jct_aligned" | "shaped"
+        reward_mode: str = "jct_aligned",   # "jct_aligned" | "shaped" | "uxprl"
         reward_scale: float = 1000.0,
         placement_reward_scale: float = 0.01,
+        uxprl_c1: float = 1.0,   # UXP-RL reward weight for non-inference tasks
+        uxprl_c2: float = 2.0,   # UXP-RL reward weight for inference tasks (c2 > c1)
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
         node_speeds: Optional[list] = None,
@@ -279,7 +304,7 @@ class KubefluxSchedEnv:
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
-        if reward_mode not in ("jct_aligned", "shaped"):
+        if reward_mode not in ("jct_aligned", "shaped", "uxprl"):
             raise ValueError(f"reward_mode={reward_mode!r}")
 
         self.jobs_factory           = jobs_factory
@@ -291,6 +316,9 @@ class KubefluxSchedEnv:
         self.reward_mode            = reward_mode
         self.reward_scale           = float(reward_scale)
         self.placement_reward_scale = float(placement_reward_scale)
+        # UXP-RL (Lin et al. 2025) reward weights: inference tasks earn c2 > c1.
+        self.uxprl_c1               = float(uxprl_c1)
+        self.uxprl_c2               = float(uxprl_c2)
         self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
         self.potential_shaping      = potential_shaping
         # P1 (anti-over-concentration): potential-based node-balance shaping.
@@ -431,9 +459,15 @@ class KubefluxSchedEnv:
             for j in st.pending:
                 end_charge -= (st.now - j.submit_ts) / self.reward_scale
 
-        reward = r_place + st.completion_reward + end_charge
-        if self.potential_shaping or self.balance_coef > 0.0:
-            reward += 0.99 * self._potential() - phi_prev
+        if self.reward_mode == "uxprl":
+            # Faithful UXP-RL reward is *only* the completion-based term (positive,
+            # per-task, inference-weighted). No placement shaping, no final-pending
+            # charge, no potential shaping — those belong to other methods.
+            reward = st.completion_reward
+        else:
+            reward = r_place + st.completion_reward + end_charge
+            if self.potential_shaping or self.balance_coef > 0.0:
+                reward += 0.99 * self._potential() - phi_prev
         obs    = self._build_obs()
         info   = {
             "now": st.now, "queue_len": len(st.pending),
@@ -607,7 +641,11 @@ class KubefluxSchedEnv:
         st.jct_sum += jct
         st.jcts.append(jct)
         st.jct_records.append((jid, jct))
-        if self.reward_mode == "shaped":
+        if self.reward_mode == "uxprl":
+            st.completion_reward += uxprl_task_reward(
+                jct, j.job_class, j.slo_s, self.uxprl_c1, self.uxprl_c2
+            ) / self.reward_scale
+        elif self.reward_mode == "shaped":
             b_jct, b_slow = self.reward_betas
             runtime  = max(1.0, j.runtime)
             slowdown = max(1.0, jct / runtime)

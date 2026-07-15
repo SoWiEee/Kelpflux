@@ -2,12 +2,15 @@
 import numpy as np
 
 from eval.scripts.run_heavytail_ab import build_report, render_summary
+from eval.scripts.tail_metrics import mean_makespan
 
 
 def _recs(arm, jcts, *, rnd=1, true=50.0):
+    # submit at t=0, end at t=jct so per-round makespan = max(jct).
     return [{"job_id": f"j{i}", "arm": arm, "round": rnd, "jct": float(j),
              "true_runtime_s": true, "reported_runtime_s": true, "mps_req": 20,
-             "wait": 1.0, "state": "COMPLETED"}
+             "wait": 1.0, "state": "COMPLETED",
+             "submit_ts": 0.0, "end_ts": float(j)}
             for i, j in enumerate(jcts)]
 
 
@@ -40,7 +43,25 @@ def test_build_report_pairs_on_common_jobs_only():
     assert rep["paired_vs_score"]["SAC"]["n"] == 2  # only j1, j2 shared
 
 
+def test_makespan_is_max_end_minus_min_submit_per_round():
+    # round 1: submit 0, ends {10,20,30} → makespan 30; round 2: ends {40,60} → 60.
+    recs = _recs("score", [10, 20, 30], rnd=1) + _recs("score", [40, 60], rnd=2)
+    assert mean_makespan(recs) == (30.0 + 60.0) / 2
+
+    # missing timestamps → that round contributes no span; all-missing → nan.
+    no_ts = [{"job_id": "j0", "round": 1, "jct": 5.0, "submit_ts": None, "end_ts": None}]
+    assert np.isnan(mean_makespan(no_ts))
+
+
+def test_build_report_includes_makespan_panel():
+    rep = build_report({"score": _recs("score", [10, 20, 30])}, sigma=0.0, family="philly")
+    assert rep["panels"]["score"]["makespan"] == 30.0
+
+
 def test_render_summary_runs():
     rep = build_report({"score": _recs("score", [10, 20, 30])}, sigma=0.0, family="philly")
     md = render_summary([rep])
     assert "σ=0.0" in md and "score" in md
+    # new 4-metric header + single paired-delta column; no CVaR/slowdown columns.
+    assert "Makespan(s)" in md and "平均周轉(s)" in md
+    assert "CVaR" not in md and "slowdown" not in md
