@@ -37,7 +37,7 @@ import numpy as np
 from sim.loader import generate_by_family
 
 LIVE_GPU_MPS = 100  # single RTX 4070 live GRES: mps:rtx4070:100
-HEAVYTAIL_FAMILIES = ("philly", "ali")  # §4.4: trace-derived, naturally heavy-tailed
+HEAVYTAIL_FAMILIES = ("philly", "ali", "aimix")  # aimix = the 4-class student-lab mix
 
 
 @dataclass(frozen=True)
@@ -48,8 +48,9 @@ class LiveJob:
     reported_runtime_s: float # estimate fed to --time and /decide (σ-noisy)
     mps_req: int              # MPS slots in [1, 100]
     gpu_count: int = 1
-    job_class: str = "batch"  # aiserve: inference / training
-    slo_s: float = 0.0        # aiserve: latency-SLO deadline on JCT (>0 = inference)
+    job_class: str = "batch"  # inference / training / llm / batch
+    slo_s: float = 0.0        # latency-SLO deadline on JCT (>0 = inference)
+    ram_req: float = 0.0      # host-RAM footprint (GB) — sent to /act for the OOM-aware obs
 
 
 @dataclass(frozen=True)
@@ -170,9 +171,10 @@ class LlmWorkloadSpec:
 
     def _mode_n(self, job: "LiveJob") -> tuple[str, int]:
         # Default to generation (serving): heavytail "batch" jobs become
-        # variable-length generation requests. Only an explicit "training" class
-        # maps to fine-tune (used by the aiserve inference+training mix).
-        mode = "train" if job.job_class == "training" else "infer"
+        # variable-length generation requests. "training" (aiserve) and "llm"
+        # (aimix Qwen fine-tune, RAM-heavy) map to fine-tune; hybrid's LLM jobs
+        # are class "batch" and stay generation.
+        mode = "train" if job.job_class in ("training", "llm") else "infer"
         rate = self.infer_rate if mode == "infer" else self.train_rate
         return mode, max(1, int(round(job.true_runtime_s * rate)))
 
@@ -214,6 +216,61 @@ class HybridWorkloadSpec:
 
     def _pick(self, job: "LiveJob"):
         return self.llm if job.mps_req >= self.llm_min_mps else self.cublas
+
+    def wrap(self, job: "LiveJob") -> str:
+        return self._pick(job).wrap(job)
+
+    def time_min(self, job: "LiveJob") -> int:
+        return self._pick(job).time_min(job)
+
+
+@dataclass(frozen=True)
+class ResnetWorkloadSpec:
+    """Real ResNet-50 GPU job (training/inference) — the 'medium/compute' tier.
+
+    In-code model (transformers ResNetConfig), no NFS/torchvision. Same
+    wrap()/time_min() interface. n (steps/batches) = true_runtime_s × rate.
+    """
+    py: str = "/shared/py/bin/python3"
+    script: str = "/shared/scripts/resnet_job.py"
+    batch_size: int = 32
+    image_size: int = 224
+    infer_rate: float = 12.0   # inference batches/sec on idle 4070 (CALIBRATE)
+    train_rate: float = 8.0    # training steps/sec on idle 4070 (CALIBRATE)
+    time_factor: float = 25.0
+    load_overhead_s: float = 30.0  # python+torch import + in-code model build
+
+    def _mode_n(self, job: "LiveJob") -> tuple[str, int]:
+        mode = "infer" if job.job_class == "inference" else "train"
+        rate = self.infer_rate if mode == "infer" else self.train_rate
+        return mode, max(1, int(round(job.true_runtime_s * rate)))
+
+    def wrap(self, job: "LiveJob") -> str:
+        mode, n = self._mode_n(job)
+        seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
+        return (f"{self.py} {self.script} --mode {mode} --n {n} "
+                f"--batch-size {self.batch_size} --image-size {self.image_size} --seed {seed}")
+
+    def time_min(self, job: "LiveJob") -> int:
+        secs = job.true_runtime_s * self.time_factor + self.load_overhead_s
+        return max(2, int(np.ceil(secs / 60.0)))
+
+
+@dataclass(frozen=True)
+class AiMixWorkloadSpec:
+    """Route each job to a real executor by ``job_class`` — the student-lab mix:
+      inference → BERT (small/latency), training → ResNet (medium/compute),
+      llm → Qwen fine-tune (large/RAM), batch → cuBLAS sgemm (matrix).
+    Matches sim.loader.generate_ai_mix's four classes; wrap()/time_min() delegate.
+    """
+    bert: BertWorkloadSpec = field(default_factory=BertWorkloadSpec)
+    resnet: ResnetWorkloadSpec = field(default_factory=ResnetWorkloadSpec)
+    llm: "LlmWorkloadSpec" = field(default_factory=lambda: LlmWorkloadSpec())
+    cublas: WorkloadSpec = field(default_factory=WorkloadSpec)
+
+    def _pick(self, job: "LiveJob"):
+        return {"inference": self.bert, "training": self.resnet,
+                "llm": self.llm}.get(job.job_class, self.cublas)
 
     def wrap(self, job: "LiveJob") -> str:
         return self._pick(job).wrap(job)
@@ -334,6 +391,35 @@ def gen_workload(
     """
     if family not in HEAVYTAIL_FAMILIES:
         raise ValueError(f"heavy-tail A/B uses only {HEAVYTAIL_FAMILIES}; got {family!r}")
+
+    if family == "aimix":
+        # Reuse the SIM aimix generator so live == training: keep each job's
+        # class / per-class mps / slo / ram_req (do NOT rank-rebucket mps — the
+        # class↔mps correlation is what keeps llm jobs at mps≥75 so two never
+        # co-reside and OOM the 3080). Only compress runtime + set arrivals.
+        src = [j for j in generate_by_family("aimix", n_jobs=n_jobs, seed=seed)
+               if j.gpu_count <= 1]
+        if not src:
+            return []
+        rts = np.array([j.runtime for j in src], dtype=float)
+        scale = target_max_s / float(np.percentile(rts, compress_pct))
+        true = np.clip(rts * scale, min_runtime_s, target_max_s)
+        arr_rng = np.random.default_rng(seed + 1)
+        if arrival_mode == "poisson":
+            gaps = arr_rng.exponential(float(true.mean()) / max(1.0, mps_oversub), len(src))
+            arrivals = np.cumsum(gaps)
+        else:
+            arrivals = np.sort(arr_rng.uniform(0.0, arrival_window_frac * target_max_s, len(src)))
+        out: List[LiveJob] = []
+        for i, j in enumerate(src):
+            rep = max(min_runtime_s, float(true[i]) * _job_noise(str(j.job_id), sigma, seed))
+            out.append(LiveJob(
+                job_id=str(j.job_id), arrival_offset_s=round(float(arrivals[i]), 3),
+                true_runtime_s=round(float(true[i]), 3), reported_runtime_s=round(rep, 3),
+                mps_req=int(np.clip(j.mps_req, 1, LIVE_GPU_MPS)), gpu_count=1,
+                job_class=j.job_class, slo_s=round(j.slo_s * scale, 3), ram_req=j.ram_req))
+        return out
+
     jobs = generate_by_family(family, n_jobs=n_jobs, seed=seed)
     jobs = [j for j in jobs if j.gpu_count <= 1]
     if not jobs:
@@ -508,12 +594,16 @@ def _node_gpu_type(node_name: str) -> str:
 
 def decide_node(serve_url: str, job: LiveJob, *, node_free_mps: list[int],
                 node_names: list[str], mps_per_gpu: int = LIVE_GPU_MPS,
+                node_free_ram: list[float] | None = None,
                 now: float | None = None) -> str | None:
     """Ask the served RL model which node to place ``job`` on (submit-time).
 
     Builds a single-job /act request over the given nodes (index ↔ node_names),
     returns the chosen node name, or None if the model no-ops / picks an
-    out-of-range node (caller then lets Slurm place it)."""
+    out-of-range node (caller then lets Slurm place it). ``node_free_ram`` is the
+    per-node free host-RAM ratio (from the caller's in-flight tally); defaults to
+    1.0 (full) so callers that don't track RAM keep working."""
+    free_ram = node_free_ram or [1.0] * len(node_names)
     payload = {
         "now": float(now if now is not None else 0.0),
         "n_nodes": len(node_names),
@@ -523,12 +613,15 @@ def decide_node(serve_url: str, job: LiveJob, *, node_free_mps: list[int],
             "job_id": job.job_id, "mps_req": job.mps_req, "gpu_count": 1,
             "gpu_type": "rtx4070", "runtime": job.reported_runtime_s,
             "submit_ts": 0.0, "can_fit": True,
+            "ram_req": float(job.ram_req), "slo_s": float(job.slo_s),
+            "job_class": job.job_class,
         }],
-        # Per-node real card type (item-1): the model now sees which node is the
-        # slow 3080 vs the fast 4070, so it can route big/long jobs accordingly.
+        # Per-node card type (rtx3080/rtx4070) AND free host-RAM ratio — the
+        # RAM-aware obs lets the policy avoid OOMing the small-RAM 3080 node.
         "nodes": [{"gpus": [{"free_mps": int(fm),
-                             "gpu_type": _node_gpu_type(nm)}]}
-                  for fm, nm in zip(node_free_mps, node_names)],
+                             "gpu_type": _node_gpu_type(nm),
+                             "free_ram_ratio": float(fr)}]}
+                  for fm, nm, fr in zip(node_free_mps, node_names, free_ram)],
     }
     resp = _post_act(serve_url, payload)
     nj = resp.get("node_j")

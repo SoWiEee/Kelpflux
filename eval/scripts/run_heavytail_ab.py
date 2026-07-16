@@ -26,6 +26,7 @@ from typing import Optional
 from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (
+    AiMixWorkloadSpec,
     HybridWorkloadSpec,
     LlmWorkloadSpec,
     WorkloadSpec,
@@ -168,18 +169,28 @@ def _make_place_fn(arm: str, *, serve_url: str, node_names: list[str], exec_pref
 
     baseline = _query_free_mps(exec_prefix, node_names)   # once per (arm, round)
     inflight: dict[str, list[tuple[float, int]]] = {n: [] for n in node_names}
+    # Per-node host-RAM tally (GB), mirroring the MPS one: node-2 (3080) has ~5GB
+    # usable vs ~62GB on node-1, so the free-RAM ratio the model sees fills up as
+    # RAM-heavy (llm) jobs land — the same OOM lever the sim env gates on.
+    ram_budget = {n: (5.0 if "3080" in n else 62.0) for n in node_names}
+    ram_inflight: dict[str, list[tuple[float, float]]] = {n: [] for n in node_names}
 
     def _place(job):
         now = time.time()
         free: list[int] = []
+        free_ram: list[float] = []
         for i, n in enumerate(node_names):
             inflight[n] = [(rel, m) for (rel, m) in inflight[n] if rel > now]  # expire
-            held = sum(m for _, m in inflight[n])
-            free.append(max(0, baseline[i] - held))
-        node = decide_node(serve_url, job, node_free_mps=free, node_names=node_names)
+            free.append(max(0, baseline[i] - sum(m for _, m in inflight[n])))
+            ram_inflight[n] = [(rel, r) for (rel, r) in ram_inflight[n] if rel > now]
+            used_ram = sum(r for _, r in ram_inflight[n])
+            free_ram.append(max(0.0, 1.0 - used_ram / ram_budget[n]))
+        node = decide_node(serve_url, job, node_free_mps=free, node_names=node_names,
+                           node_free_ram=free_ram)
         if node in inflight:
             release = now + max(1.0, float(job.reported_runtime_s))
             inflight[node].append((release, int(job.mps_req)))
+            ram_inflight[node].append((release, float(job.ram_req)))
         return node
 
     return _place
@@ -201,7 +212,13 @@ def run(args) -> int:
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
                     args.login_pod, "--"] if args.login_pod else None)
     # Real-CUDA workload (replaces sleep): same spec across all arms → fair.
-    if args.hybrid_workload:
+    if args.aimix_workload:
+        # Route by job_class: inference→BERT, training→ResNet, llm→Qwen, batch→cuBLAS.
+        # Use with --family aimix so the job stream carries the matching classes.
+        workload = AiMixWorkloadSpec(
+            llm=LlmWorkloadSpec(model=args.llm_model, batch_size=args.llm_batch_size,
+                                gen_len=args.llm_gen_len))
+    elif args.hybrid_workload:
         workload = HybridWorkloadSpec(
             llm=LlmWorkloadSpec(model=args.llm_model, batch_size=args.llm_batch_size,
                                 gen_len=args.llm_gen_len))
@@ -298,7 +315,7 @@ def main(argv=None) -> int:
                    help="UXP-RL (Lin et al. 2025) checkpoint (adds a UXP-RL live arm)")
     p.add_argument("--rlpd-ckpt", default=None,
                    help="RLPD checkpoint (adds an RLPD live arm; real-data fine-tuned policy)")
-    p.add_argument("--family", choices=["philly", "ali"], default="philly")
+    p.add_argument("--family", choices=["philly", "ali", "aimix"], default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sigmas", nargs="*", default=["0.0", "1.0"])
@@ -321,6 +338,9 @@ def main(argv=None) -> int:
     p.add_argument("--llm-workload", action="store_true",
                    help="run real small-LLM jobs (Qwen2.5-0.5B batched generation / "
                         "fine-tune) instead of sgemm — the 'AI serving' workload")
+    p.add_argument("--aimix-workload", action="store_true",
+                   help="route by job_class: inference→BERT, training→ResNet, llm→Qwen "
+                        "fine-tune, batch→cuBLAS. Use with --family aimix.")
     p.add_argument("--hybrid-workload", action="store_true",
                    help="mps<50 → cuBLAS sgemm, mps>=50 → real LLM generation. Keeps "
                         "the 25/50/75/100 buckets while fitting the 10GB 3080 (4-way "
