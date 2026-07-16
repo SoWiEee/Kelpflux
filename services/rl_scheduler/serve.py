@@ -69,12 +69,16 @@ class JobView(BaseModel):
     runtime:   float             # predicted seconds (oracle in sim)
     submit_ts: float
     can_fit:   bool  = True      # caller-side feasibility hint
+    ram_req:   float = 0.0       # host-RAM footprint (GB) — OOM lever
+    slo_s:     float = 0.0       # latency deadline (s); >0 = inference SLO
+    job_class: str   = "batch"   # inference / training / llm / batch
 
 
 class GpuView(BaseModel):
-    free_mps:     int
-    running_jobs: int   = 0
-    gpu_type:     str   = "rtx4070"
+    free_mps:       int
+    running_jobs:   int   = 0
+    gpu_type:       str   = "rtx4070"
+    free_ram_ratio: float = 1.0   # node host-RAM headroom (same for GPUs on a node)
 
 
 class NodeView(BaseModel):
@@ -136,39 +140,50 @@ class DecideResponse(BaseModel):
 
 # ── Feature construction (mirrors sim/gym_env.py exactly) ─────────────────
 
+_RAM_REF_GB = 4.0   # must match gym_env.RAM_REF_GB
+
+
 def _job_feat(j: JobView, now: float, mps_per_gpu: int) -> np.ndarray:
     gpu_oh = [1.0 if j.gpu_type == t else 0.0 for t in GPU_TYPES]
     wait   = max(0.0, now - j.submit_ts)
+    slo_urgency  = (wait / j.slo_s) if j.slo_s > 0 else 0.0
+    is_inference = 1.0 if j.job_class == "inference" else 0.0
     return np.array([
         j.mps_req / mps_per_gpu,
         float(j.gpu_count),
         *gpu_oh,                      # 2 dims (rtx4070 / rtx3080)
         math.log1p(j.runtime),
         math.log1p(wait),
-        math.log1p(wait),             # age (matches gym_env.py placeholder)
-        0.0,                          # deadline_remaining placeholder
-        0.0,                          # retry_count placeholder
+        j.ram_req / _RAM_REF_GB,      # [6] host-RAM footprint (was a dup age slot)
+        slo_urgency,                  # [7] SLO budget consumed
+        is_inference,                 # [8] latency-class flag
     ], dtype=np.float32)              # 9 dims total
 
 
 def _gpu_feat(g: GpuView, mps_per_gpu: int) -> np.ndarray:
     free_ratio = g.free_mps / mps_per_gpu if mps_per_gpu > 0 else 0.0
-    # gpu_type one-hot — derived from the per-GPU type so the policy sees card
-    # heterogeneity (must match sim/gym_env _gpu_feat: rtx4070→[1,0,0], the slow
-    # rtx3080→[0,1,0]). Caller (decide_node / live_daemon) sets g.gpu_type.
-    gpu_oh = [0.0, 1.0, 0.0] if g.gpu_type == "rtx3080" else [1.0, 0.0, 0.0]
+    # gpu_type one-hot from CARD IDENTITY (matches gym_env: [is4070, is3080, is_other]).
+    gpu_oh = [1.0 if g.gpu_type == t else 0.0 for t in GPU_TYPES] + [
+        0.0 if g.gpu_type in GPU_TYPES else 1.0]
     return np.array([
         free_ratio,
         free_ratio,                   # vram proxy (same scale as MPS in sim)
         float(g.running_jobs),
+        g.free_ram_ratio,             # host-RAM headroom (the OOM lever)
         *gpu_oh,
-    ], dtype=np.float32)              # 6 dims
+    ], dtype=np.float32)              # 7 dims
 
 
-def _topo_feat(pending: List[JobView], n_nodes: int) -> np.ndarray:
+def _topo_feat(pending: List[JobView], nodes: List[NodeView]) -> np.ndarray:
+    # [0] min free-RAM ratio across nodes; [1] fraction of pending jobs RAM-heavy.
+    node_ram = [nd.gpus[0].free_ram_ratio for nd in nodes if nd.gpus] or [1.0]
+    min_free_ram = min(node_ram)
+    heavy = sum(1 for j in pending if j.ram_req >= 2.0)
+    ram_heavy_ratio = heavy / max(1, len(pending))
     ddp_ratio  = sum(1 for j in pending if j.gpu_count > 1) / max(1, len(pending))
     cross_node = 0.0   # live daemon fills this when known
-    return np.array([1.0, 1.0, ddp_ratio, cross_node], dtype=np.float32)
+    return np.array([min_free_ram, ram_heavy_ratio, ddp_ratio, cross_node],
+                    dtype=np.float32)
 
 
 def _global_feat(pending: List[JobView], nodes: List[NodeView],
@@ -239,7 +254,7 @@ def build_obs_and_mask(
             else:
                 gpu_feats.append(np.zeros(GPU_FEAT_DIM, dtype=np.float32))
 
-    topo = _topo_feat(pending_sorted, n_nodes)
+    topo = _topo_feat(pending_sorted, req.nodes)
     glob = _global_feat(list(req.pending_jobs), req.nodes, req.now, mps_per_gpu)
 
     obs = np.concatenate([*job_feats, *gpu_feats, topo, glob]).astype(np.float32)

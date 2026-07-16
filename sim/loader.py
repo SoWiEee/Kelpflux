@@ -34,6 +34,10 @@ MPS_PER_GPU = 100
 MPS_FRACTIONAL_TIERS = (25, 50, 75)
 MPS_SMALL_TIERS = (25, 50)
 
+# Measured peak host RSS per workload class (GB) — the OOM lever on this cluster
+# (node-2/3080 has ~5GB usable). Single source of truth; gym_env imports this.
+RAM_REQ_GB = {"inference": 1.0, "training": 1.1, "llm": 2.5, "batch": 1.0}
+
 
 @dataclass(frozen=True)
 class Job:
@@ -409,11 +413,92 @@ def generate_ai_serving(
     return jobs
 
 
+def generate_ai_mix(
+    n_jobs: int = 400,
+    *,
+    seed: int = 42,
+    n_gpus: int = 2,
+    load: float = 0.7,
+    n_users: int = 20,
+    slo_factor: float = 4.0,
+    mix=((0.30, "inference"), (0.30, "training"), (0.30, "llm"), (0.10, "batch")),
+) -> List[Job]:
+    """Heterogeneous student-lab AI workload spanning the real placement levers.
+
+    Four classes, weighted toward the ones with placement leverage (per the
+    measured cluster physics: the two cards are near-equal in *speed*, so the
+    lever is host RAM + MPS packing, not a slow card):
+
+      * ``inference`` — BERT-style latency job: small (mps 25/50), short (~20s),
+        RAM-light (1.0GB), carries an SLO deadline (runtime × slo_factor).
+      * ``training``  — ResNet-style compute job: medium (mps 50/75), ~5min,
+        RAM 1.1GB, best-effort.
+      * ``llm``       — Qwen fine-tune: large (mps 75/100), ~3min, **RAM-heavy
+        2.5GB** → two concurrent OOM the 3080 node (5GB) → the key OOM lever.
+      * ``batch``     — cuBLAS "matrix" job: whole-GPU (mps 100), compute-bound,
+        RAM-light.
+
+    ``ram_req`` is set from the measured ``RAM_REQ_GB`` per class so the env's
+    host-RAM OOM gate (sim.cluster) has real signal to gate on. Executor mapping
+    (bert_job / resnet_job / llm_job / gpu_workload) is applied live by the
+    AiMix workload spec, keyed on ``job_class``.
+    """
+    rng = random.Random(seed)
+    users = [f"u{i:02d}" for i in range(n_users)]
+    gpu_types = ["rtx4070", "rtx3080"]
+    gpu_type_weights = [0.6, 0.4]
+    classes = [c for _w, c in mix]
+    weights = [w for w, _c in mix]
+
+    def _draw(cls: str):
+        if cls == "inference":
+            rt = max(2.0, rng.lognormvariate(math.log(20.0), 0.7))
+            return 1, rng.choice(MPS_SMALL_TIERS), rt, rt * slo_factor
+        if cls == "training":
+            rt = max(30.0, rng.lognormvariate(math.log(300.0), 0.6))
+            return 1, rng.choice((50, 75)), rt, 0.0
+        if cls == "llm":
+            rt = max(30.0, rng.lognormvariate(math.log(180.0), 0.6))
+            return 1, rng.choice((75, MPS_PER_GPU)), rt, 0.0
+        # batch (cuBLAS matrix)
+        rt = max(20.0, rng.lognormvariate(math.log(120.0), 0.7))
+        return 1, MPS_PER_GPU, rt, 0.0
+
+    feats = []
+    for _ in range(n_jobs):
+        cls = rng.choices(classes, weights)[0]
+        gpu, mps, runtime, slo = _draw(cls)
+        feats.append((cls, gpu, mps, runtime, slo))
+
+    mean_work = sum(rt * gc * (mp / MPS_PER_GPU) for _c, gc, mp, rt, _s in feats) / max(1, n_jobs)
+    mean_gap = mean_work / max(1e-6, n_gpus * load)
+
+    jobs: List[Job] = []
+    t = 0.0
+    for i, (cls, gpu, mps, runtime, slo) in enumerate(feats):
+        t += rng.expovariate(1.0 / mean_gap) if mean_gap > 0 else 0.0
+        jobs.append(Job(
+            job_id=f"aimix-{i:05d}",
+            user=rng.choice(users),
+            gpu_count=gpu,
+            gpu_type=rng.choices(gpu_types, gpu_type_weights)[0],
+            submit_ts=round(t, 3),
+            runtime=round(runtime, 3),
+            mem_req=0.0,
+            mps_req=mps,
+            job_class=cls,
+            slo_s=round(slo, 3),
+            ram_req=RAM_REQ_GB.get(cls, 1.0),
+        ))
+    return jobs
+
+
 TRACE_FAMILIES = {
     "philly": generate_philly_like,
     "burst": generate_burst_heavy,
     "ali": generate_ali_like,
     "aiserve": generate_ai_serving,
+    "aimix": generate_ai_mix,
 }
 
 

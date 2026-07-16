@@ -31,7 +31,7 @@ except ImportError:
     spaces = None  # type: ignore
 
 from .cluster import Cluster
-from .loader import Job, MPS_PER_GPU
+from .loader import Job, MPS_PER_GPU, RAM_REQ_GB
 
 # ── Layout constants ───────────────────────────────────────────────────────
 TOP_K     = 16
@@ -53,9 +53,9 @@ SPEED_MATRIX = {
     "rtx4070": {"inference": 1.00, "training": 1.00, "llm": 1.00, "batch": 1.00},
     "rtx3080": {"inference": 1.09, "training": 1.18, "llm": 1.17, "batch": 1.10},
 }
-# Measured peak host RSS per workload class (GB). node-2 (3080) has only ~5GB usable,
-# so concurrent llm jobs there OOM — the dominant, real asymmetry on this cluster.
-RAM_REQ_GB = {"inference": 1.0, "training": 1.1, "llm": 2.5, "batch": 1.0}
+# RAM_REQ_GB (measured peak host RSS per class) lives in loader.py as the single
+# source of truth; imported above. node-2 (3080) has only ~5GB usable, so concurrent
+# llm jobs there OOM — the dominant, real asymmetry on this cluster.
 RAM_REF_GB = 4.0   # obs normalizer for per-job ram_req
 
 # ── Cluster size — current deployment vs. target ───────────────────────────

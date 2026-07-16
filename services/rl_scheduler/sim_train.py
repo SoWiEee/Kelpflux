@@ -220,6 +220,8 @@ def sim_train(
     potential_shaping: bool = True,
     balance_coef: float = 0.0,        # P1: potential-based node-balance shaping
     node_speeds: Optional[list] = None,  # item-1: per-node relative speed (heterogeneity)
+    node_gpu_types: Optional[list] = None,  # per-node card id → SPEED_MATRIX + obs one-hot
+    node_ram_gb: Optional[list] = None,     # per-node usable host RAM (GB) → OOM gate
     normalize_reward: bool = False,   # P2: running-std reward normalization (PopArt-lite)
     use_per: bool = True,
     risk_mode: str = "mean",
@@ -275,6 +277,8 @@ def sim_train(
         potential_shaping=potential_shaping,
         balance_coef=balance_coef,
         node_speeds=node_speeds,
+        node_gpu_types=node_gpu_types,
+        node_ram_gb=node_ram_gb,
         runtime_sigma=runtime_sigma,
         interference=interference,
         colocation_actions=colocation,
@@ -475,7 +479,7 @@ def main(argv=None) -> int:
     p.add_argument("--n-nodes",       type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--trace",         default=["philly", "ali"],
-                   nargs="+", choices=["philly", "ali", "burst", "aiserve"])
+                   nargs="+", choices=["philly", "ali", "burst", "aiserve", "aimix"])
     p.add_argument("--n-jobs",        type=int, default=50)
     p.add_argument("--nstep-n",       type=int, default=10)
     p.add_argument("--no-score-warmup", action="store_true")
@@ -558,9 +562,21 @@ def main(argv=None) -> int:
     p.add_argument("--normalize-reward",     action="store_true",
                    help="P2: running-std reward normalization (§3.6)")
     p.add_argument("--node-speeds",          default="",
-                   help="item-1: comma-separated per-node relative speed, e.g. "
-                        "'1.0,0.25' (node-1 = slow 3080 at 4×). Empty = homogeneous.")
+                   help="legacy scalar per-node speed, e.g. '1.0,0.25'. Superseded by "
+                        "--node-gpu-types (per-(card,class) SPEED_MATRIX). Empty = homogeneous.")
+    p.add_argument("--node-gpu-types",        default="",
+                   help="comma-separated per-node card id, e.g. 'rtx4070,rtx3080'. Enables "
+                        "the measured per-(card,job_class) speed matrix + obs card one-hot.")
+    p.add_argument("--node-ram-gb",           default="",
+                   help="comma-separated per-node usable host RAM in GB, e.g. '62,5'. "
+                        "Enables the host-RAM OOM gate (would-be-OOM placements masked out).")
+    p.add_argument("--hetero-cluster",        action="store_true",
+                   help="shortcut for the real 2×1 cluster: --node-gpu-types rtx4070,rtx3080 "
+                        "--node-ram-gb 62,5 (overrides those two if set).")
     args = p.parse_args(argv)
+    if args.hetero_cluster:
+        args.node_gpu_types = args.node_gpu_types or "rtx4070,rtx3080"
+        args.node_ram_gb = args.node_ram_gb or "62,5"
 
     import torch
     device = args.device
@@ -626,6 +642,8 @@ def main(argv=None) -> int:
         balance_coef=args.balance_coef,
         normalize_reward=args.normalize_reward,
         node_speeds=[float(s) for s in args.node_speeds.split(",") if s.strip()] or None,
+        node_gpu_types=[s.strip() for s in args.node_gpu_types.split(",") if s.strip()] or None,
+        node_ram_gb=[float(s) for s in args.node_ram_gb.split(",") if s.strip()] or None,
         num_envs=args.num_envs,
         async_envs=not args.sync_envs,
     )
