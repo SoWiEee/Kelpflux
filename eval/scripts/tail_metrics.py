@@ -89,6 +89,42 @@ def mean_makespan(records: Sequence[dict]) -> float:
     return float(np.mean(spans)) if spans else float("nan")
 
 
+def gpu_utilization(records: Sequence[dict], total_mps: float) -> float:
+    """Achieved MPS-slot utilization = Σ(mps_req·jct) / (capacity · Σ makespan).
+
+    Work done (mps-slot-seconds) over capacity×wall-time, averaged the natural way
+    by summing per-round work and dividing by capacity×Σ(per-round makespan). 1.0 =
+    every slot busy the whole time. Records need mps_req + jct + submit_ts/end_ts.
+    """
+    by_round: dict = {}
+    for r in records:
+        by_round.setdefault(r["round"], []).append(r)
+    work = 0.0
+    cap_time = 0.0
+    for recs in by_round.values():
+        spans = [(r["submit_ts"], r["end_ts"]) for r in recs
+                 if r.get("submit_ts") is not None and r.get("end_ts") is not None]
+        if not spans:
+            continue
+        makespan = max(e for _, e in spans) - min(s for s, _ in spans)
+        if makespan <= 0:
+            continue
+        work += sum(float(r["mps_req"]) * float(r["jct"]) for r in recs)
+        cap_time += total_mps * makespan
+    return float(work / cap_time) if cap_time > 0 else float("nan")
+
+
+def sla_violation_rate(records: Sequence[dict]) -> float:
+    """Fraction of SLO jobs (slo_s>0, i.e. inference) whose JCT exceeds slo_s.
+
+    nan if there are no SLO-bearing jobs in the set."""
+    slo = [r for r in records if float(r.get("slo_s", 0.0)) > 0.0]
+    if not slo:
+        return float("nan")
+    late = sum(1 for r in slo if float(r["jct"]) > float(r["slo_s"]))
+    return late / len(slo)
+
+
 def _impr_pct(score_stat: float, model_stat: float) -> float:
     """(score - model)/score * 100. Positive = model better (lower JCT)."""
     if not np.isfinite(score_stat) or score_stat == 0:

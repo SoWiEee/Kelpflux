@@ -9,10 +9,12 @@
 set -uo pipefail
 cd /home/acane/Desktop/Kelpflux
 export PYTHONPATH=.
+# 16 cores; MAX×threads ≈ cores so parallel trainings don't oversubscribe.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 CK=/tmp/lckpts_aimix
-STEPS="${STEPS:-120000}"
+STEPS="${STEPS:-100000}"
 DEVICE="${DEVICE:-cpu}"
-MAX="${MAX:-6}"                 # concurrent trainings
+MAX="${MAX:-8}"                 # concurrent trainings
 read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="runs/train_aimix_${STAMP}.log"
@@ -26,7 +28,8 @@ declare -A ARM_FLAGS=(
 )
 COMMON=(--n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix
         --n-jobs 50 --curriculum --total-steps "$STEPS" --warmup-steps 2000
-        --device "$DEVICE" --fixed-alpha --init-alpha 0.05)
+        --device "$DEVICE" --fixed-alpha --init-alpha 0.05
+        --reward-mode mo --mo-w-jct 1.0 --mo-w-util 0.05)
 
 train_one(){ local ARM="$1" SEED="$2" OUT="runs/aimix_$1_s$2_${STAMP}"
   # shellcheck disable=SC2086

@@ -316,6 +316,8 @@ class KubefluxSchedEnv:
         placement_reward_scale: float = 0.01,
         uxprl_c1: float = 1.0,   # UXP-RL reward weight for non-inference tasks
         uxprl_c2: float = 2.0,   # UXP-RL reward weight for inference tasks (c2 > c1)
+        mo_w_jct: float = 1.0,   # reward_mode="mo": weight on the −JCT (throughput) term
+        mo_w_util: float = 0.05, # reward_mode="mo": weight on the per-step GPU-util term
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
         node_speeds: Optional[list] = None,
@@ -329,7 +331,7 @@ class KubefluxSchedEnv:
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
-        if reward_mode not in ("jct_aligned", "shaped", "uxprl"):
+        if reward_mode not in ("jct_aligned", "shaped", "uxprl", "mo"):
             raise ValueError(f"reward_mode={reward_mode!r}")
 
         self.jobs_factory           = jobs_factory
@@ -344,6 +346,11 @@ class KubefluxSchedEnv:
         # UXP-RL (Lin et al. 2025) reward weights: inference tasks earn c2 > c1.
         self.uxprl_c1               = float(uxprl_c1)
         self.uxprl_c2               = float(uxprl_c2)
+        # Multi-objective (reward_mode="mo") weights: −JCT (finish fast) vs +GPU
+        # utilization (keep cards busy). These genuinely trade off on this cluster —
+        # tight MPS packing raises utilization but its interference raises JCT.
+        self.mo_w_jct               = float(mo_w_jct)
+        self.mo_w_util              = float(mo_w_util)
         self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
         self.potential_shaping      = potential_shaping
         # P1 (anti-over-concentration): potential-based node-balance shaping.
@@ -493,6 +500,12 @@ class KubefluxSchedEnv:
             # per-task, inference-weighted). No placement shaping, no final-pending
             # charge, no potential shaping — those belong to other methods.
             reward = st.completion_reward
+        elif self.reward_mode == "mo":
+            # Multi-objective scalarization: −w_jct·JCT (completion, throughput) +
+            # w_util·utilization (per step, keep GPUs busy). st.completion_reward
+            # already holds −JCT/scale from _on_job_end (mo branch).
+            reward = (self.mo_w_jct * st.completion_reward
+                      + self.mo_w_util * st.cluster.utilization())
         else:
             reward = r_place + st.completion_reward + end_charge
             if self.potential_shaping or self.balance_coef > 0.0:

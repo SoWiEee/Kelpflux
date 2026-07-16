@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Hybrid 6-arm unified A/B on ONE DRA backend:
+# aimix 6-arm unified A/B on ONE DRA backend:
 #   fcfs | backfill | score | SAC | RDSAC-mean | RDSAC-cvar  (aimix workload)
-# Metrics (unchanged): 平均周轉(=mean JCT) / Makespan / P95 / P99, + paired Δ平均周轉% vs score.
+# Learned arms trained with the multi-objective reward (−JCT + GPU utilization).
+# 7 metrics: 平均JCT / P95 / P99 / Makespan / GPU利用率 / Slowdown / SLA違反率,
+# + paired Δ平均JCT% vs score with Holm correction.
 #
 # Three Slurm configs, restored on exit (same shape as run_full8):
 #   learned  = original (sched/backfill + priority/multifactor + JobSubmitPlugins=lua)
@@ -155,19 +157,21 @@ def panels(cfg, seed):
         for a, p in rep["panels"].items(): out.setdefault(a, []).append(p)
     return out
 
-absd = {a: {"mean": [], "mk": [], "p95": [], "p99": [], "done": []} for a in ORDER}
-per = {a: [] for a in ORDER if a != "score"}   # per-seed ΔJCT% vs that seed's score
+KEYS = ["mean", "p95", "p99", "makespan", "gpu_util", "slowdown_mean", "sla_viol", "done"]
+def _seed_metric(ps, key):
+    if key == "done":
+        return float(np.mean([p["completed"]/p["n"]*100 for p in ps if p["n"]]))
+    return float(np.nanmean([p.get(key, float("nan")) for p in ps]))
+
+absd = {a: {k: [] for k in KEYS} for a in ORDER}
+per = {a: [] for a in ORDER if a != "score"}   # per-seed ΔmeanJCT% vs that seed's score
 for s in seeds:
     L = panels("learned", s)
     if L and "score" in L:
         sc = float(np.mean([p["mean"] for p in L["score"]]))
         for a, ps in L.items():
             if a in absd:
-                absd[a]["mean"].append(np.mean([p["mean"] for p in ps]))
-                absd[a]["mk"].append(np.mean([p.get("makespan", float("nan")) for p in ps]))
-                absd[a]["p95"].append(np.mean([p["p95"] for p in ps]))
-                absd[a]["p99"].append(np.mean([p["p99"] for p in ps]))
-                absd[a]["done"].append(np.mean([p["completed"]/p["n"]*100 for p in ps if p["n"]]))
+                for k in KEYS: absd[a][k].append(_seed_metric(ps, k))
         for a in LEARNED:
             if a in L: per[a].append(100.0*(sc-np.mean([p["mean"] for p in L[a]]))/sc)
         # Slurm-native configs: their "score" panel IS the native arm, paired to the
@@ -175,38 +179,35 @@ for s in seeds:
         for cfg in ("fcfs", "backfill"):
             N = panels(cfg, s)
             if N and "score" in N:
-                v = float(np.mean([p["mean"] for p in N["score"]]))
-                absd[cfg]["mean"].append(v)
-                absd[cfg]["mk"].append(np.mean([p.get("makespan", float("nan")) for p in N["score"]]))
-                absd[cfg]["p95"].append(np.mean([p["p95"] for p in N["score"]]))
-                absd[cfg]["p99"].append(np.mean([p["p99"] for p in N["score"]]))
-                absd[cfg]["done"].append(np.mean([p["completed"]/p["n"]*100 for p in N["score"] if p["n"]]))
-                per[cfg].append(100.0*(sc-v)/sc)
+                for k in KEYS: absd[cfg][k].append(_seed_metric(N["score"], k))
+                per[cfg].append(100.0*(sc-float(np.mean([p["mean"] for p in N["score"]])))/sc)
 
-def ms(x):
+def ms(x, fmt="{:.1f}"):
     a = np.array([v for v in x if v == v], float)
-    return f"{a.mean():.1f}±{(np.std(a, ddof=1) if a.size > 1 else 0):.1f}" if a.size else "—"
+    if not a.size: return "—"
+    return f"{fmt.format(a.mean())}±{fmt.format(np.std(a, ddof=1) if a.size > 1 else 0.0)}"
 
 arms = [a for a in ORDER if absd[a]["mean"]]
 tested = [a for a in arms if a != "score" and len(per[a]) > 1]
 raw = [float(stats.ttest_1samp(np.array(per[a]), 0.0)[1]) for a in tested]
 holm = dict(zip(tested, holm_bonferroni(raw))) if tested else {}
 
-out = [f"# Hybrid 六臂統一 A/B — {tag} {stamp}", "",
-       f"seeds={seeds}；2×1 DRA MPS、oversub 2.0、node order 4070→3080（與訓練一致）。",
-       "指標：平均周轉(=mean JCT)/Makespan/P95/P99（秒）。Δ平均周轉% 正 = 比 score 快。", "",
-       "| arm | 平均周轉(s) | Makespan(s) | P95(s) | P99(s) | done% | Δ平均周轉% | Holm p | ±5%等價 |",
-       "|---|--:|--:|--:|--:|--:|--:|--:|:--:|"]
+out = [f"# aimix 六臂統一 A/B — {tag} {stamp}", "",
+       f"seeds={seeds}；2×1、node order 4070→3080、reward=多目標(JCT+GPU利用率)。",
+       "指標：平均JCT/P95/P99/Makespan(s)、GPU利用率、Slowdown、SLA違反率。Δ平均JCT% 正=比 score 快。", "",
+       "| arm | 平均JCT(s) | P95(s) | P99(s) | Makespan(s) | GPU利用率 | Slowdown | SLA違反率 | Δ平均JCT% | Holm p |",
+       "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
 for a in arms:
     d = absd[a]
+    row = (f"| {a} | {ms(d['mean'])} | {ms(d['p95'])} | {ms(d['p99'])} | {ms(d['makespan'])} | "
+           f"{ms(d['gpu_util'], '{:.2f}')} | {ms(d['slowdown_mean'], '{:.2f}')} | {ms(d['sla_viol'], '{:.2f}')} |")
     if a == "score":
-        out.append(f"| {a} | {ms(d['mean'])} | {ms(d['mk'])} | {ms(d['p95'])} | {ms(d['p99'])} | {ms(d['done'])} | （基準） | — | — |")
-        continue
-    x = np.array(per[a], float)
-    dl = f"{x.mean():+.1f}±{(np.std(x, ddof=1) if x.size > 1 else 0):.1f}" if x.size else "—"
-    hp = f"{holm[a]:.3f}" if a in holm else "—"
-    eq = ("是" if tost(x, MARGIN)[1] else "否") if x.size > 1 else "—"
-    out.append(f"| {a} | {ms(d['mean'])} | {ms(d['mk'])} | {ms(d['p95'])} | {ms(d['p99'])} | {ms(d['done'])} | {dl} | {hp} | {eq} |")
+        out.append(row + " （基準） | — |")
+    else:
+        x = np.array(per[a], float)
+        dl = f"{x.mean():+.1f}±{(np.std(x, ddof=1) if x.size > 1 else 0):.1f}" if x.size else "—"
+        hp = f"{holm[a]:.3f}" if a in holm else "—"
+        out.append(row + f" {dl} | {hp} |")
 if tested:
     sd_pool = float(np.sqrt(np.mean([np.var(per[a], ddof=1) for a in tested])))
     out += ["", f"pooled SD={sd_pool:.1f}% → MDE(n={len(seeds)}, power .8) ≈ {mde(sd_pool, len(seeds)):.1f}%",
@@ -214,4 +215,4 @@ if tested:
 Path(f"runs/{tag}_{stamp}_TABLES.md").write_text("\n".join(out))
 print("\n".join(out)); print(f"[agg] wrote runs/{tag}_{stamp}_TABLES.md")
 PY
-log "HYB6_DONE ${STAMP}"
+log "AIMIX6_DONE ${STAMP}"

@@ -209,6 +209,8 @@ def sim_train(
     out_dir: Optional[Path] = None,
     reward_mode: str = "jct_aligned",
     reward_scale: float = 20_000.0,
+    mo_w_jct: float = 1.0,
+    mo_w_util: float = 0.05,
     device: str = "cpu",
     log_every: int = 5_000,
     use_iqn: bool = True,
@@ -274,6 +276,7 @@ def sim_train(
         max_steps=active_n_jobs * max_steps_mult,
         reward_mode=reward_mode,
         reward_scale=reward_scale,
+        mo_w_jct=mo_w_jct, mo_w_util=mo_w_util,
         potential_shaping=potential_shaping,
         balance_coef=balance_coef,
         node_speeds=node_speeds,
@@ -489,7 +492,10 @@ def main(argv=None) -> int:
     p.add_argument("--batch-size",    type=int, default=256)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--reward-mode",   default="jct_aligned",
-                   choices=["jct_aligned", "shaped"])
+                   choices=["jct_aligned", "shaped", "mo"],
+                   help="mo = multi-objective: −w_jct·JCT + w_util·GPU-utilization")
+    p.add_argument("--mo-w-jct",  type=float, default=1.0)
+    p.add_argument("--mo-w-util", type=float, default=0.05)
     p.add_argument("--reward-scale",  type=float, default=20_000.0,
                    help="divisor on -JCT; larger → smaller returns "
                         "(keeps entropy term competitive with Q, default 20000)")
@@ -623,6 +629,7 @@ def main(argv=None) -> int:
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
         seed=args.seed, reward_mode=args.reward_mode,
         reward_scale=args.reward_scale,
+        mo_w_jct=args.mo_w_jct, mo_w_util=args.mo_w_util,
         out_dir=Path(args.out_dir), device=device,
         use_iqn=use_iqn,
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,

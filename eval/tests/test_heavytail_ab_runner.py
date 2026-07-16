@@ -53,15 +53,31 @@ def test_makespan_is_max_end_minus_min_submit_per_round():
     assert np.isnan(mean_makespan(no_ts))
 
 
-def test_build_report_includes_makespan_panel():
-    rep = build_report({"score": _recs("score", [10, 20, 30])}, sigma=0.0, family="philly")
-    assert rep["panels"]["score"]["makespan"] == 30.0
+def test_build_report_includes_7_metrics():
+    rep = build_report({"score": _recs("score", [10, 20, 30])}, sigma=0.0,
+                       family="philly", total_mps=100.0)
+    p = rep["panels"]["score"]
+    for k in ("mean", "p95", "p99", "makespan", "gpu_util", "slowdown_mean", "sla_viol"):
+        assert k in p, f"missing metric {k}"
+    # util = Σ(mps·jct)/(cap·makespan) = 20·(10+20+30)/(100·30) = 1200/3000 = 0.4
+    assert abs(p["gpu_util"] - 0.4) < 1e-9
+    # no SLO jobs (slo_s absent → 0) → sla_viol is nan
+    assert np.isnan(p["sla_viol"])
+
+
+def test_sla_violation_rate():
+    from eval.scripts.tail_metrics import sla_violation_rate
+    recs = [{"round": 1, "jct": 8.0, "slo_s": 10.0},   # ok
+            {"round": 1, "jct": 15.0, "slo_s": 10.0},  # late
+            {"round": 1, "jct": 5.0, "slo_s": 0.0}]    # best-effort (ignored)
+    assert sla_violation_rate(recs) == 0.5              # 1 of 2 SLO jobs late
+    assert np.isnan(sla_violation_rate([{"round": 1, "jct": 5.0, "slo_s": 0.0}]))
 
 
 def test_render_summary_runs():
     rep = build_report({"score": _recs("score", [10, 20, 30])}, sigma=0.0, family="philly")
     md = render_summary([rep])
     assert "σ=0.0" in md and "score" in md
-    # new 4-metric header + single paired-delta column; no CVaR/slowdown columns.
-    assert "Makespan(s)" in md and "平均周轉(s)" in md
-    assert "CVaR" not in md and "slowdown" not in md
+    # 7-metric header
+    for col in ("平均JCT(s)", "P95(s)", "P99(s)", "Makespan(s)", "GPU利用率", "Slowdown", "SLA違反率"):
+        assert col in md, f"missing column {col}"

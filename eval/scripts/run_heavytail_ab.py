@@ -38,7 +38,13 @@ from eval.scripts.live_ab_heavytail import (
     submit_stream,
     wait_drain,
 )
-from eval.scripts.tail_metrics import mean_makespan, paired_delta, summarize
+from eval.scripts.tail_metrics import (
+    gpu_utilization,
+    mean_makespan,
+    paired_delta,
+    sla_violation_rate,
+    summarize,
+)
 
 # score first = paired baseline. RLPD kept as an optional arm (gated on --rlpd-ckpt)
 # pending its removal; UXP-RL (Lin et al. 2025) replaces the retired CrossQ arm.
@@ -47,11 +53,13 @@ ARMS = ("score", "SAC", "RDSAC-mean", "RDSAC-cvar", "UXP-RL", "RLPD")
 
 # ── pure report builder (unit-tested) ─────────────────────────────────────────
 
-def build_report(records_by_arm: dict, *, sigma: float, family: str, beta: float = 0.25) -> dict:
-    """{arm: [join_records...]} → per-arm tail panel + paired deltas vs score.
+def build_report(records_by_arm: dict, *, sigma: float, family: str, beta: float = 0.25,
+                 total_mps: float = 200.0) -> dict:
+    """{arm: [join_records...]} → per-arm 7-metric panel + paired deltas vs score.
 
-    Pairs arms on the common (round, job_id) set so ΔJCT%/Δp99%/ΔCVaR% compare the
-    SAME jobs. score is the baseline; learned arms are diffed against it.
+    Metrics: Average JCT, P95, P99, Makespan, GPU utilization, Slowdown, SLA
+    violation rate. Pairs arms on the common (round, job_id) set; score is the
+    baseline. ``total_mps`` = cluster MPS capacity (n_gpu_nodes × 100) for utilization.
     """
     panels: dict = {}
     jct_by_arm: dict = {}
@@ -63,6 +71,8 @@ def build_report(records_by_arm: dict, *, sigma: float, family: str, beta: float
         panels[arm] = summarize(jcts, true_runtimes=trues, beta=beta)
         panels[arm]["completed"] = len(recs)
         panels[arm]["makespan"] = mean_makespan(recs)
+        panels[arm]["gpu_util"] = gpu_utilization(recs, total_mps)
+        panels[arm]["sla_viol"] = sla_violation_rate(recs)
 
     report: dict = {"sigma": sigma, "family": family, "beta": beta,
                     "panels": panels, "paired_vs_score": {}}
@@ -86,14 +96,17 @@ def render_summary(reports: list[dict]) -> str:
     for rep in reports:
         lines.append(f"## σ={rep['sigma']}  family={rep['family']}")
         lines.append("")
-        # Metrics: 平均周轉時間 (= mean JCT), Makespan, Tail Latency (P95, P99).
-        lines.append("| arm | n | 平均周轉(s) | Makespan(s) | P95(s) | P99(s) |")
-        lines.append("|---|--:|--:|--:|--:|--:|")
+        # 7 metrics: Average JCT, P95, P99, Makespan, GPU util, Slowdown, SLA-viol.
+        lines.append("| arm | n | 平均JCT(s) | P95(s) | P99(s) | Makespan(s) | GPU利用率 | Slowdown | SLA違反率 |")
+        lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
         for arm, pan in rep["panels"].items():
             lines.append(
                 f"| {arm} | {pan.get('completed', pan['n'])} | {pan['mean']:.1f} | "
+                f"{pan['p95']:.1f} | {pan['p99']:.1f} | "
                 f"{pan.get('makespan', float('nan')):.1f} | "
-                f"{pan['p95']:.1f} | {pan['p99']:.1f} |")
+                f"{pan.get('gpu_util', float('nan')):.2f} | "
+                f"{pan.get('slowdown_mean', float('nan')):.2f} | "
+                f"{pan.get('sla_viol', float('nan')):.2f} |")
         lines.append("")
         if rep["paired_vs_score"]:
             lines.append("| arm vs score | Δ平均周轉% | t-test p |")
@@ -293,7 +306,8 @@ def run(args) -> int:
 
         if not args.dry_run:
             reports.append(build_report(records_by_arm, sigma=sigma, family=args.family,
-                                        beta=args.beta))
+                                        beta=args.beta,
+                                        total_mps=100.0 * max(1, len(gpu_nodes))))
 
     if not args.dry_run:
         (out_dir / "records.json").write_text(json.dumps(all_records, indent=2))
