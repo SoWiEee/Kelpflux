@@ -48,6 +48,7 @@ class Job:
     latency_class: str = ""  # optional live replay hint: cpu/gpu warm/cold/hard placement
     job_class: str = "batch"  # workload class: inference / training / batch (SLO + analysis)
     slo_s: float = 0.0        # latency-SLO deadline (s); >0 = JCT target (inference). 0 = best-effort
+    ram_req: float = 0.0      # host RAM footprint (GB); drives OOM gating. 0 = unmodelled
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -75,6 +76,7 @@ def _job_from_dict(item: dict) -> Job:
         latency_class=str(item.get("latency_class", "")),
         job_class=str(item.get("job_class", "batch")),
         slo_s=float(item.get("slo_s", 0.0)),
+        ram_req=float(item.get("ram_req", 0.0)),
     )
 
 

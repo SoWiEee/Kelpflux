@@ -40,9 +40,23 @@ TOP_K     = 16
 GPU_TYPES = ("rtx4070", "rtx3080")
 
 JOB_FEAT_DIM    = 9
-GPU_FEAT_DIM    = 6
+GPU_FEAT_DIM    = 7   # +1: per-node free-RAM ratio (host-RAM OOM lever)
 TOPO_FEAT_DIM   = 4
 GLOBAL_FEAT_DIM = 6
+
+# ── Measured cluster physics (see docs; benchmarked 2026-07 on the live cluster) ──
+# Compute speed multiplier per (card, job_class), relative to the RTX 4070 (=1.0);
+# realized_runtime = nominal / speed. Warm compute-only best-of-N: the two cards are
+# NEAR-EQUAL — the RTX 3080 is ~1.1× the 4070, NOT the 4× slower that the old
+# node_speeds=[1.0,0.25] implied. So the real placement lever is host RAM, not speed.
+SPEED_MATRIX = {
+    "rtx4070": {"inference": 1.00, "training": 1.00, "llm": 1.00, "batch": 1.00},
+    "rtx3080": {"inference": 1.09, "training": 1.18, "llm": 1.17, "batch": 1.10},
+}
+# Measured peak host RSS per workload class (GB). node-2 (3080) has only ~5GB usable,
+# so concurrent llm jobs there OOM — the dominant, real asymmetry on this cluster.
+RAM_REQ_GB = {"inference": 1.0, "training": 1.1, "llm": 2.5, "batch": 1.0}
+RAM_REF_GB = 4.0   # obs normalizer for per-job ram_req
 
 # ── Cluster size — current deployment vs. target ───────────────────────────
 # LIVE (current): 1 host × 1 GPU (RTX 4070, MPS enabled)
@@ -116,9 +130,9 @@ MIN_RUNTIME_S = 1.0
 def _job_feat(job: Job, now: float, mps_per_gpu: int) -> np.ndarray:
     """9-dim per-job feature vector.
 
-    Indices 7/8 carry the SLO signal so the policy can be latency-aware on the
-    aiserve workload (else they are 0, i.e. legacy behaviour for best-effort
-    traces with no SLO):
+      [6] ram_req / RAM_REF — host-RAM footprint, so the policy can tell a heavy
+          (llm) job from a light one and avoid the small-RAM node. (Was a dead
+          duplicate of the wait/age slot before RAM modelling.)
       [7] slo_urgency — fraction of the latency deadline already consumed
           (wait / slo_s; >1 = already late). 0 for best-effort jobs (slo_s==0).
       [8] is_inference — 1.0 for the latency class, 0.0 for training/batch.
@@ -133,14 +147,14 @@ def _job_feat(job: Job, now: float, mps_per_gpu: int) -> np.ndarray:
         *gpu_oh,                        # 2 dims (rtx4070 / rtx3080)
         math.log1p(job.runtime),
         math.log1p(wait),
-        math.log1p(wait),               # age (duplicate until priority age added)
+        getattr(job, "ram_req", 0.0) / RAM_REF_GB,  # host-RAM footprint (was a dup wait slot)
         slo_urgency,                    # SLO budget consumed (0 = best-effort)
         is_inference,                   # latency-class flag
     ], dtype=np.float32)
 
 
 def _gpu_feat(cluster: Cluster, node_i: int, gpu_i: int) -> np.ndarray:
-    """6-dim per-GPU feature vector."""
+    """7-dim per-GPU feature vector."""
     node = cluster.nodes[node_i]
     gpu  = node.gpus[gpu_i]
     total_mps = cluster.mps_per_gpu
@@ -151,23 +165,31 @@ def _gpu_feat(cluster: Cluster, node_i: int, gpu_i: int) -> np.ndarray:
         for alloc in plan
         if alloc.node_id == node_i and gpu_i in alloc.gpu_indices
     )
-    # gpu_type one-hot — derived from per-node speed so the policy can see card
-    # heterogeneity (fast rtx4070 vs slow rtx3080). Homogeneous (speed 1.0) keeps
-    # the legacy [1,0,0]; a slow node flips to [0,1,0].
-    gpu_type_oh = ([1.0, 0.0, 0.0] if node.speed >= 1.0 else [0.0, 1.0, 0.0])
+    # gpu_type one-hot — from the node's CARD IDENTITY, not its speed. The two
+    # cards are near-equal in compute, so a speed-derived flag would be blind;
+    # keying on identity keeps the card signal even when speeds are ~equal.
+    gpu_type_oh = [1.0 if node.gpu_type == t else 0.0 for t in GPU_TYPES] + [
+        0.0 if node.gpu_type in GPU_TYPES else 1.0]   # [is_4070, is_3080, is_other]
     return np.array([
         free_ratio,
         vram_ratio,
         float(running_on_gpu),
+        node.free_ram_ratio(),   # host-RAM headroom — the OOM lever the policy must see
         *gpu_type_oh,
     ], dtype=np.float32)
 
 
 def _topo_feat(pending: List[Job], cluster: Cluster) -> np.ndarray:
-    """4-dim topology feature vector."""
-    # In sim, bandwidth is not modelled — placeholders reflect "full capacity"
-    intra_bw = 1.0
-    inter_bw  = 1.0
+    """4-dim topology/pressure feature vector.
+
+    The former two dims were dead bandwidth placeholders (sim has no network
+    model); they now carry global host-RAM pressure, the real cross-node lever:
+      [0] min free-RAM ratio across nodes (how tight the tightest node is)
+      [1] fraction of pending jobs that are RAM-heavy (ram_req ≥ 2GB, ~llm class)
+    """
+    min_free_ram = min((n.free_ram_ratio() for n in cluster.nodes), default=1.0)
+    heavy = sum(1 for j in pending if getattr(j, "ram_req", 0.0) >= 2.0)
+    ram_heavy_ratio = heavy / max(1, len(pending))
     # fraction of pending jobs needing >1 GPU (DDP pressure)
     ddp_ratio = (sum(1 for j in pending if j.gpu_count > 1) / max(1, len(pending)))
     # number of currently running cross-node allocations
@@ -175,7 +197,8 @@ def _topo_feat(pending: List[Job], cluster: Cluster) -> np.ndarray:
         1 for plan in cluster.active.values()
         if len({alloc.node_id for alloc in plan}) > 1
     )
-    return np.array([intra_bw, inter_bw, ddp_ratio, float(cross_node)], dtype=np.float32)
+    return np.array([min_free_ram, ram_heavy_ratio, ddp_ratio, float(cross_node)],
+                    dtype=np.float32)
 
 
 def _global_feat(pending: List[Job], cluster: Cluster, now: float) -> np.ndarray:
@@ -296,6 +319,8 @@ class KubefluxSchedEnv:
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
         node_speeds: Optional[list] = None,
+        node_gpu_types: Optional[list] = None,  # per-node card id (rtx4070/rtx3080)
+        node_ram_gb: Optional[list] = None,     # per-node usable host RAM (GB)
         runtime_sigma: float = 0.0,
         interference: float = 0.0,
         colocation_actions: bool = False,
@@ -331,6 +356,8 @@ class KubefluxSchedEnv:
         # gpu-type one-hot in the obs, so the policy can learn to route big/long
         # jobs to the fast card instead of being blind to which node is which.
         self.node_speeds            = list(node_speeds) if node_speeds else None
+        self.node_gpu_types         = list(node_gpu_types) if node_gpu_types else None
+        self.node_ram_gb            = list(node_ram_gb) if node_ram_gb else None
         # ── Stochastic execution (opt-in; 0/0 = legacy deterministic env) ──
         # runtime_sigma : multiplicative mean-preserving lognormal noise on the
         #                 *realized* runtime. The obs still shows the nominal
@@ -393,6 +420,8 @@ class KubefluxSchedEnv:
             gpus_per_node=self.gpus_per_node,
             mps_per_gpu=self.mps_per_gpu,
             node_speeds=self.node_speeds,
+            node_gpu_types=self.node_gpu_types,
+            node_ram_gb=self.node_ram_gb,
         )
         events: list = []
         seq = 0
@@ -586,11 +615,15 @@ class KubefluxSchedEnv:
         the chosen job already appears in ``cluster.active``.
         """
         base = job.runtime
-        # Node heterogeneity (always applies): a slower card runs the job longer.
-        # With speed==1.0 (homogeneous) this is a no-op, preserving legacy
-        # bit-for-bit determinism.
+        # Node heterogeneity. When card identities are provided (node_gpu_types set),
+        # use the measured per-(card, job_class) SPEED_MATRIX; otherwise fall back to
+        # the legacy scalar node.speed (keeps homogeneous/old-hetero paths bit-exact).
         node_id = plan[0].node_id if plan else 0
-        speed = cluster.nodes[node_id].speed
+        node = cluster.nodes[node_id]
+        if cluster.node_gpu_types is not None and node.gpu_type in SPEED_MATRIX:
+            speed = SPEED_MATRIX[node.gpu_type].get(job.job_class, 1.0)
+        else:
+            speed = node.speed
         if speed != 1.0:
             base = max(MIN_RUNTIME_S, base / speed)
         if self.runtime_sigma <= 0.0 and self.interference <= 0.0:
