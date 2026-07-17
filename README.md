@@ -294,7 +294,31 @@ PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
     --partition gpu --out-dir runs/ab_$(date +%Y%m%d-%H%M%S)
 ```
 
-### 5.4 訓練 flags 對照
+### 5.4 aimix 多目標六臂實機評估（多目標獎勵，論文 §5.3.2 表 6）
+
+在 DRA MPS + **aimix 混合真實工作負載**（30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算）下，以**多目標獎勵**（−JCT + GPU 利用率）重訓的 **score / SAC / RDSAC-mean / RDSAC-cvar** 對照 **Slurm 原生 fcfs / backfill**，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。異質叢集速度矩陣（3080 ≈ 1.1× 4070）與 host-RAM OOM 閘皆封裝於 wrapper。
+
+```bash
+# ── Step 1：多目標重訓 3 臂 × 8 seed → /tmp/lckpts_aimix/ ──
+# 已用 scripts/gpu-toggle.sh release 釋出本機 4070 時可 DEVICE=cuda；否則預設 CPU。
+DEVICE=cuda STEPS=70000 MAX=6 SEEDS="42 43 44 45 46 47 48 49" \
+    bash eval/scripts/train_aimix_seeds.sh
+# → /tmp/lckpts_aimix/{sac,rdsac_mean,rdsac_cvar}_s{42..49}.pt（24 個 checkpoint）
+
+# ── Step 2：六臂實機評估（自動換 learned/fcfs/backfill 三套 slurm.conf，結束以 trap 還原）──
+# 需 4070+3080 皆在叢集；gpu-toggle release 後須先 restore 並確認 MPS 恢復（§4.2）。
+SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
+    bash eval/scripts/run_aimix6.sh
+# → runs/aimix6_<stamp>_TABLES.md（論文表 6：7 指標 × 6 臂 + Holm）
+
+# ── Step 3：統計穩健性複核（Holm / bootstrap 95% CI / TOST 等價 / n=8 MDE，論文表 8）──
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/stage1_reanalysis.py \
+    --hybrid aimix6 --out runs/aimix6_reanalysis.json
+```
+
+> **節點順序 load-bearing。** `GPU_NODES` 內 index 0 須為快卡（4070），與訓練時的 `node_speeds` 一致；顛倒會使學習臂系統性放到慢卡、結果失真。預設 `slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0` 已正確。
+
+### 5.5 訓練 flags 對照
 
 | Flag | 說明 | 預設 |
 |------|------|------|
@@ -304,7 +328,7 @@ PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
 | `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
 
-### 5.5 執行單元測試
+### 5.6 執行單元測試
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python -m pytest sim/tests/ -q

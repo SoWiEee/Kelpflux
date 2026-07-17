@@ -9,7 +9,10 @@
 set -uo pipefail
 cd /home/acane/Desktop/Kelpflux
 export PYTHONPATH=.
-# 16 cores; MAX×threads ≈ cores so parallel trainings don't oversubscribe.
+# Cap threads so MAX×threads ≈ cores (16). WITHOUT this, 8 procs × 16 default
+# threads = 128 threads → load ~56 → thrash → ~0 progress. OMP=2 keeps 8×2=16.
+# (IQN/RDSAC is inherently ~1.6 steps/s on CPU regardless — that's the workload,
+# not the threading; the fix for wall-time is fewer seeds/steps, not more threads.)
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 CK=/tmp/lckpts_aimix
 STEPS="${STEPS:-100000}"
@@ -32,6 +35,7 @@ COMMON=(--n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix
         --reward-mode mo --mo-w-jct 1.0 --mo-w-util 0.05)
 
 train_one(){ local ARM="$1" SEED="$2" OUT="runs/aimix_$1_s$2_${STAMP}"
+  [ -f "$CK/${ARM}_s${SEED}.pt" ] && { log "  SKIP ${ARM} s${SEED} (checkpoint exists)"; return 0; }
   # shellcheck disable=SC2086
   if .venv-m11/bin/python -m services.rl_scheduler.sim_train "${COMMON[@]}" ${ARM_FLAGS[$ARM]} \
        --seed "$SEED" --out-dir "$OUT" >>"$LOG" 2>&1 && cp "$OUT/dsac.pt" "$CK/${ARM}_s${SEED}.pt"; then
