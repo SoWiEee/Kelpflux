@@ -592,7 +592,7 @@ def _decide_traceparent(req: DecideRequest) -> str:
         return ""
     with _otel.job_submit_span(
         job_id=req.job_id,
-        partition=getattr(_snapshot, "partition", "unknown") if _snapshot else "unknown",
+        partition=f"gpu-{req.gpu_type}" if req.gpu_type else "",
         gres=f"gpu:{req.gpu_count}" if req.gpu_count else "",
         requested_cpus=0,
     ) as tp:

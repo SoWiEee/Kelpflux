@@ -119,7 +119,7 @@ deploy_platform() {
   adopt_lmod_configmaps
 
   log "converging slurm-platform with live DSAC scheduler enabled"
-  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set gpu.autoLabel=false     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false     --set rlScheduler.valueAbstain=-100000     --set rlScheduler.snapshotTtlSeconds=86400
+  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set gpu.autoLabel=false     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false
 
   if [[ "$SKIP_BUILD" != "1" || "$SKIP_IMPORT" != "1" ]]; then
     log "restarting RL deployments to pick up mutable image tag $RL_IMAGE"

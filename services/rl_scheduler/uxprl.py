@@ -226,7 +226,7 @@ class UXPRLAgent:
 
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "UXPRLAgent":
-        data = torch.load(str(path), map_location="cpu", weights_only=False)
+        data = torch.load(str(path), map_location="cpu", weights_only=True)
         if data.get("algo") != "uxprl":
             raise ValueError(f"{path} is not a UXP-RL checkpoint (algo={data.get('algo')!r})")
         agent = cls(
@@ -249,7 +249,7 @@ class UXPRLAgent:
     @staticmethod
     def is_uxprl_checkpoint(path: str | Path) -> bool:
         try:
-            data = torch.load(str(path), map_location="cpu", weights_only=False)
+            data = torch.load(str(path), map_location="cpu", weights_only=True)
         except Exception:
             return False
         return data.get("algo") == "uxprl"

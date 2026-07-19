@@ -490,7 +490,7 @@ class DSACAgent:
 
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "DSACAgent":
-        data = torch.load(str(path), map_location="cpu", weights_only=False)
+        data = torch.load(str(path), map_location="cpu", weights_only=True)
         agent = cls(
             obs_dim=data["obs_dim"], n_actions=data["n_actions"],
             hidden=tuple(data.get("hidden", (256, 256))),

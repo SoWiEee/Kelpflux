@@ -104,8 +104,19 @@ spec:
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
-        # controller (lua submit filter), workers, login, snapshot agent
-        - podSelector: {}
+        # Only the three legitimate callers of :8002:
+        #   /decide   ← job_submit.lua inside slurmctld (slurm-controller)
+        #   /snapshot ← rl-snapshot-agent
+        #   /act      ← rl-placement-controller
+        # Workers/login run user sbatch payloads and must NOT reach 8002.
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-controller
+                  - rl-snapshot-agent
+                  - rl-placement-controller
       ports:
         - protocol: TCP
           port: 8002

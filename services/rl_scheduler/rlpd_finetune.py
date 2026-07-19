@@ -657,7 +657,7 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
     base_ckpt = Path(base_policy_dir) / "dsac.pt" if base_policy_dir else None
     if base_ckpt and base_ckpt.exists():
         print(f"[rlpd] warm-starting actor from {base_ckpt}")
-        sd = torch.load(base_ckpt, map_location="cpu", weights_only=False)
+        sd = torch.load(base_ckpt, map_location="cpu", weights_only=True)
         if isinstance(sd, dict) and "actor" in sd:
             agent.warm_start_actor(sd["actor"])
     warm_start = out_dir / "dsac.pt"
