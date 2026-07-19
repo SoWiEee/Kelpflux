@@ -1,29 +1,30 @@
-"""Step 5: Live scheduling daemon — DSAC on the real Slurm cluster.
+"""Live RLPD transition collector — passive behaviour logging on real Slurm.
 
-Polls squeue every POLL_INTERVAL seconds. When pending jobs exist and
-resources are free, calls the DSACAgent to select (job, node, gpu) and
-executes placement via srun with explicit --nodelist + --gres=mps:N.
+Polls squeue every POLL_INTERVAL seconds and records, for each job, the
+(obs, act, rew, next_obs) transition that the PRODUCTION scheduler (Slurm
+multifactor / score) actually realised:
 
-Logs every (obs, act, mask, rew, next_obs, done) transition to a JSONL
-file for later RLPD fine-tuning.
+  1. snapshot the decision-state (obs, mask) while a job is PENDING;
+  2. when it starts RUNNING, encode which node Slurm placed it on as ``act``;
+  3. when it finishes, charge the realised reward (−JCT) and append the
+     transition to a JSONL file for later RLPD fine-tuning.
 
-Safety invariants:
-  - Never issues srun if live_buf < LIVE_WARMUP_MIN transitions (fallback only)
-  - Abstains if agent value < VALUE_ABSTAIN or entropy > ENTROPY_ABSTAIN
-  - SHADOW_MODE=true → logs decisions but never executes srun (default)
+This is deliberately PASSIVE: it never issues srun and never overrides Slurm's
+placement. The behaviour policy is whatever the production scheduler did, which
+yields clean off-policy (s, a, r, s') data that RLPD (Ball et al. 2023) can
+learn from without perturbing the live cluster.
+
+  NOTE: this is NOT the production placement path. Slurm-safe hard placement
+  (hold/release + ``required_nodes`` over slurmrestd) lives in
+  ``placement_controller.py`` (deployed as rl-placement-controller). The old
+  srun-based active-placement path was removed on purpose — srun bypasses Slurm
+  priority/backfill/GRES-MPS accounting and the operator lifecycle guard. See
+  docs/scheduler.md (§ "live 蒐集").
 
 Usage::
-    # Shadow mode (log only, no actual placement):
-    SHADOW_MODE=true .venv-m11/bin/python -m services.rl_scheduler.live_daemon \\
-        --policy-dir runs/dsac_sim \\
-        --node-name slurm-worker-0 --gpu-hostname 192.168.1.10 \\
-        --log-dir shadow_logs
-
-    # Live mode (executes srun):
-    SHADOW_MODE=false .venv-m11/bin/python -m services.rl_scheduler.live_daemon \\
-        --policy-dir runs/dsac_sim \\
-        --node-name slurm-worker-0 \\
-        --log-dir live_logs --live-warmup 500
+    .venv-m11/bin/python -m services.rl_scheduler.live_daemon \\
+        --node-name slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx3080 \\
+        --log-dir live_logs
 """
 from __future__ import annotations
 
@@ -45,7 +46,6 @@ from sim.gym_env import (
     TOPO_FEAT_DIM, TOP_K, env_dims,
 )
 from sim.loader import MPS_PER_GPU
-from services.rl_scheduler.dsac import DSACAgent
 from services.rl_scheduler.rlpd_finetune import ReplayBuffer, Transition
 
 
@@ -299,47 +299,15 @@ def build_obs_and_mask(
     return obs, mask, top_ids
 
 
-# ── Execution ─────────────────────────────────────────────────────────────
-
-def execute_placement(
-    job: LiveJob,
-    node_name: str,
-    gpu_index: int,
-    *,
-    shadow: bool = True,
-) -> bool:
-    """Issue srun with explicit placement. Returns True if submitted."""
-    mps_n = job.mps_req
-    cmd   = [
-        "srun", f"--jobid={job.job_id}",
-        f"--nodelist={node_name}",
-        f"--gres=mps:{mps_n}",
-        "--oversubscribe",
-        "--wrap=true",   # no-op wrapper for shadow testing
-    ]
-    if shadow:
-        print(f"[daemon] SHADOW srun {' '.join(cmd)}")
-        return True
-    print(f"[daemon] exec  srun {' '.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    return r.returncode == 0
-
-
 # ── Daemon loop ───────────────────────────────────────────────────────────
 
 def run_daemon(
     *,
-    agent: DSACAgent,
     node_names: List[str],
+    log_dir: Path,
     n_gpus: int = 1,
     mps_per_gpu: int = MPS_PER_GPU,
     poll_interval: float = 30.0,
-    shadow: bool = True,
-    live_warmup_min: int = 0,
-    value_abstain: float = -1.0,
-    entropy_abstain: float = 2.5,
-    log_dir: Path,
-    runtime_predictor_url: Optional[str] = None,
     buf_capacity: int = 10_000,
 ) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -348,8 +316,8 @@ def run_daemon(
     log_path = log_dir / f"transitions_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     decisions_made = 0
 
-    print(f"[daemon] starting — nodes={node_names}  "
-          f"shadow={shadow}  poll={poll_interval}s")
+    print(f"[daemon] starting — nodes={node_names}  poll={poll_interval}s "
+          f"(passive: logs transitions, never issues srun)")
     print(f"[daemon] log → {log_path}")
 
     # Behaviour-policy observation (valid offline data, shadow-safe). We log the
@@ -430,68 +398,26 @@ def run_daemon(
             time.sleep(poll_interval)
 
 
-def _agent_select(
-    agent: DSACAgent, obs: np.ndarray, mask: np.ndarray
-) -> tuple[int, float, float]:
-    import torch
-    with torch.no_grad():
-        obs_t  = torch.as_tensor(obs,  dtype=torch.float32).unsqueeze(0)
-        mask_t = torch.as_tensor(mask, dtype=torch.bool).unsqueeze(0)
-        probs, log_probs = agent.actor.policy(obs_t, mask_t)
-        q       = agent.action_values(obs_t)
-        entropy = float(-(probs * log_probs).sum(dim=-1).item())
-        value   = float((probs * q).sum(dim=-1).item())
-        pnp     = probs.squeeze(0).cpu().numpy()
-    pnp = pnp * mask.astype(np.float32)
-    s   = pnp.sum()
-    action = int(pnp.argmax()) if s > 1e-9 else int(np.flatnonzero(mask)[0])
-    return action, value, entropy
-
-
 # ── Entry ─────────────────────────────────────────────────────────────────
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--policy-dir",    required=True)
     p.add_argument("--node-name",     nargs="+", required=True,
-                   help="Slurm node name(s) to manage")
+                   help="Slurm node name(s) to observe")
     p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--mps-per-gpu",   type=int, default=MPS_PER_GPU)
     p.add_argument("--poll-interval", type=float, default=30.0)
     p.add_argument("--log-dir",       default="shadow_logs")
-    p.add_argument("--live-warmup",   type=int, default=0,
-                   help="min live transitions before agent takes control")
-    p.add_argument("--predictor-url", default=None,
-                   help="runtime predictor API URL for predicted runtimes")
     p.add_argument("--buf-capacity",  type=int, default=10_000)
     args = p.parse_args(argv)
 
-    shadow = os.environ.get("SHADOW_MODE", "true").lower() in ("1", "true", "yes")
-    if shadow:
-        print("[daemon] SHADOW_MODE=true — decisions logged but srun not executed")
-
-    ckpt = Path(args.policy_dir) / "dsac.pt"
-    print(f"[daemon] loading agent from {ckpt}")
-    agent = DSACAgent.load(str(ckpt))
-
-    # value_abstain: env-overridable (mirrors serve.py VALUE_ABSTAIN). The
-    # default -1.0 abstains whenever the policy value < -1, which silences a
-    # checkpoint whose values sit at O(-10) (e.g. seed-43) — so it logs no
-    # transitions at all. For RLPD transition COLLECTION, set a very low
-    # threshold so the policy's decisions are actually recorded.
-    value_abstain = float(os.environ.get("VALUE_ABSTAIN", "-1.0"))
     run_daemon(
-        agent=agent,
         node_names=args.node_name,
+        log_dir=Path(args.log_dir),
         n_gpus=args.gpus_per_node,
         mps_per_gpu=args.mps_per_gpu,
         poll_interval=args.poll_interval,
-        shadow=shadow,
-        live_warmup_min=args.live_warmup,
-        log_dir=Path(args.log_dir),
-        runtime_predictor_url=args.predictor_url,
         buf_capacity=args.buf_capacity,
-        value_abstain=value_abstain,
     )
     return 0
 
