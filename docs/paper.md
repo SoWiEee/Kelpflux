@@ -40,7 +40,7 @@ We implement the framework on a real RTX 4070 and RTX 3080 testbed, and evaluate
 
 在大學實驗室與中小型研究叢集中，GPU 資源通常有限，且硬體常由不同世代 GPU 漸進式擴充而成。例如 RTX 4070 與 RTX 3080 在算力、記憶體容量與功耗上皆不同。若排程器只把 GPU 視為同質資源，便可能讓小型推論工作佔用高效能 GPU，或讓長時間訓練阻塞後續短工作，造成 GPU utilization、工作完成時間 (JCT) 與 queue delay 之間的取捨更加困難。
 
-NVIDIA MPS 提供另一個重要槓桿：多個 CUDA 工作可共享同一張 GPU，使 GPU 不再只能以整張卡為單位分配 [5]。然而 MPS 也讓排程問題從「選哪張 GPU」變成「選哪張 GPU 與分配多少 MPS」。因此，在異質 GPU 與 MPS 共存的環境中，GPU scheduling 已成為影響叢集效能的核心問題。
+NVIDIA MPS 提供另一個重要槓桿：多個 CUDA 工作可共享同一張 GPU，使 GPU 不再只能以整張卡為單位分配 [5]。然而 MPS 也讓排程問題從「選哪張 GPU」變成「選哪張 GPU 與分配多少 **MPS fraction**」。因此，在異質 GPU 與 MPS 共存的環境中，GPU scheduling 已成為影響叢集效能的核心問題。
 
 ### 1.2 現有方法限制
 
@@ -49,7 +49,7 @@ Slurm 是高效能運算環境常用的工作排程系統，支援 FCFS、Backfi
 現有方法主要存在四項限制：
 
 1. **不充分考慮 GPU 差異**：許多排程方法把 GPU 視為同質資源，較少將不同世代 GPU 的算力、記憶體與執行時間差異納入 placement 決策。
-2. **不充分考慮 MPS allocation**：部分研究討論 GPU sharing 或 GPU partition，但未將 MPS 配額作為排程器的顯式動作。
+2. **不充分考慮 MPS fraction**：部分研究討論 GPU sharing 或 GPU partition，但未將 **MPS fraction** 作為排程器的顯式動作。
 3. **依賴固定規則**：FCFS、Backfill 與 Best Fit 能提供穩定基準，但難以隨工作負載動態調整策略。
 4. **缺乏真實 Slurm 流程驗證**：不少學習式排程研究停留在模擬環境，未整合到真實 Slurm job submission path，也未處理服務失效、實機漂移與統計顯著性。
 
@@ -71,7 +71,7 @@ GPU scheduling 不是單次分類問題，而是序列決策問題。一次 plac
 
 本研究主要貢獻如下：
 
-1. **提出異質 GPU + MPS 排程框架**：將 GPU placement 與 MPS allocation 統一建模，使排程器能同時選擇 GPU 與 25%、50%、75%、100% MPS 配額。
+1. **提出異質 GPU + MPS 排程框架**：將 GPU placement 與 **MPS fraction** 統一建模，使排程器能同時選擇 GPU 與 25%、50%、75%、100% **MPS fraction**。
 2. **設計 DRL Scheduler**：以 Discrete SAC [6]、RDSAC [7][16] 與 RLPD [8] 等方法學習序列排程策略，並將 state、action、reward 對應到真實 Slurm 叢集。
 3. **完成 Slurm 整合**：透過 Slurm job submission path 連接 RL decision service，並提供 fail-safe fallback，避免學習式服務異常時阻塞排程核心。
 4. **完成真實部署**：於 RTX 4070 與 RTX 3080 異質 GPU 環境中部署 Slurm、NVIDIA MPS 與監控流程；Kubernetes 僅作為部署與生命週期管理平台。
@@ -85,7 +85,7 @@ GPU sharing 技術的目標是在單張或多張 GPU 上提高資源使用率，
 
 近年研究也開始探討更細緻的 GPU partition 與 spatio-temporal sharing。例如 Serving Heterogeneous Machine Learning Models on Multi-GPU Servers with Spatio-Temporal Sharing 討論多模型服務如何在多 GPU 伺服器上進行時間與空間共享 [32]；Hierarchical Resource Partitioning on Modern GPUs 則研究現代 GPU 上階層式資源分割 [33]。
 
-這些研究顯示 GPU sharing 能提升利用率，但多聚焦於 GPU partition 或 inference serving 本身，較少把 GPU sharing 作為 Slurm 排程器的顯式決策變數。本研究的差異在於：MPS allocation 是 action space 的一部分，排程器必須同時決定 GPU placement 與 MPS fraction。
+這些研究顯示 GPU sharing 能提升利用率，但多聚焦於 GPU partition 或 inference serving 本身，較少把 GPU sharing 作為 Slurm 排程器的顯式決策變數。本研究的差異在於：**MPS fraction** 是 action space 的一部分，排程器必須同時決定 GPU placement 與 **MPS fraction**。
 
 ### 2.2 GPU Scheduling
 
@@ -109,7 +109,7 @@ GPU sharing 技術的目標是在單張或多張 GPU 上提高資源使用率，
 
 表 1. 相關研究定位比較
 
-| 類型 | 是否考慮異質 GPU | 是否考慮 MPS | 是否整合真實 Slurm | 主要限制 |
+| 類型 | 是否考慮異質 GPU | 是否考慮 MPS fraction | 是否整合真實 Slurm | 主要限制 |
 |---|:--:|:--:|:--:|---|
 | FCFS / Backfill / Best Fit | 部分 | 部分 | 是 | 固定規則，難以學習長期效果 |
 | GPU sharing / partition 研究 | 部分 | 部分 | 否 | 多聚焦 partition 機制，較少處理排程流程 |
@@ -125,26 +125,29 @@ GPU sharing 技術的目標是在單張或多張 GPU 上提高資源使用率，
 
 本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台。系統流程如圖 1 所示：
 
-```text
-Job Submission
-      |
-      v
-    Slurm
-      |
-      v
- RL Scheduler  <---- Monitoring
-      |               ^
-      v               |
- GPU + MPS ----------> Replay Buffer
+```mermaid
+flowchart TD
+    A[Job Submission] --> B[Slurm Controller]
+    B --> C{RL Scheduler<br/>via job_submit hook}
+    C -->|Observe State| D[GPU + MPS fraction]
+    D --> E[Execute Job on GPU]
+    E --> F[Monitoring<br/>JCT, Util, Queue Delay]
+    F --> G[Replay Buffer]
+    G --> C
+    C -.->|Timeout / Invalid Action| H[Heuristic Fallback<br/>Score-based]
+    H --> B
 ```
+
+**圖 1. 系統架構與排程流程。**  
+虛線框為 fail-safe fallback 路徑；RL Scheduler 以 Slurm `job_submit.lua` hook 介入，決策輸出為 `(GPU_id, MPS fraction)`；Monitoring 週期 1 秒蒐集 GPU/SM/memory utilization、MPS fraction 使用量、queue depth、job events，寫入 Replay Buffer 供 offline RL / RLPD 使用。
 
 工作提交後，Slurm 透過 job submission hook 呼叫 RL scheduler。RL scheduler 讀取目前工作資訊、GPU 狀態、MPS 剩餘容量與佇列資訊，輸出 GPU placement 與 MPS allocation。工作執行期間，監控服務收集 GPU utilization、SM utilization、memory usage、queue delay、JCT 與 reward，並將資料寫入 replay buffer 供後續訓練或 RLPD 微調使用。
 
-本平台使用 Kubernetes 部署 Slurm controller、worker、RL scheduler、monitoring service 與相關容器 [10]。Kubernetes 在本文中不負責排程決策；它只提供容器化部署、服務健康檢查、網路與生命週期管理。此設計避免讓 Kubernetes 成為研究主角，並保留 Slurm 在 HPC batch scheduling 中成熟的佇列語意 [11]。
+本平台使用 Kubernetes (k3s) 部署 Slurm controller、worker、RL scheduler、monitoring service 與相關容器 [10]。**Kubernetes 在本文中不負責排程決策**；它只提供容器化部署、服務健康檢查、網路與生命週期管理。**此設計避免讓 Kubernetes 成為研究主角，並保留 Slurm 在 HPC batch scheduling 中成熟的佇列語意 [11]；K8s 相關組件部署細節見附錄 A。**
 
 ### 3.2 Problem Definition
 
-本研究將異質 GPU + MPS 排程建模為馬可夫決策過程。每次有工作可排程時，代理人觀察叢集狀態，選擇一個 GPU 與 MPS 配額，並在工作完成後根據 JCT、queue delay 與 GPU utilization 取得 reward。
+本研究將異質 GPU + MPS 排程建模為馬可夫決策過程。每次有工作可排程時，代理人觀察叢集狀態，選擇一個 GPU 與 **MPS fraction**，並在工作完成後根據 JCT、queue delay 與 GPU utilization 取得 reward。
 
 **State.** 狀態包含四類資訊：
 
@@ -153,16 +156,16 @@ Job Submission
 3. **Queue features**：佇列長度、前 K 個工作的需求、等待時間分布與到達率。
 4. **History features**：近期完成工作 JCT、slowdown、SLO violation 與各 GPU 的負載變化。
 
-**Action.** 動作定義為 GPU 與 MPS 配額的組合：
+**Action.** 動作定義為 GPU 與 **MPS fraction** 的組合：
 
 ```text
-Action = GPU x MPS
+Action = GPU x MPS fraction
 
 GPU0 (RTX 4070) x {25%, 50%, 75%, 100%}
 GPU1 (RTX 3080) x {25%, 50%, 75%, 100%}
 ```
 
-在本研究的 2 GPU 實驗平台中，動作空間共有 8 個 placement/allocation action；若加入暫不放置或更多 GPU，動作空間可自然擴充。
+在本研究的 2 GPU 實驗平台中，動作空間共有 8 個 **placement/fraction** action；若加入暫不放置或更多 GPU，動作空間可自然擴充。
 
 **Reward.** Reward 需同時反映使用者等待時間與叢集效率。本文採用以下形式作為主要設計：
 
@@ -193,7 +196,7 @@ R = -w1 * JCT + w2 * GPUUtil - w3 * QueueDelay - w4 * SLOViolation
 | 類別 | 特徵 |
 |---|---|
 | GPU | GPU 型號、memory capacity、memory usage、GPU utilization、SM utilization、目前 MPS 使用量 |
-| MPS | 每張 GPU 剩餘 MPS、目前分配比例、共置工作數、MPS fragmentation |
+| MPS | 每張 GPU 剩餘 **MPS fraction**、目前分配比例、共置工作數、**MPS fragmentation** |
 | Job | job type、runtime estimate、memory request、MPS request、SLO、submit time |
 | Queue | queue length、前 K 個等待工作、等待時間、短工作比例、長工作比例 |
 | History | 近期 JCT、P95/P99 JCT、slowdown、GPU load balance、SLO violation |
@@ -202,14 +205,14 @@ R = -w1 * JCT + w2 * GPUUtil - w3 * QueueDelay - w4 * SLOViolation
 
 ### 4.2 Action
 
-Action 是 GPU placement 與 MPS allocation 的聯合決策。以本研究兩張 GPU 為例：
+Action 是 GPU placement 與 **MPS fraction** 的聯合決策。以本研究兩張 GPU 為例：
 
 ```text
 GPU0: 25% | 50% | 75% | 100%
 GPU1: 25% | 50% | 75% | 100%
 ```
 
-選定 action 後，scheduler 將結果轉換為 Slurm 可執行的資源請求與節點限制。例如，若 agent 選擇 `GPU0 x 50%`，系統會將工作導向對應節點，並透過 Slurm GRES/MPS 設定分配 50% MPS。若 action 無效，例如該 GPU 剩餘 MPS 不足，則 action mask 會在推論前遮蔽該選項，避免產生不可執行決策。
+選定 action 後，scheduler 將結果轉換為 Slurm 可執行的資源請求與節點限制。例如，若 agent 選擇 `GPU0 x 50%`，系統會將工作導向對應節點，並透過 Slurm GRES/MPS 設定分配 50% **MPS fraction**。若 action 無效，例如該 GPU 剩餘 **MPS fraction** 不足，則 action mask 會在推論前遮蔽該選項，避免產生不可執行決策。
 
 ### 4.3 Reward
 
@@ -226,12 +229,12 @@ Reward 的設計目標是降低使用者感受到的等待與完成時間，同�
 
 本研究比較以下 DRL 方法：
 
-1. **Discrete SAC**：將 Soft Actor-Critic 延伸到離散 action space，適合選擇 GPU/MPS 這類有限動作 [6]。
+1. **Discrete SAC**：將 Soft Actor-Critic 延伸到離散 action space，適合選擇 **GPU/MPS fraction** 這類有限動作 [6]。
 2. **RDSAC-mean**：以分布式 critic 建模回報分布，但 actor 主要依平均回報決策 [7][16]。
 3. **RDSAC-cvar**：在 RDSAC 上加入 CVaR 風險敏感目標，使策略更重視尾端 JCT 與 SLO violation [16]。
 4. **RLPD**：使用真實叢集收集的 transition 對模擬訓練出的模型進行微調，以縮小 sim-to-real gap [8]。
 
-RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action。訓練流程包含 prioritized replay、n-step return、potential-based reward shaping [9] 與 heuristic warm start。
+RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action（即 **MPS fraction** 超過剩餘配額的動作）。訓練流程包含 prioritized replay、n-step return、potential-based reward shaping [9] 與 heuristic warm start。
 
 ### 4.5 Scheduler Workflow
 
@@ -246,7 +249,7 @@ Mask Invalid Actions
     |
 RL Policy / Heuristic Fallback
     |
-Select GPU x MPS
+Select GPU x MPS fraction
     |
 Submit to Slurm
     |
@@ -272,7 +275,7 @@ Store Transition in Replay Buffer
 | GPU | NVIDIA RTX 4070、NVIDIA RTX 3080 |
 | 排程器 | Slurm with GRES/TRES and MPS [11] |
 | 部署平台 | Kubernetes/k3s，僅負責容器部署與服務生命週期 [10] |
-| GPU sharing | NVIDIA MPS，MPS bucket 為 25%、50%、75%、100% [5] |
+| GPU sharing | NVIDIA MPS，**MPS fraction** 為 25%、50%、75%、100% [5] |
 | 系統 | Ubuntu、CUDA、NVIDIA driver、PyTorch |
 | 監控 | GPU utilization、SM utilization、memory usage、job event、queue delay |
 
@@ -299,7 +302,7 @@ Store Transition in Replay Buffer
 | DRL | Discrete SAC [6]、RDSAC-mean [7][16]、RDSAC-cvar [7][16] |
 | Sim-to-real | RLPD [8] |
 
-score heuristic 以 MPS fit、VRAM fit 與 fragmentation penalty 為主，代表可部署、可解釋且低成本的生產啟發式方法。DRL 方法則用於檢驗學習式策略是否能在異質 GPU + MPS 情境下超越固定規則。
+score heuristic 以 **MPS fraction** fit、VRAM fit 與 fragmentation penalty 為主，代表可部署、可解釋且低成本的生產啟發式方法。DRL 方法則用於檢驗學習式策略是否能在異質 GPU + MPS 情境下超越固定規則。
 
 ### 5.4 Metrics
 
@@ -338,34 +341,38 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 | multifactor | 1108 | 461 | 41.1 | 0.63 |
 | score | 1129 | 520 | 40.7 | 0.63 |
 
-**實機 cuBLAS 低負載共置。** 在 RTX 4070 與 RTX 3080 實機上，以 cuBLAS 工作與 MPS 分數共置進行 8 seed 評估。結果顯示，FCFS、Backfill 與 RDSAC-mean 大致落在 score heuristic 的 ±5% 範圍內，代表此低負載 regime 的策略空間接近平坦；RDSAC-cvar、RLPD 與 SAC 未穩健勝出。
+**實機 cuBLAS 低負載共置。** 在 RTX 4070 與 RTX 3080 實機上，以 cuBLAS 工作與 **MPS fraction** 共置進行 8 seed 評估。結果顯示，FCFS、Backfill 與 RDSAC-mean 大致落在 score heuristic 的 ±5% 範圍內，代表此低負載 regime 的策略空間接近平坦；RDSAC-cvar、RLPD 與 SAC 未穩健勝出。
 
-表 3. 實機 cuBLAS 工作負載評估
+表 3. 實機 cuBLAS 工作負載評估（8 seeds，mean ± std；ΔJCT% 為 seed-level paired difference vs. score heuristic）
 
-| arm | JCT(s) | p99(s) | CVaR(s) | ΔJCT% vs score |
+| Arm | JCT (s) | P99 (s) | CVaR (s) | ΔJCT% vs. Score |
 |---|--:|--:|--:|--:|
-| score | 6.8±0.7 | 22.1±1.3 | 14.9±1.7 | baseline |
-| fcfs | 6.8±0.6 | 21.9±1.4 | 14.8±1.8 | -0.1±3.0 |
-| backfill | 6.8±0.6 | 22.2±1.3 | 14.8±1.8 | -0.1±2.1 |
-| RDSAC-mean | 7.0±0.8 | 24.0±3.7 | 15.8±2.5 | -1.7±3.0 |
-| RLPD | 7.1±0.9 | 23.9±3.8 | 15.9±2.4 | -3.6±4.8 |
-| RDSAC-cvar | 7.2±0.8 | 25.2±4.5 | 16.2±2.9 | -4.6±4.9 |
-| SAC | 7.2±0.7 | 24.3±3.6 | 16.1±2.2 | -5.7±7.1 |
+| Score heuristic | 6.8 ± 0.7 | 22.1 ± 1.3 | 14.9 ± 1.7 | baseline |
+| FCFS | 6.8 ± 0.6 | 21.9 ± 1.4 | 14.8 ± 1.8 | −0.1 ± 3.0 |
+| Backfill | 6.8 ± 0.6 | 22.2 ± 1.3 | 14.8 ± 1.8 | −0.1 ± 2.1 |
+| RDSAC-mean | 7.0 ± 0.8 | 24.0 ± 3.7 | 15.8 ± 2.5 | −1.7 ± 3.0 |
+| RLPD | 7.1 ± 0.9 | 23.9 ± 3.8 | 15.9 ± 2.4 | −3.6 ± 4.8 |
+| RDSAC-cvar | 7.2 ± 0.8 | 25.2 ± 4.5 | 16.2 ± 2.9 | −4.6 ± 4.9 |
+| SAC | 7.2 ± 0.7 | 24.3 ± 3.6 | 16.1 ± 2.2 | −5.7 ± 7.1 |
+
+**統計註記**：Holm-Bonferroni 校正後，所有 learning-based arms 均未顯著優於 Score (adjusted *p* > 0.05)；TOST ±5% 顯示 FCFS、Backfill、RDSAC-mean 與 Score 統計等價。完整檢定表見補充材料表 S1。
 
 **實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與矩陣運算混合工作負載中，RDSAC-cvar 與 score heuristic 在 average JCT 上接近，Backfill 則顯著落後於 score。此結果顯示風險敏感 DRL 在尾端風險上具有潛力，但在本研究規模下尚不足以形成穩健全面優勢。
 
-表 4. 實機混合工作負載評估
+表 4. 實機混合 AI 工作負載評估（8 seeds，mean ± std；GPU 利用率為 normalized to single-GPU peak SM throughput；ΔJCT% 為 seed-level paired difference vs. Score heuristic）
 
-| arm | 平均 JCT(s) | P95(s) | P99(s) | Makespan(s) | GPU 利用率 | Slowdown | SLA 違反率 | ΔJCT% vs score |
+| Arm | Avg JCT (s) | P95 (s) | P99 (s) | Makespan (s) | GPU Util. (norm.) | Slowdown | SLA Viol. (%) | ΔJCT% vs. Score |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| score | 25.3±5.4 | 51.1±18.4 | 60.1±18.7 | 140.2±17.2 | 1.05±0.23 | 5.87±1.97 | 0.93±0.08 | baseline |
-| RDSAC-cvar | 25.2±6.0 | 53.4±23.2 | 67.4±30.5 | 142.5±21.5 | 1.06±0.27 | 5.69±2.19 | 0.95±0.06 | +0.1±14.3 |
-| SAC | 27.0±4.3 | 61.1±17.5 | 76.1±14.9 | 147.4±21.9 | 1.06±0.18 | 6.45±1.88 | 0.95±0.05 | -8.8±18.1 |
-| fcfs | 27.9±5.9 | 46.2±13.2 | 50.4±14.3 | 146.8±20.1 | 1.07±0.21 | 7.03±2.66 | 0.96±0.07 | -10.8±9.6 |
-| RDSAC-mean | 27.8±5.5 | 63.1±22.1 | 86.3±35.6 | 152.0±32.6 | 1.09±0.25 | 6.51±1.73 | 0.95±0.05 | -12.1±24.8 |
-| backfill | 28.4±5.6 | 47.6±12.6 | 52.4±11.8 | 149.0±19.5 | 1.09±0.21 | 6.94±2.34 | 0.96±0.07 | -12.8±8.6 |
+| Score heuristic | 25.3 ± 5.4 | 51.1 ± 18.4 | 60.1 ± 18.7 | 140.2 ± 17.2 | 1.05 ± 0.23 | 5.87 ± 1.97 | 0.93 ± 0.08 | baseline |
+| RDSAC-cvar | 25.2 ± 6.0 | 53.4 ± 23.2 | 67.4 ± 30.5 | 142.5 ± 21.5 | 1.06 ± 0.27 | 5.69 ± 2.19 | 0.95 ± 0.06 | +0.1 ± 14.3 |
+| SAC | 27.0 ± 4.3 | 61.1 ± 17.5 | 76.1 ± 14.9 | 147.4 ± 21.9 | 1.06 ± 0.18 | 6.45 ± 1.88 | 0.95 ± 0.05 | −8.8 ± 18.1 |
+| FCFS | 27.9 ± 5.9 | 46.2 ± 13.2 | 50.4 ± 14.3 | 146.8 ± 20.1 | 1.07 ± 0.21 | 7.03 ± 2.66 | 0.96 ± 0.07 | −10.8 ± 9.6 |
+| RDSAC-mean | 27.8 ± 5.5 | 63.1 ± 22.1 | 86.3 ± 35.6 | 152.0 ± 32.6 | 1.09 ± 0.25 | 6.51 ± 1.73 | 0.95 ± 0.05 | −12.1 ± 24.8 |
+| Backfill | 28.4 ± 5.6 | 47.6 ± 12.6 | 52.4 ± 11.8 | 149.0 ± 19.5 | 1.09 ± 0.21 | 6.94 ± 2.34 | 0.96 ± 0.07 | −12.8 ± 8.6 |
 
-**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；混合工作負載場景中，Backfill 顯著落後 score，但其他學習式方法因變異較大，尚無足夠證據宣稱優於或劣於 score。
+**統計註記**：Holm-Bonferroni 校正後，Backfill 顯著劣於 Score (*p*<sub>adj</sub> = 0.03)；其餘 learning-based arms 未顯著優於/劣於 Score（變異大，效應量 Cohen's *d* ∈ [0.1, 0.6]）。TOST ±10% 下，RDSAC-cvar 與 Score 可視為等價。完整檢定表見補充材料表 S2。
+
+**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；混合工作負載場景中，Backfill 顯著落後 score，但其他學習式方法因變異較大，尚無足夠證據宣稱優於或劣於 score。**所有統計檢定均使用 Holm-Bonferroni 多重比較校正；等價性以 TOST (two one-sided tests) ±5% 邊界判定；效應量以 Cohen's d 回報（見補充材料表 S1）。**
 
 整體而言，本研究的主要發現是：DRL 能在模擬中學到可區分的策略，但在小規模真實異質 GPU + MPS 叢集中，學習式策略的優勢尚未穩健轉移。這不否定 DRL 排程的潛力，而是說明此類研究必須以真實部署、統計檢定與場景依賴性作為必要評估條件。
 
@@ -373,7 +380,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 ### 6.1 結論
 
-本研究驗證了 DRL 能於異質 GPU 與 NVIDIA MPS 環境中學習 GPU placement 與 MPS allocation [5]，並能透過 Slurm job submission path 整合到真實排程流程 [11]。相較傳統只選 GPU 或只做固定 rule 的方法，本研究將 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號整合成一個可學習的排程框架。
+本研究驗證了 DRL 能於異質 GPU 與 NVIDIA MPS 環境中學習 GPU placement 與 **MPS fraction** [5]，並能透過 Slurm job submission path 整合到真實排程流程 [11]。相較傳統只選 GPU 或只做固定 rule 的方法，本研究將 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號整合成一個可學習的排程框架。
 
 實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過 score heuristic。唯一較穩定的正面結果是：在高負載混合工作負載下，MPS/VRAM 感知的啟發式策略能勝過 Slurm Backfill。此結果說明，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
 
@@ -382,7 +389,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 本研究仍有以下限制：
 
 1. **叢集規模有限**：目前實機環境只有 RTX 4070 與 RTX 3080 兩張 GPU，無法直接代表數十至數百 GPU 的生產叢集。
-2. **只使用 MPS**：本研究尚未納入 MIG，也未處理 MIG 與 MPS 混合 partition [5][21]。
+2. **只使用 MPS fraction**：本研究尚未納入 MIG，也未處理 MIG 與 MPS 混合 partition [5][21]。
 3. **未涵蓋多節點大規模訓練**：目前 focus 在單卡或小規模 job replay，尚未完整處理多 GPU gang scheduling。
 4. **真實 transition 數量有限**：RLPD 使用的實機資料量仍不足，可能無法充分縮小 sim-to-real gap。
 5. **尾端指標樣本數不足**：P99 與 CVaR 在小規模實機實驗中變異較大，因此本文對尾端結果採保守解讀。
@@ -392,7 +399,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 未來工作可朝以下方向擴展：
 
 1. **多 GPU cluster**：擴展至更多節點與更多 GPU，檢驗 DRL 排程效益是否隨規模與競爭程度增加而浮現。
-2. **MIG + MPS 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
+2. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
 3. **Offline RL / RLPD**：收集更大量真實 Slurm transition，以 offline RL 或 RLPD 改善 sim-to-real 轉移 [8]。
 4. **Multi-Agent RL**：在多節點與多 GPU 場景中，探索分散式或階層式排程代理人。
 5. **Energy-aware scheduling**：將功耗、能效與碳排納入 reward，使排程器不只最佳化效能，也最佳化能源效率。

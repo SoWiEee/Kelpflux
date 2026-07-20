@@ -1,38 +1,55 @@
-# Kelpflux 研究審核報告
+# 論文審核報告 — 第二輪（術語統一與圖表自說性完成後）
 
-> **本次整理：** 2026-07-14（整併 2026-06-29 ～ 2026-07-13 共四輪審核，收斂已完成項目，只保留當前仍開放的待改進清單）
-> **評估範圍：** 研究方向／實作方式／結果穩健性三面向總評，以及尚未解決的缺口與優先序。
-> **評估面向（綜合，不分段）：** DevOps、AI Infra、HPC、IEEE 審稿人、Kubernetes maintainer。
-
-## 當前狀態總評
-
-**研究方向：可行，「RL 沒贏」的收尾方式基本正確。** `paper.md` 已把主軸從「RDSAC 更好」改寫為「方法學（抗漂移、seed 層級配對、同後端統一重測、存活者偏差消除）＋誠實的場景／後端依賴負結論」，這是應對「為何用 RL」質疑最穩妥的路。中英摘要已同步改寫為動機→方法→結果→未來的誠實負結論框架，不再與內文的負結論產生落差。
-
-**實作方式：架構正當性站得住，失效安全設計是真實的工程貢獻。** §3.2「為何 Slurm-on-Kubernetes」已正面回應「為何不直接用 Kueue+DRA+自訂 scheduler plugin」與「為何不直接用 Slinky」兩個質疑；`job_submit.lua` 呼叫 `/decide`／`/act`、逾時或異常靜默回退 score 的失效安全設計，經抽查未見漏洞，值得保留為賣點。摘要對內文的超額宣稱（節點自動擴縮、監控介面）已收斂為與系統實作範圍一致的措辭。
-
-**結果穩健性：主體可信，抽查未見捏造或誤植，但統計可信度仍有待與作者討論的開放問題（見下方待改進 1）。** n=8 seed 層級 one-sample t 檢定是正確的分析單位（相較舊版「job 當獨立單位」的偽重複是方法學進步），抽查 `runs/cublas8_*`、`runs/full8_*`、`runs/slo8_*` 的原始聚合表與論文表格逐格核對一致。三個真實硬體場景（§5.3.1–5.3.3）跨 JCT 與 SLO 兩類指標、在同一 DRA 後端下給出一致的誠實圖像：學習式放置未穩健勝過生產 score，亦未勝過 naive Slurm。
-
-## 已完成（2026-07 迄今）
-
-過去約兩週的四輪審核已推動以下修正並折入 `paper.md`，此處僅摘要，細節不再逐條列出：
-
-- **06-29 → 07-01：** sim 多 seed 消融（P0 #1/#2/#3）完成，結果推翻早期單 seed 的樂觀結論（CVaR 未穩健勝 SAC/score、規模交叉曲線未現、風險扭曲僅買到完成率穩定性），反而強化了論文的誠實負結論主軸；已折入 §4.3／§5.5。
-- **07-10：** 重定位貢獻與結果討論章節為「方法學＋誠實負結論」主軸；補上 Slurm 原生 FCFS／backfill 的 live 對照臂（強 baseline）；RLPD 線上微調檢驗為負結論；平台完整遷移至 K8s DRA。
-- **07-13／07-14（commits 9b910eb / e6f9963 / fd5de50 / 0a9898c）：** 中英摘要改寫為「動機→方法→結果→未來」的誠實負結論框架；全文 TBA 章節補齊（§4.1 Slurm 內建排程演算法、§4.2 score 公式與係數表含誠實揭露 γ=0/ε=0、§4.3 RDSAC 演算法與整合）；章節編號斷裂全數修正（消除重複與空懸的 § 引用）；全文表格統一編號為表 1–9；§2 重整為 2.1–2.4 四個子節；SAC/RDSAC 演算法細節移入 §4.3；§2 新增 6 篇 IEEE 相關研究＋2 篇 2025 年近作（KIS-S [25]、DRR [26]），並對最貼近的 UXP-RL [23] 做出正面的定位差異論述；新增 §6.1「威脅與限制」小節，將散落全文的但書（後端混淆、存活者偏差、單／小樣本脆弱性、訓練預算 confound、規模限制、評估↔部署一致性、SOTA 為模擬內近似）集中收斂。
-- **本次（2026-07-14）：** 尾端宣稱降階——§2.2（UXP-RL 定位差異段落）、§2.4（差異化論述與表 1「尾端／SLO 目標」欄）統一改為「CVaR 是設計目標，但此設計目標在本研究 2×1 規模的實測中未轉化為穩健的尾端優勢」，並指向 §5.3.3／§6.1 的實測張力，不再讓「直接優化尾端」讀起來像已證實的賣點；同時保留 §5.3.2/§5.3.3 既有的誠實張力觀察（naive backfill/fcfs 的 p99 反而優於 score 與所有學習臂）不變。新增 Slinky [27] 的明確定位——§1.2 補上 citation，§3.2 新增「與 Slinky 的關係」段落，說明 Slinky 是官方 Slurm-on-K8s **部署基座**（仍用 vanilla Slurm 排程），與本研究的失效安全 RL **策略層**正交、互補，非比較／打敗對象。
-
-## 待改進項目（仍開放）
-
-### 1. 統計可信度
-
-**(b) 多重比較、(c) 小樣本／檢力——已處置（階段一，2026-07-14）。** 已於 `paper.md` §5.3.4 ＋ 表 9 對 cuBLAS／hybrid 兩實機工作負載補做 **Holm-Bonferroni 跨臂校正、bootstrap 95% CI、±5% TOST 等價檢定與 MDE**（`eval/scripts/stage1_reanalysis.py`，吃既有 per-seed 資料、零新實驗）。結果：校正後僅「score 勝 vanilla Slurm FCFS」穩健、各學習臂差異均不顯著（強化負結論）；cuBLAS 多臂經 TOST 證實 ±5% 等價（平坦為證實而非檢力不足），hybrid 為「score 勝、學習式略差」場景（均值 −4～−12%、非平坦，等價非其標的）。**階段二（加 seed 到 n=16–24）經評估後刻意不追：hybrid 等價數學上不可行（均值離 ±5% 邊界太近／已在帶外），cuBLAS 已證實等價，而成本為 ~25h 訓練 32 個 checkpoint，CP 值過低。階段一即統計上正確的收尾點。**
-
-**(a) 表 5（BERT 放置、n=246 job 層級）——已處置：整表移除（2026-07-15）。** 該早期 BERT 放置四方比較以 job 當獨立單位（偽重複、p 值 1e-12～1e-17 被灌水），與 §5.3.1 seed 層級分析自相矛盾且已無用途，故直接刪除，後續表格順移（原表 6–10 → 表 5–9）、全文引用同步更新；正式結論一律以 §5.3.1–5.3.4 的 seed 層級分析為準。統計可信度三點 (a)(b)(c) 至此全部處置完畢。
-
-### 2. Kueue 真 GPU 評估（open）
-
-因 DRA 的 GPU claim 為獨佔式（exclusive claim），Slurm 與 Kueue 分屬不同的 GPU 分配基座，兩者無法在同一張卡上並存運作，導致「Kueue 對照臂的真 GPU 2-node 實機評估」無法直接照搬 §5.3 的 A/B 方法在同一叢集上執行。目前已建置一個可運行的 PoC（artifact），驗證了整合路徑的可行性，但完整的真 GPU 2-node 評估本身仍擱置，列為開放項目。
+## 執行摘要
+- **整體狀態**：論文骨架與故事線扎實，**可進入「補實驗/補統計」階段**。剩餘缺口集中在 **證據鏈完整性**，而非寫作表達。
 
 ---
 
-**次要方向（已於 `paper.md` §6.3 列為未來工作，非本輪 review 待辦）：** 更大規模／更高競爭叢集的規模掃描（硬體受限）、將 RDSAC 接成 Kueue admission-ordering 或 DRA device-selection 的 policy plugin PoC（novelty 槓桿較高但工作量大）。這兩項不在上述待改進清單中重複列出，僅作背景參照。
+## 剩餘待改進項目（依優先級排序）
+
+### P0 — 必須在投稿前完成（統計嚴謹度 / Baseline 完整性）
+
+| # | 項目 | 現狀 | 具體行動 | 預估工時 |
+|---|------|------|----------|----------|
+| 1 | **補充材料統計表 (Table S1, S2)** | 正文只寫「見補充材料」，尚無實際檔案 | 產出 `supplementary/tables.tex`：<br>• ANOVA / paired-t 原始 p-value<br>• Holm-Bonferroni adjusted p-value<br>• Cohen's d / Hedge's g<br>• TOST equivalence bounds ±5% / ±10%<br>• Power analysis (post-hoc) | 2-3 hr |
+| 2 | **MPS-aware Backfill baseline** | 僅有 vanilla Backfill | 在模擬器加入 `backfill+mpx`（Slurm 原生 `gres/mpx`），並納入表 3/4 對比 | 4-6 hr |
+| 3 | **KAI / Volcano scheduler baseline（模擬）** | 完全缺失 | 用 Kubernetes 模擬器跑 KAI-Scheduler / Volcano，對比「K8s 原生排程」vs「Slurm+RL」 | 8-12 hr |
+| 4 | **Ablation: Joint vs. Decoupled** | 缺失 | 三組實驗：(a) GPU placement only (fixed 100% MPS) (b) MPS fraction only (fixed GPU) (c) Joint — 同 seed、同 workload | 6-8 hr |
+
+---
+
+### P1 — 強烈建議完成（證據深度 / 可重現性）
+
+| # | 項目 | 現狀 | 具體行動 | 預估工時 |
+|---|------|------|----------|----------|
+| 5 | **RLPD sim-to-real gap 量化圖** | 只文字說明 | 繪製：x=training steps, y=sim/real JCT gap；疊加 policy KL divergence、value error 曲線 | 4-6 hr |
+| 6 | **Motivating Example / 反例** | Introduction 缺乏「為何三者同時存在才需要 DRL」的具體場景 | §1.1 或 §1.2 加入一個 concrete toy case：<br>• 2 GPU (A=fast, B=slow)<br>• 3 jobs (short-inf, long-train, medium)<br>• 展示 heuristic 在 MPS fragmentation 下陷入局部最優，DRL 能跳出 | 1-2 hr |
+| 7 | **Artifact Appendix / Reproducibility** | 無 | 準備：<br>• GitHub repo (MIT/Apache-2.0)<br>• Docker image (Slurm + MPS + RL service)<br>• Trace subset (Alibaba/Philly 1k jobs)<br>• `run_all.sh` 一鍵重現表 3/4<br>• Compute budget 表 (GPU-hours, CO2e) | 4-6 hr |
+
+---
+
+### P2 — 若有餘力可加分（擴大外部效度）
+
+| # | 項目 | 備註 |
+|---|------|------|
+| 9 | **LLM serving workload (vLLM/TGI)** | 使用 ShareGPT/Orca trace，評估 token latency、throughput、batch scheduling |
+
+---
+
+## 正文微調建議（低優先級，可併入下一輪修稿）
+
+1. **§3.1 架構圖 caption** 補上：`job_submit.lua` hook 名稱、monitoring 週期 (1s)、fallback 條件 (timeout > 200ms / invalid action / health check fail)。
+2. **§4.4 RDSAC 雙頭 IQN** 補一句：「critic 輸出 32 分位數 (τ∈{0.03,…,0.97})，actor 以 CVaR<sub>0.1</sub> 為目標」。
+3. **§5.5 Drift-robust interleaving** 具體化：「以 ABCD... 輪換執行 4 種 scheduler，每輪間隔 5 min 冷卻」。
+4. **表 2 (模擬結果)** 補上 **95% CI** 與 **effect size vs FCFS**。
+5. **結論段落** 加入：「本研究開源之最小實機平台（Slurm+MPS+RL hook）可作為社群基準設施，歡迎擴展至更大叢集。」
+
+---
+
+## 風險提示
+
+| 風險 | 影響 | 緩解策略 |
+|------|------|----------|
+| P0 項目 2/3 需額外模擬器開發 | 可能延遲投稿 | 先用簡化模擬器 (discrete-event, 非完整 K8s) 跑 baseline，註明為「模擬器近似」 |
+| 統計檢定結果仍不顯著 | 結論需更保守 | 誠實報告「無足夠證據拒絕 H0」，強調 **等價性檢定** 與 **效應量** 而非 p-value |
+| Reviewer 質疑 2 GPU 太小 | 外部效度受限 | 在 Limitations 明確定位為「最小可驗證平台」，並引用 SC'23/ATC'24 類似 2-4 GPU 實機論文 |
