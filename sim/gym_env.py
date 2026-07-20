@@ -328,9 +328,19 @@ class KubefluxSchedEnv:
         colocation_actions: bool = False,
         slo_penalty: float = 0.0,
         noop_penalty: float = 0.0,
+        # Joint-vs-decoupled ablation (None = joint, the default full action space):
+        #   "placement_only" — job selection is frozen to the score scheduler's top
+        #                       pick; the agent only chooses the placement.
+        #   "job_only"       — placement is frozen to first-fit (smallest legal GPU
+        #                       index); the agent only chooses which job to run.
+        # Applied purely by restricting action_mask(), so obs_dim / n_actions are
+        # identical across arms and one DSACAgent shape trains all three.
+        ablation_mode: Optional[str] = None,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
+        if ablation_mode not in (None, "placement_only", "job_only"):
+            raise ValueError(f"ablation_mode={ablation_mode!r}")
         if reward_mode not in ("jct_aligned", "shaped", "uxprl", "mo"):
             raise ValueError(f"reward_mode={reward_mode!r}")
 
@@ -377,6 +387,7 @@ class KubefluxSchedEnv:
         self.interference           = float(interference)
         # ── Co-location action mode (opt-in; 1 mode = legacy action space) ──
         self.colocation_actions     = bool(colocation_actions)
+        self.ablation_mode          = ablation_mode
         self._n_modes               = 2 if colocation_actions else 1
         # SLO-aware reward (opt-in; 0 = legacy). On an aiserve job's completion a
         # latency-class job (slo_s>0) that finished past its deadline incurs a
@@ -547,7 +558,63 @@ class KubefluxSchedEnv:
                             continue
                         mask[self._encode(i, placement, mode)] = True
         mask[self._no_op] = True
+        if self.ablation_mode is not None:
+            mask = self._restrict_mask_for_ablation(mask, top)
         return mask
+
+    def _restrict_mask_for_ablation(
+        self, mask: np.ndarray, top: List[Job]
+    ) -> np.ndarray:
+        """Collapse the legal mask onto a single decision axis for the ablation.
+
+        ``placement_only`` keeps only the score scheduler's top job (agent varies
+        placement); ``job_only`` keeps each job's first-fit placement only (agent
+        varies which job). The no-op stays legal in both. Returns a new mask.
+        """
+        legal = [a for a in np.flatnonzero(mask) if a != self._no_op]
+        if not legal:
+            return mask  # only no-op available; nothing to restrict
+
+        if self.ablation_mode == "job_only":
+            # np.flatnonzero yields ascending action indices, and _encode is
+            # monotonic in (job_i, placement, mode), so the first legal action for
+            # each job is its first-fit (smallest placement, PACK) — keep just it.
+            kept: dict[int, int] = {}
+            for a in legal:
+                job_i = self._decode(a)[0]
+                if job_i not in kept:
+                    kept[job_i] = a
+            new = np.zeros_like(mask)
+            for a in kept.values():
+                new[a] = True
+            new[self._no_op] = True
+            return new
+
+        # placement_only: freeze job to the score scheduler's top legal pick.
+        head = self._ablation_head_index(top, legal)
+        new = np.zeros_like(mask)
+        for a in legal:
+            if self._decode(a)[0] == head:
+                new[a] = True
+        new[self._no_op] = True
+        return new
+
+    def _ablation_head_index(self, top: List[Job], legal: List[int]) -> int:
+        """Index (into ``top``) of the score scheduler's top job that still has a
+        legal action; falls back to the first job with any legal action."""
+        st = self._state
+        assert st is not None
+        if self._score_sched is None:
+            from .scheduler.score import ScoreScheduler
+            self._score_sched = ScoreScheduler()
+        legal_jobs = {self._decode(a)[0] for a in legal}
+        ordered = self._score_sched.order(st.pending, st.cluster, now=st.now)
+        top_ids = [j.job_id for j in top]
+        for job in ordered:
+            idx = top_ids.index(job.job_id) if job.job_id in top_ids else None
+            if idx is not None and idx in legal_jobs:
+                return idx
+        return self._decode(legal[0])[0]
 
     def score_warmup_action(self, mask: np.ndarray, rng: np.random.Generator) -> int:
         """Score-heuristic action for warmup seeding.

@@ -236,6 +236,8 @@ def sim_train(
     interference: float = 0.0,
     # Co-location action mode (B; opt-in, doubles the action space)
     colocation: bool = False,
+    # Joint-vs-decoupled ablation: None | "placement_only" | "job_only"
+    ablation_mode: Optional[str] = None,
     # SLO-aware reward (aiserve workload; 0 = off): lateness penalty on inference
     slo_penalty: float = 0.0,
     # Anti-idle (0 = off): penalty for NO_OP at a decision point where a job could
@@ -287,6 +289,7 @@ def sim_train(
         colocation_actions=colocation,
         slo_penalty=slo_penalty,
         noop_penalty=noop_penalty,
+        ablation_mode=ablation_mode,
     )
     if num_envs > 1 and node_speeds:
         raise NotImplementedError("--node-speeds not wired into the vec path; use --num-envs 1")
