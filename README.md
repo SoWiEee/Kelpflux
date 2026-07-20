@@ -189,8 +189,6 @@ PYTHONPATH=. python -m services.rl_scheduler.placement_controller \
 
 LAN IP 不一樣時用 `VALUES_FILE=<your-values.yaml>` 或 Helm values 檔調整 `storage.nfsServer`。GPU Operator 使用 `driver.enabled=false` 與 `toolkit.enabled=false`，因為 host 已經由 `setup-linux-gpu.sh` 裝好驅動與 NVIDIA Container Toolkit。
 
-目前 live scheduler 主線是 **DSAC**。舊的 PPO / SB3 smoke 與 paired-eval 工具已移除，避免和目前的 SAC/DSAC 主線混淆。
-
 > 注意：目前 `slurm-rl-scheduler:m11` 映像會載入 `runs/eval_mlp_20260514-210824/train/dsac.pt`。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新執行 `bash scripts/deploy-2.sh`。
 
 **選用功能**（在 `chart/values-k3s.yaml` 開啟）：
@@ -233,8 +231,7 @@ SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 ### 5.1 模擬訓練（目前拓樸 = 2×1，obs_dim=166 / n_actions=33，預設 RDSAC）
 
 ```bash
-# 目前生產拓樸：2 nodes × 1 GPU。預設 PER + potential shaping + IQN/RDSAC critic。
-# P1/P2 改進（§3.6）：--balance-coef 反過度集中、--normalize-reward 穩定溫度。
+# 改進選項：--balance-coef 反過度集中、--normalize-reward 穩定溫度。
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --n-nodes 2 --gpus-per-node 1 \
     --trace philly ali \
@@ -244,7 +241,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --risk-mode cvar \
     --out-dir runs/dsac_2x1_$(date +%Y%m%d)
 
-# vanilla SAC（scalar twin-Q）：加 --no-iqn；風險中立 RDSAC：--risk-mode mean
+# vanilla SAC：加 --no-iqn；風險中立 RDSAC：--risk-mode mean
 ```
 
 ### 5.2 實機微調（RLPD，忠於 Ball et al. 2023）
@@ -252,14 +249,14 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 以 shadow-safe 的 `live_daemon` 旁觀收集真實 transition（記錄 Slurm 實際落點 + 實現 JCT，不干擾生產），再做 RLPD 微調（對稱 50/50 offline/online、LayerNorm 集成 critic、fixed-α 避免離散 SAC 溫度發散）。
 
 ```bash
-# 1) 旁觀收集真實 transition（off-cluster 時用 SLURM_EXEC_PREFIX 包 squeue）
+# 1) 旁觀收集真實 transition
 SLURM_EXEC_PREFIX="kubectl exec -n slurm slurm-controller-0 -- " \
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.live_daemon \
     --policy-dir /tmp/lckpts \
     --node-name slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0 \
     --gpus-per-node 1 --mps-per-gpu 100 --poll-interval 2 --log-dir shadow_logs
 
-# 2) RLPD 微調（從 sim 母體 checkpoint 起，混入真實 transition JSONL）
+# 2) RLPD 微調
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
     --base-policy /tmp/lckpts/rdsac_cvar_s45.pt \
     --online-log 'shadow_logs/transitions_*.jsonl' \
@@ -268,35 +265,9 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
     --out-dir runs/rlpd_$(date +%Y%m%d-%H%M%S)
 ```
 
-### 5.3 實機 live A/B 評估（統一全方法 + Slurm 原生 baseline，§4.2.4）
+### 5.3 混合工作負載實機評估
 
-在 DRA MPS + hybrid Qwen serving workload（oversub 2.0）下，於**同一天同一後端**統一比較 **score / SAC / RDSAC-mean / RDSAC-cvar / CrossQ / RLPD** 與 **Slurm 原生 FCFS / backfill**，跨 8 workload seed，輸出 ΔJCT%／Δp99%／ΔCVaR% 與 seed 層級配對 t 檢定。
-
-前置：本地 serve（`:8003`，policy-dir 為含 per-train-seed checkpoint（`sac_s*`／`rdsac_*_s*`／`crossq_s*`）與 `rlpd_v3.pt` 的目錄，如 `/tmp/lckpts`）。
-
-```bash
-# 統一全方法（含 Slurm baseline；自動 reconfig slurmctld 並在結束以 trap 還原）
-SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
-    bash eval/scripts/run_full8_slurm_baselines.sh
-# → runs/full8_<stamp>_TABLES.md（表 4-4）
-
-# 底層單次 A/B（只給哪個 --*-ckpt 就跑哪臂 + score；不給 ckpt 則只跑 score baseline）
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.run_heavytail_ab \
-    --serve-url http://localhost:8003 --login-pod slurm-login-<hash> \
-    --namespace slurm --controller-pod slurm-controller-0 \
-    --sac-ckpt /tmp/lckpts/sac_s42.pt --rdsac-mean-ckpt /tmp/lckpts/rdsac_mean_s42.pt \
-    --rdsac-cvar-ckpt /tmp/lckpts/rdsac_cvar_s42.pt --crossq-ckpt /tmp/lckpts/crossq_s42.pt \
-    --rlpd-ckpt /tmp/lckpts/rlpd_v3.pt \
-    --family philly --n-jobs 30 --seed 42 --sigmas 1.0 --rounds 3 --warmup 1 --interleave \
-    --hybrid-workload --llm-model /shared/models/qwen05b --placement \
-    --gpu-nodes slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0 \
-    --arrival-mode poisson --mps-oversub 2.0 --target-max-s 20 --mps-buckets 25,50,75,100 \
-    --partition gpu --out-dir runs/ab_$(date +%Y%m%d-%H%M%S)
-```
-
-### 5.4 aimix 多目標六臂實機評估（多目標獎勵，論文 §5.3.2 表 6）
-
-在 DRA MPS + **aimix 混合真實工作負載**（30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算）下，以**多目標獎勵**（−JCT + GPU 利用率）重訓的 **score / SAC / RDSAC-mean / RDSAC-cvar** 對照 **Slurm 原生 fcfs / backfill**，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。異質叢集速度矩陣（3080 ≈ 1.1× 4070）與 host-RAM OOM 閘皆封裝於 wrapper。
+由 30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算 組成**混合真實工作負載**，以**多目標獎勵**（−JCT + GPU 利用率）重新訓練，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。
 
 ```bash
 # ── Step 1：多目標重訓 3 臂 × 8 seed → /tmp/lckpts_aimix/ ──
@@ -306,12 +277,12 @@ DEVICE=cuda STEPS=70000 MAX=6 SEEDS="42 43 44 45 46 47 48 49" \
 # → /tmp/lckpts_aimix/{sac,rdsac_mean,rdsac_cvar}_s{42..49}.pt（24 個 checkpoint）
 
 # ── Step 2：六臂實機評估（自動換 learned/fcfs/backfill 三套 slurm.conf，結束以 trap 還原）──
-# 需 4070+3080 皆在叢集；gpu-toggle release 後須先 restore 並確認 MPS 恢復（§4.2）。
+# 需 4070+3080 皆在叢集；gpu-toggle release 後須先 restore 並確認 MPS 恢復。
 SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
     bash eval/scripts/run_aimix6.sh
 # → runs/aimix6_<stamp>_TABLES.md（論文表 6：7 指標 × 6 臂 + Holm）
 
-# ── Step 3：統計穩健性複核（Holm / bootstrap 95% CI / TOST 等價 / n=8 MDE，論文表 8）──
+# ── Step 3：統計穩健性複核（Holm / bootstrap 95% CI / TOST 等價 / n=8 MDE）──
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/stage1_reanalysis.py \
     --hybrid aimix6 --out runs/aimix6_reanalysis.json
 ```
