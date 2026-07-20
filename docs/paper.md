@@ -1,6 +1,6 @@
-# 基於 Slurm 之異質 GPU 與 NVIDIA MPS 智慧排程技術研究
+# 基於 Slurm 與 Kubernetes 架構下 AI 伺服器 GPU 工作負載智慧排程技術之研究
 
-### Intelligent Scheduling for Heterogeneous GPUs with NVIDIA MPS on Slurm
+### Intelligent GPU Workload Scheduling Techniques for AI Servers under a Slurm-on-Kubernetes Architecture
 
 **作者一¹、作者二²**
 ¹○○大學 ○○系　²○○大學 ○○系
