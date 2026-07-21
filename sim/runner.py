@@ -37,11 +37,12 @@ def run(
     *,
     n_nodes: int,
     gpus_per_node: int,
-    scheduler_name: str,
+    scheduler_name: str = "",
     mps_per_gpu: int = MPS_PER_GPU,
     dispatch_latency_seconds: float = 0.0,
     latency_model: LatencyModel | None = None,
     scheduler_kwargs=None,
+    scheduler_obj=None,
 ) -> Tuple[MetricCollector, Cluster]:
     """Run the trace through the simulator.
 
@@ -52,7 +53,11 @@ def run(
     hold-release placement latency.
     """
     cluster = Cluster(n_nodes=n_nodes, gpus_per_node=gpus_per_node, mps_per_gpu=mps_per_gpu)
-    scheduler = make_scheduler(scheduler_name, **(scheduler_kwargs or {}))
+    # scheduler_obj lets callers inject a pre-built scheduler instance (e.g. a
+    # per-instance fixed-priority plan for the headroom search) without going
+    # through the name registry.
+    scheduler = scheduler_obj if scheduler_obj is not None else \
+        make_scheduler(scheduler_name, **(scheduler_kwargs or {}))
     metrics = MetricCollector()
     latency = latency_model or LatencyModel.none(dispatch_latency_seconds)
 
