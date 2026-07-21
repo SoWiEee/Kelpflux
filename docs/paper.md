@@ -376,6 +376,31 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 整體而言，本研究的主要發現是：DRL 能在模擬中學到可區分的策略，但在小規模真實異質 GPU + MPS 叢集中，學習式策略的優勢尚未穩健轉移。這不否定 DRL 排程的潛力，而是說明此類研究必須以真實部署、統計檢定與場景依賴性作為必要評估條件。
 
+### 5.7 Ceiling Analysis
+
+前述結果顯示，RDSAC 與 SAC 在本研究測試的實機負載下皆未穩健勝過 score heuristic。這個負向結果究竟是特定 RL 方法的局限，還是測試 regime 本身就沒有太多空間可贏？為了把這兩種可能性分開，本節在模擬器中進行一項獨立於任何學習式方法的天花板分析（ceiling / headroom analysis）：在 2×1 叢集上，若 GPU/MPS placement 固定為 cluster allocator 的既定政策（對所有排程器一致），排程器唯一能控制的槓桿只剩下 dispatch **ordering**——一個 schedule 即為工作優先序的一個 permutation。本研究對 {philly, ali, burst} 三個 family、各 10 seeds，以 random-restart + swap local search（以 clairvoyant SJF 為種子）搜尋每個 instance 在所有 ordering 中可達到的最佳平均 JCT，並定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。此搜尋法在小型高競爭 instance 上與窮舉所有 permutation（work-conserving priority-list schedule 的精確最優解）100% 吻合，顯示其足以逼近真正上界。由於 score 本身是動態排程器，此上界理論上仍可能被超越；但實證上 clairvoyant SJF-static 的表現與 score 幾乎相同，故 static ordering 這個較窄的類別已足以作為一個緊致（tight）的可達上界。
+
+表 5 彙整不同負載（2-GPU 叢集上的 n_jobs）下的 headroom，結果顯示 headroom 並非固定值，而是隨負載單調上升。
+
+表 5. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
+
+| 負載 (n_jobs) | Headroom（mean ± 95% CI） | Max |
+|---|--:|--:|
+| 40 | +0.1% ± 0.1% | +1.5% |
+| 60 | +0.7% ± 0.5% | +5.8% |
+| 80 | +2.0% ± 1.1% | +9.7% |
+| 100 | +4.1% ± 2.3% | +25.2% |
+| 125 | +10.3% ± 5.3% | +73.9% |
+| 150 | +14.0% ± 4.6% | +53.8% |
+
+按 family pooled over loads：philly +6.9%、burst +6.5%、ali +2.2%。本研究前述所有實機與模擬比較所用的測試負載約為 n_jobs≈50，對應表 5 中 load 40–60 區間；該區間 headroom 僅 0.1–0.7%，即 score 在此負載下已幾乎位於可達到的排程上界。換言之，第 5.6 節的核心負向結果——學習式 placement 未能穩健勝過 score——在此測試負載下具有結構性成因，而非 RDSAC 或 SAC 這類特定方法失敗：在幾乎沒有 headroom 的情況下，不論固定規則或學習式排程都沒有明顯空間可贏。
+
+然而 headroom 並非在所有負載下都小。隨 n_jobs 增加至 125–150，headroom 快速擴大至 10.3% ± 5.3%（load 125）與 14.0% ± 4.6%（load 150），個別 instance 最高可達 +73.9% 與 +53.8%（表 5 Max 欄）。這代表本研究的負向結果具有 regime 依賴性：score 只在測試負載下逼近上界，一旦進入重度壅塞，ordering 仍存在顯著且尚未被開發的空間，也為未來工作定位出一個具體的目標負載區間。需特別注意，重負載下的 headroom 樣本數小、per-instance 變異度高（寬 95% CI，max 遠高於 mean），因此不宜過度推論其穩定性。
+
+這個高負載 headroom 是否只是 score 既有 SJF 權重（ε，即 f_runtime_short 項，預設 ε=0.30）調得不夠精準所致？本研究對 ε ∈ {0, 0.30, 0.50, 0.70, 1.0} 在高負載 instance 上進行 sweep，量測調整 ε 能回收多少 headroom：load 100 下 headroom 為 +4.1%，最佳 ε 只回收 +1.3%（16%），且預設 ε=0.30 在 30 個 instance 中已有 12 個是最佳；load 125 同樣只回收 16%（9/30 以預設值最佳）；load 150 回收 27%（最佳 ε≈0.50，10/30 為最佳）。也就是說，單純線性調整 SJF 權重只能捕捉高負載 headroom 的 16–27%，其餘約 73–84% 超出線性 reweighting 所能觸及的範圍，顯示高負載下確實存在一個非平凡、但幅度有限且高變異的排程優化機會，並非僅靠調參即可窮盡。
+
+排程另一個可能的槓桿是 GPU/MPS placement 本身，而非 ordering。一項配套的 joint-vs-decoupled 消融實驗顯示，這個槓桿在本研究的叢集規模下也接近無效：無論是把 job 選擇凍結為 score 的排序（只學 placement）、或把 placement 凍結為 first-fit（只學排序），2×1 叢集上對平均 JCT 造成的改變都未達統計顯著。將本節的 ordering headroom 與此 placement 消融合併來看，兩者共同界定了 score 之上的總可贏空間：在本研究測試的負載下，ordering 貢獻了幾乎全部、但仍極小的可贏空間，而 placement 幾乎不貢獻。整體而言，本節分析把第 5.6 節的負向結果重新定位為結構性而非方法性，並將重度壅塞下的排程優化標記為未來工作的具體目標，而非本研究負向結果所能否證的假設。可重現性材料見 `runs/headroom_20260721-134003/`（headroom 結果與 `epsilon_sweep.json`），對應腳本為 `eval/scripts/headroom_analysis.py`、`eval/scripts/score_epsilon_sweep.py` 與 `sim/scheduler/fixed_priority.py`。
+
 ## 6. 結論與未來工作
 
 ### 6.1 結論
