@@ -74,6 +74,13 @@ class Cluster:
     # (all rtx4070, unbounded RAM) so existing callers/tests are unaffected.
     node_gpu_types: Optional[List[str]] = None
     node_ram_gb: Optional[List[float]] = None
+    # Host-RAM overcommit factor (opt-in). 1.0 (default) = the hard OOM gate: a
+    # placement whose nominal ram_req would exceed the node budget is refused
+    # (structural guard, unchanged). >1.0 loosens the gate so nominally-over-budget
+    # co-residency becomes *placeable* — the actual OOM then materialises
+    # stochastically at run time (see gym_env's realized-peak model), turning a
+    # hard constraint into a penalised tail event the policy must learn to avoid.
+    ram_overcommit: float = 1.0
     nodes: List[_Node] = field(init=False)
     active: dict = field(init=False)      # job_id -> List[Allocation]
     active_ram: dict = field(init=False)  # job_id -> ram_req (GB), for release
@@ -92,9 +99,14 @@ class Cluster:
         self.active_ram = {}
 
     def _ram_ok(self, node_i: int, ram_req: float) -> bool:
-        """True if node_i can host ram_req more GB without exceeding its budget."""
+        """True if node_i can host ram_req more GB within its (overcommit-scaled) budget.
+
+        With ``ram_overcommit == 1.0`` this is the exact hard gate. A larger factor
+        admits nominally-over-budget placements so the stochastic-OOM model can
+        decide their fate at run time instead of the allocator refusing outright.
+        """
         n = self.nodes[node_i]
-        return (n.used_ram_gb + ram_req) <= n.ram_gb + 1e-9
+        return (n.used_ram_gb + ram_req) <= n.ram_gb * self.ram_overcommit + 1e-9
 
     # ----- introspection -----
     def total_gpus(self) -> int:

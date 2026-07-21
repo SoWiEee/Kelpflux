@@ -325,6 +325,10 @@ class KubefluxSchedEnv:
         node_ram_gb: Optional[list] = None,     # per-node usable host RAM (GB)
         runtime_sigma: float = 0.0,
         interference: float = 0.0,
+        # ── Stochastic host-RAM OOM (opt-in; oom_penalty_s=0 → fully off) ──
+        oom_sigma: float = 0.0,
+        oom_penalty_s: float = 0.0,
+        ram_overcommit: float = 1.0,
         colocation_actions: bool = False,
         slo_penalty: float = 0.0,
         noop_penalty: float = 0.0,
@@ -385,6 +389,23 @@ class KubefluxSchedEnv:
         #                 run slower → placement quality + tail risk to manage.
         self.runtime_sigma          = float(runtime_sigma)
         self.interference           = float(interference)
+        # ── Stochastic host-RAM OOM (opt-in; oom_penalty_s == 0 → off) ──
+        # Models node-2's real failure mode: a job's *peak* host RSS is uncertain
+        # at placement time, so a nominally-fitting co-residency can still spike
+        # past the node budget and OOM → drain. Each running job draws a realized
+        # peak = ram_req · lognormal(oom_sigma) (mean-preserving, so nominal is the
+        # expectation and only the tail grows). When a placement makes a node's
+        # summed realized peaks exceed its RAM budget, the incoming job eats an
+        # oom_penalty_s recovery hit — a rare, catastrophic tail cost that a
+        # risk-aware (CVaR) policy can learn to avoid by leaving RAM headroom. The
+        # obs already exposes per-job ram_req and per-node free-RAM ratio, so the
+        # signal is *avoidable* → genuinely learnable, not a noise floor.
+        # ram_overcommit > 1.0 additionally lets nominally-over-budget placements
+        # through (harsher regime); at 1.0 the hard gate stands and OOM comes only
+        # from realized > nominal on tight packings.
+        self.oom_sigma              = float(oom_sigma)
+        self.oom_penalty_s          = float(oom_penalty_s)
+        self.ram_overcommit         = float(ram_overcommit)
         # ── Co-location action mode (opt-in; 1 mode = legacy action space) ──
         self.colocation_actions     = bool(colocation_actions)
         self.ablation_mode          = ablation_mode
@@ -406,6 +427,7 @@ class KubefluxSchedEnv:
         self._state: Optional[_RunState] = None
         self._rng = np.random.default_rng(None)
         self._episode_seed: Optional[int] = None
+        self._oom_events = 0   # count of drain-penalised placements this episode
 
         n_act = top_k * n_nodes * gpus_per_node * self._n_modes + 1
         obs_d = (top_k * JOB_FEAT_DIM
@@ -432,6 +454,7 @@ class KubefluxSchedEnv:
         # every policy. Seedless (training) resets fall back to this stream.
         self._episode_seed = seed
         self._rng = np.random.default_rng(seed)
+        self._oom_events = 0
         jobs    = self.jobs_factory()
         cluster = Cluster(
             n_nodes=self.n_nodes,
@@ -440,6 +463,7 @@ class KubefluxSchedEnv:
             node_speeds=self.node_speeds,
             node_gpu_types=self.node_gpu_types,
             node_ram_gb=self.node_ram_gb,
+            ram_overcommit=self.ram_overcommit,
         )
         events: list = []
         seq = 0
@@ -706,18 +730,61 @@ class KubefluxSchedEnv:
             speed = node.speed
         if speed != 1.0:
             base = max(MIN_RUNTIME_S, base / speed)
-        if self.runtime_sigma <= 0.0 and self.interference <= 0.0:
-            return base
-        mult = 1.0
-        if self.interference > 0.0:
-            k = self._co_residents(cluster, plan, job.job_id)
-            mult *= 1.0 + self.interference * k          # crowded GPU runs slower
-        if self.runtime_sigma > 0.0:
-            z = self._job_noise(job.job_id)
-            # mean-preserving lognormal: E[exp(σZ − σ²/2)] = 1, so only the
-            # variance grows with σ — the mean JCT stays comparable across σ.
-            mult *= math.exp(self.runtime_sigma * z - 0.5 * self.runtime_sigma ** 2)
-        return max(MIN_RUNTIME_S, base * mult)
+        if self.runtime_sigma > 0.0 or self.interference > 0.0:
+            mult = 1.0
+            if self.interference > 0.0:
+                k = self._co_residents(cluster, plan, job.job_id)
+                mult *= 1.0 + self.interference * k      # crowded GPU runs slower
+            if self.runtime_sigma > 0.0:
+                z = self._job_noise(job.job_id)
+                # mean-preserving lognormal: E[exp(σZ − σ²/2)] = 1, so only the
+                # variance grows with σ — the mean JCT stays comparable across σ.
+                mult *= math.exp(self.runtime_sigma * z - 0.5 * self.runtime_sigma ** 2)
+            base = max(MIN_RUNTIME_S, base * mult)
+        # Stochastic host-RAM OOM (opt-in). Additive drain-recovery hit when this
+        # placement pushes a node's summed realized peaks past its RAM budget.
+        # Independent of the runtime-noise draw and off unless oom_penalty_s > 0.
+        if self.oom_penalty_s > 0.0:
+            base += self._oom_penalty(plan, cluster)
+        return max(MIN_RUNTIME_S, base)
+
+    def _oom_penalty(self, plan, cluster: Cluster) -> float:
+        """Drain-recovery penalty if this placement OOMs any node it lands on.
+
+        The chosen job is already reserved in ``cluster.active`` / ``active_ram``,
+        so summing realized peaks over a node's residents includes it. A node OOMs
+        when that sum exceeds its host-RAM budget; the incoming job then eats a
+        single ``oom_penalty_s`` recovery hit. Realized peaks are common-random per
+        (episode_seed, job_id), so a paired eval OOMs the same jobs under every
+        policy — isolating the policy's RAM-headroom choices from draw luck.
+        """
+        nodes_in_plan = {a.node_id for a in plan}
+        for ni in nodes_in_plan:
+            budget = cluster.nodes[ni].ram_gb
+            peak_sum = 0.0
+            for jid, p in cluster.active.items():
+                if any(a.node_id == ni for a in p):
+                    peak_sum += self._ram_peak(jid, cluster.active_ram.get(jid, 0.0))
+            if peak_sum > budget + 1e-9:
+                self._oom_events += 1
+                return self.oom_penalty_s
+        return 0.0
+
+    def _ram_peak(self, job_id: str, ram_req: float) -> float:
+        """Realized peak host RSS = ram_req · mean-preserving lognormal(oom_sigma).
+
+        Keyed independently of the runtime-noise stream (salt 0x52414d = 'RAM') so
+        a job's memory luck and runtime luck are uncorrelated. With oom_sigma == 0
+        this is exactly ram_req (peaks equal nominal → OOM only under overcommit).
+        """
+        if ram_req <= 0.0 or self.oom_sigma <= 0.0:
+            return ram_req
+        if self._episode_seed is None:
+            z = float(self._rng.standard_normal())
+        else:
+            key = (int(self._episode_seed), int(zlib.crc32(job_id.encode())), 0x52414D)
+            z = float(np.random.default_rng(key).standard_normal())
+        return ram_req * math.exp(self.oom_sigma * z - 0.5 * self.oom_sigma ** 2)
 
     def _job_noise(self, job_id: str) -> float:
         """Standard-normal draw for a job's idiosyncratic runtime noise.

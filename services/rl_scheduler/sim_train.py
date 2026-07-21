@@ -234,6 +234,11 @@ def sim_train(
     # Stochastic execution (opt-in; gives Z_R spread for the distributional critic)
     runtime_sigma: float = 0.0,
     interference: float = 0.0,
+    # Stochastic host-RAM OOM (opt-in; oom_penalty_s > 0 turns it on). Models
+    # node-2's drain risk as a penalised tail event a risk-aware policy can avoid.
+    oom_sigma: float = 0.0,
+    oom_penalty_s: float = 0.0,
+    ram_overcommit: float = 1.0,
     # Co-location action mode (B; opt-in, doubles the action space)
     colocation: bool = False,
     # Joint-vs-decoupled ablation: None | "placement_only" | "job_only"
@@ -286,6 +291,9 @@ def sim_train(
         node_ram_gb=node_ram_gb,
         runtime_sigma=runtime_sigma,
         interference=interference,
+        oom_sigma=oom_sigma,
+        oom_penalty_s=oom_penalty_s,
+        ram_overcommit=ram_overcommit,
         colocation_actions=colocation,
         slo_penalty=slo_penalty,
         noop_penalty=noop_penalty,
@@ -293,6 +301,8 @@ def sim_train(
     )
     if num_envs > 1 and node_speeds:
         raise NotImplementedError("--node-speeds not wired into the vec path; use --num-envs 1")
+    if num_envs > 1 and oom_penalty_s > 0.0:
+        raise NotImplementedError("stochastic OOM not wired into the vec path; use --num-envs 1")
     agent = DSACAgent(
         obs_dim=obs_dim, n_actions=n_actions, device=device,
         use_iqn=use_iqn,
@@ -547,6 +557,19 @@ def main(argv=None) -> int:
     p.add_argument("--interference",         type=float, default=0.0,
                    help="per-co-resident MPS slowdown on realized runtime; "
                         "0 = off")
+    # Stochastic host-RAM OOM (opt-in): turns node-2's drain risk into a learnable
+    # tail cost. Needs a bounded --node-ram-gb; single-env path (--num-envs 1) only.
+    p.add_argument("--oom-penalty-s",        type=float, default=0.0,
+                   help="drain-recovery seconds added when a placement's summed "
+                        "realized host-RAM peaks exceed the node budget; 0 = off "
+                        "(master switch for the stochastic-OOM model)")
+    p.add_argument("--oom-sigma",            type=float, default=0.0,
+                   help="lognormal (mean-preserving) spread of realized peak RSS "
+                        "vs nominal ram_req; >0 makes tight-but-legal packings OOM "
+                        "on unlucky draws")
+    p.add_argument("--ram-overcommit",       type=float, default=1.0,
+                   help="host-RAM overcommit factor; 1.0 = hard gate, >1.0 admits "
+                        "nominally-over-budget co-residency (harsher OOM regime)")
     p.add_argument("--colocation",           action="store_true",
                    help="add PACK/ISOLATE co-location mode per placement "
                         "(doubles the action space; checkpoint-incompatible)")
@@ -645,6 +668,9 @@ def main(argv=None) -> int:
         curriculum=args.curriculum,
         runtime_sigma=args.runtime_sigma,
         interference=args.interference,
+        oom_sigma=args.oom_sigma,
+        oom_penalty_s=args.oom_penalty_s,
+        ram_overcommit=args.ram_overcommit,
         colocation=args.colocation,
         slo_penalty=args.slo_penalty,
         noop_penalty=args.noop_penalty,
