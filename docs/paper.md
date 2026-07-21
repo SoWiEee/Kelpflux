@@ -399,7 +399,23 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 這個高負載 headroom 是否只是 score 既有 SJF 權重（ε，即 f_runtime_short 項，預設 ε=0.30）調得不夠精準所致？本研究對 ε ∈ {0, 0.30, 0.50, 0.70, 1.0} 在高負載 instance 上進行 sweep，量測調整 ε 能回收多少 headroom：load 100 下 headroom 為 +4.1%，最佳 ε 只回收 +1.3%（16%），且預設 ε=0.30 在 30 個 instance 中已有 12 個是最佳；load 125 同樣只回收 16%（9/30 以預設值最佳）；load 150 回收 27%（最佳 ε≈0.50，10/30 為最佳）。也就是說，單純線性調整 SJF 權重只能捕捉高負載 headroom 的 16–27%，其餘約 73–84% 超出線性 reweighting 所能觸及的範圍，顯示高負載下確實存在一個非平凡、但幅度有限且高變異的排程優化機會，並非僅靠調參即可窮盡。
 
-排程另一個可能的槓桿是 GPU/MPS placement 本身，而非 ordering。一項配套的 joint-vs-decoupled 消融實驗顯示，這個槓桿在本研究的叢集規模下也接近無效：無論是把 job 選擇凍結為 score 的排序（只學 placement）、或把 placement 凍結為 first-fit（只學排序），2×1 叢集上對平均 JCT 造成的改變都未達統計顯著。將本節的 ordering headroom 與此 placement 消融合併來看，兩者共同界定了 score 之上的總可贏空間：在本研究測試的負載下，ordering 貢獻了幾乎全部、但仍極小的可贏空間，而 placement 幾乎不貢獻。整體而言，本節分析把第 5.6 節的負向結果重新定位為結構性而非方法性，並將重度壅塞下的排程優化標記為未來工作的具體目標，而非本研究負向結果所能否證的假設。可重現性材料見 `runs/headroom_20260721-134003/`（headroom 結果與 `epsilon_sweep.json`），對應腳本為 `eval/scripts/headroom_analysis.py`、`eval/scripts/score_epsilon_sweep.py` 與 `sim/scheduler/fixed_priority.py`。
+排程另一個可能的槓桿是 GPU/MPS placement 本身，而非 ordering。第 5.8 節的 joint-vs-decoupled 消融顯示，這個槓桿在本研究的叢集規模下同樣接近無效。將本節的 ordering headroom 與該 placement 消融合併來看，兩者共同界定了 score 之上的總可贏空間：在本研究測試的負載下，ordering 貢獻了幾乎全部、但仍極小的可贏空間，而 placement 幾乎不貢獻。整體而言，本節分析把第 5.6 節的負向結果重新定位為結構性而非方法性，並將重度壅塞下的排程優化標記為未來工作的具體目標，而非本研究負向結果所能否證的假設。可重現性材料見 `runs/headroom_20260721-134003/`（headroom 結果與 `epsilon_sweep.json`），對應腳本為 `eval/scripts/headroom_analysis.py`、`eval/scripts/score_epsilon_sweep.py` 與 `sim/scheduler/fixed_priority.py`。
+
+### 5.8 Placement 解耦消融
+
+§5.7 的天花板分析針對 ordering 槓桿；本節以一項解耦消融檢視另一個槓桿——GPU/MPS placement——在學習式策略中貢獻多少。Kelpflux 的 DRL 動作同時決定「選哪個 job」與「放到哪張 GPU」兩件事。為分離兩者，本研究在 action mask 上加入限制，訓練三個共用相同網路形狀（obs_dim / n_actions 不變）的臂：**joint**（完整動作空間，同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score heuristic 的首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。三臂各以 5 個 training seed、於 2×1 異質叢集（RTX 4070 + RTX 3080，含 node-2 host-RAM 限制）訓練 50k steps，並在 philly 與 ali 兩個 family × 5 個 eval seed 上以貪婪策略評估、取 pooled 平均 JCT；以 training seed 為配對單位對 joint 做配對比較。
+
+表 6. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT over families × seeds）
+
+| 臂 | 平均 JCT (s) | Δ vs joint | 配對 *p* |
+|---|--:|--:|--:|
+| joint | 9150 ± 2335 | — | — |
+| placement_only | 8443 ± 2631 | −5.3% ± 33.8% | 0.585 |
+| job_only | 10540 ± 1358 | +19.6% ± 35.7% | 0.295 |
+
+兩個解耦臂皆未與 joint 產生統計顯著差異（配對 *p* 分別為 0.585 與 0.295，95% CI 皆橫跨 ±34% 的零點）。其中 placement_only 與 joint 實質等價，代表在此規模下 DRL 學到的 job 選擇並未帶來穩健增益——score heuristic 的既有排序已足夠；job_only 則在方向上較差（+19.6%，但不顯著），暗示 placement 相較 job 排序是稍微更有用的槓桿，惟證據不足以定論。整體而言，placement 這個槓桿在 2×1 規模下接近無效，與 §5.7 的 ordering 天花板一致：兩者共同說明 score 之上的總可贏空間在測試負載下極小。
+
+此消融的鑑別力受兩項因素限制：其一，僅 5 個 training seed，且尾端指標在此規模下 per-instance 變異大（寬 CI）；其二，本模擬的事件模型在低負載下使每個決策點的待排佇列偏薄，job 選擇的候選數少，因而低估了 job-selection 槓桿在高負載下可能的作用——這與 §5.7「headroom 僅在重負載下打開」的結論相互呼應。可重現性材料見 `runs/ablation_std_20260720-225206/`，對應腳本為 `eval/scripts/ablation_joint_decoupled.py`。
 
 ## 6. 結論與未來工作
 
