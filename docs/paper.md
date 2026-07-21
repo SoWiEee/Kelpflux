@@ -437,14 +437,16 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 ### 6.3 未來工作
 
-未來工作可朝以下方向擴展：
+本研究的負結論是「條件性」的：§5.7 的天花板分析指出，在目前評估負載（n≈50，每 2 GPU）下，最佳排序相對 score 的可贏空間僅 0.1–0.7%，因此任何排程器（含 DRL）都貼在天花板上；但同一曲線顯示，負載升至 125–150 時 headroom 張開至 10–14%，且其中僅 16–27% 能被 score 的 SJF 權重（ε）線性吃掉，其餘需要更聰明或學習式的策略。未來工作因此以「把評估推進到 headroom 打開的重載區」為主線：
 
-1. **多 GPU cluster**：擴展至更多節點與更多 GPU，檢驗 DRL 排程效益是否隨規模與競爭程度增加而浮現。
-2. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
-3. **Offline RL / RLPD**：收集更大量真實 Slurm transition，以 offline RL 或 RLPD 改善 sim-to-real 轉移 [8]。
-4. **Multi-Agent RL**：在多節點與多 GPU 場景中，探索分散式或階層式排程代理人。
-5. **Energy-aware scheduling**：將功耗、能效與碳排納入 reward，使排程器不只最佳化效能，也最佳化能源效率。
-6. **LLM serving workload**：加入更真實的 LLM serving trace，評估 token latency、throughput、SLO violation 與 batch scheduling 的交互影響。
+1. **重載實機 A/B（主線）**：將實機評估的目標負載從目前的 n≈50 提高到 §5.7 中 headroom 顯著（≥10%）的重載區（每 2 GPU 約 125–150 個並發 job），在該區重跑 score vs. 學習式的配對 A/B。此方向已有一個正向訊號支持——2×1 實機在高競爭下 RDSAC-cvar 相對 score 達 +4.5%（配對 *p*=0.023）——但需以更高負載、更多 seed 驗證其穩健性。關鍵工程瓶頸在於 node-2 的 host-RAM 上限（§6.2），重載下的共居壓力須先解決，否則 OOM→drain 會污染量測（見第 6 項）。
+2. **多 GPU cluster 擴規模**：在確立負載相依效益後，擴展至更多節點與 GPU，區分「規模」與「負載強度」各自對 DRL 效益的貢獻。
+3. **風險感知的 OOM/drain 迴避**：目前模擬將 host RAM 視為硬性配置約束（不足即不放置），OOM 因而被 allocator 遮蔽、無從學習。若改以「可懲罰的隨機事件」建模——即允許高風險共居，但依實際峰值記憶體（放置當下不確定）以某機率觸發 OOM→node drain 並給予大幅負回饋——則 drain 這類稀有但災難性的尾端事件，正對應 RDSAC 之 CVaR 風險目標所欲最小化的對象。此方向的前提是峰值記憶體在決策當下確實不確定（如 LLM 共居的突發 RSS）；若峰值可精確預知，則一個 RAM-fit 啟發式因子即可完全捕捉，DRL 並無優勢。因 drain 在實機無法反覆取樣，須先於具隨機記憶體模型的模擬中學習、再以 RLPD 轉移（見第 4 項）。
+4. **Offline RL / RLPD**：收集更大量真實 Slurm transition，以 offline RL 或 RLPD 改善 sim-to-real 轉移 [8]。
+5. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
+6. **Multi-Agent RL**：在多節點與多 GPU 場景中，探索分散式或階層式排程代理人。
+7. **Energy-aware scheduling**：將功耗、能效與碳排納入 reward，使排程器不只最佳化效能，也最佳化能源效率。
+8. **LLM serving workload**：加入更真實的 LLM serving trace，評估 token latency、throughput、SLO violation 與 batch scheduling 的交互影響。
 
 ## 參考文獻
 
