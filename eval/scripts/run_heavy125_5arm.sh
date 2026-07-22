@@ -91,7 +91,9 @@ if ! preflight; then log "ABORT: preflight failed (see above). Fix the cluster/c
 bash eval/scripts/held_watchdog.sh "/tmp/${TAG}_wd_${STAMP}.log" & WD_PID=$!
 log "held_watchdog pid=$WD_PID"
 
-prewarm(){ for N in slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0; do timeout 180 kubectl -n $NS exec "$LOGIN" -- bash -lc "srun -p gpu -w $N --gres=mps:25 --time=5 /shared/py/bin/python3 /shared/scripts/llm_job.py --mode infer --n 1 --batch-size 4 --prompt-len 512 --gen-len 2 --model $MODEL 2>&1|tail -1" >/dev/null 2>&1 & done; wait; }
+# NOTE: wait ONLY on the prewarm srun PIDs — a bare `wait` would also block on the
+# never-exiting held_watchdog background job (WD_PID) and hang the whole run.
+prewarm(){ local pids=(); for N in slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0; do timeout 180 kubectl -n $NS exec "$LOGIN" -- bash -lc "srun -p gpu -w $N --gres=mps:25 --time=5 /shared/py/bin/python3 /shared/scripts/llm_job.py --mode infer --n 1 --batch-size 4 --prompt-len 512 --gen-len 2 --model $MODEL 2>&1|tail -1" >/dev/null 2>&1 & pids+=($!); done; wait "${pids[@]}"; }
 apply_verify(){ # $1 conf  $2 want-SchedulerType  $3 name
   patch_conf "$1"; PATCHED=1; restart_ctl_wait || { log "FATAL slurmctld not ready ($3)"; exit 1; }
   local got; got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'SchedulerType\s*=\s*\K\S+')
