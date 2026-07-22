@@ -378,7 +378,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 ### 5.7 Ceiling Analysis
 
-前述結果顯示，RDSAC 與 SAC 在本研究測試的實機負載下皆未穩健勝過 score heuristic。這個負向結果究竟是特定 RL 方法的局限，還是測試 regime 本身就沒有太多空間可贏？為了把這兩種可能性分開，本節在模擬器中進行一項獨立於任何學習式方法的天花板分析（ceiling / headroom analysis）：在 2×1 叢集上，若 GPU/MPS placement 固定為 cluster allocator 的既定政策（對所有排程器一致），排程器唯一能控制的槓桿只剩下 dispatch **ordering**——一個 schedule 即為工作優先序的一個 permutation。本研究對 {philly, ali, burst} 三個 family、各 10 seeds，以 random-restart + swap local search（以 clairvoyant SJF 為種子）搜尋每個 instance 在所有 ordering 中可達到的最佳平均 JCT，並定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。此搜尋法在小型高競爭 instance 上與窮舉所有 permutation（work-conserving priority-list schedule 的精確最優解）100% 吻合，顯示其足以逼近真正上界。由於 score 本身是動態排程器，此上界理論上仍可能被超越；但實證上 clairvoyant SJF-static 的表現與 score 幾乎相同，故 static ordering 這個較窄的類別已足以作為一個緊致（tight）的可達上界。
+前述結果顯示，RDSAC 與 SAC 在本研究測試的實機負載下皆未穩健勝過啟發式。這個負向結果究竟是特定 RL 方法的局限，還是測試 regime 本身就沒有太多空間可贏？為了把這兩種可能性分開，在模擬器中進行一項獨立於任何學習式方法的天花板分析：2×1 叢集上，若 GPU/MPS placement 固定為 cluster allocator 的既定政策（對所有排程器一致），排程器唯一能控制的槓桿只剩下 dispatch **ordering**，一個 schedule 即為工作優先序的一個 permutation。本研究對 {philly, ali, burst} 三個 family、各 10 seeds，以 random-restart + swap local search（以 clairvoyant SJF 為種子）搜尋每個 instance 在所有 ordering 中可達到的最佳平均 JCT，並定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。此搜尋法在小型高競爭 instance 上與窮舉所有 permutation（work-conserving priority-list schedule 的精確最優解）100% 吻合，顯示其足以逼近真正上界。由於啟發式本身是動態排程器，此上界理論上仍可能被超越；但實證上 clairvoyant SJF-static 的表現與 score 幾乎相同，故 static ordering 這個較窄的類別已足以作為一個緊致（tight）的可達上界。
 
 表 5 彙整不同負載（2-GPU 叢集上的 n_jobs）下的 headroom，結果顯示 headroom 並非固定值，而是隨負載單調上升。
 
@@ -395,7 +395,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 按 family pooled over loads：philly +6.9%、burst +6.5%、ali +2.2%。本研究前述所有實機與模擬比較所用的測試負載約為 n_jobs≈50，對應表 5 中 load 40–60 區間；該區間 headroom 僅 0.1–0.7%，即 score 在此負載下已幾乎位於可達到的排程上界。換言之，第 5.6 節的核心負向結果——學習式 placement 未能穩健勝過 score——在此測試負載下具有結構性成因，而非 RDSAC 或 SAC 這類特定方法失敗：在幾乎沒有 headroom 的情況下，不論固定規則或學習式排程都沒有明顯空間可贏。
 
-然而 headroom 並非在所有負載下都小。隨 n_jobs 增加至 125–150，headroom 快速擴大至 10.3% ± 5.3%（load 125）與 14.0% ± 4.6%（load 150），個別 instance 最高可達 +73.9% 與 +53.8%（表 5 Max 欄）。這代表本研究的負向結果具有 regime 依賴性：score 只在測試負載下逼近上界，一旦進入重度壅塞，ordering 仍存在顯著且尚未被開發的空間，也為未來工作定位出一個具體的目標負載區間。需特別注意，重負載下的 headroom 樣本數小、per-instance 變異度高（寬 95% CI，max 遠高於 mean），因此不宜過度推論其穩定性。
+然而 headroom 並非在所有負載下都小。隨著 n_jobs 增加至 125–150，headroom 快速擴大至 10.3% ± 5.3%（load 125）與 14.0% ± 4.6%（load 150），個別 instance 最高可達 +73.9% 與 +53.8%（表 5 Max 欄）。這代表本研究的負向結果具有 regime 依賴性：啟發式只在測試負載下逼近上界，一旦進入重度壅塞，ordering 仍存在顯著且尚未被開發的空間，也為未來工作定位出一個具體的目標負載區間。需特別注意，重負載下的 headroom 樣本數小、per-instance 變異度高（寬 95% CI，max 遠高於 mean），因此不宜過度推論其穩定性。
 
 這個高負載 headroom 是否只是 score 既有 SJF 權重（ε，即 f_runtime_short 項，預設 ε=0.30）調得不夠精準所致？本研究對 ε ∈ {0, 0.30, 0.50, 0.70, 1.0} 在高負載 instance 上進行 sweep，量測調整 ε 能回收多少 headroom：load 100 下 headroom 為 +4.1%，最佳 ε 只回收 +1.3%（16%），且預設 ε=0.30 在 30 個 instance 中已有 12 個是最佳；load 125 同樣只回收 16%（9/30 以預設值最佳）；load 150 回收 27%（最佳 ε≈0.50，10/30 為最佳）。也就是說，單純線性調整 SJF 權重只能捕捉高負載 headroom 的 16–27%，其餘約 73–84% 超出線性 reweighting 所能觸及的範圍，顯示高負載下確實存在一個非平凡、但幅度有限且高變異的排程優化機會，並非僅靠調參即可窮盡。
 
@@ -403,7 +403,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 ### 5.8 Placement 解耦消融
 
-§5.7 的天花板分析針對 ordering 槓桿；本節以一項解耦消融檢視另一個槓桿——GPU/MPS placement——在學習式策略中貢獻多少。Kelpflux 的 DRL 動作同時決定「選哪個 job」與「放到哪張 GPU」兩件事。為分離兩者，本研究在 action mask 上加入限制，訓練三個共用相同網路形狀（obs_dim / n_actions 不變）的臂：**joint**（完整動作空間，同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score heuristic 的首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。三臂各以 5 個 training seed、於 2×1 異質叢集（RTX 4070 + RTX 3080，含 node-2 host-RAM 限制）訓練 50k steps，並在 philly 與 ali 兩個 family × 5 個 eval seed 上以貪婪策略評估、取 pooled 平均 JCT；以 training seed 為配對單位對 joint 做配對比較。
+§5.7 的天花板分析針對 ordering 槓桿；本節以一項解耦消融檢視另一個槓桿——GPU/MPS placement 在學習式策略中貢獻多少。系統的 DRL 動作同時決定「選哪個 job」與「放到哪張 GPU」兩件事。為分離兩者，本研究在 action mask 上加入限制，訓練三個共用相同網路形狀（obs_dim / n_actions 不變）的臂：**joint**（完整動作空間，同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score heuristic 的首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。三臂各以 5 個 training seed、於 2×1 異質叢集（RTX 4070 + RTX 3080，含 node-2 host-RAM 限制）訓練 50k steps，並在 philly 與 ali 兩個 family × 5 個 eval seed 上以貪婪策略評估、取 pooled 平均 JCT；以 training seed 為配對單位對 joint 做配對比較。
 
 表 6. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT over families × seeds）
 
@@ -415,7 +415,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 兩個解耦臂皆未與 joint 產生統計顯著差異（配對 *p* 分別為 0.585 與 0.295，95% CI 皆橫跨 ±34% 的零點）。其中 placement_only 與 joint 實質等價，代表在此規模下 DRL 學到的 job 選擇並未帶來穩健增益——score heuristic 的既有排序已足夠；job_only 則在方向上較差（+19.6%，但不顯著），暗示 placement 相較 job 排序是稍微更有用的槓桿，惟證據不足以定論。整體而言，placement 這個槓桿在 2×1 規模下接近無效，與 §5.7 的 ordering 天花板一致：兩者共同說明 score 之上的總可贏空間在測試負載下極小。
 
-此消融的鑑別力受兩項因素限制：其一，僅 5 個 training seed，且尾端指標在此規模下 per-instance 變異大（寬 CI）；其二，本模擬的事件模型在低負載下使每個決策點的待排佇列偏薄，job 選擇的候選數少，因而低估了 job-selection 槓桿在高負載下可能的作用——這與 §5.7「headroom 僅在重負載下打開」的結論相互呼應。可重現性材料見 `runs/ablation_std_20260720-225206/`，對應腳本為 `eval/scripts/ablation_joint_decoupled.py`。
+此消融的鑑別力受兩項因素限制：其一，僅 5 個訓練 seed，且尾端指標在此規模下 per-instance 變異大（寬 CI）；其二，本模擬的事件模型在低負載下使每個決策點的待排佇列偏薄，job 選擇的候選數少，因而低估了 job-selection 槓桿在高負載下可能的作用——這與 §5.7「headroom 僅在重負載下打開」的結論相互呼應。可重現性材料見 `runs/ablation_std_20260720-225206/`，對應腳本為 `eval/scripts/ablation_joint_decoupled.py`。
 
 ## 6. 結論與未來工作
 
@@ -423,7 +423,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 本研究驗證了 DRL 能於異質 GPU 與 NVIDIA MPS 環境中學習 GPU placement 與 **MPS fraction** [5]，並能透過 Slurm job submission path 整合到真實排程流程 [11]。相較傳統只選 GPU 或只做固定 rule 的方法，本研究將 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號整合成一個可學習的排程框架。
 
-實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過 score heuristic。唯一較穩定的正面結果是：在高負載混合工作負載下，MPS/VRAM 感知的啟發式策略能勝過 Slurm Backfill。此結果說明，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
+實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過啟發式。唯一較穩定的正面結果是：在高負載混合工作負載下，MPS/VRAM 感知的啟發式策略能勝過 Slurm Backfill。此結果說明，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
 
 ### 6.2 限制
 
@@ -439,7 +439,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 未來工作可朝以下方向擴展：
 
-1. **重負載 regime 與多 GPU cluster**：§5.7 的天花板分析顯示 score 之上的可贏空間隨負載單調上升——在本研究測試負載（n_jobs≈50）下僅 0.1–0.7%，但在 2-GPU 叢集的重度壅塞區（n_jobs 125–150）擴大至 10.3–14.0%，且其中約 73–84% 超出 score 線性調參（ε）所能觸及；§5.8 則顯示 placement 槓桿在本規模下接近無效，故此空間主要來自 dispatch ordering。這為未來驗證定位出一個具體目標負載區間：在重負載下重新評估學習式排程能否穩健勝過 score。惟須強調三點誠實限制：(a) headroom 是最佳靜態排序的可達上界，僅代表「空間存在」，並不保證 DRL 能實際逼近；(b) 本研究在統一 DRA 後端下的高負載實機證據目前為負向——學習式仍略遜於 score（§5.3），故重負載是有待驗證的假設，而非本研究已成立的宣稱；(c) 重負載 headroom 的 per-instance 變異大（寬 95% CI），實機驗證需顯著更多 workload seed 方能達到統計顯著性。延伸此軸的另一方向是擴展至更多節點與 GPU，檢驗效益是否隨叢集規模進一步浮現。
+1. **重負載 regime 與多 GPU cluster**：§5.7 的天花板分析顯示啟發式之上的可贏空間隨負載單調上升——在本研究測試負載（n_jobs≈50）下僅 0.1–0.7%，但在 2-GPU 叢集的重度壅塞區（n_jobs 125–150）擴大至 10.3–14.0%，且其中約 73–84% 超出啟發式線性調參（ε）所能觸及；§5.8 則顯示 placement 槓桿在本規模下接近無效，故此空間主要來自 dispatch ordering。這為未來驗證定位出一個具體目標負載區間：在重負載下重新評估學習式排程能否穩健勝過啟發式。惟須強調三點誠實限制：(a) headroom 是最佳靜態排序的可達上界，僅代表「空間存在」，並不保證 DRL 能實際逼近；(b) 本研究在統一 DRA 後端下的高負載實機證據目前為負向——學習式仍略遜於啟發式（§5.3），故重負載是有待驗證的假設，而非本研究已成立的宣稱；(c) 重負載 headroom 的 per-instance 變異大（寬 95% CI），實機驗證需顯著更多 workload seed 方能達到統計顯著性。延伸此軸的另一方向是擴展至更多節點與 GPU，檢驗效益是否隨叢集規模進一步浮現。
 2. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
 3. **Offline RL / RLPD**：收集更大量真實 Slurm transition，以 offline RL 或 RLPD 改善 sim-to-real 轉移 [8]。
 4. **Multi-Agent RL**：在多節點與多 GPU 場景中，探索分散式或階層式排程代理人。
