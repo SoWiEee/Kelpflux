@@ -11,9 +11,12 @@ from eval.scripts.live_ab_heavytail import (  # noqa: E402
     gen_workload,
     job_name,
     join_records,
+    LlmWorkloadSpec,
+    merge_histograms,
     parse_sacct_jct,
     peak_concurrent_mps,
     sbatch_cmd,
+    state_histogram,
 )
 
 _SACCT_SAMPLE = """JobID|JobName|State|Submit|Start|End|ElapsedRaw|NodeList
@@ -220,3 +223,46 @@ def test_decide_node_noop_returns_none(monkeypatch):
     node = m.decide_node("http://serve", _lj("jobA"),
                          node_free_mps=[100, 100], node_names=["a", "b"])
     assert node is None
+
+
+def test_state_histogram_counts_every_terminal_state_by_class():
+    """The audit trail for what join_records drops: a class whose jobs all die
+    must be visible, not silently absent from the metrics."""
+    parsed = parse_sacct_jct(_SACCT_SAMPLE)
+    jobs = [LiveJob("jobA", 0.0, 50.0, 50.0, 20, job_class="inference"),
+            LiveJob("jobGone", 0.0, 50.0, 50.0, 20, job_class="llm")]
+    hist = state_histogram(jobs, parsed, "score", 1)
+    assert hist["total"] == 2
+    assert hist["states"] == {"COMPLETED": 1, "MISSING": 1}
+    assert hist["by_class"] == {"inference": {"COMPLETED": 1}, "llm": {"MISSING": 1}}
+
+
+def test_state_histogram_keeps_failed_that_join_records_drops():
+    parsed = parse_sacct_jct(_SACCT_SAMPLE)
+    jobs = [LiveJob("jobC", 0.0, 50.0, 50.0, 20, job_class="llm")]
+    assert join_records(jobs, parsed, "SAC", 0) == []      # dropped from metrics
+    assert state_histogram(jobs, parsed, "SAC", 0)["states"] == {"FAILED": 1}
+
+
+def test_merge_histograms_accumulates_across_rounds():
+    a = {"total": 2, "states": {"COMPLETED": 2}, "by_class": {"llm": {"COMPLETED": 2}}}
+    b = {"total": 3, "states": {"COMPLETED": 1, "FAILED": 2},
+         "by_class": {"llm": {"FAILED": 2}, "batch": {"COMPLETED": 1}}}
+    m = merge_histograms(a, b)
+    assert m["total"] == 5
+    assert m["states"] == {"COMPLETED": 3, "FAILED": 2}
+    assert m["by_class"] == {"llm": {"COMPLETED": 2, "FAILED": 2},
+                             "batch": {"COMPLETED": 1}}
+    assert a["states"] == {"COMPLETED": 2}                 # inputs untouched
+
+
+def test_llm_train_uses_its_own_small_shape():
+    """Fine-tune must NOT inherit the infer shape: 16×1024 tokens OOMs both
+    cards (logits [B,S,151936] upcast to fp32), which killed every Qwen job."""
+    spec = LlmWorkloadSpec()
+    train = spec.wrap(LiveJob("j1", 0.0, 10.0, 10.0, 75, job_class="llm"))
+    infer = spec.wrap(LiveJob("j2", 0.0, 10.0, 10.0, 75, job_class="inference"))
+    assert "--mode train" in train and "--mode infer" in infer
+    assert f"--batch-size {spec.train_batch_size} --prompt-len {spec.train_prompt_len}" in train
+    assert f"--batch-size {spec.batch_size} --prompt-len {spec.prompt_len}" in infer
+    assert spec.train_batch_size * spec.train_prompt_len <= 1024   # fits the 9.6GB 3080

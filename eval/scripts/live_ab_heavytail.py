@@ -160,8 +160,29 @@ class LlmWorkloadSpec:
     batch_size: int = 16
     prompt_len: int = 1024
     gen_len: int = 8
+    # Fine-tune needs its OWN (much smaller) shape. The infer shape above is safe
+    # because generate() runs under no_grad, but train does forward+backward+AdamW:
+    # weights+grads+AdamW moments ≈ 3.9 GB, and `model(ids, labels=ids)` also
+    # materialises logits [B, S, vocab=151936] and upcasts them to fp32 for the
+    # loss. At the infer shape (16×1024 = 16k tokens) that alone is ~10 GB, so
+    # EVERY Qwen fine-tune job died with torch.OutOfMemoryError ~6 s in and was
+    # then silently dropped by join_records (COMPLETED-only) — the aimix "4-way"
+    # mix was really running 3-way. Measured peak on an idle card (2026-07-27):
+    #   B×S tokens  peak VRAM   steps/s (4070 / 3080)
+    #     2048       8.98 GB     4.5 / —      ← OOMs the 9.6 GB 3080
+    #     1024       5.90 GB     7.2 / 8.4    ← chosen: fits BOTH cards
+    #      512       4.66 GB     9.6 / 12.5
+    # 1024 tokens leaves ~3.7 GB headroom on the 3080 for a co-resident mps:25
+    # cuBLAS job. Two fine-tunes still cannot co-reside (2×5.9 > 9.6), which the
+    # mps>=75 routing rule already prevents.
+    train_batch_size: int = 4
+    train_prompt_len: int = 256
     infer_rate: float = 0.9    # prefill rounds/sec on idle 4070 (calib 2026-07-07)
-    train_rate: float = 5.0    # fine-tune steps/sec on idle 4070 (calib 2026-07-07)
+    # 100 steps at 4×256, --gres=mps:75, otherwise-idle card (2026-07-27):
+    # 4070 15.1 s → 6.62 steps/s; 3080 14.5 s → 6.90 steps/s. (The 3-step probe
+    # above over-reports; this sustained number is the one to trust. Note the
+    # "slow" 3080 is marginally FASTER here — this job is bandwidth-bound.)
+    train_rate: float = 6.6
     time_factor: float = 25.0  # --time margin (slow card + contention)
     load_overhead_s: float = 120.0  # python+torch import + model load; large enough
                                      # to cover the 3080's ~88s COLD NFS model read so
@@ -182,8 +203,10 @@ class LlmWorkloadSpec:
         mode, n = self._mode_n(job)
         seed = zlib.crc32(job.job_id.encode()) & 0xFFFFFFFF
         prefix = "srun " if job.gpu_count >= 2 else ""
+        bs = self.train_batch_size if mode == "train" else self.batch_size
+        plen = self.train_prompt_len if mode == "train" else self.prompt_len
         return (f"{prefix}{self.py} {self.script} --mode {mode} --n {n} "
-                f"--batch-size {self.batch_size} --prompt-len {self.prompt_len} "
+                f"--batch-size {bs} --prompt-len {plen} "
                 f"--gen-len {self.gen_len} --model {self.model} --seed {seed}")
 
     def time_min(self, job: "LiveJob") -> int:
@@ -692,6 +715,46 @@ def join_records(jobs: List[LiveJob], parsed: dict, arm: str, round_idx: int) ->
             "node": row.get("node", ""),
         })
     return records
+
+
+def state_histogram(jobs: List[LiveJob], parsed: dict, arm: str, round_idx: int) -> dict:
+    """Count EVERY terminal state for one (arm, round), broken down by job_class.
+
+    The counterpart to ``join_records``, which deliberately keeps only COMPLETED
+    rows: a job that FAILs/TIMEOUTs vanishes from every metric, so an arm whose
+    jobs die looks *faster*. Without this the loss is invisible — that is how a
+    100% Qwen fine-tune OOM (CUDA OOM ~6 s in) went unnoticed across a whole
+    campaign and quietly turned the 4-way aimix mix into a 3-way one.
+
+    ``MISSING`` = no sacct row joined at all (never submitted, or the name did
+    not match), which is a different failure from a job that ran and died.
+    """
+    hist: dict[str, int] = {}
+    by_class: dict[str, dict[str, int]] = {}
+    for j in jobs:
+        row = parsed.get(job_name(arm, round_idx, j.job_id))
+        if row is None:
+            state = "MISSING"
+        else:
+            # sacct states carry a suffix, e.g. "CANCELLED by 1000" → keep the head.
+            state = (row.get("state") or "").strip().upper().split(" ")[0] or "UNKNOWN"
+        hist[state] = hist.get(state, 0) + 1
+        by_class.setdefault(j.job_class, {})
+        by_class[j.job_class][state] = by_class[j.job_class].get(state, 0) + 1
+    return {"total": len(jobs), "states": hist, "by_class": by_class}
+
+
+def merge_histograms(a: dict, b: dict) -> dict:
+    """Accumulate two ``state_histogram`` results (e.g. across rounds)."""
+    out = {"total": a.get("total", 0) + b.get("total", 0), "states": dict(a.get("states", {})),
+           "by_class": {k: dict(v) for k, v in a.get("by_class", {}).items()}}
+    for st, n in b.get("states", {}).items():
+        out["states"][st] = out["states"].get(st, 0) + n
+    for cls, d in b.get("by_class", {}).items():
+        tgt = out["by_class"].setdefault(cls, {})
+        for st, n in d.items():
+            tgt[st] = tgt.get(st, 0) + n
+    return out
 
 
 def build_sacct_cmd(since: str, *, kubectl: str = "kubectl", namespace: str = "slurm",
