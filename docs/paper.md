@@ -359,24 +359,24 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 **統計註記**：Holm-Bonferroni 校正後，所有 learning-based arms 均未顯著優於 Score (adjusted *p* > 0.05)；TOST ±5% 顯示 FCFS、Backfill、RDSAC-mean 與 Score 統計等價。
 
-**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與矩陣運算混合工作負載中，RDSAC-cvar 與 score heuristic 在 average JCT 上接近，Backfill 則顯著落後於 score。此結果顯示風險敏感 DRL 在尾端風險上具有潛力，但在本研究規模下尚不足以形成穩健全面優勢。
+**實機混合 AI 工作負載（真四路，load-125）。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合、每 seed 125 個工作的高負載下，六個排程器在 average JCT 上彼此接近：score 的平均 JCT 數值最低，SAC 幾乎持平（−1.0%），RDSAC-cvar 次之（−4.1%），FCFS、Backfill 與 RDSAC-mean 則方向上落後 9–14%。經 Holm-Bonferroni 校正後，沒有任何 arm 與 score 有顯著差異（最接近者為 FCFS，*p*<sub>adj</sub> = 0.075）。此為本研究負向結果在真四路、重負載下的直接驗證：學習式 placement 未能勝過 score，且 score 相對於樸素 baseline 的領先在此 seed 數下亦不具統計穩健性。為避免尾端工作被靜默丟棄而造成倖存者偏差，本評估對每個 arm 逐工作記錄終態並依工作類別普查完成率（`states.json`）；六個 arm 均完成 124–125/125 個工作、四類工作（含 Qwen fine-tuning）皆正常結束，故表 4 各項平均可排除倖存者偏差。
 
-表 4. 實機混合 AI 工作負載評估（8 seeds，mean ± std；GPU 利用率為 normalized to single-GPU peak SM throughput；ΔJCT% 為 seed-level paired difference vs. Score heuristic）
+表 4. 實機混合 AI 工作負載評估（真四路，每 seed 125 個工作，8 seeds，mean ± std；「完成」為 COMPLETED 工作數 / 125；ΔJCT% 為 seed-level paired difference vs. Score heuristic，正值表示快於 score）
 
-| Arm | Avg JCT (s) | P95 (s) | P99 (s) | Makespan (s) | GPU Util. (norm.) | Slowdown | SLA Viol. (%) | ΔJCT% vs. Score |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| Score heuristic | 25.3 ± 5.4 | 51.1 ± 18.4 | 60.1 ± 18.7 | 140.2 ± 17.2 | 1.05 ± 0.23 | 5.87 ± 1.97 | 0.93 ± 0.08 | baseline |
-| RDSAC-cvar | 25.2 ± 6.0 | 53.4 ± 23.2 | 67.4 ± 30.5 | 142.5 ± 21.5 | 1.06 ± 0.27 | 5.69 ± 2.19 | 0.95 ± 0.06 | +0.1 ± 14.3 |
-| SAC | 27.0 ± 4.3 | 61.1 ± 17.5 | 76.1 ± 14.9 | 147.4 ± 21.9 | 1.06 ± 0.18 | 6.45 ± 1.88 | 0.95 ± 0.05 | −8.8 ± 18.1 |
-| FCFS | 27.9 ± 5.9 | 46.2 ± 13.2 | 50.4 ± 14.3 | 146.8 ± 20.1 | 1.07 ± 0.21 | 7.03 ± 2.66 | 0.96 ± 0.07 | −10.8 ± 9.6 |
-| RDSAC-mean | 27.8 ± 5.5 | 63.1 ± 22.1 | 86.3 ± 35.6 | 152.0 ± 32.6 | 1.09 ± 0.25 | 6.51 ± 1.73 | 0.95 ± 0.05 | −12.1 ± 24.8 |
-| Backfill | 28.4 ± 5.6 | 47.6 ± 12.6 | 52.4 ± 11.8 | 149.0 ± 19.5 | 1.09 ± 0.21 | 6.94 ± 2.34 | 0.96 ± 0.07 | −12.8 ± 8.6 |
+| Arm | 完成 | Avg JCT (s) | P95 (s) | P99 (s) | Makespan (s) | GPU 利用率 | Slowdown | SLA Viol. | ΔJCT% vs. Score |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| Score heuristic | 125 | 125.2 ± 19.3 | 433.5 ± 146.4 | 517.6 ± 122.2 | 675.2 ± 42.2 | 8.25 ± 1.30 | 27.57 ± 4.58 | 1.00 ± 0.01 | baseline |
+| SAC | 124 | 126.2 ± 19.8 | 471.2 ± 86.2 | 566.5 ± 49.9 | 680.1 ± 37.7 | 8.00 ± 1.23 | 28.81 ± 4.52 | 1.00 ± 0.01 | −1.0 ± 7.8 |
+| RDSAC-cvar | 125 | 130.5 ± 23.3 | 395.0 ± 132.9 | 527.7 ± 110.6 | 692.6 ± 31.0 | 8.32 ± 1.43 | 29.67 ± 5.63 | 1.00 ± 0.01 | −4.1 ± 9.3 |
+| Backfill | 125 | 136.2 ± 23.4 | 255.6 ± 52.5 | 269.8 ± 50.1 | 693.9 ± 51.1 | 8.68 ± 1.39 | 30.69 ± 5.18 | 1.00 ± 0.01 | −8.9 ± 10.8 |
+| FCFS | 125 | 137.0 ± 18.3 | 241.2 ± 41.7 | 255.0 ± 43.7 | 679.2 ± 39.1 | 8.60 ± 1.24 | 33.08 ± 4.14 | 1.00 ± 0.01 | −10.0 ± 8.8 |
+| RDSAC-mean | 124 | 142.3 ± 38.8 | 469.7 ± 152.7 | 600.3 ± 77.1 | 714.1 ± 53.0 | 8.59 ± 1.81 | 32.78 ± 8.94 | 0.98 ± 0.02 | −13.9 ± 26.0 |
 
-**統計註記**：Holm-Bonferroni 校正後，Backfill 顯著劣於 Score (*p*<sub>adj</sub> = 0.03)；其餘 learning-based arms 未顯著優於/劣於 Score（變異大，效應量 Cohen's *d* ∈ [0.1, 0.6]）。TOST ±10% 下，RDSAC-cvar 與 Score 可視為等價。
+**統計註記**：Holm-Bonferroni 校正後，六個 arm 對 score 皆未達顯著（*p*<sub>adj</sub> ∈ [0.075, 0.720]）。TOST 等價檢定（seed-level 90% CI）顯示：SAC 與 score 在 ±10% 內統計等價（90% CI = [−6.2%, +4.2%]）；RDSAC-cvar 僅在 ±15% 內等價（[−10.3%, +2.1%]）；FCFS 與 Backfill 的 90% CI 完全落在 0 以下（分別 [−15.8%, −4.1%]、[−16.1%, −1.6%]），方向上一致慢於 score，但在 n=8 下未達 Holm 顯著。pooled SD = 14.3% → MDE(n=8, power .8) ≈ 16.5%，即本規模僅能偵測大於約 16.5% 的效應。P95/P99 呈現一個取捨：FCFS/Backfill 以嚴格序列執行換得較低尾端（P99 ≈ 255–270 s）但平均 JCT 較差；score 與學習式 arm 以較積極的 MPS 共置壓低平均，代價是較重的尾端（P99 ≈ 518–600 s）。SLA 違反率在此負載下對所有 arm 皆近飽和（≈1.00），不具鑑別力。
 
-**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；混合工作負載場景中，Backfill 顯著落後 score，但其他學習式方法因變異較大，尚無足夠證據宣稱優於或劣於 score。**所有統計檢定均使用 Holm-Bonferroni 多重比較校正；等價性以 TOST (two one-sided tests) ±5% 邊界判定；效應量以 Cohen's d 回報。**
+**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；真四路重負載（load-125）場景中，六個 arm 經 Holm 校正後皆與 score 無顯著差異，其中 SAC 與 score 在 ±10% 內 TOST 等價，FCFS 與 Backfill 方向上慢於 score 但未達統計穩健。**所有統計檢定均使用 Holm-Bonferroni 多重比較校正；等價性以 TOST (two one-sided tests) 判定（cuBLAS 場景採 ±5% 邊界，load-125 場景因效應量與變異較大，改報 ±10%/±15% 邊界）；效應量以 Cohen's d 回報。**
 
-整體而言，本研究的主要發現是：DRL 能在模擬中學到可區分的策略，但在小規模真實異質 GPU + MPS 叢集中，學習式策略的優勢尚未穩健轉移。這不否定 DRL 排程的潛力，而是說明此類研究必須以真實部署、統計檢定與場景依賴性作為必要評估條件。
+整體而言，本研究的主要發現是：DRL 能在模擬中學到可區分的策略，但在小規模真實異質 GPU + MPS 叢集中，學習式策略的優勢尚未穩健轉移；此結論在低負載 cuBLAS 與真四路重負載（load-125）兩個實機場景中一致成立。這不否定 DRL 排程的潛力，而是說明此類研究必須以真實部署、統計檢定與場景依賴性作為必要評估條件。
 
 ### 5.7 Ceiling Analysis
 
@@ -393,7 +393,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 | 80 | +2.0% ± 1.1% | +9.7% |
 | 100 | +4.1% ± 2.3% | +25.2% |
 
-本研究前述所有實機與模擬比較所用的測試負載約為 n_jobs≈50，對應表 5 中 load 40–60 區間；該區間 headroom 僅 0.1–0.7%，即 score 在此負載下已幾乎位於可達到的排程上界。即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。換言之，第 5.6 節的核心負向結果——學習式 placement 未能穩健勝過 score——在此測試負載下具有結構性成因，而非 RDSAC 或 SAC 這類特定方法失敗：在幾乎沒有 headroom 的情況下，不論固定規則或學習式排程都沒有明顯空間可贏。
+本研究的 cuBLAS 實機比較與模擬比較所用測試負載約為 n_jobs≈50，對應表 5 中 load 40–60 區間；該區間 headroom 僅 0.1–0.7%，即 score 在此負載下已幾乎位於可達到的排程上界。即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。值得注意的是，表 4 的真四路實機評估已把負載直接推到 n_jobs=125——即表 5 外推 headroom 更大的區間——而學習式方法在該負載下仍未勝過 score（方向上甚至落後）。這說明即使 headroom 隨負載成長使「可贏空間」變大，學習式策略在本叢集規模下仍未能把該空間轉化為實際增益。換言之，第 5.6 節的核心負向結果——學習式 placement 未能穩健勝過 score——在低負載下具結構性成因（幾乎沒有 headroom 可贏），在重負載（load-125）下則是另一種成因（headroom 存在但未被 DRL 捕捉）；兩者皆非 RDSAC 或 SAC 這類特定方法的偶然失敗。
 
 排程另一個可能的槓桿是 GPU/MPS placement 本身，而非 ordering。第 5.8 節的 joint-vs-decoupled 消融顯示，這個槓桿在本研究的叢集規模下同樣接近無效。將本節的 ordering headroom 與該 placement 消融合併來看，兩者共同界定了 score 之上的總可贏空間：在本研究測試的負載下，ordering 貢獻了幾乎全部、但仍極小的可贏空間，而 placement 幾乎不貢獻。整體而言，本節分析把第 5.6 節的負向結果重新定位為結構性而非方法性。可重現性材料見 `runs/headroom_20260721-134003/`，對應腳本為 `eval/scripts/headroom_analysis.py` 與 `sim/scheduler/fixed_priority.py`。
 
@@ -419,7 +419,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 本研究驗證了 DRL 能於異質 GPU 與 NVIDIA MPS 環境中學習 GPU placement 與 **MPS fraction** [5]，並能透過 Slurm job submission path 整合到真實排程流程 [11]。相較傳統只選 GPU 或只做固定 rule 的方法，本研究將 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號整合成一個可學習的排程框架。
 
-實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過啟發式。唯一較穩定的正面結果是：在混合工作負載下，MPS/VRAM 感知的啟發式策略能勝過 Slurm Backfill。此結果說明，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
+實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過啟發式；此結論在低負載 cuBLAS 與真四路重負載（load-125）兩個場景皆一致成立。在真四路重負載下，score 的平均 JCT 數值最低、SAC 與其在 ±10% 內統計等價；MPS/VRAM 感知的 score 相對 Slurm Backfill 雖方向上較快，但在本 seed 數下未達統計顯著（*p*<sub>adj</sub> = 0.21），故本研究不將其宣稱為穩健的正面結果。整體而言，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
 
 ### 6.2 限制
 
@@ -435,7 +435,7 @@ Average JCT 能反映整體完成效率；P95/P99 JCT 與 SLO violation 能捕�
 
 未來工作可朝以下方向擴展：
 
-1. **重負載 regime 與多 GPU cluster**：§5.7 的天花板分析顯示啟發式之上的可贏空間隨負載上升——在本研究測試負載（n_jobs≈50）下僅 0.1–0.7%，即使提高到 n_jobs=100 也僅約 4.1%；§5.8 則顯示 placement 槓桿在本規模下接近無效，故此空間主要來自 dispatch ordering。這指向一個未來驗證方向：在更重負載與更大叢集下重新評估學習式排程能否穩健勝過啟發式。惟須強調三點誠實限制：(a) headroom 是最佳靜態排序的可達上界，僅代表「空間存在」，並不保證 DRL 能實際逼近；(b) 本研究尚無重負載（n_jobs≥125）的實機結果，且在統一 DRA 後端 [15] 下、測試負載中的實機證據為負向——學習式仍略遜於啟發式（§5.6），故重負載能否翻轉此結論屬有待驗證的假設，而非本研究已成立的宣稱；(c) 尾端指標在此規模下 per-instance 變異大，實機驗證需顯著更多 workload seed 方能達到統計顯著性。延伸此軸的另一方向是擴展至更多節點與 GPU，檢驗效益是否隨叢集規模進一步浮現。
+1. **重負載 regime 與多 GPU cluster**：§5.7 的天花板分析顯示啟發式之上的可贏空間隨負載上升——在低負載 cuBLAS 場景（n_jobs≈50）下僅 0.1–0.7%，即使提高到 n_jobs=100 也僅約 4.1%；§5.8 則顯示 placement 槓桿在本規模下接近無效，故此空間主要來自 dispatch ordering。本研究已將真四路實機評估推進到 n_jobs=125（表 4）——即 headroom 外推更大的重負載區間——結果顯示學習式方法在該負載下仍未勝過 score（方向上甚至落後），故「重負載能翻轉負向結論」這個假設，在本叢集規模的現有證據下並不成立。惟須強調三點誠實限制：(a) headroom 是最佳靜態排序的可達上界，僅代表「空間存在」，並不保證 DRL 能實際逼近，而表 4 正說明 load-125 下 DRL 尚未逼近該上界；(b) 本研究的重負載實機證據止於 n_jobs=125、2×1（單節點單 GPU）、8 個 workload seed，尚未涵蓋更大 n_jobs 與更大叢集，故「更大規模是否翻轉」仍為有待驗證的假設，而非已成立的宣稱；(c) 尾端指標在此規模下 per-instance 變異大（pooled SD ≈ 14.3%、MDE ≈ 16.5%），實機驗證需顯著更多 workload seed 方能達到統計顯著性。延伸此軸的另一方向是擴展至更多節點與 GPU，檢驗效益是否隨叢集規模進一步浮現。
 2. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space。
 3. **Offline RL / RLPD**：收集更大量真實 Slurm transition，以 offline RL 或 RLPD 改善 sim-to-real 轉移 [8]。
 4. **Multi-Agent RL**：在多節點與多 GPU 場景中，探索分散式或階層式排程代理人。
