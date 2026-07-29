@@ -515,7 +515,9 @@ class RLPDAgent:
                  fixed_alpha: bool = False, init_alpha: float = 0.05,
                  device: str = "cpu") -> None:
         self.device = torch.device(device)
+        self.obs_dim = obs_dim
         self.n_actions = n_actions
+        self.hidden = tuple(hidden)
         self.subset = min(subset, n_critics)
         self.gamma = gamma
         self.tau = tau
@@ -621,9 +623,31 @@ class RLPDAgent:
             return int(torch.multinomial(probs, 1).item())
 
     def save(self, path) -> None:
+        """Export a **serve-compatible** checkpoint carrying the RLPD-trained actor.
+
+        `serve.py` loads every non-UXP-RL checkpoint through `DSACAgent.load`,
+        which requires the full DSAC key set (obs_dim, actor_target, q1/q2,
+        targets, opt_*). The RLPD critic ensemble is never used at inference —
+        `select_action` samples the categorical actor — so we copy the trained
+        actor into a scalar-critic DSACAgent shell and save *that* as the primary
+        (servable) checkpoint. The native RLPD ensemble is kept alongside as a
+        `.rlpd` sidecar for provenance / resume. Without this, the faithful RLPD
+        checkpoint is unservable and the eval's RLPD arm cannot run.
+        """
+        from .dsac import DSACAgent
+        shell = DSACAgent(self.obs_dim, self.n_actions, hidden=self.hidden,
+                          use_iqn=False, fixed_alpha=self.fixed_alpha,
+                          device="cpu")
+        shell.actor.load_state_dict(self.actor.state_dict())
+        shell.actor_target.load_state_dict(self.actor.state_dict())
+        with torch.no_grad():
+            shell.log_alpha.fill_(float(self.log_alpha.detach().cpu()))
+        shell.save(path)  # DSAC format → loadable by serve.py / DSACAgent.load
+        # Provenance: the native RLPD ensemble critic (not used at inference).
         torch.save({"actor": self.actor.state_dict(), "q": self.q.state_dict(),
                     "log_alpha": self.log_alpha.detach().cpu(),
-                    "n_actions": self.n_actions, "rlpd": True}, path)
+                    "obs_dim": self.obs_dim, "n_actions": self.n_actions,
+                    "rlpd": True}, str(path) + ".rlpd")
 
 
 def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,

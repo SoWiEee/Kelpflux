@@ -231,7 +231,7 @@ Reward 的設計目標是降低使用者感受到的等待與完成時間，同�
 1. **Discrete SAC**：將 Soft Actor-Critic 延伸到離散 action space，適合 job 選擇與 GPU placement 這類有限離散動作 [6]。
 2. **RDSAC-mean**：以分布式 critic 建模回報分布，但 actor 主要依平均回報決策 [7][16]。
 3. **RDSAC-cvar**：在 RDSAC 上加入 CVaR 風險敏感目標，使策略更重視尾端 JCT 與 SLO violation [16]。
-4. **RLPD**：使用真實叢集收集的 transition 對模擬訓練出的模型進行微調，以縮小 sim-to-real gap [8]。
+4. **RLPD**：以真實資料對模擬訓練出的模型進行微調，縮小 sim-to-real gap [8]。本研究的 RLPD agent 忠實採用原論文核心配方——每個 batch 對稱取樣 50% sim 先驗 + 50% 真實資料、critic 加 LayerNorm 的 critic ensemble（隨機子集取 min）、高 UTD——但**訓練機制為離線**：更新迴圈只做梯度更新、不在真環境即時互動（`agent.update` 無 `env.step`），故為「sim + 真實混合 buffer 的離線微調」，非原論文的真線上更新。真實資料方面，唯一一批實機 RL transition 因 obs 維度已隨叢集擴編改變而不相容，故 online buffer 改以真實 sacct 工作串流（經 `collect-live-trace.py` 擷取）在模擬中以 score 示範動作回放產生（維度無關）。
 
 RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action（即所選放置的 GPU 剩餘 **MPS fraction** 不足以容納該工作請求的動作）。訓練流程包含 prioritized replay、n-step return、potential-based reward shaping [9] 與 heuristic warm start。需澄清命名：本研究的 RDSAC 為自組的「distributional + discrete SAC」，以離散動作空間搭配 IQN 分位數 critic 建構 [7][16]，與 Duan 等人 [17] 針對連續控制、將回報建模為單一高斯分布的 Distributional Soft Actor-Critic 不同，兩者不應混淆。
 
@@ -386,22 +386,25 @@ seed 間變異雖大（工作串流隨機性所致），但 SLO 違反率上 FCF
 
 **統計註記**：Holm-Bonferroni 校正後，所有 learning-based arms 均未顯著優於 Score (adjusted *p* > 0.05)；TOST ±5% 顯示 FCFS、Backfill、RDSAC-mean 與 Score 統計等價。
 
-**實機混合 AI 工作負載（真四路，load-125）。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合、每 seed 125 個工作的高負載下，六個排程器在 average JCT 上彼此接近：score 的平均 JCT 數值最低，SAC 幾乎持平（−1.0%），RDSAC-cvar 次之（−4.1%），FCFS、Backfill 與 RDSAC-mean 則方向上落後 9–14%。經 Holm-Bonferroni 校正後，沒有任何 arm 與 score 有顯著差異（最接近者為 FCFS，*p*<sub>adj</sub> = 0.075）。此為本研究負向結果在真四路、重負載下的直接驗證：學習式 placement 未能勝過 score，且 score 相對於樸素 baseline 的領先在此 seed 數下亦不具統計穩健性。為避免尾端工作被靜默丟棄而造成倖存者偏差，本評估對每個 arm 逐工作記錄終態並依工作類別普查完成率（`states.json`）；六個 arm 均完成 124–125/125 個工作、四類工作（含 Qwen fine-tuning）皆正常結束，故表 4 各項平均可排除倖存者偏差。
+**實機混合 AI 工作負載（真四路，load-125）。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合、每 seed 125 個工作的高負載下，七個排程器在 average JCT 上彼此接近：以真實資料 sim-to-real 微調的 RLPD 是唯一數值上不輸 score 的學習臂（ΔJCT +2.2%，惟此均值受單一 seed 拉高、中位數約與 score 打平），SAC 幾乎持平（−1.0%），RDSAC-cvar 次之（−4.1%），FCFS、Backfill 與 RDSAC-mean 則方向上落後 9–14%。經 Holm-Bonferroni 校正後，沒有任何 arm 與 score 有顯著差異（最接近顯著者為 FCFS，*p*<sub>adj</sub> = 0.075）。此為本研究負向結果在真四路、重負載下的直接驗證：即使是以真實資料適應過的 RLPD 也未能穩健勝過 score，且 score 相對於樸素 baseline 的領先在此 seed 數下亦不具統計穩健性。為避免尾端工作被靜默丟棄而造成倖存者偏差，本評估對每個 arm 逐工作記錄終態並依工作類別普查完成率（`states.json`）；各 arm 均完成 124–125/125 個工作、四類工作（含 Qwen fine-tuning）皆正常結束，故表 4 各項平均可排除倖存者偏差。
 
-表 4. 實機混合 AI 工作負載評估（真四路，每 seed 125 個工作，8 seeds，mean ± std；「完成」為 COMPLETED 工作數 / 125；ΔJCT% 為 seed-level paired difference vs. Score heuristic，正值表示快於 score）
+表 4. 實機混合 AI 工作負載評估（真四路，每 seed 125 個工作，8 seeds，mean ± std；「完成」為 COMPLETED 工作數 / 125；ΔJCT% 為 seed-level paired difference vs. Score heuristic，正值表示快於 score）。RLPD† 為事後追加的第 7 臂，以相同基礎設施單獨評估、配對其 own-run score（CRN）。
 
 | Arm | 完成 | Avg JCT (s) | P95 (s) | P99 (s) | Makespan (s) | GPU 利用率 | Slowdown | SLA Viol. | ΔJCT% vs. Score |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | Score heuristic | 125 | 125.2 ± 19.3 | 433.5 ± 146.4 | 517.6 ± 122.2 | 675.2 ± 42.2 | 8.25 ± 1.30 | 27.57 ± 4.58 | 1.00 ± 0.01 | baseline |
+| RLPD† | 125 | 110.7 ± 18.9 | 418.0 ± 103.5 | 509.0 ± 80.2 | 656.2 ± 40.8 | 7.45 ± 1.34 | 23.62 ± 5.29 | 1.00 ± 0.01 | +2.2 ± 8.0 |
 | SAC | 124 | 126.2 ± 19.8 | 471.2 ± 86.2 | 566.5 ± 49.9 | 680.1 ± 37.7 | 8.00 ± 1.23 | 28.81 ± 4.52 | 1.00 ± 0.01 | −1.0 ± 7.8 |
 | RDSAC-cvar | 125 | 130.5 ± 23.3 | 395.0 ± 132.9 | 527.7 ± 110.6 | 692.6 ± 31.0 | 8.32 ± 1.43 | 29.67 ± 5.63 | 1.00 ± 0.01 | −4.1 ± 9.3 |
 | Backfill | 125 | 136.2 ± 23.4 | 255.6 ± 52.5 | 269.8 ± 50.1 | 693.9 ± 51.1 | 8.68 ± 1.39 | 30.69 ± 5.18 | 1.00 ± 0.01 | −8.9 ± 10.8 |
 | FCFS | 125 | 137.0 ± 18.3 | 241.2 ± 41.7 | 255.0 ± 43.7 | 679.2 ± 39.1 | 8.60 ± 1.24 | 33.08 ± 4.14 | 1.00 ± 0.01 | −10.0 ± 8.8 |
 | RDSAC-mean | 124 | 142.3 ± 38.8 | 469.7 ± 152.7 | 600.3 ± 77.1 | 714.1 ± 53.0 | 8.59 ± 1.81 | 32.78 ± 8.94 | 0.98 ± 0.02 | −13.9 ± 26.0 |
 
-**統計註記**：Holm-Bonferroni 校正後，六個 arm 對 score 皆未達顯著（*p*<sub>adj</sub> ∈ [0.075, 0.720]）。TOST 等價檢定（seed-level 90% CI）顯示：SAC 與 score 在 ±10% 內統計等價（90% CI = [−6.2%, +4.2%]）；RDSAC-cvar 僅在 ±15% 內等價（[−10.3%, +2.1%]）；FCFS 與 Backfill 的 90% CI 完全落在 0 以下（分別 [−15.8%, −4.1%]、[−16.1%, −1.6%]），方向上一致慢於 score，但在 n=8 下未達 Holm 顯著。pooled SD = 14.3% → MDE(n=8, power .8) ≈ 16.5%，即本規模僅能偵測大於約 16.5% 的效應。P95/P99 呈現一個取捨：FCFS/Backfill 以嚴格序列執行換得較低尾端（P99 ≈ 255–270 s）但平均 JCT 較差；score 與學習式 arm 以較積極的 MPS 共置壓低平均，代價是較重的尾端（P99 ≈ 518–600 s）。SLA 違反率在此負載下對所有 arm 皆近飽和（≈1.00），不具鑑別力。
+**統計註記**：Holm-Bonferroni 校正後，七個 arm 對 score 皆未達顯著。TOST 等價檢定（seed-level 90% CI）顯示：RLPD 與 score 在 ±10% 內統計等價（ΔJCT +2.2 ± 8.0%，*t*-test *p* = 0.46，90% CI = [−3.1%, +7.6%]）；SAC 亦在 ±10% 內等價（90% CI = [−6.2%, +4.2%]）；RDSAC-cvar 僅在 ±15% 內等價（[−10.3%, +2.1%]）；FCFS 與 Backfill 的 90% CI 完全落在 0 以下（分別 [−15.8%, −4.1%]、[−16.1%, −1.6%]），方向上一致慢於 score，但在 n=8 下未達 Holm 顯著。pooled SD = 14.3% → MDE(n=8, power .8) ≈ 16.5%，即本規模僅能偵測大於約 16.5% 的效應。P95/P99 呈現一個取捨：FCFS/Backfill 以嚴格序列執行換得較低尾端（P99 ≈ 255–270 s）但平均 JCT 較差；score 與學習式 arm 以較積極的 MPS 共置壓低平均，代價是較重的尾端（P99 ≈ 509–600 s）。SLA 違反率在此負載下對所有 arm 皆近飽和（≈1.00），不具鑑別力。
 
-**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；真四路重負載（load-125）場景中，六個 arm 經 Holm 校正後皆與 score 無顯著差異，其中 SAC 與 score 在 ±10% 內 TOST 等價，FCFS 與 Backfill 方向上慢於 score 但未達統計穩健。**所有統計檢定均使用 Holm-Bonferroni 多重比較校正；等價性以 TOST (two one-sided tests) 判定（cuBLAS 場景採 ±5% 邊界，load-125 場景因效應量與變異較大，改報 ±10%/±15% 邊界）。**
+† **RLPD 的判讀須格外保守。** RLPD 為事後追加、以相同基礎設施單獨評估的一次跑，其 own-run score 基線 AvgJCT 為 113.7 ± 19.8 s（低於主表 score 的 125.2 s，反映真實叢集跨日變異），故 RLPD 的**絕對**指標欄不宜與其他列直接比較，惟 ΔJCT%（seed-paired vs. 同 run score，CRN）可跨列比較。RLPD 的 +2.2% 均值受單一 seed（+20.7%）拉高，去除後其餘 7 seed 中位數約 −0.3%，即 RLPD 實質上與 score 打平而非勝出；此結果與「以真實資料 sim-to-real 微調可拉近、但未穩健超越啟發式」一致，且 RLPD 的實作為 sim 先驗 + 真實工作負載 score 示範回放的**離線**微調（見 §4.4），非原論文的真線上更新。
+
+**統計解讀。** 多重比較校正後，學習式方法在兩個實機場景中皆未穩健勝過 score heuristic。cuBLAS 場景中，RDSAC-mean、FCFS 與 Backfill 可被視為與 score 在 ±5% 內統計等價；真四路重負載（load-125）場景中，七個 arm 經 Holm 校正後皆與 score 無顯著差異，其中離線 sim-to-real 微調的 RLPD 與 SAC 皆與 score 在 ±10% 內 TOST 等價（RLPD 數值上略快 +2.2% 但受單一 seed 拉高、非穩健），FCFS 與 Backfill 方向上慢於 score 但未達統計穩健。**所有統計檢定均使用 Holm-Bonferroni 多重比較校正；等價性以 TOST (two one-sided tests) 判定（cuBLAS 場景採 ±5% 邊界，load-125 場景因效應量與變異較大，改報 ±10%/±15% 邊界）。**
 
 整體而言，本研究的主要發現是：DRL 能在模擬中學到可區分的策略，但在小規模真實異質 GPU + MPS 叢集中，學習式策略的優勢尚未穩健轉移；此結論在低負載 cuBLAS 與真四路重負載（load-125）兩個實機場景中一致成立。這不否定 DRL 排程的潛力，而是說明此類研究必須以真實部署、統計檢定與場景依賴性作為必要評估條件。
 
@@ -446,7 +449,7 @@ seed 間變異雖大（工作串流隨機性所致），但 SLO 違反率上 FCF
 
 本研究驗證了 DRL 能於異質 GPU 與 NVIDIA MPS 環境中學習 GPU placement 與 **MPS fraction** [5]，並能透過 Slurm job submission path 整合到真實排程流程 [11]。相較傳統只選 GPU 或只做固定 rule 的方法，本研究將 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號整合成一個可學習的排程框架。
 
-實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過啟發式；此結論在低負載 cuBLAS 與真四路重負載（load-125）兩個場景皆一致成立。在真四路重負載下，score 的平均 JCT 數值最低、SAC 與其在 ±10% 內統計等價；MPS/VRAM 感知的 score 相對 Slurm Backfill 雖方向上較快，但在本 seed 數下未達統計顯著（*p*<sub>adj</sub> = 0.21），故本研究不將其宣稱為穩健的正面結果。整體而言，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
+實驗結果顯示，學習式策略在模擬環境可區分 FCFS、Backfill 與啟發式策略，但在 RTX 4070 與 RTX 3080 的小規模實機環境中，尚未穩健勝過啟發式；此結論在低負載 cuBLAS 與真四路重負載（load-125）兩個場景皆一致成立。在真四路重負載下，以真實資料離線微調的 RLPD 是唯一數值上不輸 score 的學習臂（+2.2%，惟受單一 seed 拉高、中位數約打平且不顯著），SAC 亦與 score 在 ±10% 內統計等價；MPS/VRAM 感知的 score 相對 Slurm Backfill 雖方向上較快，但在本 seed 數下未達統計顯著（*p*<sub>adj</sub> = 0.21），故本研究不將任一方向宣稱為穩健的正面結果。整體而言，在異質 GPU + MPS 排程中，策略效益高度依賴工作負載、硬體規模與底層資源分配後端。
 
 ### 6.2 限制
 
@@ -455,7 +458,7 @@ seed 間變異雖大（工作串流隨機性所致），但 SLO 違反率上 FCF
 1. **叢集規模有限**：目前實機環境只有 RTX 4070 與 RTX 3080 兩張 GPU，無法直接代表數十至數百 GPU 的生產叢集。
 2. **只使用 MPS fraction**：本研究尚未納入 MIG，也未處理 MIG 與 MPS 混合 partition [5][21]。
 3. **未涵蓋多節點大規模訓練**：目前 focus 在單卡或小規模 job replay，尚未完整處理多 GPU gang scheduling。
-4. **真實 transition 數量有限**：RLPD 使用的實機資料量仍不足，可能無法充分縮小 sim-to-real gap。
+4. **RLPD 為離線微調且真實資料有限**：本研究的 RLPD 雖忠實採用原論文的對稱取樣、critic ensemble 與 LayerNorm 配方，但訓練機制為離線（無真環境即時互動），且唯一一批實機 RL transition 因 obs 維度變更而不相容，改以真實工作負載的 score 示範回放替代；真線上 RLPD（policy 於真叢集持續互動）需多節點 live 訓練部署，屬未完成工作。故表 4 中 RLPD 與 score 打平的結果，應理解為「離線 sim-to-real 微調」的效益上界估計，而非真線上 RLPD 的完整潛力。
 5. **尾端指標樣本數不足**：P99 與 CVaR 在小規模實機實驗中變異較大，因此本文對尾端結果採保守解讀。
 
 ### 6.3 未來工作

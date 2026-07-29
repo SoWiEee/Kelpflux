@@ -38,6 +38,9 @@ SEEDS=( ${SEEDS:-42 43 44 45 46 47 48 49} )
 CONFIGS=( ${CONFIGS:-learned fcfs backfill} )
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 TAG="${TAG:-aimix6}"
+# Optional 7th arm: offline-fine-tuned RLPD (faithful RLPDAgent, serve-exported).
+# CONFIGS="rlpd" RLPD_CKPT=/path/dsac.pt → run_heavytail_ab runs score + RLPD only.
+RLPD_CKPT="${RLPD_CKPT:-}"
 LOG="runs/${TAG}_${STAMP}.log"
 ORIG=/tmp/slurm.conf.${TAG}orig.$$
 mkdir -p runs
@@ -120,6 +123,7 @@ common_args=(--serve-url "$SERVE" --login-pod "$LOGIN" --namespace $NS --control
 for CFG in "${CONFIGS[@]}"; do
   case "$CFG" in
     learned)  apply_verify "$ORIG"          "sched/backfill" learned ;;
+    rlpd)     apply_verify "$ORIG"          "sched/backfill" rlpd ;;
     fcfs)     apply_verify "$CONF_fcfs"     "sched/builtin"  fcfs ;;
     backfill) apply_verify "$CONF_backfill" "sched/backfill" backfill ;;
   esac
@@ -134,6 +138,13 @@ for CFG in "${CONFIGS[@]}"; do
       .venv-m11/bin/python -m eval.scripts.run_heavytail_ab "${common_args[@]}" --seed "$SEED" \
         --sac-ckpt "${CK}/sac_s${SEED}.pt" --rdsac-mean-ckpt "${CK}/rdsac_mean_s${SEED}.pt" \
         --rdsac-cvar-ckpt "${CK}/rdsac_cvar_s${SEED}.pt" \
+        --out-dir "$OUT" >>"$LOG" 2>&1 || log "  [$CFG] s$SEED exit $?"
+    elif [ "$CFG" = "rlpd" ]; then
+      # 7th arm: score + RLPD only (single shared offline-fine-tuned checkpoint,
+      # same convention as run_full8/run_slo8). RLPD pairs vs this run's score (CRN).
+      [ -f "$RLPD_CKPT" ] || { log "  SKIP s$SEED missing RLPD_CKPT=$RLPD_CKPT"; continue; }
+      .venv-m11/bin/python -m eval.scripts.run_heavytail_ab "${common_args[@]}" --seed "$SEED" \
+        --rlpd-ckpt "$RLPD_CKPT" \
         --out-dir "$OUT" >>"$LOG" 2>&1 || log "  [$CFG] s$SEED exit $?"
     else
       # no ckpts → run_heavytail_ab runs the score arm only; with the Lua stripped this
