@@ -34,6 +34,8 @@ from eval.scripts.live_ab_heavytail import (
     decide_node,
     gen_workload,
     join_records,
+    merge_histograms,
+    state_histogram,
     parse_free_mps,
     submit_stream,
     wait_drain,
@@ -220,6 +222,8 @@ def run(args) -> int:
     mps_buckets = [int(b) for b in args.mps_buckets.split(",") if b.strip()] or None
     all_records: list[dict] = []
     reports: list[dict] = []
+    # Terminal-state census per arm — the audit trail for what join_records drops.
+    states_by_arm: dict = {a: {"total": 0, "states": {}, "by_class": {}} for a in arms}
 
     import shlex as _shlex
     exec_prefix = ([*_shlex.split(args.kubectl), "exec", "-n", args.namespace,
@@ -283,9 +287,18 @@ def run(args) -> int:
             parsed = collect_sacct(since, kubectl=args.kubectl, namespace=args.namespace,
                                    controller_pod=args.controller_pod)
             rr = join_records(jobs, parsed, arm, rnd)
+            hist = state_histogram(jobs, parsed, arm, rnd)
+            done = hist["states"].get("COMPLETED", 0)
+            if done < hist["total"]:
+                # Loud, because join_records is about to drop these silently and
+                # the missing jobs would otherwise make this arm look faster.
+                lost = {k: v for k, v in sorted(hist["states"].items()) if k != "COMPLETED"}
+                print(f"[ab] WARN {arm} {tag}: only {done}/{hist['total']} COMPLETED "
+                      f"— dropped {lost}; by class {hist['by_class']}", flush=True)
             if not is_warm:               # discard warmup round(s)
                 records_by_arm[arm].extend(rr)
                 all_records.extend(rr)
+                states_by_arm[arm] = merge_histograms(states_by_arm[arm], hist)
 
         total = args.warmup + args.rounds
         if args.interleave:
@@ -312,6 +325,7 @@ def run(args) -> int:
     if not args.dry_run:
         (out_dir / "records.json").write_text(json.dumps(all_records, indent=2))
         (out_dir / "reports.json").write_text(json.dumps(reports, indent=2))
+        (out_dir / "states.json").write_text(json.dumps(states_by_arm, indent=2))
         (out_dir / "SUMMARY.md").write_text(render_summary(reports))
         print(f"[ab] wrote {out_dir}/SUMMARY.md")
     else:

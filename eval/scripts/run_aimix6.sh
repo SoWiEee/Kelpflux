@@ -28,10 +28,19 @@ LOGIN="${LOGIN_POD:-slurm-login-7f8cfbc48-c875f}"
 # be first or every learned arm silently places onto the slow card.
 GPU_NODES="${GPU_NODES:-slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0}"
 MODEL="${MODEL:-/shared/models/qwen05b}"
-read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49}"
-read -r -a CONFIGS <<< "${CONFIGS:-learned fcfs backfill}"
-STAMP=$(date +%Y%m%d-%H%M%S)
+# `read -r -a <<<` only consumes the FIRST line of a here-string, so a
+# newline-separated SEEDS (e.g. SEEDS="$(seq 42 64)") would silently collapse to
+# one seed and the run would look complete. Unquoted array expansion splits on
+# IFS (space+tab+newline) instead.
+# shellcheck disable=SC2206
+SEEDS=( ${SEEDS:-42 43 44 45 46 47 48 49} )
+# shellcheck disable=SC2206
+CONFIGS=( ${CONFIGS:-learned fcfs backfill} )
+STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 TAG="${TAG:-aimix6}"
+# Optional 7th arm: offline-fine-tuned RLPD (faithful RLPDAgent, serve-exported).
+# CONFIGS="rlpd" RLPD_CKPT=/path/dsac.pt → run_heavytail_ab runs score + RLPD only.
+RLPD_CKPT="${RLPD_CKPT:-}"
 LOG="runs/${TAG}_${STAMP}.log"
 ORIG=/tmp/slurm.conf.${TAG}orig.$$
 mkdir -p runs
@@ -114,6 +123,7 @@ common_args=(--serve-url "$SERVE" --login-pod "$LOGIN" --namespace $NS --control
 for CFG in "${CONFIGS[@]}"; do
   case "$CFG" in
     learned)  apply_verify "$ORIG"          "sched/backfill" learned ;;
+    rlpd)     apply_verify "$ORIG"          "sched/backfill" rlpd ;;
     fcfs)     apply_verify "$CONF_fcfs"     "sched/builtin"  fcfs ;;
     backfill) apply_verify "$CONF_backfill" "sched/backfill" backfill ;;
   esac
@@ -128,6 +138,13 @@ for CFG in "${CONFIGS[@]}"; do
       .venv-m11/bin/python -m eval.scripts.run_heavytail_ab "${common_args[@]}" --seed "$SEED" \
         --sac-ckpt "${CK}/sac_s${SEED}.pt" --rdsac-mean-ckpt "${CK}/rdsac_mean_s${SEED}.pt" \
         --rdsac-cvar-ckpt "${CK}/rdsac_cvar_s${SEED}.pt" \
+        --out-dir "$OUT" >>"$LOG" 2>&1 || log "  [$CFG] s$SEED exit $?"
+    elif [ "$CFG" = "rlpd" ]; then
+      # 7th arm: score + RLPD only (single shared offline-fine-tuned checkpoint,
+      # same convention as run_full8/run_slo8). RLPD pairs vs this run's score (CRN).
+      [ -f "$RLPD_CKPT" ] || { log "  SKIP s$SEED missing RLPD_CKPT=$RLPD_CKPT"; continue; }
+      .venv-m11/bin/python -m eval.scripts.run_heavytail_ab "${common_args[@]}" --seed "$SEED" \
+        --rlpd-ckpt "$RLPD_CKPT" \
         --out-dir "$OUT" >>"$LOG" 2>&1 || log "  [$CFG] s$SEED exit $?"
     else
       # no ckpts → run_heavytail_ab runs the score arm only; with the Lua stripped this
@@ -157,10 +174,14 @@ def panels(cfg, seed):
         for a, p in rep["panels"].items(): out.setdefault(a, []).append(p)
     return out
 
-KEYS = ["mean", "p95", "p99", "makespan", "gpu_util", "slowdown_mean", "sla_viol", "done"]
+KEYS = ["mean", "p95", "p99", "makespan", "gpu_util", "slowdown_mean", "sla_viol", "ndone"]
 def _seed_metric(ps, key):
-    if key == "done":
-        return float(np.mean([p["completed"]/p["n"]*100 for p in ps if p["n"]]))
+    if key == "ndone":
+        # COUNT of jobs that reached the metrics — join_records keeps only COMPLETED,
+        # so TIMEOUT/FAILED jobs silently vanish from every mean. An arm that stalls
+        # or misplaces jobs then looks FASTER (its slow jobs were dropped). Report it
+        # so an imbalance vs score is visible instead of being read as a win.
+        return float(np.mean([p["n"] for p in ps]))
     return float(np.nanmean([p.get(key, float("nan")) for p in ps]))
 
 absd = {a: {k: [] for k in KEYS} for a in ORDER}
@@ -195,11 +216,11 @@ holm = dict(zip(tested, holm_bonferroni(raw))) if tested else {}
 out = [f"# aimix 六臂統一 A/B — {tag} {stamp}", "",
        f"seeds={seeds}；2×1、node order 4070→3080、reward=多目標(JCT+GPU利用率)。",
        "指標：平均JCT/P95/P99/Makespan(s)、GPU利用率、Slowdown、SLA違反率。Δ平均JCT% 正=比 score 快。", "",
-       "| arm | 平均JCT(s) | P95(s) | P99(s) | Makespan(s) | GPU利用率 | Slowdown | SLA違反率 | Δ平均JCT% | Holm p |",
-       "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+       "| arm | 完成數 | 平均JCT(s) | P95(s) | P99(s) | Makespan(s) | GPU利用率 | Slowdown | SLA違反率 | Δ平均JCT% | Holm p |",
+       "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
 for a in arms:
     d = absd[a]
-    row = (f"| {a} | {ms(d['mean'])} | {ms(d['p95'])} | {ms(d['p99'])} | {ms(d['makespan'])} | "
+    row = (f"| {a} | {ms(d['ndone'], '{:.0f}')} | {ms(d['mean'])} | {ms(d['p95'])} | {ms(d['p99'])} | {ms(d['makespan'])} | "
            f"{ms(d['gpu_util'], '{:.2f}')} | {ms(d['slowdown_mean'], '{:.2f}')} | {ms(d['sla_viol'], '{:.2f}')} |")
     if a == "score":
         out.append(row + " （基準） | — |")
@@ -211,7 +232,8 @@ for a in arms:
 if tested:
     sd_pool = float(np.sqrt(np.mean([np.var(per[a], ddof=1) for a in tested])))
     out += ["", f"pooled SD={sd_pool:.1f}% → MDE(n={len(seeds)}, power .8) ≈ {mde(sd_pool, len(seeds)):.1f}%",
-            "判讀：Holm 校正後仍顯著才是穩健差異；TOST『是』= 90%CI 落在 ±5% 內（證實等價）；兩者皆否 = 此規模下不可區分。"]
+            "判讀：Holm 校正後仍顯著才是穩健差異；TOST『是』= 90%CI 落在 ±5% 內（證實等價）；兩者皆否 = 此規模下不可區分。",
+            "**先看『完成數』**：僅 COMPLETED 的 job 進入各項平均（TIMEOUT/FAILED 會被丟棄），故完成數明顯低於 score 的 arm，其較低的 JCT 是倖存者偏差而非較快；此時 Δ平均JCT% 不可採信。"]
 Path(f"runs/{tag}_{stamp}_TABLES.md").write_text("\n".join(out))
 print("\n".join(out)); print(f"[agg] wrote runs/{tag}_{stamp}_TABLES.md")
 PY

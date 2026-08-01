@@ -35,11 +35,16 @@ CK="${CK:-/tmp/lckpts}"
 # (fcfs/backfill/score/sac/rdsac_cvar); add rdsac_mean for the 6-arm §5.3 parity set.
 read -r -a LEARNED <<< "${LEARNED:-sac rdsac_cvar}"
 
+# NOTE: SEEDS must word-split on BOTH spaces and newlines. `read -r -a <<<` only
+# reads the first line of a here-string, so a newline-separated SEEDS (e.g. the
+# `$(seq 42 64)` default, or `SEEDS="$(seq 42 64)"`) would collapse to just the
+# first seed. Unquoted array expansion splits on IFS (space+tab+newline) → correct.
+# shellcheck disable=SC2206
 if [ "${SMOKE:-0}" = "1" ]; then
-  N_JOBS="${N_JOBS:-6}"; ROUNDS="${ROUNDS:-1}"; read -r -a SEEDS <<< "${SEEDS:-42}"
+  N_JOBS="${N_JOBS:-6}"; ROUNDS="${ROUNDS:-1}"; SEEDS=( ${SEEDS:-42} )
   log_prefix="[SMOKE] "
 else
-  N_JOBS="${N_JOBS:-125}"; ROUNDS="${ROUNDS:-1}"; read -r -a SEEDS <<< "${SEEDS:-$(seq 42 64)}"
+  N_JOBS="${N_JOBS:-125}"; ROUNDS="${ROUNDS:-1}"; SEEDS=( ${SEEDS:-$(seq 42 64)} )
   log_prefix=""
 fi
 OVERSUB="${OVERSUB:-2.0}"
