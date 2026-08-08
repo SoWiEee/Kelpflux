@@ -61,11 +61,11 @@ GPU scheduling 不是單次分類問題，而是序列決策問題。一次 plac
 
 本研究的核心貢獻在於將「異質 GPU + MPS + 真實 Slurm 流程」三者結合，具體如下：
 
-1. **異質 GPU placement 與 MPS-aware 的聯合排程動作空間**：不同於 UXP-RL [23] 僅決定 CPU-vs-GPU 的資源類型、KIS-S [25] 僅調整 Kubernetes 推論副本數、DRR [26] 僅針對碎片化，本研究讓單一學習式策略在真實 Slurm 佇列上同時決定「派哪個工作」與「放到哪張異質 GPU」，並以工作攜帶的 MPS fraction 需求（25%/50%/75%/100%）作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。
+1. **異質 GPU placement 與 MPS-aware 的聯合排程動作空間**：不同於 UXP-RL [23] 僅決定 CPU-vs-GPU 的資源類型、KIS-S [25] 僅調整 Kubernetes 推論副本數、DRR [26] 僅針對碎片化，本研究讓單一學習式策略在真實 Slurm 佇列上同時決定「派哪個工作」與「放到哪張異質 GPU」，並以工作攜帶的 MPS fraction 需求（25%/50%/75%/100%）作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。此設計首次在真實 Slurm 佇列上刻畫「job 選擇與異質 GPU placement 聯合決策」相對於僅決定資源類型 [23] 或僅調整副本數 [25] 的可行性與行為差異。
 
-2. **失效安全的 Slurm 策略層整合**：不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入真實 Slurm job submission path，並提供 fail-safe fallback——當 RL 服務逾時、回傳無效 action 或健康檢查失敗時自動回退至啟發式策略，使排程核心 (slurmctld) 永不被阻塞。此設計讓 DRL scheduler 得以在真實排程路徑中部署，而不需修改 Slurm 核心。
+2. **失效安全的 Slurm 策略層整合**：不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入真實 Slurm job submission path，並提供 fail-safe fallback——當 RL 服務逾時、回傳無效 action 或健康檢查失敗時自動回退至啟發式策略，使排程核心 (slurmctld) 永不被阻塞。此設計讓 DRL scheduler 得以在真實排程路徑中部署，而不需修改 Slurm 核心。本研究因此證明學習式排程可在不更動 slurmctld 的前提下安全嵌入生產排程路徑，這是先前純模擬研究 [23][25] 未曾示範的部署可行性。
 
-3. **sim-to-real 實機驗證與效益刻畫**：於 RTX 4070 與 RTX 3080 異質 GPU 環境完成部署，並以 trace replay 與真實 AI workload 比較 FCFS、Backfill、heuristic、SAC、RDSAC 與 RLPD。結果顯示學習式策略在平均 JCT 上優於傳統 Slurm 排程；本研究並以多 seed 配對、多重比較校正與等價檢定（附錄 A）嚴謹刻畫此效益的統計邊界與場景依賴性，此為純模擬研究難以提供的實機方法學貢獻。
+3. **sim-to-real 實機驗證與效益刻畫**：於 RTX 4070 與 RTX 3080 異質 GPU 環境完成部署，並以 trace replay 與真實 AI workload 比較 FCFS、Backfill、heuristic、SAC、RDSAC 與 RLPD。結果顯示學習式策略在平均 JCT 上優於傳統 Slurm 排程；本研究並以多 seed 配對、多重比較校正與等價檢定（附錄 A）嚴謹刻畫此效益的統計邊界與場景依賴性，此為純模擬研究難以提供的實機方法學貢獻。更具體而言，本研究以實機證據指出一項純模擬難以揭示的邊界條件：學習式優勢相對傳統 Slurm 成立，但相對已 size-aware 的啟發式並不穩健、而是隨負載與場景變動，這也提示「DRL 必然勝過啟發式」的預設在真實異質小叢集上需重新檢視（詳附錄 A）。
 
 ## 2. 相關研究
 
