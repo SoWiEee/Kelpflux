@@ -302,7 +302,9 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 ### 5.5 與啟發式基準的嚴謹比較
 
-表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 則未構成穩健超越。以 aimix125c campaign 的 seed-level 配對差（ΔJCT%，正值代表快於 score；n=8，配對 t 檢定，Holm-Bonferroni 校正；TOST 等價界限**事前**定為 ±10%）進行嚴謹比較：
+表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 則未構成穩健超越。以 aimix125c campaign 的 seed-level 配對差（ΔJCT%，正值代表快於 score；n=8，配對 t 檢定，Holm-Bonferroni 校正；TOST 等價界限**事前**定為 ±10%）進行嚴謹比較。
+
+本節數值與表 6 **完全同源**（同一 aimix125c、同一 n=8 seeds）：以表 6 之 seed-mean JCT 直接相除即可還原各臂 ΔJCT%——例如 RDSAC-mean (125.2−142.3)/125.2 = −13.7%、FCFS −9.4%、SAC −0.8%，與下列 seed-level 配對均值（−13.9%／−10.0%／−1.0%）**一致**，殘餘 ≤0.6 pp 之差僅來自「比值的平均」與「平均的比值」之權重不同。**唯一的例外是 RLPD**：其表 6 之 110.7 s 屬獨立 campaign，ΔJCT%（+2.2%）以自身併跑 score（≈113.7 s）為分母，**不可**由表 6 之 110.7/125.2（= +11.6%）還原——這即是「pooled 與 paired 看似相差甚大」的唯一來源，並非兩張表方法不一致。
 
 - **SAC**：ΔJCT −1.0%（95% CI [−7.5, +5.5]、Cohen's *d*=−0.13、adjusted *p*=0.72）；其 90% CI 落於 ±10% 內，**通過 TOST 等價**，與 score 實務等價。
 - **RDSAC-cvar**：−4.1%（95% CI [−11.9, +3.7]、*d*=−0.44、adjusted *p*=0.53）；點估計慢於 score，未達顯著、亦未通過 ±10% 等價。
