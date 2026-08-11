@@ -306,20 +306,30 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 本節各臂 ΔJCT% **直接由表 6 之 seed-mean JCT 計算** `(JCT_score − JCT_arm) / JCT_score × 100`，故與表 6 **逐格一致、可直接驗證**（例如 RDSAC-mean (125.2−142.3)/125.2 = −13.7%、FCFS −9.4%、SAC −0.8%）；95% CI、Cohen's *d*、adjusted *p* 與 TOST 則由 seed-level 配對差得出。RLPD 之絕對平均 JCT 取自併跑其自身 score 基準的評估（見表 6 註 †），故其 ΔJCT% 以該基準計算。
 
-- **SAC**：ΔJCT −0.8%（95% CI [−7.3, +5.7]、Cohen's *d*=−0.10、adjusted *p*=0.72）；其 90% CI 落於 ±10% 內，**通過 TOST 等價**，與 score 實務等價。
-- **RDSAC-cvar**：−4.2%（95% CI [−12.0, +3.6]、*d*=−0.45、adjusted *p*=0.53）；點估計慢於 score，未達顯著、亦未通過 ±10% 等價。
-- **RDSAC-mean**：−13.7%（95% CI [−35.4, +8.0]、*d*=−0.53、adjusted *p*=0.53）；信賴區間甚寬，點估計明顯慢於 score。
-- 作為對照，**FCFS**（−9.4%、95% CI [−16.8, −2.0]、*d*=−1.07、adjusted *p*=0.075）與 **Backfill**（−8.8%、95% CI [−17.8, +0.2]、*d*=−0.81、adjusted *p*=0.21）點估計皆慢於 score。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——這是小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
+六臂的完整統計如表 8。
 
-整體而言，無任一學習臂在配對檢定下穩健超越 size-aware 啟發式：SAC 與 score 實務等價，其餘學習臂點估計偏慢且信賴區間寬。
+表 8. 與 size-aware 啟發式（score）之嚴謹比較（aimix125c，n=8 seeds；ΔJCT% 正值＝快於 score，由表 6 之 seed-mean JCT 直接相除）
 
-RLPD 取得表 6 中最佳的絕對平均 JCT（110.7 s）；其相對併跑之 score 基準的配對改善為 ΔJCT +2.2%（95% CI [−4.5, +8.9]、*d*=+0.28、配對 t *p*=0.46），90% CI 落於 ±10% 內、**通過 TOST 等價**，即與 score 實務等價（該基準見表 6 註 †）。因此 RLPD 亦未構成對 size-aware 啟發式的穩健超越。
+| 臂 | ΔJCT% | 95% CI | Cohen's *d* | Holm adj. *p* | TOST ±10% |
+|---|--:|--:|--:|--:|:--:|
+| SAC | −0.8 | [−7.3, +5.7] | −0.10 | 0.72 | 通過 |
+| RDSAC-cvar | −4.2 | [−12.0, +3.6] | −0.45 | 0.53 | 否 |
+| RDSAC-mean | −13.7 | [−35.4, +8.0] | −0.53 | 0.53 | 否 |
+| FCFS | −9.4 | [−16.8, −2.0] | −1.07 | 0.075 | 否 |
+| Backfill | −8.8 | [−17.8, +0.2] | −0.81 | 0.21 | 否 |
+| **RLPD** † | **+2.2** | [−4.5, +8.9] | +0.28 | 0.46 | 通過 |
+
+† RLPD 之基準為其自身併跑之 score（絕對平均 JCT 110.7 s，為表 6 最佳）；其 ΔJCT% 以該基準計算，不與前五臂同 Holm family。
+
+僅 SAC 與 RLPD 通過 ±10% TOST 等價（與 score 實務等價），其餘臂點估計偏慢且信賴區間甚寬。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——此為小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
+
+整體而言，無任一臂（含取得表 6 最佳絕對 JCT 的 RLPD）在配對檢定下穩健超越 size-aware 啟發式：SAC 與 RLPD 與 score 實務等價（±10% TOST 通過），其餘臂點估計偏慢且信賴區間寬。
 
 ### 5.6 天花板分析
 
-為區分負向結果是源於特定 RL 方法的局限、還是測試 regime 本身空間有限，本研究在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只剩 dispatch **ordering**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。結果（表 8）顯示 headroom 隨負載單調上升：在本研究 cuBLAS 與模擬比較的測試負載（n_jobs≈50，對應 load 40–60）下 headroom 僅 0.1–0.7%，即 score 已幾乎位於可達排程上界；即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。這說明低負載下的策略空間確實接近平坦，是負向結果的結構性原因，而不是特定方法的偶然失敗。
+為區分負向結果是源於特定 RL 方法的局限、還是測試 regime 本身空間有限，本研究在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只剩 dispatch **ordering**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。結果（表 9）顯示 headroom 隨負載單調上升：在本研究 cuBLAS 與模擬比較的測試負載（n_jobs≈50，對應 load 40–60）下 headroom 僅 0.1–0.7%，即 score 已幾乎位於可達排程上界；即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。這說明低負載下的策略空間確實接近平坦，是負向結果的結構性原因，而不是特定方法的偶然失敗。
 
-表 8. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
+表 9. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
 
 | 負載 (n_jobs) | Headroom（mean ± 95% CI） | Max |
 |---|--:|--:|
@@ -330,9 +340,9 @@ RLPD 取得表 6 中最佳的絕對平均 JCT（110.7 s）；其相對併跑之 
 
 ### 5.7 Placement 解耦消融
 
-排程的另一個可能槓桿是 GPU/MPS placement 本身，而非 ordering。本研究以解耦消融訓練三個網路形狀相同的臂：**joint**（同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score 首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。結果（表 9）顯示兩個解耦臂與 joint 的差異均未達統計顯著；但估計區間很寬，且本分析未進行 TOST，因此「未顯著」不能解讀為實質等價，也不能據此判定 job 選擇或 placement 無效。此消融只能說明：在目前 2×1、5 training seeds 的樣本下，尚無法辨識哪個決策槓桿帶來穩定優勢。
+排程的另一個可能槓桿是 GPU/MPS placement 本身，而非 ordering。本研究以解耦消融訓練三個網路形狀相同的臂：**joint**（同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score 首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。結果（表 10）顯示兩個解耦臂與 joint 的差異均未達統計顯著；但估計區間很寬，且本分析未進行 TOST，因此「未顯著」不能解讀為實質等價，也不能據此判定 job 選擇或 placement 無效。此消融只能說明：在目前 2×1、5 training seeds 的樣本下，尚無法辨識哪個決策槓桿帶來穩定優勢。
 
-表 9. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT）
+表 10. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT）
 
 | 臂 | 平均 JCT (s) | Δ vs joint | 配對 *p* |
 |---|--:|--:|--:|
