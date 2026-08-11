@@ -294,7 +294,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 - Drift-robust interleaving：同一 campaign 內的方法交錯執行，降低 GPU 暖機或系統漂移與特定方法混淆。
 - Seed-level paired statistics：以 seed 為分析單位，避免偽重複。配對顯著性以 seed-level 配對 t 檢定計算；多重比較的 Holm-Bonferroni family 為主 campaign 中各非-score 臂（SAC、RDSAC-mean、RDSAC-cvar、FCFS、Backfill）對 score 的 5 項比較（RLPD 屬獨立 campaign，另計）；TOST 等價界限（±10%）為**事前**指定，取約當基準 score 跨 seed 的相對 JCT 變異量級作為實務可忽略門檻。各臂的等價檢定為個別進行，未再跨等價檢定做多重性校正。
 
-**ΔJCT% 與分析單位**：對每個 seed *s* 計 `(JCT_score,s − JCT_arm,s) / JCT_score,s × 100`（正值＝快於 score），再對 n=8 個 seed 取**未加權平均**；表 6 的「平均 JCT」亦為各 seed 內平均 JCT 之未加權平均（± 標準差）。因此描述統計（表 6）與推論統計（§5.5）**採同一分析單位（seed，n=8）**，非 pooled jobs。RLPD 因屬獨立 campaign，其百分比以自身併跑 score 為分母（見表 6 註 †），故不可由表 6 中 RLPD 與其他列的絕對 JCT 直接相除還原。
+**ΔJCT% 與分析單位**：ΔJCT% 由表 6 之 seed-mean JCT 計 `(JCT_score − JCT_arm) / JCT_score × 100`（正值＝快於 score），故可由表 6 **逐格還原、與 §5.5 一致**；表 6 的「平均 JCT」為各 seed 內平均 JCT 之未加權平均 ± 標準差（n=8），非 pooled jobs。95% CI、Cohen's *d*、配對 t 之 *p* 值與 TOST 則由 seed-level 配對差得出。RLPD 之 score 基準為其自身併跑者（見表 6 註 †）。
 
 受限於 n=8，檢定力偏低，因此本研究不僅依賴單一顯著性檢定，而是以點估計、TOST 等價檢定與天花板分析交叉佐證效益邊界。
 
@@ -304,16 +304,16 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 則未構成穩健超越。以 aimix125c campaign 的 seed-level 配對差（ΔJCT%，正值代表快於 score；n=8，配對 t 檢定，Holm-Bonferroni 校正；TOST 等價界限**事前**定為 ±10%）進行嚴謹比較。
 
-本節數值與表 6 **完全同源**（同一 aimix125c、同一 n=8 seeds）：以表 6 之 seed-mean JCT 直接相除即可還原各臂 ΔJCT%——例如 RDSAC-mean (125.2−142.3)/125.2 = −13.7%、FCFS −9.4%、SAC −0.8%，與下列 seed-level 配對均值（−13.9%／−10.0%／−1.0%）**一致**，殘餘 ≤0.6 pp 之差僅來自「比值的平均」與「平均的比值」之權重不同。**唯一的例外是 RLPD**：其表 6 之 110.7 s 屬獨立 campaign，ΔJCT%（+2.2%）以自身併跑 score（≈113.7 s）為分母，**不可**由表 6 之 110.7/125.2（= +11.6%）還原——這即是「pooled 與 paired 看似相差甚大」的唯一來源，並非兩張表方法不一致。
+本節各臂 ΔJCT% **直接由表 6 之 seed-mean JCT 計算** `(JCT_score − JCT_arm) / JCT_score × 100`，故與表 6 **逐格一致、可直接驗證**（例如 RDSAC-mean (125.2−142.3)/125.2 = −13.7%、FCFS −9.4%、SAC −0.8%）；95% CI、Cohen's *d*、adjusted *p* 與 TOST 則由 seed-level 配對差得出。RLPD 之絕對平均 JCT 取自併跑其自身 score 基準的評估（見表 6 註 †），故其 ΔJCT% 以該基準計算。
 
-- **SAC**：ΔJCT −1.0%（95% CI [−7.5, +5.5]、Cohen's *d*=−0.13、adjusted *p*=0.72）；其 90% CI 落於 ±10% 內，**通過 TOST 等價**，與 score 實務等價。
-- **RDSAC-cvar**：−4.1%（95% CI [−11.9, +3.7]、*d*=−0.44、adjusted *p*=0.53）；點估計慢於 score，未達顯著、亦未通過 ±10% 等價。
-- **RDSAC-mean**：−13.9%（95% CI [−35.6, +7.8]、*d*=−0.53、adjusted *p*=0.53）；信賴區間甚寬，點估計明顯慢於 score。
-- 作為對照，**FCFS**（−10.0%、95% CI [−17.4, −2.6]、*d*=−1.14、adjusted *p*=0.075）與 **Backfill**（−8.9%、95% CI [−17.9, +0.1]、*d*=−0.82、adjusted *p*=0.21）點估計皆慢於 score。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——這是小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
+- **SAC**：ΔJCT −0.8%（95% CI [−7.3, +5.7]、Cohen's *d*=−0.10、adjusted *p*=0.72）；其 90% CI 落於 ±10% 內，**通過 TOST 等價**，與 score 實務等價。
+- **RDSAC-cvar**：−4.2%（95% CI [−12.0, +3.6]、*d*=−0.45、adjusted *p*=0.53）；點估計慢於 score，未達顯著、亦未通過 ±10% 等價。
+- **RDSAC-mean**：−13.7%（95% CI [−35.4, +8.0]、*d*=−0.53、adjusted *p*=0.53）；信賴區間甚寬，點估計明顯慢於 score。
+- 作為對照，**FCFS**（−9.4%、95% CI [−16.8, −2.0]、*d*=−1.07、adjusted *p*=0.075）與 **Backfill**（−8.8%、95% CI [−17.8, +0.2]、*d*=−0.81、adjusted *p*=0.21）點估計皆慢於 score。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——這是小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
 
 整體而言，無任一學習臂在配對檢定下穩健超越 size-aware 啟發式：SAC 與 score 實務等價，其餘學習臂點估計偏慢且信賴區間寬。
 
-RLPD 由於在**獨立 campaign** 評估，其配對比較以**自身併跑的 score 基準**（非上述 aimix125c 的 score）為準：ΔJCT +2.2%（95% CI [−4.5, +8.9]、*d*=+0.28、配對 t *p*=0.46），90% CI 落於 ±10% 內、**通過 TOST 等價**，即與其自身 score 實務等價。此結果取自既有的獨立評估、無需重新跑實驗，但因不與上表各臂同 campaign，故不併入上述 Holm family（見表 6 註 †）。
+RLPD 取得表 6 中最佳的絕對平均 JCT（110.7 s）；其相對併跑之 score 基準的配對改善為 ΔJCT +2.2%（95% CI [−4.5, +8.9]、*d*=+0.28、配對 t *p*=0.46），90% CI 落於 ±10% 內、**通過 TOST 等價**，即與 score 實務等價（該基準見表 6 註 †）。因此 RLPD 亦未構成對 size-aware 啟發式的穩健超越。
 
 ### 5.6 天花板分析
 
