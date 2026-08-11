@@ -129,7 +129,7 @@ Action = (選 job_i ∈ top-K 佇列) × (放置到 node_j / gpu_k)  ∪  {no-op
 R = w_jct · (−JCT / reward_scale) + w_util · GPUUtil
 ```
 
-本研究訓練使用 w_jct=1.0、w_util=0.05、reward_scale=20000。JCT = 完成時間 − 提交時間，已包含 queue delay；GPUUtil 是模擬器每一步的叢集資源使用狀態，用於避免策略學到保守閒置；因此 reward 的 util 項於每一步給予、JCT 項則於工作完成時給予。另可選用 potential-based reward shaping [31] 提供密集訊號，並以 opt-in 的 SLO 逾時懲罰處理延遲敏感工作。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習長期排程結果。
+本研究訓練使用 w_jct=1.0、w_util=0.05、reward_scale=20000。JCT = 完成時間 − 提交時間，已包含 queue delay；GPUUtil = 叢集 MPS 使用率 = used_MPS / total_MPS ∈ [0, 1]，為模擬器每一步的資源使用狀態，用於避免策略學到保守閒置。兩項計入頻率不同：util 項於**每一步**計入、−JCT/reward_scale 項於**工作完成時**計入（reward_scale=20000 相對於訓練分布的 JCT 量級選定，使該項落於 O(0.1) 尺度）。util 項設計上為小權重（0.05）的「維持 GPU 忙碌」輔助訊號，惟因每步計入，其累積影響會隨 episode 長度上升，故兩項的實際權衡取決於 JCT 尺度與 episode 長度。另可選用 potential-based reward shaping [31] 提供密集訊號，並以 opt-in 的 SLO 逾時懲罰處理延遲敏感工作。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習長期排程結果。
 
 ### 3.2 系統架構
 
@@ -255,7 +255,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 **實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。在主要 campaign 中，SAC（126.2 s）與 RDSAC-cvar（130.5 s）的平均 JCT 點估計低於 FCFS（137.0 s）與 Backfill（136.2 s），與 size-aware 啟發式（125.2 s）則相當接近；RDSAC-cvar 在尾端（P99）於學習式策略內部表現相對較佳。以真實資料 sim-to-real 微調的 RLPD 取得表中最佳的平均 JCT 點估計（110.7 s）；惟 RLPD 為獨立配對評估（表 6 註 †），其相對自身併跑 score 基準的改善約 2.2%（點估計，未達統計顯著，詳 §5.5）。整體而言，部分學習式策略在平均 JCT 上優於傳統 Slurm 排程（FCFS／Backfill），但相對已 size-aware 的啟發式尚未形成穩健優勢。
 
-表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，8 seeds，mean ± std；完成數為各 seed 平均，各臂皆接近滿額；JCT、P95、P99 單位為秒）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.5）。
+表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，n=8 seeds；表列 JCT／P95／P99 為各 seed 內平均之**未加權平均 ± 標準差**，單位秒；完成數為各 seed 平均，各臂皆接近滿額；ΔJCT% 定義見 §5.4）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.5）。
 
 | 排程器 | 完成數 | 平均 JCT (s) | P95 (s) | P99 (s) |
 |---|--:|--:|--:|--:|
@@ -292,7 +292,9 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 - Common random numbers：同一 seed 下的排程器共用相同工作序列。
 - Drift-robust interleaving：同一 campaign 內的方法交錯執行，降低 GPU 暖機或系統漂移與特定方法混淆。
-- Seed-level paired statistics：以 seed 為分析單位，避免偽重複。配對顯著性以 seed-level 配對 t 檢定計算；多重比較的 Holm-Bonferroni family 為主 campaign 中各非-score 臂（SAC、RDSAC-mean、RDSAC-cvar、FCFS、Backfill）對 score 的 5 項比較（RLPD 屬獨立 campaign，另計）；TOST 等價界限（±10%）為事前指定。
+- Seed-level paired statistics：以 seed 為分析單位，避免偽重複。配對顯著性以 seed-level 配對 t 檢定計算；多重比較的 Holm-Bonferroni family 為主 campaign 中各非-score 臂（SAC、RDSAC-mean、RDSAC-cvar、FCFS、Backfill）對 score 的 5 項比較（RLPD 屬獨立 campaign，另計）；TOST 等價界限（±10%）為**事前**指定，取約當基準 score 跨 seed 的相對 JCT 變異量級作為實務可忽略門檻。各臂的等價檢定為個別進行，未再跨等價檢定做多重性校正。
+
+**ΔJCT% 與分析單位**：對每個 seed *s* 計 `(JCT_score,s − JCT_arm,s) / JCT_score,s × 100`（正值＝快於 score），再對 n=8 個 seed 取**未加權平均**；表 6 的「平均 JCT」亦為各 seed 內平均 JCT 之未加權平均（± 標準差）。因此描述統計（表 6）與推論統計（§5.5）**採同一分析單位（seed，n=8）**，非 pooled jobs。RLPD 因屬獨立 campaign，其百分比以自身併跑 score 為分母（見表 6 註 †），故不可由表 6 中 RLPD 與其他列的絕對 JCT 直接相除還原。
 
 受限於 n=8，檢定力偏低，因此本研究不僅依賴單一顯著性檢定，而是以點估計、TOST 等價檢定與天花板分析交叉佐證效益邊界。
 
