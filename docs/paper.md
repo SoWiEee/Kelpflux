@@ -253,9 +253,9 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | multifactor | 1108 ± 398 | 461 ± 264 | 41.1 ± 20.1 |
 | score | 1129 ± 398 | 520 ± 331 | 40.7 ± 19.0 |
 
-**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。在主要 campaign 中，SAC（126.2 s）與 RDSAC-cvar（130.5 s）的平均 JCT 點估計低於 FCFS（137.0 s）與 Backfill（136.2 s），與 size-aware 啟發式（125.2 s）則相當接近；RDSAC-cvar 在尾端（P99）於學習式策略內部表現相對較佳。以真實資料 sim-to-real 微調的 RLPD 取得表中最佳的平均 JCT 點估計（110.7 s）；惟 RLPD 為獨立配對評估（表 6 註 †），其相對自身併跑 score 基準的改善約 2.2%（點估計，未達統計顯著，詳 §5.4）。整體而言，部分學習式策略在平均 JCT 上優於傳統 Slurm 排程（FCFS／Backfill），但相對已 size-aware 的啟發式尚未形成穩健優勢。
+**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。在主要 campaign 中，SAC（126.2 s）與 RDSAC-cvar（130.5 s）的平均 JCT 點估計低於 FCFS（137.0 s）與 Backfill（136.2 s），與 size-aware 啟發式（125.2 s）則相當接近；RDSAC-cvar 在尾端（P99）於學習式策略內部表現相對較佳。以真實資料 sim-to-real 微調的 RLPD 取得表中最佳的平均 JCT 點估計（110.7 s）；惟 RLPD 為獨立配對評估（表 6 註 †），其相對自身併跑 score 基準的改善約 2.2%（點估計，未達統計顯著，詳 §5.5）。整體而言，部分學習式策略在平均 JCT 上優於傳統 Slurm 排程（FCFS／Backfill），但相對已 size-aware 的啟發式尚未形成穩健優勢。
 
-表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，8 seeds，mean ± std；完成數為各 seed 平均，各臂皆接近滿額；JCT、P95、P99 單位為秒）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.4）。
+表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，8 seeds，mean ± std；完成數為各 seed 平均，各臂皆接近滿額；JCT、P95、P99 單位為秒）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.5）。
 
 | 排程器 | 完成數 | 平均 JCT (s) | P95 (s) | P99 (s) |
 |---|--:|--:|--:|--:|
@@ -269,9 +269,24 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 由表 6 可以發現，在平均 JCT 的部分，SAC 與 RDSAC-cvar 的平均 優於 FCFS／Backfill，但相對啟發式的差距很小，而 RDSAC-mean 則較差。FCFS／Backfill 以嚴格序列執行換得較低的 P99 (255~270 s)，明顯低於啟發式與學習式策略的 509–600 s。也發現 RDSAC-cvar 在**學習式策略內部**取得較佳尾端平衡。
 
-> 以下 §5.3–5.7 以嚴謹的統計方法（seed-level 配對、Holm-Bonferroni 多重比較校正、TOST 等價檢定）進一步刻畫上述效益的統計邊界與場景依賴性，並輔以天花板分析與 placement 消融解析可贏空間的來源。
+### 5.3 系統行為量測
 
-### 5.3 統計方法
+除排程品質外，本研究亦量測學習式決策路徑的系統行為，以檢驗其失效安全整合是否非侵入。在 2×1 平台上以 8 個工作負載 seed（每 seed 125 個工作）重放排程序列，於控制平面（CPU）逐次計時策略決策，並依線上服務的判定門檻（低信心 value／entropy）將每次決策分類為 RL 主導、低信心回退，或暫不派遣（no-op），結果如表 7。
+
+決策延遲為次毫秒級（p99 0.27 ms、最大 7.3 ms），較 Lua hook 的 fail-safe 逾時門檻（150 ms）低約三個數量級；在 76,099 次決策中無任一次逾時，顯示 RL 路徑對 slurmctld 幾乎零額外負擔，逾時型回退不會因決策過慢而觸發。在實際放置決策中約 12% 因低信心回退至啟發式基準、其餘由 RL 主導；其中大量的 no-op 反映離散事件下多數時間步並無可派工作，屬正常等待行為。
+
+表 7. 系統行為量測（RDSAC-cvar 策略，2×1，8 seeds × 125 工作，控制平面 CPU）
+
+| 指標 | 數值 |
+|---|--:|
+| 決策延遲 mean／p50／p95／p99／max (ms) | 0.19／0.18／0.26／0.27／7.27 |
+| 逾時（> 150 ms fail-safe 門檻）比例 | 0.00%（0 / 76,099） |
+| 放置決策中低信心回退比例 | 12.0%（115 / 959） |
+| RL 主導放置比例 | 88.0%（844 / 959） |
+
+> 以下 §5.4–5.8 以嚴謹的統計方法（seed-level 配對、Holm-Bonferroni 多重比較校正、TOST 等價檢定）進一步刻畫上述效益的統計邊界與場景依賴性，並輔以天花板分析與 placement 消融解析可贏空間的來源。
+
+### 5.4 統計方法
 
 實機評估採用三項方法降低誤判：
 
@@ -283,7 +298,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 > 上述配對與 interleaving 保證只適用於各自 campaign 內，不能用來支持跨 campaign 的 RLPD-vs-FCFS／Backfill 比較。百分比若由彙總平均值計算，僅描述點估計；推論性結論以同一 seed 內的配對差為準。
 
-### 5.4 與啟發式基準的嚴謹比較
+### 5.5 與啟發式基準的嚴謹比較
 
 表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 則未構成穩健超越。以 aimix125c campaign 的 seed-level 配對差（ΔJCT%，正值代表快於 score；n=8，配對 t 檢定，Holm-Bonferroni 校正；TOST 等價界限**事前**定為 ±10%）進行嚴謹比較：
 
@@ -296,11 +311,11 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 RLPD 由於在**獨立 campaign** 評估，其配對比較以**自身併跑的 score 基準**（非上述 aimix125c 的 score）為準：ΔJCT +2.2%（95% CI [−4.5, +8.9]、*d*=+0.28、配對 t *p*=0.46），90% CI 落於 ±10% 內、**通過 TOST 等價**，即與其自身 score 實務等價。此結果取自既有的獨立評估、無需重新跑實驗，但因不與上表各臂同 campaign，故不併入上述 Holm family（見表 6 註 †）。
 
-### 5.5 天花板分析
+### 5.6 天花板分析
 
-為區分負向結果是源於特定 RL 方法的局限、還是測試 regime 本身空間有限，本研究在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只剩 dispatch **ordering**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。結果（表 7）顯示 headroom 隨負載單調上升：在本研究 cuBLAS 與模擬比較的測試負載（n_jobs≈50，對應 load 40–60）下 headroom 僅 0.1–0.7%，即 score 已幾乎位於可達排程上界；即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。這說明低負載下的策略空間確實接近平坦，是負向結果的結構性原因，而不是特定方法的偶然失敗。
+為區分負向結果是源於特定 RL 方法的局限、還是測試 regime 本身空間有限，本研究在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只剩 dispatch **ordering**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。結果（表 8）顯示 headroom 隨負載單調上升：在本研究 cuBLAS 與模擬比較的測試負載（n_jobs≈50，對應 load 40–60）下 headroom 僅 0.1–0.7%，即 score 已幾乎位於可達排程上界；即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。這說明低負載下的策略空間確實接近平坦，是負向結果的結構性原因，而不是特定方法的偶然失敗。
 
-表 7. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
+表 8. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
 
 | 負載 (n_jobs) | Headroom（mean ± 95% CI） | Max |
 |---|--:|--:|
@@ -309,11 +324,11 @@ RLPD 由於在**獨立 campaign** 評估，其配對比較以**自身併跑的 s
 | 80 | +2.0% ± 1.1% | +9.7% |
 | 100 | +4.1% ± 2.3% | +25.2% |
 
-### 5.6 Placement 解耦消融
+### 5.7 Placement 解耦消融
 
-排程的另一個可能槓桿是 GPU/MPS placement 本身，而非 ordering。本研究以解耦消融訓練三個網路形狀相同的臂：**joint**（同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score 首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。結果（表 8）顯示兩個解耦臂與 joint 的差異均未達統計顯著；但估計區間很寬，且本分析未進行 TOST，因此「未顯著」不能解讀為實質等價，也不能據此判定 job 選擇或 placement 無效。此消融只能說明：在目前 2×1、5 training seeds 的樣本下，尚無法辨識哪個決策槓桿帶來穩定優勢。
+排程的另一個可能槓桿是 GPU/MPS placement 本身，而非 ordering。本研究以解耦消融訓練三個網路形狀相同的臂：**joint**（同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score 首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。結果（表 9）顯示兩個解耦臂與 joint 的差異均未達統計顯著；但估計區間很寬，且本分析未進行 TOST，因此「未顯著」不能解讀為實質等價，也不能據此判定 job 選擇或 placement 無效。此消融只能說明：在目前 2×1、5 training seeds 的樣本下，尚無法辨識哪個決策槓桿帶來穩定優勢。
 
-表 8. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT）
+表 9. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT）
 
 | 臂 | 平均 JCT (s) | Δ vs joint | 配對 *p* |
 |---|--:|--:|--:|
@@ -321,9 +336,9 @@ RLPD 由於在**獨立 campaign** 評估，其配對比較以**自身併跑的 s
 | placement_only | 8443 ± 2631 | −5.3% ± 33.8% | 0.585 |
 | job_only | 10540 ± 1358 | +19.6% ± 35.7% | 0.295 |
 
-### 5.7 效益邊界小結
+### 5.8 效益邊界小結
 
-綜合 §5.4–5.6 得知，部分學習式策略（SAC、RDSAC-cvar）的平均 JCT 優於傳統 Slurm 排程（FCFS/Backfill），RLPD 於其獨立評估中相對自身 score 略勝，但均未形成相對 size-aware 啟發式的穩健優勢。更需強調的是，這些較低的平均 JCT 是以顯著的尾端代價換得：啟發式與學習式策略的 P99（約 500–600 s）約為 FCFS／Backfill（255–270 s）的兩倍。因此現有證據較能支持的結論是——學習式策略可能以較重的尾端延遲換取較低的平均 JCT，且尚未穩健超越 size-aware 啟發式。從模擬天花板分析指出，在測試負載下 score 之上的 ordering headroom 很小：低負載近乎平坦，較高負載雖出現 headroom，現有 DRL 策略仍未穩定捕捉。placement 消融則因變異過大而無法提供確定歸因。本節據此界定效益成立的條件與仍待解決的不確定性；策略效益主要取決於工作負載、硬體規模與底層資源分配後端。
+綜合 §5.5–5.7 得知，部分學習式策略（SAC、RDSAC-cvar）的平均 JCT 優於傳統 Slurm 排程（FCFS/Backfill），RLPD 於其獨立評估中相對自身 score 略勝，但均未形成相對 size-aware 啟發式的穩健優勢。更需強調的是，這些較低的平均 JCT 是以顯著的尾端代價換得：啟發式與學習式策略的 P99（約 500–600 s）約為 FCFS／Backfill（255–270 s）的兩倍。因此現有證據較能支持的結論是——學習式策略可能以較重的尾端延遲換取較低的平均 JCT，且尚未穩健超越 size-aware 啟發式。從模擬天花板分析指出，在測試負載下 score 之上的 ordering headroom 很小：低負載近乎平坦，較高負載雖出現 headroom，現有 DRL 策略仍未穩定捕捉。placement 消融則因變異過大而無法提供確定歸因。本節據此界定效益成立的條件與仍待解決的不確定性；策略效益主要取決於工作負載、硬體規模與底層資源分配後端。
 
 > 相關材料見 `runs/headroom_*/` 與 `runs/ablation_std_*/`
 
