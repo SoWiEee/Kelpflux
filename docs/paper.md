@@ -290,9 +290,11 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 - **SAC**：ΔJCT −1.0%（95% CI [−7.5, +5.5]、Cohen's *d*=−0.13、adjusted *p*=0.72）；其 90% CI 落於 ±10% 內，**通過 TOST 等價**，與 score 實務等價。
 - **RDSAC-cvar**：−4.1%（95% CI [−11.9, +3.7]、*d*=−0.44、adjusted *p*=0.53）；點估計慢於 score，未達顯著、亦未通過 ±10% 等價。
 - **RDSAC-mean**：−13.9%（95% CI [−35.6, +7.8]、*d*=−0.53、adjusted *p*=0.53）；信賴區間甚寬，點估計明顯慢於 score。
-- 作為對照，**FCFS**（−10.0%、adjusted *p*=0.075）與 **Backfill**（−8.9%、adjusted *p*=0.21）皆明顯慢於 score。
+- 作為對照，**FCFS**（−10.0%、95% CI [−17.4, −2.6]、*d*=−1.14、adjusted *p*=0.075）與 **Backfill**（−8.9%、95% CI [−17.9, +0.1]、*d*=−0.82、adjusted *p*=0.21）點估計皆慢於 score。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——這是小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
 
-整體而言，無任一學習臂在配對檢定下穩健超越 size-aware 啟發式：SAC 與 score 實務等價，其餘學習臂點估計偏慢且信賴區間寬。RLPD 於其獨立 campaign 相對自身 score 基準 +2.2%（配對 t 檢定 *p*=0.46），同樣未達顯著。
+整體而言，無任一學習臂在配對檢定下穩健超越 size-aware 啟發式：SAC 與 score 實務等價，其餘學習臂點估計偏慢且信賴區間寬。
+
+RLPD 由於在**獨立 campaign** 評估，其配對比較以**自身併跑的 score 基準**（非上述 aimix125c 的 score）為準：ΔJCT +2.2%（95% CI [−4.5, +8.9]、*d*=+0.28、配對 t *p*=0.46），90% CI 落於 ±10% 內、**通過 TOST 等價**，即與其自身 score 實務等價。此結果取自既有的獨立評估、無需重新跑實驗，但因不與上表各臂同 campaign，故不併入上述 Holm family（見表 6 註 †）。
 
 ### 5.5 天花板分析
 
