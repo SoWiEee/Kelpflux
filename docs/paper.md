@@ -104,7 +104,7 @@ Tsenos 與 Kalogeraki [26] 針對缺乏原生虛擬化支援的邊緣 GPU（如�
 
 ### 3.1 研究目的
 
-本研究的目標是在異質 GPU 與 NVIDIA MPS 環境中，學習一個能在 MPS 配額約束下決定工作派遣與 GPU placement 的排程策略，以降低 average JCT 與尾端 JCT，並兼顧資源使用狀態。更具體而言，本研究要回答兩個問題：第一，DRL 在模擬環境中相對固定規則的表現如何；第二，此學習式策略部署到真實異質 GPU 叢集後，相對 FCFS、Backfill 與 size-aware 啟發式的效益與限制為何。
+本研究的目標是在異質 GPU 與 NVIDIA MPS 環境中，學習一個能在 MPS 配額約束下決定工作派遣與 GPU placement 的排程策略，以降低 average JCT 與尾端 JCT。更具體而言，本研究要回答兩個問題：第一，DRL 在模擬環境中相對固定規則的表現如何；第二，此學習式策略部署到真實異質 GPU 叢集後，相對 FCFS、Backfill 與 size-aware 啟發式的效益與限制為何。
 
 本研究將異質 GPU + MPS 排程建模為馬可夫決策過程 (MDP)。每次有工作可排程時，代理人觀察叢集狀態，選擇一個工作與其 GPU placement，並在工作完成後根據 JCT 與 GPU utilization 取得 reward。
 
@@ -129,13 +129,13 @@ Action = (選 job_i ∈ top-K 佇列) × (放置到 node_j / gpu_k)  ∪  {no-op
 R = w_jct · (−JCT / reward_scale) + w_util · GPUUtil
 ```
 
-本研究訓練使用 w_jct=1.0、w_util=0.05、reward_scale=20000。JCT = 完成時間 − 提交時間，已包含 queue delay；GPUUtil 是模擬器每一步的叢集資源使用狀態，用於避免策略學到保守閒置。另可選用 potential-based reward shaping [31] 提供密集訊號，並以 opt-in 的 SLO 逾時懲罰處理延遲敏感工作。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習長期排程結果。
+本研究訓練使用 w_jct=1.0、w_util=0.05、reward_scale=20000。JCT = 完成時間 − 提交時間，已包含 queue delay；GPUUtil 是模擬器每一步的叢集資源使用狀態，用於避免策略學到保守閒置；因此 reward 的 util 項於每一步給予、JCT 項則於工作完成時給予。另可選用 potential-based reward shaping [31] 提供密集訊號，並以 opt-in 的 SLO 逾時懲罰處理延遲敏感工作。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習長期排程結果。
 
 ### 3.2 系統架構
 
-本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台。系統流程如圖 1 所示。使用者提交工作後，Slurm 透過 job submission hook 呼叫 RL scheduler；RL scheduler 讀取目前工作資訊、GPU 狀態、MPS 剩餘容量與佇列資訊，輸出所選工作與其 GPU placement（工作的 MPS fraction 依其請求分配、非策略輸出）。工作執行期間，監控服務收集 GPU utilization、SM utilization、memory usage、queue delay、JCT 與 reward，並將資料寫入 replay buffer 供後續訓練或 RLPD (Reinforcement Learning with Prior Data) [9] 微調使用。
+本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台（圖 1）。學習式策略以服務形式接入 Slurm 的工作提交流程：策略讀取工作、GPU、MPS 剩餘容量與佇列狀態，輸出建議的工作與 GPU placement，並由系統於提交時據以綁定節點（工作的 MPS fraction 依其請求分配、非策略輸出）。若策略服務逾時或回傳不可行決策，系統自動回退至啟發式路徑，確保排程核心不被阻塞。工作執行期間，監控服務收集資源使用、queue delay、JCT 與 reward，寫入 replay buffer 供後續訓練或 RLPD (Reinforcement Learning with Prior Data) [9] 微調使用。
 
-圖 1 描述系統設計及 held-job controller 原型；其中 post-submit actuation 以虛線標示，代表尚未在受測環境成功落實。表 6 的實機 A/B 使用受控評估 harness：對每個即將提交的工作呼叫 `/act` 取得 node choice，再以 `sbatch -w <node>` 提交未 held 的工作。此設計可隔離 GPU placement 的效果，但繞過 placement controller，也沒有讓策略從 pending queue 中挑選下一個工作。因此，表 6 不作為 held-controller 聯合派遣效能或可行性的證據。
+需說明的是，本文的實機評估聚焦於 **GPU placement** 的效果：系統於提交時取得策略建議的節點並綁定，藉此在真實叢集上比較不同 placement 決策。至於由策略即時從佇列挑選下一個工作的完整線上派遣，目前仍為原型、尚未於受測環境穩定落實，因此不納入本文的實機效能宣稱。
 
 ```mermaid
 flowchart TD
@@ -154,7 +154,7 @@ flowchart TD
     J --> B
 ```
 
-**圖 1. 系統架構與排程流程。** `job_submit.lua` 負責 submit-time scoring／priority intent，並可選配提交時節點綁定；placement controller 原型對 held queue 呼叫 `/act`，但受測版本的 post-submit 節點約束未生效。虛線表示未驗證的 actuation 與 fail-safe 路徑：逾時、不可行 action 或 no-op 時不套用 placement。Monitoring 週期 1 秒蒐集 GPU/SM/memory utilization、MPS 使用量、queue depth 與 job events，寫入 Replay Buffer。
+**圖 1. 系統架構與排程流程。** 學習式策略接入 Slurm 提交流程，於提交時提供節點綁定建議；完整的即時佇列選擇與 placement 仍為原型（圖中虛線）。逾時、不可行決策或 no-op 時回退至 Slurm／啟發式路徑。監控服務週期蒐集資源使用、queue delay 與 job events，寫入 Replay Buffer。
 
 本平台使用 Kubernetes (k3s) 部署 Slurm controller、worker、RL scheduler、monitoring service 與相關容器 [5]。底層 GPU 基礎建設是透過 Kubernetes Dynamic Resource Allocation (DRA) 宣告與取得裝置 [32]，工作層級的 MPS 配額仍由 Slurm `gres/mps` 與對應的 MPS 執行環境落實。**Kubernetes 在本文中不負責工作排程決策**，只提供容器化部署、服務健康檢查、網路與生命週期管理。此設計保留 Slurm 在 HPC batch scheduling 中成熟的佇列語意 [4]。此方向與將 Slurm 整合進 Kubernetes 的 Slinky [10] 互補：Slinky 提供 Slurm-on-Kubernetes 部署基礎，本研究則在 Slurm 排程路徑上加入具失效回退機制的學習式策略層。
 
@@ -201,14 +201,21 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 | 項目 | 設定 |
 |---|---|
-| GPU | NVIDIA RTX 4070、NVIDIA RTX 3080 |
-| 排程器 | Slurm with GRES/TRES and MPS [4] |
-| 部署平台 | Kubernetes/k3s，僅負責容器部署與服務生命週期 [5] |
+| 節點 1（控制平面） | Intel Core i7-10700（16 執行緒）、64 GB RAM、NVIDIA RTX 4070 |
+| 節點 2（工作節點） | Intel Core i7-9700、8 GB RAM、NVIDIA RTX 3080 |
+| 作業系統 | Ubuntu 24.04.4 LTS（kernel 7.0.0 / 6.8.0） |
+| NVIDIA driver／CUDA | 580.167.08／CUDA 13.0 |
+| 容器平台 | k3s v1.34.6、containerd 2.2.2；僅負責容器部署與服務生命週期 [5] |
+| GPU 資源宣告 | Kubernetes Dynamic Resource Allocation (DRA) driver v0.4.1 [32] |
+| 排程器 | Slurm 23.11.7 with GRES/TRES and MPS（slurmrestd REST API v0.0.37）[4] |
 | GPU sharing | NVIDIA MPS，MPS fraction 為 25%、50%、75%、100% [3] |
-| 系統 | Ubuntu、CUDA、NVIDIA driver、PyTorch |
-| 監控 | GPU 利用率、SM 利用率、memory usage、job event、queue delay |
+| 深度學習框架 | PyTorch |
+| 網路 | 同一區域網路，節點間 RTT ≈ 0.16 ms（ping 量測，可忽略） |
+| 監控 | SM 利用率、memory usage、job event、queue delay |
 
 訓練資料集使用 Alibaba GPU Trace 與 Microsoft Philly Trace：前者用於參考生產 MLaaS 工作的到達率、工作長度與資源需求分布 [2]，後者用於參考多租戶 GPU training workload 的佇列與 JCT 特性 [1]。同時在本研究叢集上執行 cuBLAS、BERT inference、ResNet training、Qwen fine-tuning 與矩陣運算等真實 AI 工作。
+
+為確保比較公平，各方法在同一評估中取得一致的工作資訊：FCFS／Backfill 使用提交時的 Slurm time-limit；模擬中 score 的 SJF 項與學習式策略的 runtime 特徵皆來自同一組執行時間估計（模擬為 oracle），無單一方法獨享的未來資訊；實機部署因 runtime predictor 未上線，score 停用 SJF 項（ε=0），僅使用 MPS-fit 與 VRAM-fit。
 
 直接在實際環境從頭訓練需要數十萬到數百萬個 transition，而真實叢集中一個決策對應一個跑數分鐘至數小時的任務，收集足夠樣本需時數月。因此本研究採 sim-to-real 兩段式：(1) 在模擬環境大量訓練，產出基本模型；(2) 上線部署，記錄真實叢集 (observation, action, reward) 資料；(3) 以 RLPD 用真實資料把基本模型微調成真實環境策略。DRL 訓練參數如表 4 所示；所有學習臂共用網路與最佳化設定，僅 critic 家族與風險目標不同。
 
@@ -240,25 +247,25 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 表 5. 模擬環境下 AI-serving 工作負載的排程器比較（8 個 held-out workload seed，mean ± std；score 使用 sim 預設 ε=0.30）
 
-| 排程器 | 平均 JCT (s) | 推論 JCT (s) | SLO 違反 (%) | 使用率 |
-|---|--:|--:|--:|--:|
-| FCFS | 2199 ± 1201 | 1847 ± 1151 | 66.5 ± 23.2 | 0.58 |
-| multifactor | 1108 ± 398 | 461 ± 264 | 41.1 ± 20.1 | 0.63 |
-| score | 1129 ± 398 | 520 ± 331 | 40.7 ± 19.0 | 0.63 |
+| 排程器 | 平均 JCT (s) | 推論 JCT (s) | SLO 違反 (%) |
+|---|--:|--:|--:|
+| FCFS | 2199 ± 1201 | 1847 ± 1151 | 66.5 ± 23.2 |
+| multifactor | 1108 ± 398 | 461 ± 264 | 41.1 ± 20.1 |
+| score | 1129 ± 398 | 520 ± 331 | 40.7 ± 19.0 |
 
-**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。以真實資料 sim-to-real 微調的 RLPD 取得最佳平均 JCT（110.7 s），相較 FCFS（137.0 s）與 Backfill（136.2 s）分別快約 19.2% 與 18.7%，也優於啟發式（125.2 s；此為點估計，統計顯著性見 §5.4）；SAC 與 RDSAC-cvar 也都優於 FCFS／Backfill，其中 RDSAC-cvar 在尾端（P99）上的表現相對較佳。學習式策略在平均 JCT 上優於 Slurm 傳統排程，這反映了在排程框架中整合 GPU 型號差異、MPS 配額、工作特徵與佇列狀態所帶來的改善。
+**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。在主要 campaign 中，SAC（126.2 s）與 RDSAC-cvar（130.5 s）的平均 JCT 點估計低於 FCFS（137.0 s）與 Backfill（136.2 s），與 size-aware 啟發式（125.2 s）則相當接近；RDSAC-cvar 在尾端（P99）於學習式策略內部表現相對較佳。以真實資料 sim-to-real 微調的 RLPD 取得表中最佳的平均 JCT 點估計（110.7 s）；惟 RLPD 為獨立配對評估（表 6 註 †），其相對自身併跑 score 基準的改善約 2.2%（點估計，未達統計顯著，詳 §5.4）。整體而言，部分學習式策略在平均 JCT 上優於傳統 Slurm 排程（FCFS／Backfill），但相對已 size-aware 的啟發式尚未形成穩健優勢。
 
-表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，8 seeds，mean ± std；JCT、P95 與 P99 單位為秒，GPU 利用率為平均並發 MPS 槽數）
+表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，8 seeds，mean ± std；JCT、P95、P99 單位為秒）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.4）。
 
-| 排程器 | 平均 JCT (s) | P95 (s) | P99 (s) | GPU 利用率 |
-|---|--:|--:|--:|--:|
-| FCFS | 137.0 ± 18.3 | 241.2 ± 41.7 | 255.0 ± 43.7 | 8.60 ± 1.24 |
-| Backfill | 136.2 ± 23.4 | 255.6 ± 52.5 | 269.8 ± 50.1 | 8.68 ± 1.39 |
-| 啟發式 | 125.2 ± 19.3 | 433.5 ± 146.4 | 517.6 ± 122.2 | 8.25 ± 1.30 |
-| SAC | 126.2 ± 19.8 | 471.2 ± 86.2 | 566.5 ± 49.9 | 8.00 ± 1.23 |
-| RDSAC-mean | 142.3 ± 38.8 | 469.7 ± 152.7 | 600.3 ± 77.1 | 8.59 ± 1.81 |
-| RDSAC-cvar | 130.5 ± 23.3 | 395.0 ± 132.9 | 527.7 ± 110.6 | 8.32 ± 1.43 |
-| **RLPD** | **110.7 ± 18.9** | 418.0 ± 103.5 | 509.0 ± 80.2 | 7.45 ± 1.34 |
+| 排程器 | 平均 JCT (s) | P95 (s) | P99 (s) |
+|---|--:|--:|--:|
+| FCFS | 137.0 ± 18.3 | 241.2 ± 41.7 | 255.0 ± 43.7 |
+| Backfill | 136.2 ± 23.4 | 255.6 ± 52.5 | 269.8 ± 50.1 |
+| 啟發式 | 125.2 ± 19.3 | 433.5 ± 146.4 | 517.6 ± 122.2 |
+| SAC | 126.2 ± 19.8 | 471.2 ± 86.2 | 566.5 ± 49.9 |
+| RDSAC-mean | 142.3 ± 38.8 | 469.7 ± 152.7 | 600.3 ± 77.1 |
+| RDSAC-cvar | 130.5 ± 23.3 | 395.0 ± 132.9 | 527.7 ± 110.6 |
+| **RLPD** † | **110.7 ± 18.9** | 418.0 ± 103.5 | 509.0 ± 80.2 |
 
 由表 6 可以發現，在平均 JCT 的部分，SAC 與 RDSAC-cvar 的平均 優於 FCFS／Backfill，但相對啟發式的差距很小，而 RDSAC-mean 則較差。FCFS／Backfill 以嚴格序列執行換得較低的 P99 (255~270 s)，明顯低於啟發式與學習式策略的 509–600 s。也發現 RDSAC-cvar 在**學習式策略內部**取得較佳尾端平衡。
 
@@ -270,13 +277,15 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 - Common random numbers：同一 seed 下的排程器共用相同工作序列。
 - Drift-robust interleaving：同一 campaign 內的方法交錯執行，降低 GPU 暖機或系統漂移與特定方法混淆。
-- Seed-level paired statistics：以 seed 為分析單位，避免偽重複。多個方法同時比較時採 Holm-Bonferroni 校正，並以 TOST 判斷預先指定範圍內的實務等價。
+- Seed-level paired statistics：以 seed 為分析單位，避免偽重複。配對顯著性以 seed-level 配對 t 檢定計算；多重比較的 Holm-Bonferroni family 為各學習臂（SAC、RDSAC-mean、RDSAC-cvar、RLPD）對 score 的比較；TOST 等價界限（±10%）為事前指定。
+
+受限於 n=8，檢定力偏低，因此本研究不僅依賴單一顯著性檢定，而是以點估計、TOST 等價檢定與天花板分析交叉佐證效益邊界。
 
 > 上述配對與 interleaving 保證只適用於各自 campaign 內，不能用來支持跨 campaign 的 RLPD-vs-FCFS／Backfill 比較。百分比若由彙總平均值計算，僅描述點估計；推論性結論以同一 seed 內的配對差為準。
 
 ### 5.4 與啟發式基準的嚴謹比較
 
-表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 的 seed-level 差異經 Holm-Bonferroni 校正後未達統計顯著（adjusted *p* > 0.05）；SAC 與 score 在 ±10% 界線內通過 TOST 等價檢定，而 RLPD 相對啟發式的 seed-level 平均改善約 2.2%，同樣未形成統計上穩健的優勢。整體而言，現有證據只支持部分學習式策略的平均 JCT 點估計改善，不支持其穩健超越 size-aware 啟發式。
+表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 的 seed-level 差異經 Holm-Bonferroni 校正後未達統計顯著（adjusted *p* > 0.05）；SAC 與 score 在 ±10% 界線內通過 TOST 等價檢定，而 RLPD 於其獨立配對 campaign 中相對併跑 score 基準的 seed-level 平均改善約 2.2%（配對 t 檢定 *p*=0.46），同樣未形成統計上穩健的優勢。整體而言，現有證據只支持部分學習式策略的平均 JCT 點估計改善，不支持其穩健超越 size-aware 啟發式。
 
 ### 5.5 天花板分析
 
