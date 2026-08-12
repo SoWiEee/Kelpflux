@@ -71,7 +71,7 @@ RAM_REF_GB = 4.0   # obs normalizer for per-job ram_req
 #   1. Set N_NODES=2, N_GPUS=2 below (or pass n_nodes=2, gpus_per_node=2 to env)
 #   2. Retrain DSAC from scratch (obs_dim 160→178, n_actions 17→65 — checkpoint
 #      is NOT compatible; different network input/output shape)
-#   3. Update rlpd_finetune.py / hierarchical.py CLI defaults to match
+#   3. Update rlpd_finetune.py CLI defaults to match
 #   4. In Slurm: verify two worker nodes are registered and GRES is correct
 N_NODES = 1   # current: single host  ← change to 2 when second GPU is online
 N_GPUS  = 1   # current: single GPU   ← change to 2 when second GPU is online
@@ -115,10 +115,6 @@ def env_dims(n_nodes: int, gpus_per_node: int, top_k: int = TOP_K,
     n_modes = 2 if colocation else 1
     n_act = top_k * n_nodes * gpus_per_node * n_modes + 1
     return obs, n_act
-
-# Bandwidth placeholders (sim has no real network model; feats are 1.0 = full)
-_INTRA_BW_TOTAL = 1.0
-_INTER_BW_TOTAL = 1.0
 
 # Floor on a realized (post-noise) runtime so stochastic draws can't produce
 # zero/negative durations.
@@ -941,9 +937,3 @@ class KubefluxSchedEnv:
 
     def close(self):
         self._state = None
-
-
-# Register gymnasium subclass if gymnasium is available
-if gym is not None:
-    class KubefluxSchedGymEnv(KubefluxSchedEnv, gym.Env):  # type: ignore
-        pass

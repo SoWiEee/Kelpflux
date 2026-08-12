@@ -58,15 +58,6 @@ class Job:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# Normalized format
-# ---------------------------------------------------------------------------
-def load_normalized(path: str) -> List[Job]:
-    with open(path, "r") as fh:
-        raw = json.load(fh)
-    return [_job_from_dict(item) for item in raw]
-
-
 def _job_from_dict(item: dict) -> Job:
     return Job(
         job_id=str(item["job_id"]),

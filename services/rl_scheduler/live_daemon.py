@@ -167,38 +167,6 @@ def query_cluster(node_names: List[str], n_gpus: int,
     return cluster
 
 
-def query_pending_jobs(runtime_predictor_url: Optional[str] = None) -> List[LiveJob]:
-    """Get pending jobs from squeue, optionally call runtime predictor."""
-    raw  = _run(["squeue", "--json"])
-    jobs = _parse_squeue(raw)
-    pending = [j for j in jobs if j.state == "PENDING"]
-
-    if runtime_predictor_url:
-        for j in pending:
-            if j.runtime <= 0:
-                try:
-                    import urllib.request, urllib.parse
-                    body = json.dumps({"gpu_count": j.gpu_count,
-                                       "mps_req": j.mps_req}).encode()
-                    req = urllib.request.Request(
-                        runtime_predictor_url,
-                        data=body,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=1) as r:
-                        pred = json.loads(r.read())
-                        j.runtime = float(pred.get("predicted_s", 600))
-                except Exception:
-                    j.runtime = 600.0   # fallback: 10 min
-    else:
-        for j in pending:
-            if j.runtime <= 0:
-                j.runtime = 600.0
-
-    return pending
-
-
 # ── Observation builder (mirrors gym_env.py) ──────────────────────────────
 
 def _job_feat(j: LiveJob, now: float, mps_per_gpu: int) -> np.ndarray:

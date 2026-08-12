@@ -22,7 +22,6 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 from urllib import request as _urlrequest
 
 from eval.scripts.live_ab_heavytail import (

@@ -40,7 +40,6 @@ from prometheus_client import (
 from pydantic import BaseModel, Field
 from starlette.responses import Response
 
-from . import features as feat
 from .features import FEATURE_COLS, UserStats, make_inference_row
 
 log = logging.getLogger("runtime-predictor")

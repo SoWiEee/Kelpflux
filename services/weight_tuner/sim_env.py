@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Tuple
 
 # Make `import sim.*` work whether we're invoked from repo root or not.
 _HERE = os.path.dirname(__file__)
@@ -25,7 +25,6 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from sim.loader import MPS_PER_GPU, generate_by_family  # noqa: E402
-from sim.runner import run as sim_run  # noqa: E402
 
 
 Arm = Tuple[float, ...]
@@ -50,61 +49,6 @@ def context_vector(spec: TraceSpec) -> Tuple[float, float, float]:
     mean_mps = sum(j.mps_req for j in jobs) / max(n, 1) / float(MPS_PER_GPU)
     mean_gpu = sum(j.gpu_count for j in jobs) / max(n, 1) / 8.0
     return (n / 2000.0, mean_mps, mean_gpu)
-
-
-class SimPull:
-    """Callable `(arm, context) -> reward` that runs the simulator.
-
-    Context tuples are matched back to trace specs by exact tuple lookup
-    in `_lookup`. Callers register specs up front via `register_trace()`.
-    """
-
-    def __init__(
-        self,
-        *,
-        nodes: int = 4,
-        gpus_per_node: int = 4,
-        scheduler: str = "score",
-        beta: float = 0.20,            # fixed; tuner explores alpha/delta/epsilon
-        fragmentation: bool = False,
-    ):
-        self.nodes = nodes
-        self.gpus_per_node = gpus_per_node
-        self.scheduler = scheduler
-        self.beta = beta
-        self.fragmentation = fragmentation
-        self._lookup: Dict[Tuple[float, ...], TraceSpec] = {}
-        self._cache: Dict[Tuple[Arm, Tuple[float, ...]], float] = {}
-
-    def register_trace(self, spec: TraceSpec) -> Tuple[float, ...]:
-        ctx = context_vector(spec)
-        self._lookup[ctx] = spec
-        return ctx
-
-    def __call__(self, arm: Arm, context: Sequence[float]) -> float:
-        ctx_key = tuple(context)
-        cache_key = (tuple(arm), ctx_key)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        spec = self._lookup.get(ctx_key)
-        if spec is None:
-            raise KeyError(f"unknown context {ctx_key} — register the trace first")
-        alpha, delta, epsilon = arm
-        jobs = generate_by_family(spec.family, n_jobs=spec.n_jobs, seed=spec.seed)
-        metrics, _ = sim_run(
-            jobs,
-            n_nodes=self.nodes,
-            gpus_per_node=self.gpus_per_node,
-            scheduler_name=self.scheduler,
-            scheduler_kwargs={
-                "alpha": alpha, "beta": self.beta,
-                "delta": delta, "epsilon": epsilon,
-            },
-        )
-        jct_mean = metrics.summary()["jct_mean"]
-        reward = -jct_mean / 3600.0  # negative hours; bandit maximises
-        self._cache[cache_key] = reward
-        return reward
 
 
 def default_arm_grid() -> List[Arm]:

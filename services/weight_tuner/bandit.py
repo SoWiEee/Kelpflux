@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Hashable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -210,23 +210,6 @@ class TrainResult:
     policy: BanditPolicy
     history: List[BanditObservation] = field(default_factory=list)
     best_arm_at_each_round: List[Arm] = field(default_factory=list)
-
-    def cumulative_reward(self) -> List[float]:
-        s = 0.0
-        out = []
-        for obs in self.history:
-            s += obs.reward
-            out.append(s)
-        return out
-
-    def cumulative_regret(self, oracle_reward_per_round: List[float]) -> List[float]:
-        assert len(oracle_reward_per_round) == len(self.history)
-        s = 0.0
-        out = []
-        for obs, oracle in zip(self.history, oracle_reward_per_round):
-            s += (oracle - obs.reward)
-            out.append(s)
-        return out
 
 
 def train(

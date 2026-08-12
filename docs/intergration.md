@@ -343,7 +343,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 > 1. 若改用 module 預設而非 CLI 旗標，把 `sim/gym_env.py:60-61` 的 `N_NODES`/`N_GPUS` 改成你要的拓樸（2×1 → `N_NODES=2, N_GPUS=1`）。注意 `gym_env.py:54-58` 的 comment 範例寫的是 2×2（`N_NODES=2, N_GPUS=2`），別照抄。
 > 2. **GPU 型別建模已完成**（見 §0.1）：`GPU_TYPES`、`_gpu_type_to_vram`、`sim/loader.py` 生成器、predictor/snapshot 字母表都已收斂成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 已是 9。重訓直接吃這個維度即可，不用再動字母表。
 > 3.（選用）若要精確區分 3080 的 10 GB 上限，補 `_DEFAULT_TIERS_GB`（`score.py:24`）與 `chart/values.yaml:270` 的 10 GB tier；預設維持 (12, 24)。
-> 4. 同步 `rlpd_finetune.py` 與（已封存的）`hierarchical.py` 的 CLI 預設拓樸，避免 fine-tune 時又退回 1×1。
+> 4. 同步 `rlpd_finetune.py` 的 CLI 預設拓樸，避免 fine-tune 時又退回 1×1。
 
 訓練完成後（持久路線，正式上線建議）：
 

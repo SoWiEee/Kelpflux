@@ -38,7 +38,7 @@ from typing import Callable
 
 import numpy as np
 
-from sim.gym_env import KubefluxSchedEnv, env_dims, MODE_PACK
+from sim.gym_env import KubefluxSchedEnv, MODE_PACK
 from sim.loader import generate_by_family
 from sim.scheduler.score import ScoreScheduler
 from services.rl_scheduler.dsac import DSACAgent

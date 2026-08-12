@@ -30,7 +30,6 @@ import os
 import pickle
 import shutil
 import sys
-from typing import Optional
 
 import lightgbm as lgb
 import numpy as np

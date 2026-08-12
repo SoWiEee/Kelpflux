@@ -113,14 +113,10 @@ class _ScalarCritic(nn.Module):
                  hidden: Sequence[int] = (256, 256), layer_norm: bool = True) -> None:
         super().__init__()
         self.encoder = _build_mlp(obs_dim, hidden, n_actions, layer_norm)
-        self.head = nn.Identity()
 
     def q_values(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns Q(s,·) of shape (B, n_actions)."""
-        h = self.encoder(obs)
-        if isinstance(self.head, nn.Identity):
-            return h
-        return self.head(F.relu(h))
+        return self.encoder(obs)
 
 
 class _CategoricalActor(nn.Module):

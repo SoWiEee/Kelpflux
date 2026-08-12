@@ -20,8 +20,8 @@ unit-testable from a fixture without needing a live cluster — see
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, field
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +320,6 @@ class RequeueDecider:
         )
         self._history.append(now)
         return decision, decision.reason
-
-    # Read-only view of decision history — useful for tests and debug.
-    def recent_decisions(self, *, now: float) -> List[float]:
-        self._trim_history(now)
-        return list(self._history)
 
 
 # ---------------------------------------------------------------------------

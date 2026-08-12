@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.request as _urlreq
 import zlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np

@@ -44,7 +44,7 @@ except ImportError:
         return p, ci
 
 
-from sim.gym_env import KubefluxSchedEnv, env_dims
+from sim.gym_env import KubefluxSchedEnv
 from sim.loader import generate_by_family
 from sim.runner import run as sim_run
 from services.rl_scheduler.dsac import DSACAgent

@@ -39,10 +39,6 @@ class K8sClient:
         except ApiException:
             return False
 
-    # Backward-compatible alias.
-    def pod_ready(self, pod_name: str) -> bool:
-        return self.pod_is_ready(pod_name)
-
     def get_annotation(self, resource: str, name: str, key: str) -> str | None:
         """Return the value of a metadata annotation, or None if absent/unreadable."""
         try:
