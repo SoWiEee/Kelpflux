@@ -30,22 +30,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 
 from sim.gym_env import (
-    GPU_FEAT_DIM, GPU_TYPES, GLOBAL_FEAT_DIM, JOB_FEAT_DIM,
-    TOPO_FEAT_DIM, TOP_K, env_dims,
+    JOB_FEAT_DIM, TOP_K, env_dims,
+    _job_feat, _gpu_feat, _topo_feat, _global_feat,
 )
-from sim.loader import MPS_PER_GPU
+from sim.loader import Job as SimJob, MPS_PER_GPU, RAM_REQ_GB
+from sim.cluster import Cluster as SimCluster, Allocation
 from services.rl_scheduler.rlpd_finetune import ReplayBuffer, Transition
 
 
@@ -61,20 +62,9 @@ class LiveJob:
     submit_ts: float
     state:     str     # PENDING / RUNNING / COMPLETED / etc.
     nodelist:  str     # empty if pending
-
-
-@dataclass
-class LiveGpu:
-    node_name:    str
-    gpu_index:    int
-    free_mps:     int
-    running_jobs: int = 0
-
-
-@dataclass
-class LiveCluster:
-    nodes: Dict[str, List[LiveGpu]] = field(default_factory=dict)
-    mps_per_gpu: int = MPS_PER_GPU
+    job_class: str = "batch"   # from sbatch --comment; drives ram_req/slo/is_inference
+    slo_s:     float = 0.0     # latency deadline (inference class), from --comment
+    ram_req:   float = 0.0     # host-RAM footprint (GB), from --comment
 
 
 # Optional exec prefix so the daemon can run OFF-cluster (e.g. on the dev host
@@ -92,6 +82,36 @@ def _run(cmd: List[str], timeout: int = 20) -> str:
         return r.stdout.strip()
     except Exception:
         return ""
+
+
+_SACCT_FMT = "%Y-%m-%dT%H:%M:%S"
+_DONE_STATES = ("COMPLETED", "FAILED", "TIMEOUT", "CANCEL", "OUT_OF")
+
+
+def _sacct_jct(job_id: str) -> Optional[float]:
+    """True realized JCT = End − Submit (seconds), read from sacct.
+
+    ``squeue --json`` retains completed jobs for ``MinJobAge`` (300s here), so
+    ``now − pending_ts`` overstates JCT by up to that window — a systematic reward
+    bias that defeats the point of a faithful online-log. sacct carries the real
+    End, and the End−Submit delta is timezone-independent. Returns None if the job
+    is not yet terminal / sacct is unavailable so the caller can fall back."""
+    raw = _run(["sacct", "-X", "-P", "-n", "-j", str(job_id),
+                "-o", "Submit,End,State"])
+    for line in raw.split("\n"):
+        parts = line.strip().split("|")
+        if len(parts) < 3:
+            continue
+        submit, end, state = parts[0], parts[1], parts[2].upper()
+        if not any(s in state for s in _DONE_STATES):
+            continue
+        try:
+            t0 = datetime.strptime(submit, _SACCT_FMT)
+            t1 = datetime.strptime(end, _SACCT_FMT)
+        except (ValueError, TypeError):
+            return None
+        return max(1.0, (t1 - t0).total_seconds())
+    return None
 
 
 def _parse_squeue(raw: str) -> List[LiveJob]:
@@ -116,119 +136,125 @@ def _parse_squeue(raw: str) -> List[LiveJob]:
                 if nums:
                     mps_req = nums[-1]
         gpu_count = j.get("gpus_total", 1) or 1
+        # sbatch --comment carries the training-truth fields Slurm state can't
+        # otherwise expose — job_class, gpu_type, slo_s, ram_req, reported runtime.
+        # Without them the obs (ram/slo/is_inference/free_ram one-hot) can't match
+        # the sim the policy trained on. See live_ab_heavytail.py::sbatch_cmd.
+        meta = {}
+        craw = j.get("comment", "") or ""
+        if craw:
+            try:
+                meta = json.loads(craw)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        cls = str(meta.get("cls", "batch"))
+        tl = j.get("time_limit", {})
+        tl_s = (tl.get("number", 0) * 60) if isinstance(tl, dict) else 0
+        st_ = j.get("submit_time", {})
+        submit_ts = float(st_.get("number", time.time())) if isinstance(st_, dict) else time.time()
         jobs.append(LiveJob(
             job_id=str(j.get("job_id", "")),
-            mps_req=mps_req or MPS_PER_GPU,  # default = full GPU
+            mps_req=int(meta.get("mps", 0) or mps_req or MPS_PER_GPU),
             gpu_count=int(gpu_count),
-            gpu_type="rtx4070",
-            runtime=float(j.get("time_limit", {}).get("number", 0) * 60
-                          if isinstance(j.get("time_limit"), dict) else 0),
-            submit_ts=float(j.get("submit_time", {}).get("number", time.time())
-                            if isinstance(j.get("submit_time"), dict) else time.time()),
+            gpu_type=str(meta.get("gtype", "rtx4070")),
+            runtime=float(meta.get("reported", tl_s)),
+            submit_ts=submit_ts,
             state=state,
             nodelist=str(j.get("nodes", "") or ""),
+            job_class=cls,
+            slo_s=float(meta.get("slo", 0.0) or 0.0),
+            ram_req=float(meta.get("ram", RAM_REQ_GB.get(cls, 1.0))),
         ))
     return jobs
 
 
-def _parse_scontrol_node(raw: str, node_name: str,
-                          mps_per_gpu: int, n_gpus: int) -> List[LiveGpu]:
-    """Parse scontrol show node output to extract free MPS per GPU."""
-    gpus = []
-    # Try to find AllocTRES/CfgTRES for MPS slots
-    free_mps = mps_per_gpu  # default = fully free
+# ── Observation builder: map live Slurm state → sim objects, then reuse the
+#    canonical gym_env feature extractors. Single source of truth = no drift.
+#
+#    (The previous hand-rolled _job_feat/_gpu_feat_live/_topo_feat/_global_feat
+#    were frozen at the pre-host-RAM obs layout — 6-d GPU feats, hardcoded 4070
+#    one-hot, placeholder topo — so they emitted a 166-d obs that silently
+#    diverged from the 168-d policy. Reusing gym_env's extractors makes the two
+#    provably identical; see sim/tests/test_live_daemon_obs_parity.py.) ────────
 
-    for line in raw.split("\n"):
-        if "AllocTRES" in line:
-            for token in line.split():
-                if "mps" in token.lower() and "=" in token:
-                    try:
-                        used = int(token.split("mps")[-1].lstrip(":="))
-                        free_mps = max(0, mps_per_gpu - used)
-                    except ValueError:
-                        pass
-
-    for gi in range(n_gpus):
-        gpus.append(LiveGpu(
-            node_name=node_name, gpu_index=gi,
-            free_mps=free_mps,  # simplified: same free for all GPUs on node
-        ))
-    return gpus
+# Per-card usable host RAM (GB) — MUST match training's `--hetero-cluster
+# --node-ram-gb 62,5` so live free_ram_ratio lands on the scale the policy
+# trained on (node-1/4070 ≈ 62GB, node-2/3080 ≈ 5GB after system + slurmd).
+NODE_RAM_GB = {"rtx4070": 62.0, "rtx3080": 5.0}
+NODE_RAM_GB_DEFAULT = 62.0
 
 
-def query_cluster(node_names: List[str], n_gpus: int,
-                  mps_per_gpu: int) -> LiveCluster:
-    """Query Slurm for current GPU state on each node."""
-    cluster = LiveCluster(mps_per_gpu=mps_per_gpu)
-    for node in node_names:
-        raw  = _run(["scontrol", "show", "node", node])
-        gpus = _parse_scontrol_node(raw, node, mps_per_gpu, n_gpus)
-        cluster.nodes[node] = gpus
-    return cluster
+def _node_gpu_type(node_name: str) -> str:
+    """Card identity from the Slurm node name (drives the gpu-type one-hot)."""
+    n = (node_name or "").lower()
+    if "3080" in n:
+        return "rtx3080"
+    return "rtx4070"
 
 
-# ── Observation builder (mirrors gym_env.py) ──────────────────────────────
-
-def _job_feat(j: LiveJob, now: float, mps_per_gpu: int) -> np.ndarray:
-    gpu_oh = [1.0 if j.gpu_type == t else 0.0 for t in GPU_TYPES]
-    wait   = max(0.0, now - j.submit_ts)
-    return np.array([
-        j.mps_req / mps_per_gpu,
-        float(j.gpu_count),
-        *gpu_oh,
-        math.log1p(j.runtime),
-        math.log1p(wait),
-        math.log1p(wait),
-        0.0, 0.0,
-    ], dtype=np.float32)
+def _live_to_sim_job(j: LiveJob) -> SimJob:
+    """Rehydrate a sim Job from a LiveJob so the canonical extractors apply."""
+    return SimJob(
+        job_id=j.job_id, user="live", gpu_count=int(j.gpu_count),
+        gpu_type=j.gpu_type, submit_ts=float(j.submit_ts),
+        runtime=float(j.runtime), mem_req=0.0, mps_req=int(j.mps_req),
+        job_class=j.job_class, slo_s=float(j.slo_s), ram_req=float(j.ram_req),
+    )
 
 
-def _gpu_feat_live(g: LiveGpu, mps_per_gpu: int) -> np.ndarray:
-    free_ratio = g.free_mps / mps_per_gpu if mps_per_gpu > 0 else 0.0
-    return np.array([
-        free_ratio, free_ratio, float(g.running_jobs),
-        1.0, 0.0, 0.0,   # rtx4070 one-hot
-    ], dtype=np.float32)
-
-
-def _topo_feat(pending: List[LiveJob]) -> np.ndarray:
-    ddp_ratio = sum(1 for j in pending if j.gpu_count > 1) / max(1, len(pending))
-    return np.array([1.0, 1.0, ddp_ratio, 0.0], dtype=np.float32)
-
-
-def _global_feat(pending: List[LiveJob], cluster: LiveCluster, now: float) -> np.ndarray:
-    queue_len = len(pending)
-    if len(pending) >= 2:
-        rts   = sorted(j.runtime for j in pending)
-        n     = len(rts)
-        p50   = rts[int(n * 0.50)]
-        p90   = rts[min(int(n * 0.90), n - 1)]
-        spread = (p90 / p50) if p50 > 0 else 1.0
-    else:
-        spread = 1.0
-    tod = (now % 86400) / 86400.0
-    return np.array([
-        math.log1p(queue_len), spread, 0.0,
-        math.sin(2 * math.pi * tod),
-        math.cos(2 * math.pi * tod),
-        0.0,
-    ], dtype=np.float32)
+def _reconstruct_sim_cluster(
+    running: List[LiveJob], node_names: List[str], n_gpus: int, mps_per_gpu: int
+) -> SimCluster:
+    """Build a sim Cluster whose per-GPU free_mps, per-node used_ram, and active
+    allocations mirror the live running set — the same state sim tracks, so the
+    gym extractors produce a training-consistent obs. Assumes gpus_per_node==1
+    (the 2×1 deployment invariant): a running job occupies GPU 0 on each node it
+    landed on (gang jobs span both nodes)."""
+    node_types = [_node_gpu_type(nm) for nm in node_names]
+    node_ram = [NODE_RAM_GB.get(t, NODE_RAM_GB_DEFAULT) for t in node_types]
+    cl = SimCluster(
+        n_nodes=len(node_names), gpus_per_node=n_gpus, mps_per_gpu=mps_per_gpu,
+        node_gpu_types=node_types, node_ram_gb=node_ram,
+    )
+    for rj in running:
+        hit = [k for k, nm in enumerate(node_names) if nm and nm in (rj.nodelist or "")]
+        if not hit:
+            continue
+        for ni in hit:
+            for gi in range(n_gpus):
+                g = cl.nodes[ni].gpus[gi]
+                g.free_mps = max(0, g.free_mps - int(rj.mps_req))
+        cl.active[rj.job_id] = [
+            Allocation(job_id=rj.job_id, node_id=ni,
+                       gpu_indices=list(range(n_gpus)), mps_per_gpu=int(rj.mps_req))
+            for ni in hit
+        ]
+        for ni in set(hit):
+            cl.nodes[ni].used_ram_gb += float(rj.ram_req)
+        cl.active_ram[rj.job_id] = float(rj.ram_req)
+    return cl
 
 
 def build_obs_and_mask(
     pending: List[LiveJob],
-    cluster: LiveCluster,
+    running: List[LiveJob],
     node_names: List[str],
     n_gpus: int,
+    mps_per_gpu: int,
     now: float,
 ) -> tuple[np.ndarray, np.ndarray, List[Optional[str]]]:
+    """Canonical 168-d obs for the live cluster: rehydrate sim Job/Cluster from
+    the live pending+running sets, then run the SAME feature extractors gym_env
+    uses in ``_build_obs`` (job feats top-k, per-GPU feats, full-pending topo +
+    global). Guarantees the logged obs matches what the policy trained on."""
     n_nodes      = len(node_names)
-    mps_per_gpu  = cluster.mps_per_gpu
     n_placements = n_nodes * n_gpus
     n_actions    = TOP_K * n_placements + 1
     no_op        = n_actions - 1
 
-    top = sorted(pending, key=lambda j: j.submit_ts)[:TOP_K]
+    cl = _reconstruct_sim_cluster(running, node_names, n_gpus, mps_per_gpu)
+    sim_pending = [_live_to_sim_job(j) for j in pending]
+    top = sorted(sim_pending, key=lambda j: j.submit_ts)[:TOP_K]
 
     job_feats: List[np.ndarray] = []
     top_ids:   List[Optional[str]] = []
@@ -241,27 +267,21 @@ def build_obs_and_mask(
             top_ids.append(None)
 
     gpu_feats: List[np.ndarray] = []
-    for node in node_names:
-        gpus = cluster.nodes.get(node, [])
+    for ni in range(n_nodes):
         for gi in range(n_gpus):
-            if gi < len(gpus):
-                gpu_feats.append(_gpu_feat_live(gpus[gi], mps_per_gpu))
-            else:
-                gpu_feats.append(np.zeros(GPU_FEAT_DIM, dtype=np.float32))
+            gpu_feats.append(_gpu_feat(cl, ni, gi))
 
-    topo = _topo_feat(top)
-    glob = _global_feat(top, cluster, now)
+    topo = _topo_feat(sim_pending, cl)
+    glob = _global_feat(sim_pending, cl, now)
 
     obs = np.concatenate([*job_feats, *gpu_feats, topo, glob]).astype(np.float32)
 
     mask = np.zeros(n_actions, dtype=bool)
-    for i, j in enumerate(top):
-        for nj, node in enumerate(node_names):
-            gpus = cluster.nodes.get(node, [])
+    for i, jb in enumerate(top):
+        for nj in range(n_nodes):
             for gk in range(n_gpus):
-                if gk < len(gpus) and gpus[gk].free_mps >= j.mps_req:
-                    a = i * n_placements + nj * n_gpus + gk
-                    mask[a] = True
+                if cl.nodes[nj].gpus[gk].free_mps >= jb.mps_req:
+                    mask[i * n_placements + nj * n_gpus + gk] = True
     mask[no_op] = True
 
     return obs, mask, top_ids
@@ -307,7 +327,6 @@ def run_daemon(
         while True:
             now      = time.time()
             all_jobs = _parse_squeue(_run(["squeue", "--json"]))
-            cluster  = query_cluster(node_names, n_gpus, mps_per_gpu)
             pending  = [j for j in all_jobs if "PENDING" in str(j.state).upper()]
             running  = [j for j in all_jobs if "RUNNING" in str(j.state).upper()]
             live_ids = {j.job_id for j in all_jobs}
@@ -316,7 +335,7 @@ def run_daemon(
             #     state a scheduler faced just before the job was placed).
             if pending:
                 obs, mask, top_ids = build_obs_and_mask(
-                    pending, cluster, node_names, n_gpus, now)
+                    pending, running, node_names, n_gpus, mps_per_gpu, now)
                 for jid in top_ids:
                     if jid:
                         pending_obs[jid] = (obs.copy(), mask.copy(),
@@ -338,14 +357,19 @@ def run_daemon(
             # (3) A job that FINISHED = realised reward (−JCT) → log the transition.
             if pending:
                 next_obs, next_mask, _ = build_obs_and_mask(
-                    pending, cluster, node_names, n_gpus, now)
+                    pending, running, node_names, n_gpus, mps_per_gpu, now)
             else:
                 next_obs  = np.zeros(obs_dim, dtype=np.float32)
                 next_mask = np.zeros(n_actions, dtype=bool); next_mask[-1] = True
             for jid in list(in_flight):
                 if jid not in live_ids:
                     o, act, m, ts = in_flight.pop(jid)
-                    jct = max(1.0, now - ts)
+                    # True JCT from sacct End−Submit (not now−ts, which MinJobAge
+                    # squeue retention inflates by up to 300s). Fall back to the
+                    # wall-clock estimate only if sacct can't answer.
+                    jct = _sacct_jct(jid)
+                    if jct is None:
+                        jct = max(1.0, now - ts)
                     rew = -jct / 1000.0
                     live_buf.add(Transition(
                         obs=o, act=int(act), rew=float(rew),

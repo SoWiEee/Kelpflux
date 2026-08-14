@@ -51,6 +51,7 @@ class LiveJob:
     job_class: str = "batch"  # inference / training / llm / batch
     slo_s: float = 0.0        # latency-SLO deadline on JCT (>0 = inference)
     ram_req: float = 0.0      # host-RAM footprint (GB) — sent to /act for the OOM-aware obs
+    gpu_type: str = "rtx4070" # per-job preferred card (obs one-hot); from the sim aimix mix
 
 
 @dataclass(frozen=True)
@@ -440,7 +441,8 @@ def gen_workload(
                 job_id=str(j.job_id), arrival_offset_s=round(float(arrivals[i]), 3),
                 true_runtime_s=round(float(true[i]), 3), reported_runtime_s=round(rep, 3),
                 mps_req=int(np.clip(j.mps_req, 1, LIVE_GPU_MPS)), gpu_count=1,
-                job_class=j.job_class, slo_s=round(j.slo_s * scale, 3), ram_req=j.ram_req))
+                job_class=j.job_class, slo_s=round(j.slo_s * scale, 3),
+                ram_req=j.ram_req, gpu_type=j.gpu_type))
         return out
 
     jobs = generate_by_family(family, n_jobs=n_jobs, seed=seed)
@@ -546,6 +548,10 @@ def sbatch_cmd(job: LiveJob, arm: str, round_idx: int, *,
         "job_id": job.job_id, "true": round(job.true_runtime_s, 2),
         "reported": round(job.reported_runtime_s, 2), "mps": job.mps_req,
         "arm": arm, "round": round_idx,
+        # Training-truth fields the live_daemon rehydrates into the sim obs so the
+        # logged transitions match the 168-d policy (see live_daemon.py).
+        "cls": job.job_class, "gtype": job.gpu_type,
+        "slo": round(job.slo_s, 2), "ram": round(job.ram_req, 3),
     }, separators=(",", ":"))
     # sleep mode: --time from the (noisy) reported estimate the scheduler sees.
     # CUDA mode: --time inflated for slow-card × contention so jobs aren't killed.

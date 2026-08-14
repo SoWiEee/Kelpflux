@@ -14,7 +14,7 @@ export PYTHONPATH=.
 # (IQN/RDSAC is inherently ~1.6 steps/s on CPU regardless — that's the workload,
 # not the threading; the fix for wall-time is fewer seeds/steps, not more threads.)
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
-CK=/tmp/lckpts_aimix
+CK="${CK:-/tmp/lckpts_aimix}"   # override to an in-repo dir, e.g. CK=runs/ckpts_aimix16
 STEPS="${STEPS:-100000}"
 DEVICE="${DEVICE:-cpu}"
 MAX="${MAX:-8}"                 # concurrent trainings
