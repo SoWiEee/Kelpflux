@@ -258,6 +258,8 @@ class ReplayBuffer:
 
 def collect_sim_rollouts(*, n_transitions: int, trace_family: str,
                          n_jobs: int, n_nodes: int, gpus_per_node: int,
+                         node_gpu_types: Optional[list] = None,
+                         node_ram_gb: Optional[list] = None,
                          seed: int = 42) -> ReplayBuffer:
     """Fill offline buffer using a uniform-random masked policy in sim.
 
@@ -278,6 +280,7 @@ def collect_sim_rollouts(*, n_transitions: int, trace_family: str,
     env = KubefluxSchedEnv(
         _factory, n_nodes=n_nodes, gpus_per_node=gpus_per_node,
         max_steps=n_jobs * 100,
+        node_gpu_types=node_gpu_types, node_ram_gb=node_ram_gb,
     )
     obs_dim   = int(np.prod(env.observation_space.shape))
     n_actions = int(env.action_space.n)
@@ -657,7 +660,9 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                n_critics: int = 10, subset: int = 2,
                fixed_alpha: bool = False, init_alpha: float = 0.05,
                trace_family: str = "philly", n_jobs: int = 100,
-               n_nodes: int = 1, gpus_per_node: int = 1) -> None:
+               n_nodes: int = 1, gpus_per_node: int = 1,
+               node_gpu_types: Optional[list] = None,
+               node_ram_gb: Optional[list] = None) -> None:
     """Faithful RLPD fine-tune (see RLPDAgent): symmetric 50/50 offline+online
     batches, LayerNorm critic ensemble + random-subset target, high UTD.
 
@@ -735,6 +740,7 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
             ],
             n_nodes=n_nodes, gpus_per_node=gpus_per_node,
             max_steps=n_jobs * 200, reward_mode="jct_aligned",
+            node_gpu_types=node_gpu_types, node_ram_gb=node_ram_gb,
         )
         obs, _ = env.reset()
         done = False
@@ -794,11 +800,32 @@ def main(argv=None) -> int:
     # When second GPU is online: change both to 2 and retrain from scratch.
     p.add_argument("--n-nodes", type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
+    # Heterogeneous cluster — must match the base policy's training regime and the
+    # live obs the online-log was built with (gpu one-hot + free_ram_ratio use these).
+    # NOTE: reward stays jct_aligned (the online-log logs −JCT/1000); the RLPD critic
+    # trains from scratch and needs offline↔online reward CONSISTENCY, not parity with
+    # the base's mo-reward training. So only cluster shape is threaded, not reward.
+    p.add_argument("--hetero-cluster", action="store_true",
+                   help="shortcut for the real 2×1 cluster: "
+                        "--node-gpu-types rtx4070,rtx3080 --node-ram-gb 62,5")
+    p.add_argument("--node-gpu-types", default=None,
+                   help="per-node card ids, comma-separated (e.g. rtx4070,rtx3080)")
+    p.add_argument("--node-ram-gb", default=None,
+                   help="per-node usable host RAM GB, comma-separated (e.g. 62,5)")
     p.add_argument("--out-dir",
                    default=f"runs/m11_rlpd_{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args(argv)
 
     base = Path(args.base_policy) if args.base_policy else Path(args.out_dir)
+
+    # --hetero-cluster is shorthand for the real 2×1 card+RAM layout.
+    if args.hetero_cluster:
+        args.node_gpu_types = args.node_gpu_types or "rtx4070,rtx3080"
+        args.node_ram_gb = args.node_ram_gb or "62,5"
+    node_gpu_types = ([s.strip() for s in args.node_gpu_types.split(",") if s.strip()]
+                      if args.node_gpu_types else None)
+    node_ram_gb = ([float(s) for s in args.node_ram_gb.split(",") if s.strip()]
+                   if args.node_ram_gb else None)
 
     print(f"[rlpd] collecting offline buffer ({args.offline_steps} steps)...")
     offline = collect_sim_rollouts(
@@ -807,6 +834,8 @@ def main(argv=None) -> int:
         n_jobs=args.n_jobs,
         n_nodes=args.n_nodes,
         gpus_per_node=args.gpus_per_node,
+        node_gpu_types=node_gpu_types,
+        node_ram_gb=node_ram_gb,
     )
     print(f"[rlpd] offline buffer size = {len(offline)}")
 
@@ -857,6 +886,8 @@ def main(argv=None) -> int:
         n_jobs=args.n_jobs,
         n_nodes=args.n_nodes,
         gpus_per_node=args.gpus_per_node,
+        node_gpu_types=node_gpu_types,
+        node_ram_gb=node_ram_gb,
     )
     return 0
 
