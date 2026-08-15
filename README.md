@@ -246,23 +246,20 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 
 ### 5.2 實機微調（RLPD，忠於 Ball et al. 2023）
 
-以 shadow-safe 的 `live_daemon` 旁觀收集真實 transition（記錄 Slurm 實際落點 + 實現 JCT，不干擾生產），再做 RLPD 微調（對稱 50/50 offline/online、LayerNorm 集成 critic、fixed-α 避免離散 SAC 溫度發散）。
+以 shadow-safe 的 `live_daemon` 旁觀收集真實 transition（記錄 Slurm 實際落點 + **sacct 真 JCT**，不干擾生產），再做 RLPD 微調（對稱 50/50 offline/online、LayerNorm 集成 critic、fixed-α 避免離散 SAC 溫度發散）。`live_daemon` 的 obs 直接重用 `gym_env` 的 canonical 特徵抽取（單一真相源，避免 168-d 漂移）；reward 用 sacct `End−Submit`（避開 `MinJobAge` squeue 滯留造成的 JCT 灌水）。
 
 ```bash
-# 1) 旁觀收集真實 transition
-SLURM_EXEC_PREFIX="kubectl exec -n slurm slurm-controller-0 -- " \
-PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.live_daemon \
-    --policy-dir /tmp/lckpts \
-    --node-name slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0 \
-    --gpus-per-node 1 --mps-per-gpu 100 --poll-interval 2 --log-dir shadow_logs
+# 1) 旁觀收集真實 168-d online-log（serve :8003 跑 rdsac_cvar 當 behavior + daemon shadow 記錄）
+#    16h 時間界定迴圈送 aimix batch → shadow_logs/transitions_*.jsonl（RLPD 的 raw --online-log）
+DURATION_S=57600 N_JOBS=30 bash eval/scripts/collect_aimix_onlinelog.sh
 
-# 2) RLPD 微調
-PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
-    --base-policy /tmp/lckpts/rdsac_cvar_s45.pt \
-    --online-log 'shadow_logs/transitions_*.jsonl' \
-    --n-critics 10 --subset 2 --fixed-alpha --init-alpha 0.05 \
-    --n-nodes 2 --gpus-per-node 1 \
-    --out-dir runs/rlpd_$(date +%Y%m%d-%H%M%S)
+# 2) 16-seed RLPD 微調：各 warm-start rdsac_cvar_sXX，共用同一份真 online-log。
+#    offline sim prior 用 --hetero-cluster（對齊 base/online-log 的 gpu one-hot + free_ram_ratio）；
+#    reward 維持 jct_aligned（RLPD critic 從頭訓練，需 offline↔online reward 一致，online-log 記 −JCT/1000）。
+#    CPU（本機 4070 被 Slurm/DRA 佔用）；~240s/seed。
+ONLINE_LOG=shadow_logs/transitions_20260814-203143.jsonl \
+    bash eval/scripts/train_rlpd_aimix16.sh
+# → runs/ckpts_aimix16/rlpd_cvar_s{42..57}.pt（16 個，serve/eval 可載入）
 ```
 
 ### 5.3 混合工作負載實機評估
@@ -285,6 +282,23 @@ SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
 # ── Step 3：統計穩健性複核（Holm / bootstrap 95% CI / TOST 等價 / n=8 MDE）──
 PYTHONPATH=. .venv-m11/bin/python eval/scripts/stage1_reanalysis.py \
     --hybrid aimix6 --out runs/aimix6_reanalysis.json
+```
+
+### 5.4 重載六臂實機評估（§6.3 headroom 區，基準 = backfill，無 score）
+
+在 §5.7 ceiling 分析指出 headroom 開窗的重載 regime（n_jobs≈150，2-GPU）複核學習式排程。**六臂**：FCFS / Backfill（Slurm-native，剝除 Lua）+ SAC / RDSAC-mean / RDSAC-cvar / RLPD（學習式落點）。**score 已從評估項目移除**；主要顯著性檢定為 **seed-level 配對 ΔJCT% vs backfill**（backfill = Slurm 預設生產排程器，當基準）。三套 slurm.conf 自動切換，結束以 trap 還原。
+
+```bash
+# 前置：本地 168-d serve on :8003（eval 逐臂 /reload 對應 checkpoint）
+SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
+    --policy-dir /tmp/aimix_eval_policy --port 8003 &   # policy-dir 放任一 168-d ckpt 當初始
+
+# 先 SMOKE 驗 wiring（6 jobs / 1 seed，短），再全量
+SMOKE=1 bash eval/scripts/run_heavy150_aimix_5arm.sh
+
+# 全量：6 臂 × 16 seed × 150 jobs（real-CUDA；learned 輪帶 --no-score）
+CK=runs/ckpts_aimix16 bash eval/scripts/run_heavy150_aimix_5arm.sh
+# → runs/heavy150aimix_<stamp>_TABLES.md（JCT/Makespan/P95/P99 + 對 backfill 的 ΔJCT% / seed_t p）
 ```
 
 > **節點順序 load-bearing。** `GPU_NODES` 內 index 0 須為快卡（4070），與訓練時的 `node_speeds` 一致；顛倒會使學習臂系統性放到慢卡、結果失真。預設 `slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0` 已正確。

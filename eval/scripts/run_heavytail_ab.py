@@ -214,7 +214,8 @@ def run(args) -> int:
     ckpts = {"SAC": args.sac_ckpt, "RDSAC-mean": args.rdsac_mean_ckpt,
              "RDSAC-cvar": args.rdsac_cvar_ckpt, "UXP-RL": args.uxprl_ckpt,
              "RLPD": args.rlpd_ckpt}
-    arms = [a for a in ARMS if a == "score" or ckpts.get(a)]
+    arms = [a for a in ARMS
+            if (a == "score" and not args.no_score) or ckpts.get(a)]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     sigmas = [float(s) for s in args.sigmas]
@@ -342,6 +343,9 @@ def main(argv=None) -> int:
                    help="UXP-RL (Lin et al. 2025) checkpoint (adds a UXP-RL live arm)")
     p.add_argument("--rlpd-ckpt", default=None,
                    help="RLPD checkpoint (adds an RLPD live arm; real-data fine-tuned policy)")
+    p.add_argument("--no-score", action="store_true",
+                   help="drop the score-Lua baseline arm (learned arms only; paired "
+                        "deltas are then re-based downstream, e.g. vs backfill)")
     p.add_argument("--family", choices=["philly", "ali", "aimix"], default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)
