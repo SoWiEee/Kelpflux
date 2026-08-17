@@ -269,6 +269,19 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 由表 6 可以發現，在平均 JCT 的部分，SAC 與 RDSAC-cvar 的平均 優於 FCFS／Backfill，但相對啟發式的差距很小，而 RDSAC-mean 則較差。FCFS／Backfill 以嚴格序列執行換得較低的 P99 (255~270 s)，明顯低於啟發式與學習式策略的 509–600 s。也發現 RDSAC-cvar 在**學習式策略內部**取得較佳尾端平衡。
 
+**重載複核（150 工作／16 seed，基準改為 Backfill，score 移除）。** 為在 §5.7 天花板分析所指出「headroom 開窗」的較重負載 regime 進一步檢驗，並以更大樣本與更直接的基準複核，另跑一組六臂實機評估：每 seed 工作數由 125 提高至 150、workload seed 由 8 擴至 16，移除 size-aware score 臂，直接以 Slurm 生產排程器 **Backfill** 作為 seed-level 配對基準；RLPD 於此 campaign 為一等公民臂，由 §5.1 所述之忠實 168 維線上日誌（2 786 筆真實 transition、以 sacct 真實 JCT 計 reward）微調而得。結果如表 6b。**無任何學習式策略在平均 JCT 上顯著勝過 Backfill**（皆 *p*>0.05）：RDSAC-mean 最接近打平（−1.3%，16 seed 中 10 個較快，*p*=0.70），SAC／RDSAC-cvar／RLPD 平均略慢於 Backfill（−4.5%～−5.3%，皆未達顯著）；FCFS 則顯著慢於 Backfill（−13.1%，0/16，*p*<0.001），確認基準本身具鑑別力。與表 6 一致，學習式策略的尾端明顯更差：P99 均落在 ≈639–668 s，約為 Slurm-native（≈263–282 s）的 2.4 倍。此較重負載、較大樣本的複核強化本文核心結論——**即使在天花板分析指出效益空間開啟的負載區間，學習式 placement 仍無法穩健勝過已充分調校的生產 Slurm 排程，且以平均 JCT 的打平換取顯著更差的尾端延遲**。（此 campaign 之忠實 RLPD 於重載下不再取得表 6 之最佳平均 JCT，顯示其相對優勢亦取決於負載與基準。）
+
+表 6b. 重載混合 AI 工作負載評估（每 seed 提交 150 個工作，n=16 seeds；JCT／Makespan／P95／P99 為各 seed 內平均之未加權平均 ± 標準差，單位秒；score 已自評估項目移除，Backfill 為配對基準；ΔJCT% 見表 8b）
+
+| 排程器 | 平均 JCT (s) | Makespan (s) | P95 (s) | P99 (s) |
+|---|--:|--:|--:|--:|
+| FCFS | 151.4 ± 29.1 | 778.9 ± 37.4 | 270.2 ± 45.1 | 282.4 ± 46.6 |
+| **Backfill**（基準） | 134.6 ± 28.8 | 757.5 ± 46.8 | 251.2 ± 48.2 | 263.2 ± 48.7 |
+| SAC | 138.9 ± 23.8 | 776.4 ± 36.1 | 540.4 ± 120.5 | 655.6 ± 66.1 |
+| RDSAC-mean | 134.9 ± 27.0 | 764.4 ± 38.0 | 447.3 ± 165.2 | 640.5 ± 73.5 |
+| RDSAC-cvar | 140.2 ± 27.1 | 783.0 ± 30.7 | 529.2 ± 139.4 | 639.3 ± 61.1 |
+| RLPD | 139.4 ± 28.6 | 786.8 ± 39.4 | 513.1 ± 177.8 | 667.5 ± 55.3 |
+
 ### 5.3 系統行為量測
 
 除排程品質外，本研究亦量測學習式決策路徑的系統行為，以檢驗其失效安全整合是否非侵入。在 2×1 平台上以 8 個工作負載 seed（每 seed 125 個工作）重放排程序列，於控制平面（CPU）逐次計時策略決策，並依線上服務的判定門檻（低信心 value／entropy）將每次決策分類為 RL 主導、低信心回退，或暫不派遣（no-op），結果如表 7。
@@ -320,6 +333,18 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | **RLPD** † | **+2.2** | [−4.5, +8.9] | +0.28 | 0.46 | 通過 |
 
 † RLPD 之基準為其自身併跑之 score（絕對平均 JCT 110.7 s，為表 6 最佳）；其 ΔJCT% 以該基準計算，不與前五臂同 Holm family。
+
+**重載六臂之配對統計（基準 Backfill）。** 表 8b 列出 §5.2 重載複核 campaign（150 工作／16 seed，score 移除）中，各臂相對 **Backfill** 的 seed-level 配對 ΔJCT%（正值＝快於 Backfill）與 one-sample t 檢定（自由度 15）。此 campaign 以 Backfill 為唯一配對基準、無 score 臂，故 ΔJCT% 直接由表 6b 之 seed-mean JCT 計 `(JCT_backfill − JCT_arm) / JCT_backfill × 100`。除 **FCFS 顯著慢於 Backfill**（−13.1%，0/16 seed 較快，*p*<0.001）外，四個學習式臂**均未達顯著**（*p* 介於 0.16–0.70），且點估計皆為負（略慢於 Backfill）；其中 RDSAC-mean 最接近等價（−1.3%，10/16 較快，*p*=0.70）。即便未施加多重比較校正，除 FCFS-較慢外亦無任一臂達顯著。此結果在更大樣本（n=16）與更重負載（150 工作）下重現 §5.2 主 campaign 的型態——**學習式 placement 相對生產 Slurm（Backfill）無穩健優勢，且尾端顯著更差**（表 6b：學習式 P99 ≈639–668 s vs Slurm-native ≈263–282 s）。
+
+表 8b. 重載六臂相對 Backfill 之配對比較（heavy150aimix，n=16 seeds；ΔJCT% 正值＝快於 Backfill，為各 seed 配對差之平均 ± 標準差，由表 6b 之 seed-mean JCT 直接相除；*p* 為 one-sample t 檢定 vs 0，未施 Holm 校正）
+
+| 臂 | ΔJCT% vs Backfill | seed 較快數 | t 檢定 *p* |
+|---|--:|:--:|--:|
+| FCFS | −13.1 ± 7.3 | 0/16 | **<0.001** |
+| SAC | −4.9 ± 15.7 | 8/16 | 0.233 |
+| RDSAC-mean | −1.3 ± 13.4 | 10/16 | 0.701 |
+| RDSAC-cvar | −5.3 ± 14.5 | 7/16 | 0.160 |
+| RLPD | −4.5 ± 14.5 | 7/16 | 0.230 |
 
 僅 SAC 與 RLPD 通過 ±10% TOST 等價（與 score 實務等價），其餘臂點估計偏慢且信賴區間甚寬。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——此為小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
 
