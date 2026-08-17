@@ -21,7 +21,13 @@
 set -uo pipefail
 cd /home/acane/Desktop/Kelpflux
 export KUBECONFIG=$HOME/.kube/config PYTHONPATH=.
-STAMP=$(date +%Y%m%d-%H%M%S)
+# STAMP override + PHASES filter let a partial run be resumed: e.g. after a flaky
+# apply_verify failure that only killed the backfill phase, re-run just that phase
+# under the SAME STAMP so aggregate finds all learned/fcfs/backfill dirs together.
+#   PHASES=backfill STAMP=20260815-135722 bash eval/scripts/run_heavy150_aimix_5arm.sh
+STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
+PHASES="${PHASES:-learned fcfs backfill}"
+want_phase(){ [[ " $PHASES " == *" $1 "* ]]; }
 TAG="${TAG:-heavy150aimix}"
 LOG="runs/${TAG}_${STAMP}.log"
 CM=slurm-config-static; NS=slurm; CTL=slurm-controller-0
@@ -97,11 +103,20 @@ log "held_watchdog pid=$WD_PID"
 prewarm(){ local pids=(); for N in slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0; do timeout 180 kubectl -n $NS exec "$LOGIN" -- bash -lc "srun -p gpu -w $N --gres=mps:25 --time=5 /shared/py/bin/python3 /shared/scripts/llm_job.py --mode infer --n 1 --batch-size 4 --prompt-len 512 --gen-len 2 --model $MODEL 2>&1|tail -1" >/dev/null 2>&1 & pids+=($!); done; wait "${pids[@]}"; }
 apply_verify(){ # $1 conf  $2 want-SchedulerType  $3 name
   patch_conf "$1"; PATCHED=1; restart_ctl_wait || { log "FATAL slurmctld not ready ($3)"; exit 1; }
-  local got; got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'SchedulerType\s*=\s*\K\S+')
-  [ "$got" = "$2" ] || { log "FATAL SchedulerType=$got != $2 ($3)"; exit 1; }
+  # pod-ready (containerStatuses.ready) precedes slurmctld RPC-ready: `scontrol show
+  # config` can return an EMPTY SchedulerType for ~tens of seconds after restart.
+  # Poll until the RPC answers with the expected value instead of failing on the race.
+  local got="" i
+  for i in $(seq 1 20); do
+    got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'SchedulerType\s*=\s*\K\S+')
+    [ "$got" = "$2" ] && break
+    sleep 6
+  done
+  [ "$got" = "$2" ] || { log "FATAL SchedulerType='$got' != $2 ($3) after 20×6s poll"; exit 1; }
   resume_nodes; log "config $3 active (SchedulerType=$got)"; }
 
-# ---- config1: learned (original config, Lua on) → score + learned arms interleaved ----
+# ---- config1: learned (original config, Lua on) → learned arms (--no-score) ----
+if want_phase learned; then
 apply_verify "$ORIG" "sched/backfill" "learned"
 prewarm
 for SEED in "${SEEDS[@]}"; do
@@ -115,6 +130,7 @@ for SEED in "${SEEDS[@]}"; do
     --arrival-mode poisson --mps-oversub "$OVERSUB" --target-max-s 20 --mps-buckets 25,50,75,100 \
     --partition gpu --out-dir "runs/${TAG}_learned_s${SEED}_${STAMP}" >>"$LOG" 2>&1 || log "  [learned] s$SEED exit $?"
 done
+else log "SKIP learned phase (PHASES=$PHASES)"; fi
 
 # ---- config2 & 3: Slurm-native (score panel only, no Lua) ----
 run_slurm(){ # $1 name  $2 conf  $3 want-SchedulerType
@@ -128,8 +144,8 @@ run_slurm(){ # $1 name  $2 conf  $3 want-SchedulerType
       --arrival-mode poisson --mps-oversub "$OVERSUB" --target-max-s 20 --mps-buckets 25,50,75,100 \
       --partition gpu --out-dir "runs/${TAG}_${1}_s${SEED}_${STAMP}" >>"$LOG" 2>&1 || log "  [$1] s$SEED exit $?"
   done; }
-run_slurm fcfs     "$CONF_fcfs"     "sched/builtin"
-run_slurm backfill "$CONF_backfill" "sched/backfill"
+want_phase fcfs     && run_slurm fcfs     "$CONF_fcfs"     "sched/builtin"  || log "SKIP fcfs phase (PHASES=$PHASES)"
+want_phase backfill && run_slurm backfill "$CONF_backfill" "sched/backfill" || log "SKIP backfill phase (PHASES=$PHASES)"
 
 log "=== aggregating (JCT / Makespan / P95 / P99 + seed-paired ΔJCT% vs backfill) ==="
 .venv-m11/bin/python eval/scripts/aggregate_heavy150_vs_backfill.py "$STAMP" "$TAG" "${LEARNED[*]}" "${SEEDS[@]}" >>"$LOG" 2>&1 \
