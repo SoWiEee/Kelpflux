@@ -17,7 +17,7 @@ Usage:
 Compares JCT / wait tail from sacct.
 """
 from __future__ import annotations
-import argparse, subprocess, time, sys
+import argparse, json, subprocess, time, sys, urllib.request
 import numpy as np
 from sim.loader import generate_by_family
 from services.rl_scheduler.placement_controller import (
@@ -34,6 +34,21 @@ def _exec(pod, script, timeout=60):
     r = subprocess.run(["kubectl", "exec", "-n", NS, pod, "--", "bash", "-lc", script],
                        capture_output=True, text=True, timeout=timeout)
     return r.stdout.strip()
+
+
+def reload_serve(ckpt_path, serve=SERVE, timeout=30):
+    """Hot-swap the served checkpoint (serve.py /reload). Absolute path so the
+    serve process — running from an arbitrary cwd — always resolves it."""
+    import os
+    ckpt = os.path.abspath(ckpt_path)
+    data = json.dumps({"checkpoint": ckpt}).encode()
+    req = urllib.request.Request(serve.rstrip("/") + "/reload", data=data,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        out = json.loads(resp.read().decode() or "{}")
+    print(f"[reload] {out.get('variant')} obs={out.get('obs_dim')} "
+          f"act={out.get('n_actions')} ← {ckpt}", flush=True)
+    return out
 
 
 def gen_jobs(n, seed, target_max):
@@ -75,43 +90,78 @@ def squeue_snapshot():
             running_mps[node] += mps
         elif state == "PENDING" and "JobHeld" in reason:
             held.append((jid, name, mps))
-    nodes = [SlurmNode(name=n, free_mps=max(0, MPS_PER_GPU * 2 - running_mps[n]),
+    # per-node capacity = MPS_PER_GPU (each node has 1 GPU × mps:100, CfgTRES
+    # gres/mps=100, OverSubscribe=NO). NOT ×2 — that stale 2-GPU/node assumption
+    # (a) made RL over-release so the overflow queued in Slurm PRIORITY order,
+    # overriding RL's ordering, and (b) fed the model free_mps/mps_per_gpu ratios
+    # up to 2.0 it never saw in training (mps:100 → max 1.0) — out-of-distribution.
+    nodes = [SlurmNode(name=n, free_mps=max(0, MPS_PER_GPU - running_mps[n]),
                        running_jobs=0, gpu_type="rtx4070" if "4070" in n else "rtx3080")
              for n in NODES]
     return held, nodes
 
 
-def run_scontrol_arm(jobs):
+def run_scontrol_arm(jobs, deadline_min=25):
     # submit all HELD; remember slurm-id → job features + a monotone submit_ts
     meta = {}
     for i, j in enumerate(jobs):
         sid = submit(j, held=True)
         if sid: meta[sid] = {**j, "order": i}
     print(f"[scontrol] submitted {len(meta)} held jobs", flush=True)
-    # loop: /act over held → pin+release chosen job
-    deadline = time.time() + 25 * 60
+    # BATCH-DRAIN loop (not one-release-per-1.5s — that serial throttle injected a
+    # ~2-3s/job artificial wait that dominated short jobs and made RL look far worse
+    # than backfill, which bursts all jobs so Slurm fills capacity at once). Each
+    # cycle: snapshot free_mps once, then let RL repeatedly pick its top held job and
+    # place it while capacity remains (RL owns ORDER + NODE), decrementing a LOCAL
+    # free_mps tally; actuate the whole batch in ONE kubectl exec; then wait briefly
+    # for running jobs to free MPS and re-snapshot. This mirrors backfill's fill-now
+    # behaviour so the comparison isolates scheduling quality, not release cadence.
+    deadline = time.time() + deadline_min * 60
     while time.time() < deadline:
         held, nodes = squeue_snapshot()
         held = [(sid, nm, mps) for (sid, nm, mps) in held if sid in meta]
         if not held:
             break
-        sjobs = [SlurmJob(job_id=sid, name=nm, state="PENDING", reason="JobHeld",
-                          mps_req=meta[sid]["mps"], gpu_count=1, gpu_type=meta[sid]["gtype"],
-                          runtime=meta[sid]["rt"], submit_ts=meta[sid]["order"])
-                 for (sid, nm, mps) in held]
-        payload = build_act_payload(sjobs, nodes, mps_per_gpu=MPS_PER_GPU)
-        try:
-            act = post_act(payload, scheduler_url=SERVE, timeout=10)
-        except Exception as e:
-            print("  /act err", e); time.sleep(2); continue
-        sel = act.get("selected_job_id"); node_j = act.get("node_j")
-        if sel is None or node_j is None or sel not in meta:
-            # RL abstained / no fit → release the longest-waiting held job on its fit node
-            sid = held[0][0]; node = NODES[0]
-        else:
-            sid = sel; node = NODES[int(node_j)] if int(node_j) < len(NODES) else NODES[0]
-        _exec(CTL, f"scontrol update job={sid} ReqNodeList={node} 2>&1; scontrol release {sid} 2>&1")
-        time.sleep(1.5)
+        free = {n.name: n.free_mps for n in nodes}
+        remaining = {sid: (nm, mps) for (sid, nm, mps) in held}
+        batch = []  # (sid, node)
+        # fill available capacity: RL picks order+node; fall back to longest-wait/first-fit
+        while remaining:
+            sjobs = [SlurmJob(job_id=sid, name=nm, state="PENDING", reason="JobHeld",
+                              mps_req=meta[sid]["mps"], gpu_count=1, gpu_type=meta[sid]["gtype"],
+                              runtime=meta[sid]["rt"], submit_ts=meta[sid]["order"])
+                     for sid, (nm, mps) in remaining.items()]
+            fnodes = [SlurmNode(name=n.name, free_mps=int(free[n.name]), running_jobs=0,
+                                gpu_type=n.gpu_type) for n in nodes]
+            try:
+                act = post_act(build_act_payload(sjobs, fnodes, mps_per_gpu=MPS_PER_GPU),
+                               scheduler_url=SERVE, timeout=10)
+            except Exception as e:
+                print("  /act err", e); act = {}
+            sel = act.get("selected_job_id"); node_j = act.get("node_j")
+            if sel in remaining and node_j is not None and 0 <= int(node_j) < len(NODES):
+                sid = sel; node = NODES[int(node_j)]
+            else:
+                sid = None  # RL abstained → fall to first-fit below
+            need = meta[sid]["mps"] if sid else None
+            # if RL's pick doesn't fit its node, or RL abstained, first-fit the
+            # longest-waiting job onto any node with room (keeps capacity full).
+            if sid is None or free.get(node, 0) < need:
+                placed = False
+                for cand in sorted(remaining, key=lambda s: meta[s]["order"]):
+                    for n in NODES:
+                        if free[n] >= meta[cand]["mps"]:
+                            sid, node, need = cand, n, meta[cand]["mps"]; placed = True; break
+                    if placed:
+                        break
+                if not placed:
+                    break  # nothing fits any node right now → wait for capacity
+            batch.append((sid, node)); free[node] -= need; remaining.pop(sid)
+        if batch:
+            cmd = "; ".join(f"scontrol update job={sid} ReqNodeList={node} 2>&1; scontrol release {sid} 2>&1"
+                            for sid, node in batch)
+            _exec(CTL, cmd, timeout=120)
+        time.sleep(2)  # let running jobs free MPS before the next snapshot
     return list(meta.keys())
 
 
@@ -141,6 +191,21 @@ def run_bind_arm(jobs):
                            f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid: ids.append(sid)
     print(f"[bind] submitted {len(ids)} jobs (burst)", flush=True)
+    return ids
+
+
+def run_backfill_arm(jobs):
+    """Baseline: submit every job UNHELD with no -w and no scontrol — Slurm's
+    backfill scheduler picks both order AND node. This is the control the RL
+    scontrol arm must beat: same job stream, same slurm.conf (backfill+aging),
+    RL-selection replaced by Slurm-selection."""
+    ids = []
+    for j in jobs:
+        name = f"sc{j['jid'].split('-')[-1]}"
+        sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time=5 -J {name} "
+                           f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
+        if sid: ids.append(sid)
+    print(f"[backfill] submitted {len(ids)} jobs (Slurm schedules)", flush=True)
     return ids
 
 
@@ -174,14 +239,28 @@ def collect_jct(ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol"], required=True)
+    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
+    ap.add_argument("--deadline-min", type=float, default=25.0,
+                    help="scontrol drain deadline (min); scale up with --n-jobs")
+    ap.add_argument("--reload-ckpt", default="",
+                    help="POST /reload this checkpoint into serve before the run "
+                         "(the per-arm RL model for scontrol/bind); empty = no reload")
+    ap.add_argument("--out-json", default="",
+                    help="write {arm,seed,jct[],wait[]} here for aggregation")
     a = ap.parse_args()
+    if a.reload_ckpt:
+        reload_serve(a.reload_ckpt)
     jobs = gen_jobs(a.n_jobs, a.seed, a.target_max)
     print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s", flush=True)
-    ids = run_scontrol_arm(jobs) if a.arm == "scontrol" else run_bind_arm(jobs)
+    if a.arm == "scontrol":
+        ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
+    elif a.arm == "backfill":
+        ids = run_backfill_arm(jobs)
+    else:
+        ids = run_bind_arm(jobs)
     wait_done(ids)
     jct, wait = collect_jct(ids)
     if len(jct):
@@ -191,6 +270,12 @@ def main():
               f"wait p95={np.percentile(wait,95):.0f} max={wait.max():.0f}")
     else:
         print(f"=== {a.arm}: no completed jobs")
+    if a.out_json:
+        with open(a.out_json, "w") as fh:
+            json.dump({"arm": a.arm, "seed": a.seed, "n_jobs": a.n_jobs,
+                       "reload_ckpt": a.reload_ckpt,
+                       "jct": jct.tolist(), "wait": wait.tolist()}, fh)
+        print(f"[out] wrote {a.out_json} (n={len(jct)})", flush=True)
 
 
 if __name__ == "__main__":
