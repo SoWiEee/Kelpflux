@@ -316,6 +316,7 @@ class KubefluxSchedEnv:
         mo_w_util: float = 0.05, # reward_mode="mo": weight on the per-step GPU-util term
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
+        fairness_coef: float = 0.0,   # convex (quadratic) per-job JCT penalty (obj-changing)
         node_speeds: Optional[list] = None,
         node_gpu_types: Optional[list] = None,  # per-node card id (rtx4070/rtx3080)
         node_ram_gb: Optional[list] = None,     # per-node usable host RAM (GB)
@@ -368,6 +369,7 @@ class KubefluxSchedEnv:
         # split across nodes earns shaping reward (Ng et al. 1999: optimal policy
         # unchanged, only exploration is guided away from crowding one card).
         self.balance_coef           = float(balance_coef)
+        self.fairness_coef          = float(fairness_coef)
         # Item-1 (node heterogeneity): per-node relative speed. None → homogeneous.
         # A slow card (e.g. 3080 at 0.25) runs jobs ~4× longer AND shows a distinct
         # gpu-type one-hot in the obs, so the policy can learn to route big/long
@@ -537,6 +539,10 @@ class KubefluxSchedEnv:
             # already holds −JCT/scale from _on_job_end (mo branch).
             reward = (self.mo_w_jct * st.completion_reward
                       + self.mo_w_util * st.cluster.utilization())
+            # P1 balance shaping also applies under mo (potential-based → optimum-
+            # preserving, Ng et al. 1999); guarded so balance_coef=0 leaves mo unchanged.
+            if self.potential_shaping or self.balance_coef > 0.0:
+                reward += 0.99 * self._potential() - phi_prev
         else:
             reward = r_place + st.completion_reward + end_charge
             if self.potential_shaping or self.balance_coef > 0.0:
@@ -827,8 +833,15 @@ class KubefluxSchedEnv:
             slowdown = max(1.0, jct / runtime)
             st.completion_reward += (b_jct * (-jct / self.reward_scale)
                                      + b_slow * (-math.log(slowdown)))
-        else:  # jct_aligned
+        else:  # jct_aligned / mo
             st.completion_reward += -jct / self.reward_scale
+            # Fairness/anti-starvation: a CONVEX per-job penalty on JCT. Squaring the
+            # normalized JCT makes the objective min Σ(JCT + fairness·JCT²) = mean + a
+            # tail/variance term. Unlike potential shaping (optimum-preserving), this
+            # CHANGES the objective — trading a little mean for a bounded worst case,
+            # which is exactly what the mean-JCT reward could not express.
+            if self.fairness_coef > 0.0:
+                st.completion_reward += -self.fairness_coef * (jct / self.reward_scale) ** 2
         # SLO lateness penalty (opt-in): latency-class jobs past deadline.
         if self.slo_penalty > 0.0 and j.slo_s > 0.0 and jct > j.slo_s:
             st.completion_reward += -self.slo_penalty * (jct - j.slo_s) / self.reward_scale

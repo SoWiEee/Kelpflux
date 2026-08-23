@@ -221,6 +221,7 @@ def sim_train(
     # New improvements
     potential_shaping: bool = True,
     balance_coef: float = 0.0,        # P1: potential-based node-balance shaping
+    fairness_coef: float = 0.0,       # convex per-job JCT penalty (anti-starvation, obj-changing)
     node_speeds: Optional[list] = None,  # item-1: per-node relative speed (heterogeneity)
     node_gpu_types: Optional[list] = None,  # per-node card id → SPEED_MATRIX + obs one-hot
     node_ram_gb: Optional[list] = None,     # per-node usable host RAM (GB) → OOM gate
@@ -286,6 +287,7 @@ def sim_train(
         mo_w_jct=mo_w_jct, mo_w_util=mo_w_util,
         potential_shaping=potential_shaping,
         balance_coef=balance_coef,
+        fairness_coef=fairness_coef,
         node_speeds=node_speeds,
         node_gpu_types=node_gpu_types,
         node_ram_gb=node_ram_gb,
@@ -589,6 +591,9 @@ def main(argv=None) -> int:
     p.add_argument("--sync-envs",            action="store_true",
                    help="with --num-envs>1, step envs in-process instead of in "
                         "worker processes (no wall-clock win; for debugging)")
+    p.add_argument("--fairness-coef",        type=float, default=0.0,
+                   help="convex (quadratic) per-job JCT penalty on completion: "
+                        "min Σ(JCT+fairness·JCT²)=mean+tail (objective-changing, not φ)")
     p.add_argument("--balance-coef",         type=float, default=0.0,
                    help="P1: potential-based node-balance shaping coefficient (§3.6)")
     p.add_argument("--normalize-reward",     action="store_true",
@@ -676,6 +681,7 @@ def main(argv=None) -> int:
         noop_penalty=args.noop_penalty,
         max_steps_mult=args.max_steps_mult,
         balance_coef=args.balance_coef,
+        fairness_coef=args.fairness_coef,
         normalize_reward=args.normalize_reward,
         node_speeds=[float(s) for s in args.node_speeds.split(",") if s.strip()] or None,
         node_gpu_types=[s.strip() for s in args.node_gpu_types.split(",") if s.strip()] or None,
