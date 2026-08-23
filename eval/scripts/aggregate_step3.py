@@ -45,7 +45,7 @@ def ci95(x):
 
 
 def main():
-    d = sys.argv[1] if len(sys.argv) > 1 else max(glob.glob("runs/step3_*"), key=os.path.getmtime)
+    d = sys.argv[1] if len(sys.argv) > 1 else max(glob.glob("runs/step3*"), key=os.path.getmtime)
     data = load(d)
     if "backfill" not in data:
         print("no backfill baseline found in", d); return 1

@@ -194,6 +194,104 @@ def run_bind_arm(jobs):
     return ids
 
 
+def precompute_schedule(jobs, serve=SERVE):
+    """Simulate a draining 2-node cluster with the SERVED policy to get RL's full
+    dispatch order+node WITHOUT live latency: repeatedly /act over remaining jobs
+    given the current free_mps, advancing sim time as running jobs finish. Returns
+    {jid: (rank, node)} with rank 0 = dispatched first.
+
+    This is the reactive→static conversion (cf. sim FixedPriorityScheduler): the
+    policy is reactive, so we roll it forward against a deterministic drain to read
+    off the order it WOULD impose, then hand that order to Slurm as fixed priorities
+    (see run_priority_arm). Same /act semantics, capacity (100), and first-fit
+    fallback as the live path — only the cluster is in-memory."""
+    free = {n: MPS_PER_GPU for n in NODES}
+    running = []           # (end_time, node, mps)
+    t = 0.0
+    # gen_jobs dicts have no "order"; assign a monotone submit index (the policy's
+    # obs uses submit_ts for age, matching the live scontrol arm's meta[...] = order).
+    pending = {j["jid"]: {**j, "order": i} for i, j in enumerate(jobs)}
+    rank, node_of, counter = {}, {}, 0
+    while pending:
+        progressed = False
+        while pending:
+            sjobs = [SlurmJob(job_id=jid, name="x", state="PENDING", reason="JobHeld",
+                              mps_req=j["mps"], gpu_count=1, gpu_type=j["gtype"],
+                              runtime=j["rt"], submit_ts=j["order"])
+                     for jid, j in pending.items()]
+            fnodes = [SlurmNode(name=n, free_mps=int(free[n]), running_jobs=0,
+                                gpu_type="rtx4070" if "4070" in n else "rtx3080") for n in NODES]
+            try:
+                act = post_act(build_act_payload(sjobs, fnodes, mps_per_gpu=MPS_PER_GPU),
+                               scheduler_url=serve, timeout=10)
+            except Exception:
+                act = {}
+            sel = act.get("selected_job_id"); node_j = act.get("node_j")
+            node = need = None
+            if sel in pending and node_j is not None and 0 <= int(node_j) < len(NODES):
+                sel_node = NODES[int(node_j)]
+                if free[sel_node] >= pending[sel]["mps"]:
+                    jid, node, need = sel, sel_node, pending[sel]["mps"]
+                else:
+                    sel = None  # RL pick doesn't fit its node → first-fit
+            else:
+                sel = None
+            if sel is None:  # RL abstained / no-fit → first-fit longest-waiting
+                pick = None
+                for cand in sorted(pending, key=lambda s: pending[s]["order"]):
+                    for n in NODES:
+                        if free[n] >= pending[cand]["mps"]:
+                            pick = (cand, n, pending[cand]["mps"]); break
+                    if pick:
+                        break
+                if not pick:
+                    break  # nothing fits current free_mps → advance time
+                jid, node, need = pick
+            rank[jid] = counter; node_of[jid] = node; counter += 1
+            free[node] -= need
+            running.append((t + pending[jid]["rt"], node, need))
+            pending.pop(jid); progressed = True
+        if pending:
+            if not running:  # deadlock guard: nothing running and nothing fits
+                for cand in sorted(pending, key=lambda s: pending[s]["order"]):
+                    rank[cand] = counter; node_of[cand] = NODES[0]; counter += 1
+                break
+            running.sort()
+            end, node, mps = running.pop(0); t = end; free[node] += mps
+    return rank, node_of
+
+
+def run_priority_arm(jobs):
+    """Fair in-process actuation of RL's schedule: precompute order+node, submit all
+    HELD (nothing starts), then in ONE controller script RELEASE all + set each job's
+    Priority via ``scontrol update`` (direct_set_prio — survives release, unlike a
+    priority set while still held, which Slurm recomputes away). Slurm's own in-process
+    backfill scheduler then actuates by that fixed priority at native speed — RL owns
+    ORDER+NODE, Slurm owns TIMING. No Python poll loop, so the actuation latency that
+    made every policy look identical in the hold/poll-release path is gone."""
+    rank, node_of = precompute_schedule(jobs)
+    sid_rank = {}
+    for j in jobs:
+        jid = j["jid"]; node = node_of.get(jid, NODES[0])
+        name = f"sc{jid.split('-')[-1]}"
+        sid = _exec(LOGIN, f"sbatch -H -p gpu -w {node} --gres=mps:{j['mps']} --time=5 -J {name} "
+                           f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
+        if sid:
+            sid_rank[sid] = rank.get(jid, len(jobs))
+    # rank 0 → highest priority. SPACING (10000) >> the max age contribution under
+    # fast-aging (PriorityWeightAge=1000 × age_norm≤1), so even if direct_set_prio
+    # did NOT freeze aging, RL's order can't be reshuffled by wait time. BASE keeps
+    # the lowest-ranked job (rank≤149) positive and distinct.
+    BASE, SPACING = 5_000_000, 10_000
+    ids = " ".join(sid_rank)
+    setp = "; ".join(f"scontrol update jobid={sid} Priority={BASE - r * SPACING} 2>&1"
+                     for sid, r in sid_rank.items())
+    _exec(CTL, f"scontrol release {ids} 2>&1; {setp}", timeout=240)
+    print(f"[priority] {len(sid_rank)} jobs released+prioritized (Slurm actuates in-process)",
+          flush=True)
+    return list(sid_rank)
+
+
 def run_backfill_arm(jobs):
     """Baseline: submit every job UNHELD with no -w and no scontrol — Slurm's
     backfill scheduler picks both order AND node. This is the control the RL
@@ -239,7 +337,7 @@ def collect_jct(ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill"], required=True)
+    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill", "priority"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
@@ -257,6 +355,8 @@ def main():
     print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s", flush=True)
     if a.arm == "scontrol":
         ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
+    elif a.arm == "priority":
+        ids = run_priority_arm(jobs)
     elif a.arm == "backfill":
         ids = run_backfill_arm(jobs)
     else:
