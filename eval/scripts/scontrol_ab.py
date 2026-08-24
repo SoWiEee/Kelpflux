@@ -22,7 +22,8 @@ import numpy as np
 from sim.loader import generate_by_family
 from services.rl_scheduler.placement_controller import (
     SlurmJob, SlurmNode, build_act_payload, post_act)
-from eval.scripts.live_ab_heavytail import LiveJob, AiMixWorkloadSpec, LlmWorkloadSpec
+from eval.scripts.live_ab_heavytail import (
+    LiveJob, AiMixWorkloadSpec, LlmWorkloadSpec, gen_workload)
 
 NS = "slurm"; CTL = "slurm-controller-0"
 LOGIN = "slurm-login-7f8cfbc48-c875f"
@@ -34,10 +35,11 @@ REAL_WORKLOAD = None  # set by main() from --real-workload; None → sleep+MPS
 
 def _to_livejob(j: dict) -> LiveJob:
     """Adapt a gen_jobs() dict to the LiveJob shape AiMixWorkloadSpec.wrap()/
-    time_min() expect. true_runtime_s = reported_runtime_s = rt (no σ-noise here
-    — the scontrol/priority arms don't model estimate error, matching §5.8)."""
-    return LiveJob(job_id=j["jid"], arrival_offset_s=0.0,
-                   true_runtime_s=float(j["rt"]), reported_runtime_s=float(j["rt"]),
+    time_min() expect. true_runtime_s drives the real work; reported (σ-noisy from
+    gen_workload) drives --time via time_min()."""
+    return LiveJob(job_id=j["jid"], arrival_offset_s=float(j.get("arrival", 0.0)),
+                   true_runtime_s=float(j["rt"]),
+                   reported_runtime_s=float(j.get("reported", j["rt"])),
                    mps_req=int(j["mps"]), job_class=j.get("cls", "batch"),
                    gpu_type=j.get("gtype", "rtx4070"))
 
@@ -46,9 +48,22 @@ def wrap_and_time(j: dict) -> tuple[str, int]:
     """(--wrap payload, --time minutes) for one job — real AiMix workload when
     REAL_WORKLOAD is set (module-level, from --real-workload), else sleep+MPS."""
     if REAL_WORKLOAD is None:
-        return f"sleep {j['rt']}", 5
+        return f"sleep {int(round(j['rt']))}", 5
     lj = _to_livejob(j)
     return REAL_WORKLOAD.wrap(lj), REAL_WORKLOAD.time_min(lj)
+
+
+def submit_stream(jobs, submit_one):
+    """Submit jobs at their poisson ``arrival`` offsets (real-time paced) — the
+    queue builds up over time exactly as in run_heavy150 (arrival_mode=poisson),
+    instead of a single 150-job burst. submit_one(job) does the per-job sbatch
+    (+priority for the priority arm). Burst streams (arrival≈0) submit near-instantly."""
+    t0 = time.time()
+    for j in sorted(jobs, key=lambda x: x.get("arrival", 0.0)):
+        dt = j.get("arrival", 0.0) - (time.time() - t0)
+        if dt > 0:
+            time.sleep(dt)
+        submit_one(j)
 
 
 def _exec(pod, script, timeout=60):
@@ -72,14 +87,21 @@ def reload_serve(ckpt_path, serve=SERVE, timeout=30):
     return out
 
 
-def gen_jobs(n, seed, target_max):
-    jobs = [j for j in generate_by_family("aimix", n_jobs=n, seed=seed) if j.gpu_count <= 2]
-    mx = max(j.runtime for j in jobs)
+def gen_jobs(n, seed, target_max, arrival_mode="poisson", oversub=2.0, sigma=1.0):
+    """Same job stream as run_heavy150_aimix_5arm.sh: delegate to gen_workload
+    (the canonical LiveJob generator) so arrival times, runtime compression, σ-noise
+    and per-class MPS all match the prior campaign exactly. arrival_mode='poisson'
+    gives spread-out arrivals (mean gap = mean(true)/oversub) — jobs arrive faster
+    than served, so a queue BUILDS but is never the whole 150-job burst at once."""
+    live = gen_workload("aimix", n_jobs=n, seed=seed, sigma=sigma,
+                        target_max_s=target_max, mps_oversub=oversub,
+                        arrival_mode=arrival_mode)
     out = []
-    for j in jobs:
-        rt = max(2.0, round(j.runtime / mx * target_max))
+    for j in live:
         out.append({"jid": j.job_id, "cls": j.job_class, "mps": int(j.mps_req),
-                    "rt": rt, "gtype": j.gpu_type, "submit": j.submit_ts})
+                    "rt": j.true_runtime_s, "reported": j.reported_runtime_s,
+                    "gtype": j.gpu_type, "arrival": j.arrival_offset_s,
+                    "submit": j.arrival_offset_s})
     return out
 
 
@@ -218,29 +240,39 @@ def run_bind_arm(jobs):
 
 
 def precompute_schedule(jobs, serve=SERVE):
-    """Simulate a draining 2-node cluster with the SERVED policy to get RL's full
-    dispatch order+node WITHOUT live latency: repeatedly /act over remaining jobs
-    given the current free_mps, advancing sim time as running jobs finish. Returns
-    {jid: (rank, node)} with rank 0 = dispatched first.
+    """Roll the SERVED policy forward against a deterministic, ARRIVAL-AWARE drain
+    to read off the dispatch order+node it would impose, then hand that order to
+    Slurm as fixed priorities (see run_priority_arm). Returns {jid: rank}, {jid: node}.
 
-    This is the reactive→static conversion (cf. sim FixedPriorityScheduler): the
-    policy is reactive, so we roll it forward against a deterministic drain to read
-    off the order it WOULD impose, then hand that order to Slurm as fixed priorities
-    (see run_priority_arm). Same /act semantics, capacity (100), and first-fit
-    fallback as the live path — only the cluster is in-memory."""
+    Arrival-aware so it matches the real system under poisson arrival: a job only
+    becomes eligible after its ``arrival`` offset, and the policy sees a ROLLING
+    TOP-16 window of the currently-arrived-and-waiting queue (build_act_payload
+    already truncates to TOP_K=16, sorted by submit_ts=arrival → oldest-waiting
+    first) — exactly the top-16 select+place interface the live policy uses. The
+    sim clock advances to the next event = min(next arrival, next completion).
+    Reactive→static conversion (cf. sim FixedPriorityScheduler)."""
+    all_jobs = {j["jid"]: dict(j) for j in jobs}
+    arrivals = sorted(all_jobs.values(), key=lambda j: j.get("arrival", 0.0))
+    ai = 0                              # index into arrivals not yet released
     free = {n: MPS_PER_GPU for n in NODES}
-    running = []           # (end_time, node, mps)
+    running = []                       # (end_time, node, mps)
     t = 0.0
-    # gen_jobs dicts have no "order"; assign a monotone submit index (the policy's
-    # obs uses submit_ts for age, matching the live scontrol arm's meta[...] = order).
-    pending = {j["jid"]: {**j, "order": i} for i, j in enumerate(jobs)}
+    pending = {}                       # jid -> job (arrived, not dispatched)
     rank, node_of, counter = {}, {}, 0
-    while pending:
+
+    def release_arrivals():
+        nonlocal ai
+        while ai < len(arrivals) and arrivals[ai].get("arrival", 0.0) <= t + 1e-9:
+            pending[arrivals[ai]["jid"]] = arrivals[ai]; ai += 1
+
+    release_arrivals()
+    while pending or ai < len(arrivals) or running:
         progressed = False
         while pending:
+            # submit_ts = arrival → build_act_payload's top-16 window = oldest-waiting 16.
             sjobs = [SlurmJob(job_id=jid, name="x", state="PENDING", reason="JobHeld",
                               mps_req=j["mps"], gpu_count=1, gpu_type=j["gtype"],
-                              runtime=j["rt"], submit_ts=j["order"])
+                              runtime=j["rt"], submit_ts=j.get("arrival", 0.0))
                      for jid, j in pending.items()]
             fnodes = [SlurmNode(name=n, free_mps=int(free[n]), running_jobs=0,
                                 gpu_type="rtx4070" if "4070" in n else "rtx3080") for n in NODES]
@@ -259,9 +291,9 @@ def precompute_schedule(jobs, serve=SERVE):
                     sel = None  # RL pick doesn't fit its node → first-fit
             else:
                 sel = None
-            if sel is None:  # RL abstained / no-fit → first-fit longest-waiting
+            if sel is None:  # RL abstained / no-fit → first-fit oldest-waiting
                 pick = None
-                for cand in sorted(pending, key=lambda s: pending[s]["order"]):
+                for cand in sorted(pending, key=lambda s: pending[s].get("arrival", 0.0)):
                     for n in NODES:
                         if free[n] >= pending[cand]["mps"]:
                             pick = (cand, n, pending[cand]["mps"]); break
@@ -274,63 +306,87 @@ def precompute_schedule(jobs, serve=SERVE):
             free[node] -= need
             running.append((t + pending[jid]["rt"], node, need))
             pending.pop(jid); progressed = True
-        if pending:
-            if not running:  # deadlock guard: nothing running and nothing fits
-                for cand in sorted(pending, key=lambda s: pending[s]["order"]):
-                    rank[cand] = counter; node_of[cand] = NODES[0]; counter += 1
-                break
-            running.sort()
-            end, node, mps = running.pop(0); t = end; free[node] += mps
+        # advance the clock to the next event (arrival or completion)
+        next_arr = arrivals[ai].get("arrival", 0.0) if ai < len(arrivals) else None
+        next_end = min((e for e, _, _ in running), default=None)
+        cands = [x for x in (next_arr, next_end) if x is not None]
+        if not cands:
+            break
+        t = max(t, min(cands))
+        # free any jobs that finished at/before t
+        still = []
+        for e, node, mps in running:
+            if e <= t + 1e-9:
+                free[node] += mps
+            else:
+                still.append((e, node, mps))
+        running = still
+        release_arrivals()
+        if not progressed and not pending and ai >= len(arrivals) and not running:
+            break
+    # any never-dispatched (shouldn't happen) → append in arrival order
+    for j in arrivals:
+        if j["jid"] not in rank:
+            rank[j["jid"]] = counter; node_of[j["jid"]] = NODES[0]; counter += 1
     return rank, node_of
 
 
+RELEASE_BASE, RELEASE_SPACING = 5_000_000, 10_000  # rank 0 → highest Slurm Priority
+
+
 def run_priority_arm(jobs):
-    """Fair in-process actuation of RL's schedule: precompute order+node, submit all
-    HELD (nothing starts), then in ONE controller script RELEASE all + set each job's
-    Priority via ``scontrol update`` (direct_set_prio — survives release, unlike a
-    priority set while still held, which Slurm recomputes away). Slurm's own in-process
-    backfill scheduler then actuates by that fixed priority at native speed — RL owns
-    ORDER+NODE, Slurm owns TIMING. No Python poll loop, so the actuation latency that
-    made every policy look identical in the hold/poll-release path is gone."""
-    rank, node_of = precompute_schedule(jobs)
+    """Actuate RL's ORDERING natively: precompute the policy's dispatch order
+    (arrival-aware, rolling top-16), then submit each job at its poisson arrival,
+    UNHELD, and right after submit set its Slurm ``Priority`` from the precomputed
+    rank via ``scontrol update`` (direct_set_prio — sticks on an unheld job; a
+    priority set while held is recomputed away). Slurm's own in-process backfill
+    scheduler then orders the queued jobs by that fixed priority AND places them
+    freely — RL owns ORDER, Slurm owns PLACEMENT+TIMING.
+
+    NB: we deliberately DO NOT ``-w`` pin the RL-chosen node. Pinning killed
+    concurrency under poisson (a high-priority job pinned to a busy node blocks
+    while the other node idles — Slurm can't backfill a pinned job elsewhere;
+    under burst every node always had a ready pinned job so it didn't bite). Since
+    RL PLACEMENT showed no benefit anyway (§5.2/table 6b), isolating RL ORDERING
+    (priority only, Slurm places) is both the cleaner test of the §5.8 thesis and
+    removes the serialization confound — placement is then identical to the
+    Backfill/FCFS controls, so the comparison is purely about ordering."""
+    rank, _node_of = precompute_schedule(jobs)
     sid_rank = {}
-    for j in jobs:
-        jid = j["jid"]; node = node_of.get(jid, NODES[0])
+
+    def submit_one(j):
+        jid = j["jid"]; r = rank.get(jid, len(jobs))
         name = f"sc{jid.split('-')[-1]}"
         wrap, tmin = wrap_and_time(j)
-        sid = _exec(LOGIN, f"sbatch -H -p gpu -w {node} --gres=mps:{j['mps']} --time={tmin} -J {name} "
+        sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time={tmin} -J {name} "
                            f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid:
-            sid_rank[sid] = rank.get(jid, len(jobs))
-    # rank 0 → highest priority. SPACING (10000) >> the max age contribution under
-    # fast-aging (PriorityWeightAge=1000 × age_norm≤1), so even if direct_set_prio
-    # did NOT freeze aging, RL's order can't be reshuffled by wait time. BASE keeps
-    # the lowest-ranked job (rank≤149) positive and distinct.
-    BASE, SPACING = 5_000_000, 10_000
-    ids = " ".join(sid_rank)
-    setp = "; ".join(f"scontrol update jobid={sid} Priority={BASE - r * SPACING} 2>&1"
-                     for sid, r in sid_rank.items())
-    _exec(CTL, f"scontrol release {ids} 2>&1; {setp}", timeout=240)
-    print(f"[priority] {len(sid_rank)} jobs released+prioritized (Slurm actuates in-process)",
+            _exec(CTL, f"scontrol update jobid={sid} Priority={RELEASE_BASE - r * RELEASE_SPACING} 2>&1")
+            sid_rank[sid] = r
+
+    submit_stream(jobs, submit_one)
+    print(f"[priority] {len(sid_rank)} jobs submitted+prioritized (order-only, Slurm places) "
+          f"over {'poisson' if any(j.get('arrival',0)>3 for j in jobs) else 'burst'} arrivals",
           flush=True)
     return list(sid_rank)
 
 
 def run_backfill_arm(jobs):
-    """Baseline: submit every job UNHELD with no -w and no scontrol — Slurm's own
-    scheduler picks both order AND node. Used for BOTH the Backfill control
-    (cluster running SchedulerType=sched/backfill) and the FCFS control (cluster
-    running SchedulerType=sched/builtin + PriorityType=priority/basic, no
-    backfill-skip) — the submission is identical; only the orchestrator's cluster
-    config differs between the two phases (see run_step3_prio.sh)."""
+    """Baseline: submit every job UNHELD (no -w, no priority) at its poisson arrival
+    time — Slurm's own scheduler picks both order AND node. Used for BOTH the Backfill
+    control (SchedulerType=sched/backfill) and FCFS (sched/builtin + priority/basic);
+    submission is identical, only the orchestrator's cluster config differs."""
     ids = []
-    for j in jobs:
+
+    def submit_one(j):
         name = f"sc{j['jid'].split('-')[-1]}"
         wrap, tmin = wrap_and_time(j)
         sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time={tmin} -J {name} "
                            f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid: ids.append(sid)
-    print(f"[backfill] submitted {len(ids)} jobs (Slurm schedules)", flush=True)
+
+    submit_stream(jobs, submit_one)
+    print(f"[backfill] submitted {len(ids)} jobs over poisson arrivals (Slurm schedules)", flush=True)
     return ids
 
 
@@ -380,14 +436,24 @@ def main():
                          "instead of sleep+MPS (§5.8's wait-dominated proxy)")
     ap.add_argument("--llm-model", default="/shared/models/qwen05b",
                     help="Qwen model path for --real-workload's llm class")
+    ap.add_argument("--arrival-mode", choices=["poisson", "burst"], default="poisson",
+                    help="poisson (default; spread arrivals, matches run_heavy150) "
+                         "or burst (all ~t0). poisson builds a queue over time.")
+    ap.add_argument("--oversub", type=float, default=2.0,
+                    help="MPS oversubscription factor → poisson mean gap = mean(rt)/oversub")
+    ap.add_argument("--sigma", type=float, default=1.0,
+                    help="lognormal σ on the REPORTED runtime estimate (drives --time)")
     a = ap.parse_args()
     if a.real_workload:
         global REAL_WORKLOAD
         REAL_WORKLOAD = AiMixWorkloadSpec(llm=LlmWorkloadSpec(model=a.llm_model))
     if a.reload_ckpt:
         reload_serve(a.reload_ckpt)
-    jobs = gen_jobs(a.n_jobs, a.seed, a.target_max)
-    print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s", flush=True)
+    jobs = gen_jobs(a.n_jobs, a.seed, a.target_max, arrival_mode=a.arrival_mode,
+                    oversub=a.oversub, sigma=a.sigma)
+    span = max((j.get("arrival", 0.0) for j in jobs), default=0.0)
+    print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s "
+          f"arrival={a.arrival_mode} span={span:.0f}s", flush=True)
     if a.arm == "scontrol":
         ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
     elif a.arm == "priority":

@@ -35,7 +35,12 @@ CK="${CK:-runs/ckpts_aimix16_fair}"
 MODEL="${MODEL:-/shared/models/qwen05b}"
 N_JOBS="${N_JOBS:-150}"; TARGET_MAX="${TARGET_MAX:-20}"; MAXAGE="${MAXAGE:-00:05:00}"
 REAL_WORKLOAD="${REAL_WORKLOAD:-0}"   # 1 → real AiMix GPU jobs instead of sleep+MPS
-read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57}"
+ARRIVAL_MODE="${ARRIVAL_MODE:-poisson}"   # poisson (spread, matches run_heavy150) or burst
+# Load sweep: run the whole grid at each oversub → poisson mean gap = mean(rt)/oversub,
+# so bigger oversub = faster arrivals = DEEPER standing queue = more ordering leverage.
+# The sweep shows the ordering headroom EMERGE with load (live §5.6 confirmation).
+read -r -a OVERSUBS <<< "${OVERSUBS:-2 4 6}"
+read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49}"
 read -r -a ARMS  <<< "${ARMS:-backfill sac rdsac_mean rdsac_cvar rlpd_cvar}"
 read -r -a PHASES <<< "${PHASES:-fcfs main}"   # fcfs, main, or both
 ORIG="/tmp/slurm.conf.s3porig.$$"
@@ -76,7 +81,8 @@ ck_for(){ local arm="$1" seed="$2"; case "$arm" in backfill|fcfs) echo "";; *) e
 
 log "### Step 3 PRIORITY actuation: RL order+node via fixed Priority vs Backfill/FCFS"
 log "### CK=$CK  N_JOBS=$N_JOBS  target_max=${TARGET_MAX}s  aging=$MAXAGE  real_workload=$REAL_WORKLOAD"
-log "### arms=${ARMS[*]}  seeds=${SEEDS[*]}  phases=${PHASES[*]}  out=$OUT"
+log "### arrival=$ARRIVAL_MODE  OVERSUBS=${OVERSUBS[*]}  arms=${ARMS[*]}  seeds=${SEEDS[*]}  phases=${PHASES[*]}  out=$OUT"
+CUR_OUT="$OUT"; CUR_OVERSUB=2.0   # set per-oversub in the sweep loop below
 
 WARMED=0
 warmup_caches(){ # run a throwaway real-job burst once so NFS model reads / torch
@@ -93,39 +99,48 @@ warmup_caches(){ # run a throwaway real-job burst once so NFS model reads / torc
 }
 
 run_client(){ # $1=submit-arm(fcfs/backfill/priority)  $2=label(json stem)  $3=seed  $4=ckpt("" if none)
-  local OJ="$OUT/${2}_s${3}.json"
+  local OJ="$CUR_OUT/${2}_s${3}.json"
   [ -f "$OJ" ] && { log "  SKIP $2 s$3 (done)"; return 0; }
-  log "  [$2] seed $3"
+  log "  [$2] seed $3 (oversub=$CUR_OVERSUB)"
   sweep
   local RELOAD=(); [ -n "$4" ] && RELOAD=(--reload-ckpt "$4")
   .venv-m11/bin/python -m eval.scripts.scontrol_ab \
     --arm "$1" --n-jobs "$N_JOBS" --seed "$3" --target-max "$TARGET_MAX" \
+    --arrival-mode "$ARRIVAL_MODE" --oversub "$CUR_OVERSUB" \
     "${RELOAD[@]}" "${REALFLAG[@]}" --out-json "$OJ" >>"$LOG" 2>&1 || log "  $2 s$3 exit $?"
 }
 
-for PHASE in "${PHASES[@]}"; do
-  case "$PHASE" in
-    fcfs)
-      apply_verify "$CONF_FCFS" "sched/builtin" "fcfs"
-      warmup_caches
-      for SEED in "${SEEDS[@]}"; do run_client fcfs fcfs "$SEED" ""; done
-      ;;
-    main)
-      apply_verify "$CONF_MAIN" "sched/backfill" "main"
-      got=""; for i in $(seq 1 20); do got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'PriorityMaxAge\s*=\s*\K\S+'); [ -n "$got" ] && [ "$got" != "7-00:00:00" ] && break; sleep 6; done
-      log "PriorityMaxAge now = $got"
-      warmup_caches
-      for SEED in "${SEEDS[@]}"; do
-        for ARM in "${ARMS[@]}"; do
-          CKPT=$(ck_for "$ARM" "$SEED")
-          if [ -n "$CKPT" ] && [ ! -f "$CKPT" ]; then log "  SKIP $ARM s$SEED (no ckpt)"; continue; fi
-          WARM=priority; [ "$ARM" = "backfill" ] && WARM=backfill
-          run_client "$WARM" "$ARM" "$SEED" "$CKPT"
+run_phases(){ # runs the fcfs/main phases at the current CUR_OVERSUB/CUR_OUT
+  for PHASE in "${PHASES[@]}"; do
+    case "$PHASE" in
+      fcfs)
+        apply_verify "$CONF_FCFS" "sched/builtin" "fcfs"
+        warmup_caches
+        for SEED in "${SEEDS[@]}"; do run_client fcfs fcfs "$SEED" ""; done
+        ;;
+      main)
+        apply_verify "$CONF_MAIN" "sched/backfill" "main"
+        got=""; for i in $(seq 1 20); do got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'PriorityMaxAge\s*=\s*\K\S+'); [ -n "$got" ] && [ "$got" != "7-00:00:00" ] && break; sleep 6; done
+        log "PriorityMaxAge now = $got"
+        warmup_caches
+        for SEED in "${SEEDS[@]}"; do
+          for ARM in "${ARMS[@]}"; do
+            CKPT=$(ck_for "$ARM" "$SEED")
+            if [ -n "$CKPT" ] && [ ! -f "$CKPT" ]; then log "  SKIP $ARM s$SEED (no ckpt)"; continue; fi
+            WARM=priority; [ "$ARM" = "backfill" ] && WARM=backfill
+            run_client "$WARM" "$ARM" "$SEED" "$CKPT"
+          done
         done
-      done
-      ;;
-  esac
+        ;;
+    esac
+  done
+}
+
+for OV in "${OVERSUBS[@]}"; do
+  CUR_OVERSUB="$OV"; CUR_OUT="$OUT/ov${OV}"; mkdir -p "$CUR_OUT"
+  log "### ===== oversub=$OV  →  $CUR_OUT ====="
+  run_phases
 done
 sweep
-log "### done stamp=$STAMP  jsons: $(ls "$OUT"/*.json 2>/dev/null | wc -l)"
+log "### done stamp=$STAMP  jsons: $(find "$OUT" -name '*.json' 2>/dev/null | wc -l)"
 echo "$OUT"
