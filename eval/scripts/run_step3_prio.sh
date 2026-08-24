@@ -78,6 +78,20 @@ log "### Step 3 PRIORITY actuation: RL order+node via fixed Priority vs Backfill
 log "### CK=$CK  N_JOBS=$N_JOBS  target_max=${TARGET_MAX}s  aging=$MAXAGE  real_workload=$REAL_WORKLOAD"
 log "### arms=${ARMS[*]}  seeds=${SEEDS[*]}  phases=${PHASES[*]}  out=$OUT"
 
+WARMED=0
+warmup_caches(){ # run a throwaway real-job burst once so NFS model reads / torch
+  # imports / GPU+MPS spin-up are WARM before any measured run — otherwise whichever
+  # arm runs first (fcfs) pays the cold-cache tail the others don't (drift confound).
+  [ "$WARMED" = 1 ] && return 0; WARMED=1
+  [ "${WARMUP:-1}" = "1" ] || return 0
+  log "### cache warmup: ${WARMUP_JOBS:-24} real jobs (all classes) — discarded"
+  sweep
+  .venv-m11/bin/python -m eval.scripts.scontrol_ab \
+    --arm backfill --n-jobs "${WARMUP_JOBS:-24}" --seed 999 --target-max "$TARGET_MAX" \
+    "${REALFLAG[@]}" >>"$LOG" 2>&1 || log "  warmup exit $?"
+  sweep
+}
+
 run_client(){ # $1=submit-arm(fcfs/backfill/priority)  $2=label(json stem)  $3=seed  $4=ckpt("" if none)
   local OJ="$OUT/${2}_s${3}.json"
   [ -f "$OJ" ] && { log "  SKIP $2 s$3 (done)"; return 0; }
@@ -93,12 +107,14 @@ for PHASE in "${PHASES[@]}"; do
   case "$PHASE" in
     fcfs)
       apply_verify "$CONF_FCFS" "sched/builtin" "fcfs"
+      warmup_caches
       for SEED in "${SEEDS[@]}"; do run_client fcfs fcfs "$SEED" ""; done
       ;;
     main)
       apply_verify "$CONF_MAIN" "sched/backfill" "main"
       got=""; for i in $(seq 1 20); do got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'PriorityMaxAge\s*=\s*\K\S+'); [ -n "$got" ] && [ "$got" != "7-00:00:00" ] && break; sleep 6; done
       log "PriorityMaxAge now = $got"
+      warmup_caches
       for SEED in "${SEEDS[@]}"; do
         for ARM in "${ARMS[@]}"; do
           CKPT=$(ck_for "$ARM" "$SEED")
