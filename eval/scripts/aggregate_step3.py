@@ -12,7 +12,7 @@ from __future__ import annotations
 import glob, json, os, sys
 import numpy as np
 
-ORDER = ["backfill", "sac", "rdsac_mean", "rdsac_cvar", "rlpd_cvar"]
+ORDER = ["fcfs", "backfill", "sac", "rdsac_mean", "rdsac_cvar", "rlpd_cvar"]
 
 
 def load(d):

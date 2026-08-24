@@ -22,12 +22,33 @@ import numpy as np
 from sim.loader import generate_by_family
 from services.rl_scheduler.placement_controller import (
     SlurmJob, SlurmNode, build_act_payload, post_act)
+from eval.scripts.live_ab_heavytail import LiveJob, AiMixWorkloadSpec, LlmWorkloadSpec
 
 NS = "slurm"; CTL = "slurm-controller-0"
 LOGIN = "slurm-login-7f8cfbc48-c875f"
 NODES = ["slurm-worker-gpu-rtx4070-0", "slurm-worker-gpu-rtx3080-0"]
 MPS_PER_GPU = 100
 SERVE = "http://localhost:8003"
+REAL_WORKLOAD = None  # set by main() from --real-workload; None → sleep+MPS
+
+
+def _to_livejob(j: dict) -> LiveJob:
+    """Adapt a gen_jobs() dict to the LiveJob shape AiMixWorkloadSpec.wrap()/
+    time_min() expect. true_runtime_s = reported_runtime_s = rt (no σ-noise here
+    — the scontrol/priority arms don't model estimate error, matching §5.8)."""
+    return LiveJob(job_id=j["jid"], arrival_offset_s=0.0,
+                   true_runtime_s=float(j["rt"]), reported_runtime_s=float(j["rt"]),
+                   mps_req=int(j["mps"]), job_class=j.get("cls", "batch"),
+                   gpu_type=j.get("gtype", "rtx4070"))
+
+
+def wrap_and_time(j: dict) -> tuple[str, int]:
+    """(--wrap payload, --time minutes) for one job — real AiMix workload when
+    REAL_WORKLOAD is set (module-level, from --real-workload), else sleep+MPS."""
+    if REAL_WORKLOAD is None:
+        return f"sleep {j['rt']}", 5
+    lj = _to_livejob(j)
+    return REAL_WORKLOAD.wrap(lj), REAL_WORKLOAD.time_min(lj)
 
 
 def _exec(pod, script, timeout=60):
@@ -65,8 +86,9 @@ def gen_jobs(n, seed, target_max):
 def submit(job, held):
     h = "-H " if held else ""
     name = f"sc{job['jid'].split('-')[-1]}"
-    cmd = (f"sbatch {h}-p gpu --gres=mps:{job['mps']} --time=5 -J {name} "
-           f"--wrap 'sleep {job['rt']}' 2>&1 | grep -oE '[0-9]+'")
+    wrap, tmin = wrap_and_time(job)
+    cmd = (f"sbatch {h}-p gpu --gres=mps:{job['mps']} --time={tmin} -J {name} "
+           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'")
     sid = _exec(LOGIN, cmd)
     return sid.strip()
 
@@ -187,8 +209,9 @@ def run_bind_arm(jobs):
     ids = []
     for j, node in plan:
         name = f"sc{j['jid'].split('-')[-1]}"
-        sid = _exec(LOGIN, f"sbatch -p gpu -w {node} --gres=mps:{j['mps']} --time=5 -J {name} "
-                           f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
+        wrap, tmin = wrap_and_time(j)
+        sid = _exec(LOGIN, f"sbatch -p gpu -w {node} --gres=mps:{j['mps']} --time={tmin} -J {name} "
+                           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid: ids.append(sid)
     print(f"[bind] submitted {len(ids)} jobs (burst)", flush=True)
     return ids
@@ -274,8 +297,9 @@ def run_priority_arm(jobs):
     for j in jobs:
         jid = j["jid"]; node = node_of.get(jid, NODES[0])
         name = f"sc{jid.split('-')[-1]}"
-        sid = _exec(LOGIN, f"sbatch -H -p gpu -w {node} --gres=mps:{j['mps']} --time=5 -J {name} "
-                           f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
+        wrap, tmin = wrap_and_time(j)
+        sid = _exec(LOGIN, f"sbatch -H -p gpu -w {node} --gres=mps:{j['mps']} --time={tmin} -J {name} "
+                           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid:
             sid_rank[sid] = rank.get(jid, len(jobs))
     # rank 0 → highest priority. SPACING (10000) >> the max age contribution under
@@ -293,15 +317,18 @@ def run_priority_arm(jobs):
 
 
 def run_backfill_arm(jobs):
-    """Baseline: submit every job UNHELD with no -w and no scontrol — Slurm's
-    backfill scheduler picks both order AND node. This is the control the RL
-    scontrol arm must beat: same job stream, same slurm.conf (backfill+aging),
-    RL-selection replaced by Slurm-selection."""
+    """Baseline: submit every job UNHELD with no -w and no scontrol — Slurm's own
+    scheduler picks both order AND node. Used for BOTH the Backfill control
+    (cluster running SchedulerType=sched/backfill) and the FCFS control (cluster
+    running SchedulerType=sched/builtin + PriorityType=priority/basic, no
+    backfill-skip) — the submission is identical; only the orchestrator's cluster
+    config differs between the two phases (see run_step3_prio.sh)."""
     ids = []
     for j in jobs:
         name = f"sc{j['jid'].split('-')[-1]}"
-        sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time=5 -J {name} "
-                           f"--wrap 'sleep {j['rt']}' 2>&1 | grep -oE '[0-9]+'").strip()
+        wrap, tmin = wrap_and_time(j)
+        sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time={tmin} -J {name} "
+                           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
         if sid: ids.append(sid)
     print(f"[backfill] submitted {len(ids)} jobs (Slurm schedules)", flush=True)
     return ids
@@ -337,7 +364,7 @@ def collect_jct(ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill", "priority"], required=True)
+    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill", "priority", "fcfs"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
@@ -348,7 +375,15 @@ def main():
                          "(the per-arm RL model for scontrol/bind); empty = no reload")
     ap.add_argument("--out-json", default="",
                     help="write {arm,seed,jct[],wait[]} here for aggregation")
+    ap.add_argument("--real-workload", action="store_true",
+                    help="run real AiMix GPU jobs (BERT/ResNet/Qwen/cuBLAS, §5.2/6b) "
+                         "instead of sleep+MPS (§5.8's wait-dominated proxy)")
+    ap.add_argument("--llm-model", default="/shared/models/qwen05b",
+                    help="Qwen model path for --real-workload's llm class")
     a = ap.parse_args()
+    if a.real_workload:
+        global REAL_WORKLOAD
+        REAL_WORKLOAD = AiMixWorkloadSpec(llm=LlmWorkloadSpec(model=a.llm_model))
     if a.reload_ckpt:
         reload_serve(a.reload_ckpt)
     jobs = gen_jobs(a.n_jobs, a.seed, a.target_max)
@@ -357,7 +392,7 @@ def main():
         ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
     elif a.arm == "priority":
         ids = run_priority_arm(jobs)
-    elif a.arm == "backfill":
+    elif a.arm in ("backfill", "fcfs"):
         ids = run_backfill_arm(jobs)
     else:
         ids = run_bind_arm(jobs)
