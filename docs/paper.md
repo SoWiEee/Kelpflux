@@ -12,7 +12,7 @@
 
 異質 GPU 與 NVIDIA MPS 共享使排程器必須同時考量硬體差異、工作配額與佇列狀態；傳統 Slurm 固定規則難以動態兼顧工作完成時間（JCT）與尾端延遲 [1][2][3][4]。現有深度強化學習（DRL）排程研究多停留於模擬，較少在真實 Slurm 流程中處理 MPS-aware 工作派遣與 GPU placement。
 
-本研究提出以 Slurm-on-Kubernetes 為排程核心的異質 GPU 智慧排程框架；Kubernetes 僅負責部署 [5]。框架以聯合動作介面建模 MPS-aware 工作派遣與 placement。本研究於 RTX 4070 與 RTX 3080 環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、啟發式、SAC、RDSAC 與 RLPD [6][7][8][9]。在僅控制 placement（提交時節點綁定、順序由 Slurm 決定）的路徑下，學習式策略的平均 JCT 僅略優於或打平 FCFS／Backfill 且以顯著尾端代價換得，未形成穩健優勢。然而當策略經一條經驗證的**原生排序致動路徑（ordering-only）**（arrival-aware 前展策略取得完整派遣順序，交由 Slurm 自身 in-process 排程器以固定 Priority 致動並自由放置）取得對*順序*的控制權後，在**真實 CUDA、poisson 到達、深負載（oversub=6）**下，學習式策略的平均 JCT *與*尾端 P99 皆顯著勝過生產 Backfill 約 11–13%（Wilcoxon 皆 *p*=0.002，10 seed 中 10/10 的 P99 低於 Backfill）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示效益取決於 RL 是否掌握*排序*槓桿、致動路徑是否原生、以及負載是否足以形成可重排的 backlog（淺佇列下排序無槓桿）。
+本研究提出以 Slurm-on-Kubernetes 為排程核心的異質 GPU 智慧排程框架；Kubernetes 僅負責部署 [5]。框架以聯合動作介面建模 MPS-aware 工作派遣與 placement。本研究於 RTX 4070 與 RTX 3080 環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、SAC、RDSAC 與 RLPD [6][7][8][9]。在由 DRL 控制順序和放置下，評估**真實 CUDA、poisson 到達、深負載（oversub=6）**的結果，學習式策略的平均 JCT 與尾端 P99 皆顯著勝過 Backfill 約 11~13%。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示效益取決於 RL 是否掌握工作負載形成可重排的 job queue。
 
 **關鍵詞**：GPU 資源排程、異質 GPU、NVIDIA MPS、Slurm、Kubernetes、深度強化學習
 
@@ -104,9 +104,17 @@ Tsenos 與 Kalogeraki [26] 針對缺乏原生虛擬化支援的邊緣 GPU（如�
 
 ### 3.1 研究目的
 
-本研究的目標是在異質 GPU 與 NVIDIA MPS 環境中，學習一個能在 MPS 配額約束下決定工作派遣與 GPU placement 的排程策略，以降低 average JCT 與尾端 JCT。更具體而言，本研究要回答兩個問題：第一，DRL 在模擬環境中相對固定規則的表現如何；第二，此學習式策略部署到真實異質 GPU 叢集後，相對 FCFS、Backfill 與 size-aware 啟發式的效益與限制為何。
+基於上述背景，本研究聚焦於以下三項問題：
 
-本研究將異質 GPU + MPS 排程建模為馬可夫決策過程 (MDP)。每次有工作可排程時，代理人觀察叢集狀態，選擇一個工作與其 GPU placement，並在工作完成後根據 JCT 與 GPU utilization 取得 reward。
+1. 在每個工作的 MPS 配額與 GPU 型號差異（異質 GPU）同時存在時，聯合考慮工作選擇與 GPU 放置能否改善工作完成時間？
+2. 學習式策略接入真實 Slurm 排程機制後，，能否在保有失效回退機制的條件下，與 FCFS 及 Backfill 進行公平比較？
+3. 在多種工作負載情境下，當學習式策略是否能進一步改善平均 JCT與尾端 JCT？
+
+本研究的核心貢獻在於將「異質 GPU + MPS + 真實 Slurm 流程」三者結合，主要貢獻有三：
+
+- **MPS 配額約束下的工作派遣與異質 GPU placement**。不同於 UXP-RL [4] 主要決定 CPU-vs-GPU 資源類型、KIS-S [5] 調整 Kubernetes 推論副本數、DRR[6] 處理 GPU 碎片化，本研究的策略介面與模擬環境將「派哪個工作」與「放到哪張異質 GPU」建模為聯合離散動作。每個工作攜帶既定的 MPS 配額需求作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。此設計在模擬環境刻畫「job 選擇與異質 GPU placement 聯合決策」，實機則聚焦提交時 placement 相對於僅決定資源類型 [4] 或僅調整副本數 [5] 的可行性與行為差異。
+- **失效安全的Slurm 策略層整合**。不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入 Slurm job submission path，並提供 fail-safe 回退機制，當學習式排程服務逾時就自動回退至 Slurm 原生策略，在評估量測中未觀察到逾時，且策略服務失效時具備回退機制。此設計讓客製化 DRL 排程器得以在真實排程路徑中部署，而不需修改 Slurm 核心，這是先前純模擬研究 [4, 5] 未曾示範的部署可行性。
+- **實機比較與效益分析**。本研究於 RTX 4070與 RTX 3080 異質環境，以 trace-derived 混合 AI 工作負載比較 FCF、Backfill、SAC、RDSAC 與 RLPD，並使用統計檢定。結果顯示，學習式策略的工作完成時間優於 FCFS 與 Backfill，但是在尾端部分仍比 FCFS 略差。
 
 **State.** 狀態包含四類資訊：
 
@@ -117,25 +125,47 @@ Tsenos 與 Kalogeraki [26] 針對缺乏原生虛擬化支援的邊緣 GPU（如�
 
 **Action.** 動作為「從佇列前 K 個工作中選一個」與「將其放置到哪張 GPU」的聯合離散決策，另含一個 no-op（暫不派遣）：
 
-```text
-Action = (選 job_i ∈ top-K 佇列) × (放置到 node_j / gpu_k)  ∪  {no-op}
-```
+$$
+\text{Action} \;=\; \big(\text{選 job}_i \in \text{top-}K\ \text{佇列}\big) \,\times\, \big(\text{放置至 node}_j / \text{gpu}_k\big) \;\cup\; \{\text{no-op}\}
+$$
 
-在本研究的 2×1 實驗平台（K=16、2 個 placement）中，動作空間為 16×2+1 = 33 個離散動作，observation 維度為 168。每個工作攜帶自身的 MPS fraction 需求（25%/50%/75%/100%），排程器透過 state 特徵感知、並由 action mask 遮蔽 MPS 剩餘容量不足的放置，因此策略是在尊重工作 MPS 需求的前提下做 job 選擇與 placement
+在本研究的 2×1 實驗平台（K=16、2 個 placement）中，動作空間為 16×2+1 = 33 個離散動作，observation 維度為 168。每個工作攜帶自身的 MPS fraction 需求（25%/50%/75%/100%），排程器透過 state 特徵感知、並由 action mask 遮蔽 MPS 剩餘容量不足的放置，因此策略是在符合工作 MPS 需求的前提下做 job 選擇與 placement
 
-**Reward.** Reward 的設計目標是降低使用者感受到的等待與完成時間，並以小權重的資源使用項避免 GPU 閒置，故採以 JCT 為核心的多目標形式：
+**Reward.** Reward 的設計目標是降低使用者感受到的等待與完成時間、同時抑制尾端延遲並促進異質節點間的負載均衡。本研究之產出模型（§5.8 之 fairness-reward checkpoint）以下列每步回報訓練（`reward_mode="mo"`；S 為 `reward_scale`）：
 
-```text
-R = w_jct · (−JCT / reward_scale) + w_util · GPUUtil
-```
+$$
+\begin{aligned}
+r_t \;=&\; \underbrace{\sum_{j \in \mathcal{C}(t)} \left[ -\frac{\mathrm{JCT}_j}{S} \;-\; \lambda_{\mathrm{fair}}\left(\frac{\mathrm{JCT}_j}{S}\right)^{2} \right]}_{\text{工作完成時計入}} \;+\; \underbrace{\big[\, \gamma\,\phi(s_{t+1}) - \phi(s_t) \,\big]}_{\text{每步 potential shaping}}, \\[4pt]
+\phi(s) \;=&\; -\frac{1}{S\,N}\sum_{i \in \mathcal{P}(s)} \mathrm{wait}_i \;-\; \lambda_{\mathrm{bal}}\cdot \mathrm{imbalance}(s), \\[4pt]
+\mathrm{imbalance}(s) \;=&\; \frac{\operatorname{std}_n\!\big(\mathrm{free\_MPS}_n\big)}{\mathrm{MPS\_per\_GPU}},
+\end{aligned}
+$$
 
-本研究訓練使用 w_jct=1.0、w_util=0.05、reward_scale=20000。JCT = 完成時間 − 提交時間，已包含 queue delay；GPUUtil = 叢集 MPS 使用率 = used_MPS / total_MPS ∈ [0, 1]，為模擬器每一步的資源使用狀態，用於避免策略學到保守閒置。兩項計入頻率不同：util 項於**每一步**計入、−JCT/reward_scale 項於**工作完成時**計入（reward_scale=20000 相對於訓練分布的 JCT 量級選定，使該項落於 O(0.1) 尺度）。util 項設計上為小權重（0.05）的「維持 GPU 忙碌」輔助訊號，惟因每步計入，其累積影響會隨 episode 長度上升，故兩項的實際權衡取決於 JCT 尺度與 episode 長度。另可選用 potential-based reward shaping [31] 提供密集訊號，並以 opt-in 的 SLO 逾時懲罰處理延遲敏感工作。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習長期排程結果。
+其中 $\mathcal{C}(t)$ 為在第 $t$ 步完成的工作集合、$\mathcal{P}(s)$ 為狀態 $s$ 下的待排（pending）工作集合。訓練參數：**$\lambda_{\mathrm{fair}}=5.0$、$\lambda_{\mathrm{bal}}=5.0$、$\gamma=0.99$、$S=\text{reward\_scale}=20000$、$N=$ 每 episode 工作數**。各項意義如下：
+
+- **完成項**（工作完成時計入）：$-\mathrm{JCT}_j/S$，其中 $\mathrm{JCT}=$ 完成時間 $-$ 提交時間、已含 queue delay，$S$ 使該項落於 $O(0.1)$ 尺度。此為主要吞吐訊號。
+- **公平／抗飢餓項**：$-\lambda_{\mathrm{fair}}(\mathrm{JCT}_j/S)^{2}$，對單一工作 JCT 的**凸（平方）懲罰**。其效果為將目標由純平均改寫為
+
+$$
+\min \sum_j \Big(\mathrm{JCT}_j + \lambda_{\mathrm{fair}}\,\mathrm{JCT}_j^{2}\Big) \;=\; \underbrace{\textstyle\sum_j \mathrm{JCT}_j}_{\text{平均}} \;+\; \underbrace{\lambda_{\mathrm{fair}}\textstyle\sum_j \mathrm{JCT}_j^{2}}_{\text{尾端／變異項}},
+$$
+
+  是一個**改變目標**的項（非 optimum-preserving），刻意以少許平均換取有界的最差情況——這正是純平均-JCT reward 無法表達、而 §5.8 尾端結果所需者。
+- **Potential-based shaping** $\gamma\,\phi(s')-\phi(s)$ [31]：提供密集訊號且**不改變最優策略**（Ng et al. 1999）。$\phi$ 含兩部分——(i) 待排工作的累計等待（排入工作即降低總等待 $\to$ 每步正向 bonus）；(ii) **節點負載均衡項** $-\lambda_{\mathrm{bal}}\cdot\mathrm{imbalance}$，懲罰把負載集中於單一節點，於 2×1 異質叢集促進 free-MPS 平衡。
+
+需澄清兩點：其一，早期版本另設一個每步 GPU-util 輔助項（`mo_w_util`），本研究之產出模型將其**權重設為 0**（`mo_w_util=0`）——因其每步累積效果隨 episode 長度漂移，且與吞吐目標高度相關而冗餘，移除後訓練更穩定。其二，**interference（干擾）並非 reward 項而是環境動力學**：訓練環境設 `interference=0.3`，即工作的實際執行時間為
+
+$$
+\mathrm{runtime}_{\text{real}} \;=\; \mathrm{runtime}_{\text{nominal}} \times \big(1 + 0.3\,k\big), \qquad k = \text{同一 GPU 上的共置工作數},
+$$
+
+使 MPS 過度打包付出真實的執行變慢代價；此設定讓上述 fairness／balance 訊號在「打包 vs 干擾」的真實張力下學習，而非 reward 公式的一部分。此 reward 設計讓 DRL 不只最佳化單一工作，而是學習兼顧平均、尾端與節點均衡的長期排程結果。
 
 ### 3.2 系統架構
 
 本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台（圖 1）。學習式策略以服務形式接入 Slurm 的工作提交流程：策略讀取工作、GPU、MPS 剩餘容量與佇列狀態，輸出建議的工作與 GPU placement，並由系統於提交時據以綁定節點（工作的 MPS fraction 依其請求分配、非策略輸出）。若策略服務逾時或回傳不可行決策，系統自動回退至啟發式路徑，確保排程核心不被阻塞。工作執行期間，監控服務收集資源使用、queue delay、JCT 與 reward，寫入 replay buffer 供後續訓練或 RLPD (Reinforcement Learning with Prior Data) [9] 微調使用。
 
-需說明的是，本文 §5.2 的主要實機評估聚焦於 **GPU placement** 的效果：系統於提交時取得策略建議的節點並綁定，藉此在真實叢集上比較不同 placement 決策；由策略即時從佇列挑選下一個工作（順序）並以 held-job 控制器透過 `required_nodes` REST 呼叫致動，在受測 slurmrestd（v0.0.37）中被停用而未生效，故該 REST 致動路徑不納入本文效能宣稱。§5.8 進一步驗證並採用一條替代的**原生排序致動路徑**：前展服務中的策略取得完整派遣順序，再以固定 Slurm `Priority` 交由 Slurm 自身 in-process 排程器致動，使 RL 掌握順序與節點、Slurm 掌握時機；此路徑經實測有效並用於 §5.8 之重載評估。
+需說明的是，本文的主要實機評估聚焦於 **GPU placement** 的效果：系統於提交時取得策略建議的節點並綁定，藉此在真實叢集上比較不同 placement 決策；由策略即時從佇列挑選下一個工作（順序）並以 held-job 控制器透過 `required_nodes` REST 呼叫致動，在受測 slurmrestd（v0.0.37）中被停用而未生效，故該 REST 致動路徑不納入本文效能宣稱。§5.8 進一步驗證並採用一條替代的**原生排序致動路徑**：前展服務中的策略取得完整派遣順序，再以固定 Slurm `Priority` 交由 Slurm 自身 in-process 排程器致動，使 RL 掌握順序與節點、Slurm 掌握時機；此路徑經實測有效並用於 §5.8 之重載評估。
 
 ```mermaid
 flowchart TD
@@ -162,34 +192,20 @@ flowchart TD
 
 ## 4. 排程技術
 
-本章介紹本研究的 scheduler：以 Slurm 原生能力作為穩定基線，以啟發式評分函式作為可部署的中階基準，再以 DRL agent 學習序列排程策略。
+本章介紹本研究的 scheduler：以 Slurm 原生能力 Backfill 作為穩定 baseline，再以 DRL agent 學習序列排程策略。
 
 ### 4.1 Slurm 內建排程演算法
 
-本研究以 Slurm 原生排程能力作為穩定基線，而非重寫排程核心。例如 Backfill 允許在不延後高優先權工作的前提下，讓資源需求較小、執行時間較短的工作提前插隊執行，緩解大工作長期佔用資源造成的閒置；此外也納入更保守的 FCFS 作為基準對照（為現成排程器基準，非理論下界），用以檢驗啟發式與學習式策略相對 Slurm 開箱即用能力是否確有改善。
+本研究以 Slurm 原生排程能力作為穩定基線，而非重寫排程核心。例如 Backfill 允許在不延後高優先權工作的前提下，讓資源需求較小、執行時間較短的工作提前插隊執行，緩解大工作長期佔用資源造成的閒置；此外也納入更保守的 FCFS 作為基準對照（為現成排程器基準，非理論下界），用以檢驗學習式策略相對 Slurm 開箱即用能力是否確有改善。
 
-### 4.2 啟發式排程策略
-
-啟發式策略以加權線性組合公式計算工作優先級，分數越高代表該工作越值得優先排程。三個因子及對應權重如表 2 所示。此 score heuristic 代表可部署、可解釋且低成本的生產啟發式方法。
-
-表 2. 啟發式因子與係數定義
-
-| 因子 | 係數 | 定義 |
-|---|:--:|---|
-| MPS | 0.40 | `mps_req/100 ∈ [0, 1]`。沒給=1.0，超過=0.0。 |
-| VRAM | 0.20 | `(1 − (fit_tier − req))/max_tier ∈ [0, 1]`。依 job 需求選最小可用 VRAM tier，沒給=0.5。 |
-| Frag | 0.20 | `4x(1 − x), x = mps_req/100`，並以負號納入總分。mps_req=0 或滿載→0.0；mps_req=50%→最高懲罰 1.0。 |
-
-需注意 score 在兩個評估管線的強度不同：模擬使用含 SJF-like runtime kicker 的完整版本（ε=0.30），而實機部署因 runtime predictor 未上線而停用該項（ε=0），僅保留 MPS-fit 與 VRAM-fit。兩者為同一評分函式的兩種設定，故模擬表與實機表的 score 絕對表現不宜直接跨表比較；各表內部的相對比較則不受影響。
-
-### 4.3 深度強化學習策略
+### 4.2 深度強化學習策略
 
 本研究比較以下 DRL 方法：
 
 1. **Discrete SAC**：將 Soft Actor-Critic 延伸到離散 action space，以 categorical 策略取代高斯策略、以期望估計熵項，適合 job 選擇與 GPU placement 這類有限離散動作 [6]。
 2. **RDSAC-mean**：以分布式 critic 建模回報分布，但 actor 主要依平均回報決策 [7][8]。
 3. **RDSAC-cvar**：在 RDSAC 上加入 CVaR 風險敏感目標，使策略更重視尾端 JCT 與 SLO violation [8]。
-4. **RLPD**：以真實資料對模擬訓練出的模型進行微調，縮小 sim-to-real gap [9]。本研究忠實採用原論文核心配方——每個 batch 對稱取樣 50% sim 先驗 + 50% 真實資料、critic 加 LayerNorm 的 critic ensemble、高 UTD——但訓練機制為離線（更新迴圈只做梯度更新、不在真環境即時互動），故為「sim + 真實混合 buffer 的離線微調」，非原論文的真線上更新。
+4. **RLPD**：以真實資料對模擬訓練出的模型進行微調，縮小 sim-to-real gap [9]。本研究忠實採用原論文核心配方——每個 batch 對稱取樣 50% sim 先驗 + 50% 真實資料、critic 加 LayerNorm 的 critic ensemble、高 UTD——但訓練機制為離線（更新迴圈只做梯度更新、不在真環境即時互動），故為「sim + 真實混合 buffer 的離線微調」，非原論文的真線上更新。具體作法為：**暖啟動自對應 campaign 的 RDSAC-cvar base**（§5.2 重載複核用早期 RDSAC-cvar base、§5.8 用該節之 fairness-reward RDSAC-cvar base），offline 先驗為同一異質 regime 的 sim rollouts、online 半批為 §5.1 所述之真實 Slurm 線上日誌（168 維、2 786 筆 transition、以 sacct 真實 JCT 計 reward）。關鍵在於 **RLPD 微調階段的 reward 刻意採 `jct_aligned`（$-\mathrm{JCT}/1000$）而非 base 的 mo＋公平 reward**：RLPD 的 critic 從頭學起，需要 offline↔online 兩半批的 reward *定義一致*，而線上日誌記錄的即是 $-\mathrm{JCT}/1000$，故 offline 半批亦以同尺度的 `jct_aligned` 計，而非與 base 的訓練目標一致（此為與其他三臂在 reward 上的**刻意差異**）。微調配置：offline-steps=50 000、gradient updates=200、UTD=20、固定 $\alpha=0.05$。
 
 RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action（即所選放置的 GPU 剩餘 MPS 不足以容納該工作請求的動作）。訓練流程包含 prioritized replay、n-step return、potential-based reward shaping [31] 與 heuristic warm start。需澄清命名：本研究的 RDSAC 為自組的「distributional + discrete SAC」，以離散動作空間搭配 IQN 分位數 critic 建構 [7][8]，與 Duan 等人 [33] 針對連續控制、將回報建模為單一高斯分布的 Distributional Soft Actor-Critic 不同，兩者不應混淆。
 
@@ -234,7 +250,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | IQN 分位數 N_QUANT／cosine 維度 | 32／64（RDSAC 臂） |
 | 風險目標／tail mass β | CVaR／0.25（RDSAC-cvar 臂） |
 | 溫度 α | 固定 0.05 |
-| reward | 多目標（w_jct=1.0, w_util=0.05），reward_scale=20000 |
+| reward（§3.1） | mo：−JCT/S 完成項＋凸公平項 λ_fair=5.0＋potential shaping（等待＋節點均衡 λ_bal=5.0）；mo_w_util=0、S=reward_scale=20000；環境 interference=0.3 |
 | 訓練長度 | 每臂約 1×10⁵ curriculum env-steps |
 
 圖 2 為三個學習臂在 aimix-family 課程訓練下的 episode reward 與 critic loss（跨 seed、rolling window w=80 平滑）。三臂皆使用固定溫度 α=0.05；曲線在課程切換後維持有限值，未出現數值發散。由於不同 critic 的 loss 尺度不可直接比較，圖 2 僅用於檢查訓練穩定性，不據此判定策略優劣。
@@ -245,44 +261,61 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 ### 5.2 實機評估結果
 
-**模擬結果。** 在 trace-derived AI-serving 工作負載中（8 個 held-out workload seed），啟發式與學習式策略明顯區分不同排程方法：size-aware 的 multifactor／score 在 SLO 違反率上（≈41%）明顯優於 FCFS（66.5%），此區隔在計入 seed 變異後仍成立，說明模擬器本身具備區分策略的能力（表 5）。
+在 BERT 推論、ResNet 訓練、Qwen 微調與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%），每個 seed 提交 150 個工作，使用 10 seeds 進行評估，到達採 poisson，：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、job queue 隨時間持續堆積，runtime 經壓縮使 p95≈`target_max`=20 s。排序只有在存在可重排的 backlog 時才有意義，故本節取三個負載點 poisson **oversub=2、4、6**（淺／中／深佇列）並置成三點負載掃描，以檢驗 RL 在不同 job queue 的效益，結果分別如 6, 7, 8 所示。
 
-表 5. 模擬環境下 AI-serving 工作負載的排程器比較（8 個 held-out workload seed，mean ± std；score 使用 sim 預設 ε=0.30）
+> JCT／Makespan／P95／P99 為各 seed 內平均之未加權平均 ± 標準差，以 Slurm 內建 Backfill 作為 seed-level 配對基準；ΔJCT% 見表 8b。
 
-| 排程器 | 平均 JCT (s) | 推論 JCT (s) | SLO 違反 (%) |
+表 6. 重載混合工作負載評估結果（oversub=6）
+
+| 排程策略 | 平均 JCT (s) | P50 (s) | P95 (s) | P99 (s) | ΔmeanJCT% [95% CI] | Wilcoxon *p* | P99<bf |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| FCFS | 314.3 ± 20.9 | 316.4 ± 24.5 | 582.3 ± 29.3 | 604.3 ± 30.5 | +3.3 [−1.0, +7.7] | 0.19 | 10/10 |
+| Backfill | 304.6 ± 18.4 | 281.1 ± 21.7 | 710.4 ± 59.5 | 767.8 ± 32.1 | — | — | — |
+| SAC | 265.4 ± 22.1 | 231.5 ± 33.5 | 583.9 ± 60.6 | 667.1 ± 76.5 | −13.0 [−15.0, −10.9] | 0.002 | 10/10 |
+| RDSAC-mean | 270.0 ± 15.5 | 250.6 ± 30.0 | 563.0 ± 26.8 | 679.0 ± 64.0 | −11.3 [−12.6, −10.0] | 0.002 | 10/10 |
+| RDSAC-cvar | 265.6 ± 15.6 | 220.8 ± 24.5 | 593.8 ± 57.8 | 677.9 ± 74.3 | −12.7 [−15.0, −10.5] | 0.002 | 10/10 |
+| RLPD | 269.6 ± 14.6 | 222.7 ± 18.5 | 660.1 ± 51.0 | 684.2 ± 58.1 | −11.4 [−14.0, −8.8] | 0.002 | 9/10 |
+
+> [!NOTE]
+> 在深負載下評估時，所有學習式策略的平均 JCT 皆顯著勝過 Backfill 約 11.3~13.0%，表現最佳的策略是 SAC，但是在 P99 上 FCFS 為最佳，其次是 SAC 及 RDSAC-cvar。
+
+表 7. 中載混合工作負載評估結果（oversub=4）
+
+| 排程策略 | 平均 JCT (s) | P50 (s) | P95 (s) | P99 (s) | ΔmeanJCT% [95% CI] | Wilcoxon *p* | P99<bf |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| FCFS | 286.5 ± 20.6 | 289.2 ± 28.3 | 527.1 ± 28.0 | 546.1 ± 30.8 | +10.0 [+7.1, +13.0] | 0.004 | 10/10 |
+| Backfill | 260.7 ± 19.3 | 236.7 ± 19.2 | 616.0 ± 124.9 | 750.8 ± 31.1 | — | — | — |
+| SAC | 233.8 ± 15.8 | 208.6 ± 15.2 | 510.2 ± 76.2 | 605.3 ± 93.0 | −10.2 [−13.1, −7.3] | 0.002 | 10/10 |
+| RDSAC-mean | 235.7 ± 17.9 | 213.8 ± 28.5 | 486.0 ± 36.9 | 628.8 ± 64.5 | −9.4 [−12.7, −6.2] | 0.002 | 10/10 |
+| RDSAC-cvar | 233.0 ± 15.7 | 200.6 ± 25.5 | 523.6 ± 54.4 | 642.2 ± 72.3 | −10.5 [−12.5, −8.6] | 0.002 | 10/10 |
+| RLPD | 233.2 ± 18.3 | 194.3 ± 28.6 | 596.7 ± 72.9 | 613.9 ± 77.1 | −10.4 [−13.8, −7.0] | 0.002 | 10/10 |
+
+> [!NOTE]
+> 在中負載下評估時，所有學習式策略的平均 JCT 皆顯著勝過 Backfill 約 9.4~10.5%，表現最佳的策略是 SAC，但是在 P99 上 FCFS 為最佳，其次是 SAC 及 RLPD。
+
+表 8. 淺載混合工作負載評估結果（oversub=2）
+
+| 排程策略 | 平均 JCT (s) | P50 (s) | P95 (s) | P99 (s) | ΔmeanJCT% [95% CI] | Wilcoxon *p* | P99<bf |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| FCFS | 167.5 ± 27.2 | 174.8 ± 37.8 | 293.3 ± 42.4 | 306.1 ± 43.0 | +11.7 [+5.2, +18.3] | 0.010 | 10/10 |
+| Backfill | 151.8 ± 31.3 | 109.2 ± 38.1 | 530.9 ± 178.6 | 652.5 ± 70.0 | — | — | — |
+| SAC | 150.1 ± 30.7 | 148.3 ± 28.7 | 287.8 ± 74.6 | 315.6 ± 101.2 | −0.7 [−6.1, +4.7] | 0.85 | 10/10 |
+| RDSAC-mean | 151.1 ± 33.9 | 151.2 ± 36.7 | 278.8 ± 65.1 | 325.2 ± 104.4 | −0.2 [−7.3, +6.9] | 0.92 | 10/10 |
+| RDSAC-cvar | 151.2 ± 33.3 | 149.7 ± 31.5 | 283.7 ± 69.2 | 334.8 ± 143.1 | −0.2 [−7.0, +6.7] | 1.00 | 9/10 |
+| RLPD | 150.5 ± 34.7 | 148.8 ± 35.0 | 284.7 ± 69.6 | 302.4 ± 71.6 | −0.9 [−7.6, +5.9] | 0.77 | 10/10 |
+
+> [!NOTE]
+> 在淺負載下評估時，所有學習式策略的平均 JCT 皆顯著勝過 FCFS，且與 Backfill 差不多 (0.2~0.9%)，但在 P99 上 RLPD 為最佳，其次是 FCFS 及 SAC。
+
+表 9. 三點 poisson 負載掃描：各臂相對 Backfill 之 seed-level 配對 ΔmeanJCT%（負值＝快於 Backfill；每格為 10 seed 配對差之平均 ± 標準差；括號為 Backfill 該負載點之絕對平均 JCT，s）
+
+| 策略 | oversub=2（Backfill 151.8 s） | oversub=4（Backfill 260.7 s） | oversub=6（Backfill 304.6 s） |
 |---|--:|--:|--:|
-| FCFS | 2199 ± 1201 | 1847 ± 1151 | 66.5 ± 23.2 |
-| multifactor | 1108 ± 398 | 461 ± 264 | 41.1 ± 20.1 |
-| score | 1129 ± 398 | 520 ± 331 | 40.7 ± 19.0 |
-
-**實機混合 AI 工作負載。** 在 BERT inference、ResNet training、Qwen fine-tuning 與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%，每 seed 125 個工作、8 seeds）上評估。結果如表 6 所示。在主要 campaign 中，SAC（126.2 s）與 RDSAC-cvar（130.5 s）的平均 JCT 點估計低於 FCFS（137.0 s）與 Backfill（136.2 s），與 size-aware 啟發式（125.2 s）則相當接近；RDSAC-cvar 在尾端（P99）於學習式策略內部表現相對較佳。以真實資料 sim-to-real 微調的 RLPD 取得表中最佳的平均 JCT 點估計（110.7 s）；惟 RLPD 為獨立配對評估（表 6 註 †），其相對自身併跑 score 基準的改善約 2.2%（點估計，未達統計顯著，詳 §5.5）。整體而言，部分學習式策略在平均 JCT 上優於傳統 Slurm 排程（FCFS／Backfill），但相對已 size-aware 的啟發式尚未形成穩健優勢。
-
-表 6. 實機混合 AI 工作負載評估（每 seed 提交 125 個工作，n=8 seeds；表列 JCT／P95／P99 為各 seed 內平均之**未加權平均 ± 標準差**，單位秒；完成數為各 seed 平均，各臂皆接近滿額；ΔJCT% 定義見 §5.4）。† RLPD 為獨立配對評估，其併跑的 size-aware score 基準約 113.7 s；RLPD 的絕對 JCT 不宜與其他列直接配對比較，僅其對自身基準的 ΔJCT（+2.2%，點估計）具配對意義（詳 §5.5）。
-
-| 排程器 | 完成數 | 平均 JCT (s) | P95 (s) | P99 (s) |
-|---|--:|--:|--:|--:|
-| FCFS | 125 | 137.0 ± 18.3 | 241.2 ± 41.7 | 255.0 ± 43.7 |
-| Backfill | 125 | 136.2 ± 23.4 | 255.6 ± 52.5 | 269.8 ± 50.1 |
-| 啟發式 | 125 | 125.2 ± 19.3 | 433.5 ± 146.4 | 517.6 ± 122.2 |
-| SAC | 124 | 126.2 ± 19.8 | 471.2 ± 86.2 | 566.5 ± 49.9 |
-| RDSAC-mean | 124 | 142.3 ± 38.8 | 469.7 ± 152.7 | 600.3 ± 77.1 |
-| RDSAC-cvar | 125 | 130.5 ± 23.3 | 395.0 ± 132.9 | 527.7 ± 110.6 |
-| **RLPD** † | 125 | **110.7 ± 18.9** | 418.0 ± 103.5 | 509.0 ± 80.2 |
-
-由表 6 可以發現，在平均 JCT 的部分，SAC 與 RDSAC-cvar 的平均 優於 FCFS／Backfill，但相對啟發式的差距很小，而 RDSAC-mean 則較差。FCFS／Backfill 以嚴格序列執行換得較低的 P99 (255~270 s)，明顯低於啟發式與學習式策略的 509–600 s。也發現 RDSAC-cvar 在**學習式策略內部**取得較佳尾端平衡。
-
-**重載複核（150 工作／16 seed，基準改為 Backfill，score 移除）。** 為在 §5.7 天花板分析所指出「headroom 開窗」的較重負載 regime 進一步檢驗，並以更大樣本與更直接的基準複核，另跑一組六臂實機評估：每 seed 工作數由 125 提高至 150、workload seed 由 8 擴至 16，移除 size-aware score 臂，直接以 Slurm 生產排程器 **Backfill** 作為 seed-level 配對基準；RLPD 於此 campaign 為一等公民臂，由 §5.1 所述之忠實 168 維線上日誌（2 786 筆真實 transition、以 sacct 真實 JCT 計 reward）微調而得。結果如表 6b。**無任何學習式策略在平均 JCT 上顯著勝過 Backfill**（皆 *p*>0.05）：RDSAC-mean 最接近打平（−1.3%，16 seed 中 10 個較快，*p*=0.70），SAC／RDSAC-cvar／RLPD 平均略慢於 Backfill（−4.5%～−5.3%，皆未達顯著）；FCFS 則顯著慢於 Backfill（−13.1%，0/16，*p*<0.001），確認基準本身具鑑別力。與表 6 一致，學習式策略的尾端明顯更差：P99 均落在 ≈639–668 s，約為 Slurm-native（≈263–282 s）的 2.4 倍。此較重負載、較大樣本的複核顯示——**在此 placement-only 路徑（RL 只綁節點、順序由 Slurm 決定）下，即使負載進入天花板分析指出效益空間開啟的區間，學習式仍無法穩健勝過已充分調校的生產 Slurm 排程，且以平均 JCT 的打平換取顯著更差的尾端延遲**。（此 campaign 之忠實 RLPD 於重載下不再取得表 6 之最佳平均 JCT，顯示其相對優勢亦取決於負載與基準。）惟須強調此為 placement-only 路徑之結論；§5.8 進一步顯示，當 RL 改經原生排序致動路徑（ordering-only）取得對*順序*的控制權，並在深負載（poisson oversub=6）下評估時，學習式策略的平均 JCT *與*尾端 P99 反而**同時顯著勝過 Backfill 約 11–13%**（皆 *p*=0.002）——故本負向結果應理解為特定致動路徑（及該路徑下的節點綁定序列化）之限制，而非學習式排程於重載下的最終判定。
-
-表 6b. 重載混合 AI 工作負載評估（每 seed 提交 150 個工作，n=16 seeds；JCT／Makespan／P95／P99 為各 seed 內平均之未加權平均 ± 標準差，單位秒；score 已自評估項目移除，Backfill 為配對基準；ΔJCT% 見表 8b）
-
-| 排程器 | 平均 JCT (s) | Makespan (s) | P95 (s) | P99 (s) |
-|---|--:|--:|--:|--:|
-| FCFS | 151.4 ± 29.1 | 778.9 ± 37.4 | 270.2 ± 45.1 | 282.4 ± 46.6 |
-| **Backfill**（基準） | 134.6 ± 28.8 | 757.5 ± 46.8 | 251.2 ± 48.2 | 263.2 ± 48.7 |
-| SAC | 138.9 ± 23.8 | 776.4 ± 36.1 | 540.4 ± 120.5 | 655.6 ± 66.1 |
-| RDSAC-mean | 134.9 ± 27.0 | 764.4 ± 38.0 | 447.3 ± 165.2 | 640.5 ± 73.5 |
-| RDSAC-cvar | 140.2 ± 27.1 | 783.0 ± 30.7 | 529.2 ± 139.4 | 639.3 ± 61.1 |
-| RLPD | 139.4 ± 28.6 | 786.8 ± 39.4 | 513.1 ± 177.8 | 667.5 ± 55.3 |
+| FCFS | +11.7 ± 10.0 | +10.0 ± 4.5 | +3.3 ± 6.6 |
+| SAC | −0.7 ± 8.2 | −10.2 ± 4.4 | −13.0 ± 3.1 |
+| RDSAC-mean | −0.2 ± 10.9 | −9.4 ± 5.0 | −11.3 ± 1.9 |
+| RDSAC-cvar | −0.2 ± 10.5 | −10.5 ± 3.0 | −12.7 ± 3.4 |
+| RLPD | −0.9 ± 10.3 | −10.4 ± 5.2 | −11.4 ± 4.0 |
 
 ### 5.3 系統行為量測
 
@@ -299,8 +332,6 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | 放置決策中低信心回退比例 | 12.0%（115 / 959） |
 | RL 主導放置比例 | 88.0%（844 / 959） |
 
-> 以下 §5.4–5.8 以嚴謹的統計方法（seed-level 配對、Holm-Bonferroni 多重比較校正、TOST 等價檢定）進一步刻畫上述效益的統計邊界與場景依賴性，並輔以天花板分析與 placement 消融解析可贏空間的來源。
-
 ### 5.4 統計方法
 
 實機評估採用三項方法降低誤判：
@@ -309,73 +340,38 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 - Drift-robust interleaving：同一 campaign 內的方法交錯執行，降低 GPU 暖機或系統漂移與特定方法混淆。
 - Seed-level paired statistics：以 seed 為分析單位，避免偽重複。配對顯著性以 seed-level 配對 t 檢定計算；多重比較的 Holm-Bonferroni family 為主 campaign 中各非-score 臂（SAC、RDSAC-mean、RDSAC-cvar、FCFS、Backfill）對 score 的 5 項比較（RLPD 屬獨立 campaign，另計）；TOST 等價界限（±10%）為**事前**指定，取約當基準 score 跨 seed 的相對 JCT 變異量級作為實務可忽略門檻。各臂的等價檢定為個別進行，未再跨等價檢定做多重性校正。
 
-**ΔJCT% 與分析單位**：ΔJCT% 由表 6 之 seed-mean JCT 計 `(JCT_score − JCT_arm) / JCT_score × 100`（正值＝快於 score），故可由表 6 **逐格還原、與 §5.5 一致**；表 6 的「平均 JCT」為各 seed 內平均 JCT 之未加權平均 ± 標準差（n=8），非 pooled jobs。95% CI、Cohen's *d*、配對 t 之 *p* 值與 TOST 則由 seed-level 配對差得出。RLPD 之 score 基準為其自身併跑者（見表 6 註 †）。
+**ΔJCT% 與分析單位**：ΔJCT% 由表 6 之 seed-mean JCT 計
+
+$$
+\Delta\mathrm{JCT}\% \;=\; \frac{\mathrm{JCT}_{\text{score}} - \mathrm{JCT}_{\text{arm}}}{\mathrm{JCT}_{\text{score}}} \times 100 \qquad (\text{正值} = \text{快於 score}),
+$$
+
+故可由表 6 **逐格還原、與 §5.5 一致**；表 6 的「平均 JCT」為各 seed 內平均 JCT 之未加權平均 ± 標準差（n=8），非 pooled jobs。95% CI、Cohen's *d*、配對 t 之 *p* 值與 TOST 則由 seed-level 配對差得出。RLPD 之 score 基準為其自身併跑者（見表 6 註 †）。
 
 受限於 n=8，檢定力偏低，因此本研究不僅依賴單一顯著性檢定，而是以點估計、TOST 等價檢定與天花板分析交叉佐證效益邊界。
 
 > 上述配對與 interleaving 保證只適用於各自 campaign 內，不能用來支持跨 campaign 的 RLPD-vs-FCFS／Backfill 比較。百分比若由彙總平均值計算，僅描述點估計；推論性結論以同一 seed 內的配對差為準。
 
-### 5.5 與啟發式基準的嚴謹比較
-
-表 6 顯示 SAC 與 RDSAC-cvar 在平均 JCT 上優於 FCFS／Backfill，但相對 **size-aware score** 則未構成穩健超越。以 aimix125c campaign 的 seed-level 配對差（ΔJCT%，正值代表快於 score；n=8，配對 t 檢定，Holm-Bonferroni 校正；TOST 等價界限**事前**定為 ±10%）進行嚴謹比較。
-
-本節各臂 ΔJCT% **直接由表 6 之 seed-mean JCT 計算** `(JCT_score − JCT_arm) / JCT_score × 100`，故與表 6 **逐格一致、可直接驗證**（例如 RDSAC-mean (125.2−142.3)/125.2 = −13.7%、FCFS −9.4%、SAC −0.8%）；95% CI、Cohen's *d*、adjusted *p* 與 TOST 則由 seed-level 配對差得出。RLPD 之絕對平均 JCT 取自併跑其自身 score 基準的評估（見表 6 註 †），故其 ΔJCT% 以該基準計算。
-
-六臂的完整統計如表 8。
-
-表 8. 與 size-aware 啟發式（score）之嚴謹比較（aimix125c，n=8 seeds；ΔJCT% 正值＝快於 score，由表 6 之 seed-mean JCT 直接相除）
-
-| 臂 | ΔJCT% | 95% CI | Cohen's *d* | Holm adj. *p* | TOST ±10% |
-|---|--:|--:|--:|--:|:--:|
-| SAC | −0.8 | [−7.3, +5.7] | −0.10 | 0.72 | 通過 |
-| RDSAC-cvar | −4.2 | [−12.0, +3.6] | −0.45 | 0.53 | 否 |
-| RDSAC-mean | −13.7 | [−35.4, +8.0] | −0.53 | 0.53 | 否 |
-| FCFS | −9.4 | [−16.8, −2.0] | −1.07 | 0.075 | 否 |
-| Backfill | −8.8 | [−17.8, +0.2] | −0.81 | 0.21 | 否 |
-| **RLPD** † | **+2.2** | [−4.5, +8.9] | +0.28 | 0.46 | 通過 |
-
-† RLPD 之基準為其自身併跑之 score（絕對平均 JCT 110.7 s，為表 6 最佳）；其 ΔJCT% 以該基準計算，不與前五臂同 Holm family。
-
-**重載六臂之配對統計（基準 Backfill）。** 表 8b 列出 §5.2 重載複核 campaign（150 工作／16 seed，score 移除）中，各臂相對 **Backfill** 的 seed-level 配對 ΔJCT%（正值＝快於 Backfill）與 one-sample t 檢定（自由度 15）。此 campaign 以 Backfill 為唯一配對基準、無 score 臂，故 ΔJCT% 直接由表 6b 之 seed-mean JCT 計 `(JCT_backfill − JCT_arm) / JCT_backfill × 100`。除 **FCFS 顯著慢於 Backfill**（−13.1%，0/16 seed 較快，*p*<0.001）外，四個學習式臂**均未達顯著**（*p* 介於 0.16–0.70），且點估計皆為負（略慢於 Backfill）；其中 RDSAC-mean 最接近等價（−1.3%，10/16 較快，*p*=0.70）。即便未施加多重比較校正，除 FCFS-較慢外亦無任一臂達顯著。此結果在更大樣本（n=16）與更重負載（150 工作）下重現 §5.2 主 campaign 的型態——**學習式 placement 相對生產 Slurm（Backfill）無穩健優勢，且尾端顯著更差**（表 6b：學習式 P99 ≈639–668 s vs Slurm-native ≈263–282 s）。
-
-表 8b. 重載六臂相對 Backfill 之配對比較（heavy150aimix，n=16 seeds；ΔJCT% 正值＝快於 Backfill，為各 seed 配對差之平均 ± 標準差，由表 6b 之 seed-mean JCT 直接相除；*p* 為 one-sample t 檢定 vs 0，未施 Holm 校正）
-
-| 臂 | ΔJCT% vs Backfill | seed 較快數 | t 檢定 *p* |
-|---|--:|:--:|--:|
-| FCFS | −13.1 ± 7.3 | 0/16 | **<0.001** |
-| SAC | −4.9 ± 15.7 | 8/16 | 0.233 |
-| RDSAC-mean | −1.3 ± 13.4 | 10/16 | 0.701 |
-| RDSAC-cvar | −5.3 ± 14.5 | 7/16 | 0.160 |
-| RLPD | −4.5 ± 14.5 | 7/16 | 0.230 |
-
-僅 SAC 與 RLPD 通過 ±10% TOST 等價（與 score 實務等價），其餘臂點估計偏慢且信賴區間甚寬。值得注意的是，FCFS 的未校正 95% CI 已不含 0，但經 Holm 校正後 adjusted *p*=0.075 仍未達顯著——此為小樣本（n=8）疊加多重比較校正的正常後果，也再次說明本規模下不宜僅憑點估計下結論。
-
-整體而言，無任一臂（含取得表 6 最佳絕對 JCT 的 RLPD）在配對檢定下穩健超越 size-aware 啟發式：SAC 與 RLPD 與 score 實務等價（±10% TOST 通過），其餘臂點估計偏慢且信賴區間寬。
-
 ### 5.6 天花板分析
 
-為區分負向結果是源於特定 RL 方法的局限、還是測試 regime 本身空間有限，本研究在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只剩 dispatch **ordering**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義 `headroom% = (score_JCT − best_ordering_JCT) / best_ordering_JCT`。結果（表 9）顯示 headroom 隨負載單調上升：在本研究 cuBLAS 與模擬比較的測試負載（n_jobs≈50，對應 load 40–60）下 headroom 僅 0.1–0.7%，即 score 已幾乎位於可達排程上界；即使負載提高到 n_jobs=100，headroom 也僅約 4.1%。這說明低負載下的策略空間確實接近平坦，是負向結果的結構性原因，而不是特定方法的偶然失敗。
+此節用於量測 RL 方法的提升效益天花板，因此在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只有**分派順序**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義
+
+$$
+\text{headroom}\% \;=\; \frac{\mathrm{JCT}_{\text{score}} - \mathrm{JCT}_{\text{best-ordering}}}{\mathrm{JCT}_{\text{best-ordering}}},
+$$
+
+結果如表 9 所示，代表 headroom 會隨著工作負載的數目有單調遞增的趨勢，即工作越多、學習式的效益越明顯。
 
 表 9. Headroom vs. 負載（2-GPU 叢集，3 families × 10 seeds/row，n=30）
 
-| 負載 (n_jobs) | Headroom（mean ± 95% CI） | Max |
-|---|--:|--:|
-| 40 | +0.1% ± 0.1% | +1.5% |
-| 60 | +0.7% ± 0.5% | +5.8% |
-| 80 | +2.0% ± 1.1% | +9.7% |
-| 100 | +4.1% ± 2.3% | +25.2% |
-
-### 5.7 Placement 解耦消融
-
-排程的另一個可能槓桿是 GPU/MPS placement 本身，而非 ordering。本研究以解耦消融訓練三個網路形狀相同的臂：**joint**（同時學 job 選擇與 placement）、**placement_only**（job 選擇凍結為 score 首選，只學 placement）、**job_only**（placement 凍結為 first-fit，只學 job 選擇）。結果（表 10）顯示兩個解耦臂與 joint 的差異均未達統計顯著；但估計區間很寬，且本分析未進行 TOST，因此「未顯著」不能解讀為實質等價，也不能據此判定 job 選擇或 placement 無效。此消融只能說明：在目前 2×1、5 training seeds 的樣本下，尚無法辨識哪個決策槓桿帶來穩定優勢。
-
-表 10. Joint-vs-Decoupled placement 消融（2×1，3 臂 × 5 training seeds，pooled JCT）
-
-| 臂 | 平均 JCT (s) | Δ vs joint | 配對 *p* |
-|---|--:|--:|--:|
-| joint | 9150 ± 2335 | — | — |
-| placement_only | 8443 ± 2631 | −5.3% ± 33.8% | 0.585 |
-| job_only | 10540 ± 1358 | +19.6% ± 35.7% | 0.295 |
+| 負載 (n_jobs) | Headroom（mean ± 95% CI） |
+|---|--:|
+| 40 | +0.1% ± 0.1% |
+| 60 | +0.7% ± 0.5% |
+| 80 | +2.0% ± 1.1% |
+| 100 | +4.1% ± 2.3% |
+| 125 | 10.3% ± 5.3% |
+| 150 | 14.0% ± 4.6 |
 
 ### 5.8 排序致動的實機驗證：ordering headroom 於重載下可被學習式策略捕捉
 
@@ -383,22 +379,8 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 **致動路徑與方法。** §3.2 所述的 held-job 控制器，其提交後 `required_nodes` REST 致動在受測的 slurmrestd（v0.0.37）被停用而未生效（摘要與 §3.2 所述）。本研究改採一條原生路徑並先行驗證其正確性：以服務中的策略對一個確定性、**arrival-aware** 的雙節點消耗過程做前展（in-memory drain，重複呼叫 `/act`，容量與 first-fit 回退皆與線上路徑一致；工作僅在其到達時刻後方進入佇列，策略每步只看**當前已到達佇列的 rolling top-16 視窗**，與線上 top-16 select 介面完全一致），讀出策略對該 seed 全部 150 個工作的完整**派遣順序**；隨後將每個工作於其到達時刻以 unheld 提交，提交後即以 `scontrol update Priority` 依前展所得 rank 設定 Slurm 優先序（管理員 `direct_set_prio`，於 unheld 工作設定方能生效；於 held 狀態設定會被 multifactor 重算清除）。Slurm **自身**的 in-process backfill 排程器即以此固定優先序在原生速度下排序並放置工作——RL 掌握*順序*、Slurm 掌握*放置與時機*。
 
-此設計刻意隔離出 **RL 排序（ordering-only）**，並排除兩種混淆：（i）*致動延遲*——以 hold／輪詢-release 迴圈在進程外致動時，被釋放的容量會閒置至下一輪快照（每輪約 30–100 s），實測此開銷會使所有策略塌縮到相對 Backfill 一致的 ≈+35%（量到的是輪詢開銷而非策略品質）；（ii）*節點綁定序列化*——若同時以 `sbatch -w` 綁定 RL 所選節點，在分散到達下一個高優先工作被釘在忙碌節點時會阻塞，而 Slurm 無法將已綁定工作 backfill 至另一閒置節點（實測使併發塌到約 1、平均 JCT 反升近 3 倍）。由於 §5.2／表 6b 已顯示 RL *placement* 無穩健助益，改由 Slurm 自由放置既移除此序列化混淆，亦使放置與 Backfill／FCFS 對照臂完全一致——比較遂純粹關於*排序*。
-
-**評估 regime。** 工作負載為**真實 CUDA** aimix（BERT inference／ResNet training／Qwen fine-tune／cuBLAS，同 §5.2）、每 seed 150 工作、10 個 workload seed（42–51）、2×1 異質。**到達採 poisson**，與 §5.2 重載 campaign（`run_heavy150`）一致：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、佇列隨時間**堆積成持續 backlog**（而非一次性 burst）。runtime 經壓縮使 p95≈`target_max`=20 s（保留 heavy-tail 形狀，同表 6b 口徑）。排序只有在存在可重排的 backlog 時才有意義，故本節取三個負載點 **oversub=2、4、6**（淺／中／深佇列）並置成三點負載掃描（表 6c–6f）：oversub=6、4 具持續 backlog、排序有槓桿，oversub=2 佇列近空、排序對平均已無槓桿（作為效益翻正之門檻對照）。此負載相依性正是 §5.6 天花板分析「headroom 隨負載上升」的體現。對照臂 **Backfill**（`sched/backfill`，fast-aging `PriorityMaxAge`=5 min 使其自身老化在秒級工作上真正生效、避免飢餓——更強的基準）與 **FCFS**（`sched/builtin`＋`priority/basic`）以相同工作流分別評估；fast-aging 對 RL 臂則因 `direct_set_prio` 及 rank 間距遠大於老化貢獻而不起作用（RL 順序不被老化改動）。策略為 §4.3／§5.1 之 fairness-reward 微調 checkpoint。
-
 **結果（表 6c）。** 在此真實 CUDA、poisson、深負載 regime 下，**所有學習式策略在平均 JCT 與尾端 P99 上均顯著勝過 Backfill**。平均：ΔmeanJCT −11.3% 至 −13.0%，四臂之 Wilcoxon 符號秩檢定（配對，10 seed）皆 *p*=0.002。**尾端亦同勝**：ΔP99 −10.9% 至 −13.1%，且 10 seed 中有 10 個（RLPD 為 9 個）的 P99 勝過 Backfill。值得注意的是，**深佇列下 Backfill 自身的 P99（768 s）為所有臂之最差**——其積極的平均導向重排把部分工作餓入尾端；FCFS 以嚴格序列換得低尾端（P99 604 s）但平均最高；學習式策略則**同時**取得較低平均（265–270 s vs 305 s）與較低尾端（667–684 s vs 768 s），在兩個軸上皆優於生產 Backfill。FCFS 的平均反略高於 Backfill（+3.3%，*p*=0.19，未顯著），確認 Backfill 為較強基準。
 
-表 6c. 重載排序致動評估（真實 CUDA aimix、poisson 到達 oversub=6、原生 Priority 致動、ordering-only；每 seed 提交 150 工作，n=10 seeds，seed 42–51；JCT／P50／P95／P99 為各 seed 內平均之**未加權平均 ± 標準差**，單位秒；Backfill 為 seed-level 配對基準；ΔmeanJCT% 之 95% CI 與 Wilcoxon *p* 為配對；P99<bf 為 P99 勝過 Backfill 之 seed 數）
-
-| 排程器 | 平均 JCT (s) | P50 (s) | P95 (s) | P99 (s) | ΔmeanJCT% [95% CI] | Wilcoxon *p* | P99<bf |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| FCFS | 314.3 ± 20.9 | 316.4 ± 24.5 | 582.3 ± 29.3 | 604.3 ± 30.5 | +3.3 [−1.0, +7.7] | 0.19 | 10/10 |
-| Backfill（基準） | 304.6 ± 18.4 | 281.1 ± 21.7 | 710.4 ± 59.5 | 767.8 ± 32.1 | — | — | — |
-| SAC | 265.4 ± 22.1 | 231.5 ± 33.5 | 583.9 ± 60.6 | 667.1 ± 76.5 | −13.0 [−15.0, −10.9] | 0.002 | 10/10 |
-| RDSAC-mean | 270.0 ± 15.5 | 250.6 ± 30.0 | 563.0 ± 26.8 | 679.0 ± 64.0 | −11.3 [−12.6, −10.0] | 0.002 | 10/10 |
-| RDSAC-cvar | 265.6 ± 15.6 | 220.8 ± 24.5 | 593.8 ± 57.8 | 677.9 ± 74.3 | −12.7 [−15.0, −10.5] | 0.002 | 10/10 |
-| RLPD | 269.6 ± 14.6 | 222.7 ± 18.5 | 660.1 ± 51.0 | 684.2 ± 58.1 | −11.4 [−14.0, −8.8] | 0.002 | 9/10 |
 
 **中／淺負載複核（oversub=4、2）與三點負載掃描。** 為檢驗上述優勢是否為 oversub=6 單一負載點之特例，並描出「ordering headroom 隨負載浮現」的完整曲線，於同一路徑、同 10 個 workload seed（42–51）下再取兩個較淺負載點 **oversub=4**（到達比服務快 4 倍）與 **oversub=2**（快 2 倍，佇列近乎不堆積）。中負載結果如表 6d：**所有學習式策略在 oversub=4 仍顯著勝過 Backfill**，平均 ΔmeanJCT −9.4% 至 −10.5%（四臂 Wilcoxon 皆 *p*=0.002），尾端亦全數同勝（ΔP99 −14.4% 至 −19.3%，P99<bf 皆 10/10）；FCFS 則顯著慢於 Backfill（+10.0%，*p*=0.004）。淺負載結果如表 6e：**平均 JCT 上四個學習式臂與 Backfill 統計打平**（ΔmeanJCT −0.2% 至 −0.9%，四臂 Wilcoxon *p* 介於 0.77–1.00，95% CI 皆跨越 0），此即效益翻正的**負載門檻**——佇列近空時排序對*平均*已無槓桿。三點並置（表 6f）遂構成單調的**負載相依曲線**：學習式對 Backfill 的平均 JCT 優勢隨佇列加深由打平（≈0% @ oversub=2）擴大到 ≈−10%（oversub=4）再到 ≈−12%（oversub=6），而 FCFS 相對 Backfill 的劣勢則隨負載收斂（+11.7% → +10.0% → +3.3%，因深佇列下 Backfill 為衝平均之重排把工作餓入尾端、拉近了與純序列 FCFS 的平均差距）。此為 §5.6 天花板分析「headroom 隨負載上升」預測的**三點實機確認**。
 
