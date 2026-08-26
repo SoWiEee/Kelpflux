@@ -385,7 +385,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 此設計刻意隔離出 **RL 排序（ordering-only）**，並排除兩種混淆：（i）*致動延遲*——以 hold／輪詢-release 迴圈在進程外致動時，被釋放的容量會閒置至下一輪快照（每輪約 30–100 s），實測此開銷會使所有策略塌縮到相對 Backfill 一致的 ≈+35%（量到的是輪詢開銷而非策略品質）；（ii）*節點綁定序列化*——若同時以 `sbatch -w` 綁定 RL 所選節點，在分散到達下一個高優先工作被釘在忙碌節點時會阻塞，而 Slurm 無法將已綁定工作 backfill 至另一閒置節點（實測使併發塌到約 1、平均 JCT 反升近 3 倍）。由於 §5.2／表 6b 已顯示 RL *placement* 無穩健助益，改由 Slurm 自由放置既移除此序列化混淆，亦使放置與 Backfill／FCFS 對照臂完全一致——比較遂純粹關於*排序*。
 
-**評估 regime。** 工作負載為**真實 CUDA** aimix（BERT inference／ResNet training／Qwen fine-tune／cuBLAS，同 §5.2）、每 seed 150 工作、10 個 workload seed（42–51）、2×1 異質。**到達採 poisson**，與 §5.2 重載 campaign（`run_heavy150`）一致：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、佇列隨時間**堆積成持續 backlog**（而非一次性 burst）。runtime 經壓縮使 p95≈`target_max`=20 s（保留 heavy-tail 形狀，同表 6b 口徑）。排序只有在存在可重排的 backlog 時才有意義，故本節取兩個具 backlog 的負載點 **oversub=4 與 6**（中／深佇列）並置成兩點負載掃描（表 6c–6e）；淺佇列（如 oversub=2）下佇列常近空、排序幾無槓桿（smoke 實測此時 RL 反略差），此負載相依性正是 §5.6 天花板分析「headroom 隨負載上升」的體現。對照臂 **Backfill**（`sched/backfill`，fast-aging `PriorityMaxAge`=5 min 使其自身老化在秒級工作上真正生效、避免飢餓——更強的基準）與 **FCFS**（`sched/builtin`＋`priority/basic`）以相同工作流分別評估；fast-aging 對 RL 臂則因 `direct_set_prio` 及 rank 間距遠大於老化貢獻而不起作用（RL 順序不被老化改動）。策略為 §4.3／§5.1 之 fairness-reward 微調 checkpoint。
+**評估 regime。** 工作負載為**真實 CUDA** aimix（BERT inference／ResNet training／Qwen fine-tune／cuBLAS，同 §5.2）、每 seed 150 工作、10 個 workload seed（42–51）、2×1 異質。**到達採 poisson**，與 §5.2 重載 campaign（`run_heavy150`）一致：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、佇列隨時間**堆積成持續 backlog**（而非一次性 burst）。runtime 經壓縮使 p95≈`target_max`=20 s（保留 heavy-tail 形狀，同表 6b 口徑）。排序只有在存在可重排的 backlog 時才有意義，故本節取三個負載點 **oversub=2、4、6**（淺／中／深佇列）並置成三點負載掃描（表 6c–6f）：oversub=6、4 具持續 backlog、排序有槓桿，oversub=2 佇列近空、排序對平均已無槓桿（作為效益翻正之門檻對照）。此負載相依性正是 §5.6 天花板分析「headroom 隨負載上升」的體現。對照臂 **Backfill**（`sched/backfill`，fast-aging `PriorityMaxAge`=5 min 使其自身老化在秒級工作上真正生效、避免飢餓——更強的基準）與 **FCFS**（`sched/builtin`＋`priority/basic`）以相同工作流分別評估；fast-aging 對 RL 臂則因 `direct_set_prio` 及 rank 間距遠大於老化貢獻而不起作用（RL 順序不被老化改動）。策略為 §4.3／§5.1 之 fairness-reward 微調 checkpoint。
 
 **結果（表 6c）。** 在此真實 CUDA、poisson、深負載 regime 下，**所有學習式策略在平均 JCT 與尾端 P99 上均顯著勝過 Backfill**。平均：ΔmeanJCT −11.3% 至 −13.0%，四臂之 Wilcoxon 符號秩檢定（配對，10 seed）皆 *p*=0.002。**尾端亦同勝**：ΔP99 −10.9% 至 −13.1%，且 10 seed 中有 10 個（RLPD 為 9 個）的 P99 勝過 Backfill。值得注意的是，**深佇列下 Backfill 自身的 P99（768 s）為所有臂之最差**——其積極的平均導向重排把部分工作餓入尾端；FCFS 以嚴格序列換得低尾端（P99 604 s）但平均最高；學習式策略則**同時**取得較低平均（265–270 s vs 305 s）與較低尾端（667–684 s vs 768 s），在兩個軸上皆優於生產 Backfill。FCFS 的平均反略高於 Backfill（+3.3%，*p*=0.19，未顯著），確認 Backfill 為較強基準。
 
@@ -400,7 +400,9 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | RDSAC-cvar | 265.6 ± 15.6 | 220.8 ± 24.5 | 593.8 ± 57.8 | 677.9 ± 74.3 | −12.7 [−15.0, −10.5] | 0.002 | 10/10 |
 | RLPD | 269.6 ± 14.6 | 222.7 ± 18.5 | 660.1 ± 51.0 | 684.2 ± 58.1 | −11.4 [−14.0, −8.8] | 0.002 | 9/10 |
 
-**中負載複核（oversub=4）與兩點負載掃描。** 為檢驗上述優勢是否為 oversub=6 單一負載點之特例，並開始描出「ordering headroom 隨負載浮現」的曲線，於同一路徑、同 10 個 workload seed（42–51）下再取一較淺負載點 **oversub=4**（到達比服務快 4 倍，backlog 較淺）。結果如表 6d：**所有學習式策略在 oversub=4 仍顯著勝過 Backfill**，平均 ΔmeanJCT −9.4% 至 −10.5%（四臂 Wilcoxon 皆 *p*=0.002），尾端亦全數同勝（ΔP99 −14.4% 至 −19.3%，P99<bf 皆 10/10）；FCFS 則顯著慢於 Backfill（+10.0%，*p*=0.004），確認 Backfill 仍為較強基準。將兩點並置（表 6e）可見清楚的**負載相依趨勢**：學習式對 Backfill 的平均 JCT 優勢隨佇列加深而擴大（約 −10% @ oversub=4 → 約 −12% @ oversub=6），而 FCFS 相對 Backfill 的劣勢則隨負載收斂（+10.0% → +3.3%，因深佇列下 Backfill 為衝平均之重排把工作餓入尾端、拉近了與純序列 FCFS 的平均差距）。此為 §5.6 天花板分析「headroom 隨負載上升」預測的**兩點實機確認**；更淺負載（oversub=2）之量測（預期優勢趨近 0 甚至翻負，標出效益翻正之負載門檻）進行中，完整三點曲線列於後續材料。
+**中／淺負載複核（oversub=4、2）與三點負載掃描。** 為檢驗上述優勢是否為 oversub=6 單一負載點之特例，並描出「ordering headroom 隨負載浮現」的完整曲線，於同一路徑、同 10 個 workload seed（42–51）下再取兩個較淺負載點 **oversub=4**（到達比服務快 4 倍）與 **oversub=2**（快 2 倍，佇列近乎不堆積）。中負載結果如表 6d：**所有學習式策略在 oversub=4 仍顯著勝過 Backfill**，平均 ΔmeanJCT −9.4% 至 −10.5%（四臂 Wilcoxon 皆 *p*=0.002），尾端亦全數同勝（ΔP99 −14.4% 至 −19.3%，P99<bf 皆 10/10）；FCFS 則顯著慢於 Backfill（+10.0%，*p*=0.004）。淺負載結果如表 6e：**平均 JCT 上四個學習式臂與 Backfill 統計打平**（ΔmeanJCT −0.2% 至 −0.9%，四臂 Wilcoxon *p* 介於 0.77–1.00，95% CI 皆跨越 0），此即效益翻正的**負載門檻**——佇列近空時排序對*平均*已無槓桿。三點並置（表 6f）遂構成單調的**負載相依曲線**：學習式對 Backfill 的平均 JCT 優勢隨佇列加深由打平（≈0% @ oversub=2）擴大到 ≈−10%（oversub=4）再到 ≈−12%（oversub=6），而 FCFS 相對 Backfill 的劣勢則隨負載收斂（+11.7% → +10.0% → +3.3%，因深佇列下 Backfill 為衝平均之重排把工作餓入尾端、拉近了與純序列 FCFS 的平均差距）。此為 §5.6 天花板分析「headroom 隨負載上升」預測的**三點實機確認**。
+
+值得注意的是，**淺負載下平均雖打平、尾端 P99 學習式卻仍穩定勝過 Backfill**（ΔP99 −49% 至 −54%，P99<bf 9–10/10；表 6e）。此非矛盾而是 Backfill 在淺佇列的行為特徵：其貪婪的短工作優先重排取得極低中位數（P50 109 s）卻把少數工作餓入尾端（P99 652 s），因受餓工作數過少而**未能撼動平均**（Backfill 平均仍 152 s）；學習式較公平的排序以略高的中位數（P50 ≈149 s）換得大幅較低的尾端（P99 ≈302–335 s），兩者於平均相抵。故本節之負載掃描係就*平均 JCT* headroom 而言單調隨負載上升（§5.6 之預測對象），而在*尾端*上，即便淺負載、學習式排序亦能規避 Backfill 的重排飢餓。惟淺負載 P99 之 seed 間變異偏大（Backfill P99 標準差 70 s、RDSAC-cvar 達 143 s），此尾端優勢之強度不宜過度外推。
 
 表 6d. 中負載排序致動評估（真實 CUDA aimix、poisson 到達 **oversub=4**、原生 Priority 致動、ordering-only；每 seed 提交 150 工作，n=10 seeds，seed 42–51；欄位定義同表 6c）
 
@@ -413,19 +415,30 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | RDSAC-cvar | 233.0 ± 15.7 | 200.6 ± 25.5 | 523.6 ± 54.4 | 642.2 ± 72.3 | −10.5 [−12.5, −8.6] | 0.002 | 10/10 |
 | RLPD | 233.2 ± 18.3 | 194.3 ± 28.6 | 596.7 ± 72.9 | 613.9 ± 77.1 | −10.4 [−13.8, −7.0] | 0.002 | 10/10 |
 
-表 6e. 兩點 poisson 負載掃描：各臂相對 Backfill 之 seed-level 配對 ΔmeanJCT%（負值＝快於 Backfill；每格為 10 seed 配對差之平均 ± 標準差；括號為 Backfill 該負載點之絕對平均 JCT，s）
+表 6e. 淺負載排序致動評估（真實 CUDA aimix、poisson 到達 **oversub=2**、原生 Priority 致動、ordering-only；每 seed 提交 150 工作，n=10 seeds，seed 42–51；欄位定義同表 6c。注意 Backfill 於淺佇列的 P50 極低但 P99 極高的尾端飢餓形態）
 
-| 臂 | oversub=4（Backfill 260.7 s） | oversub=6（Backfill 304.6 s） |
-|---|--:|--:|
-| FCFS | +10.0 ± 4.5 | +3.3 ± 6.6 |
-| SAC | −10.2 ± 4.4 | −13.0 ± 3.1 |
-| RDSAC-mean | −9.4 ± 5.0 | −11.3 ± 1.9 |
-| RDSAC-cvar | −10.5 ± 3.0 | −12.7 ± 3.4 |
-| RLPD | −10.4 ± 5.2 | −11.4 ± 4.0 |
+| 排程器 | 平均 JCT (s) | P50 (s) | P95 (s) | P99 (s) | ΔmeanJCT% [95% CI] | Wilcoxon *p* | P99<bf |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| FCFS | 167.5 ± 27.2 | 174.8 ± 37.8 | 293.3 ± 42.4 | 306.1 ± 43.0 | +11.7 [+5.2, +18.3] | 0.010 | 10/10 |
+| Backfill（基準） | 151.8 ± 31.3 | 109.2 ± 38.1 | 530.9 ± 178.6 | 652.5 ± 70.0 | — | — | — |
+| SAC | 150.1 ± 30.7 | 148.3 ± 28.7 | 287.8 ± 74.6 | 315.6 ± 101.2 | −0.7 [−6.1, +4.7] | 0.85 | 10/10 |
+| RDSAC-mean | 151.1 ± 33.9 | 151.2 ± 36.7 | 278.8 ± 65.1 | 325.2 ± 104.4 | −0.2 [−7.3, +6.9] | 0.92 | 10/10 |
+| RDSAC-cvar | 151.2 ± 33.3 | 149.7 ± 31.5 | 283.7 ± 69.2 | 334.8 ± 143.1 | −0.2 [−7.0, +6.7] | 1.00 | 9/10 |
+| RLPD | 150.5 ± 34.7 | 148.8 ± 35.0 | 284.7 ± 69.6 | 302.4 ± 71.6 | −0.9 [−7.6, +5.9] | 0.77 | 10/10 |
 
-**詮釋與界限。** 三點結論：（1）重載下 Backfill 之上的 ordering headroom 不僅存在，且**可被現有學習式策略在真實 CUDA、realistic poisson 到達下捕捉**——前提是 RL 須經由一條原生致動路徑取得對*順序*的控制權。這修正了 §5.2／§5.7 的歸因：placement-only 的負向結果與 2.4 倍尾端，相當程度上是「未賦予 RL 順序控制權」與「進程外綁定／節點綁定致動」之限制，而非「RL 無法貢獻」之證明。（2）此結果亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，學習式策略的 P99 反而**穩定低於** Backfill（10/10）——因為此 regime 的尾端主要來自 Backfill 為衝平均而產生的重排飢餓，正是 RL 排序可避免者。（3）界限須明列：本結果為**兩個深／中負載點**（oversub=4 與 6）之量測，二者皆為學習式顯著勝過 Backfill 且優勢隨負載加深而擴大（表 6e）；效益仍具負載相依性（淺佇列下排序無槓桿），最淺負載點（oversub=2）之量測進行中以標出效益翻正之門檻、補足完整三點曲線。此外前展所得為策略的 reactive→static 轉換（arrival-aware，與 §5.6 之 FixedPriorityScheduler 同法），是策略順序的一致近似而非逐步反應重放；本節隔離*排序*效益，RL *placement* 之效果另見 §5.2／§5.7。
+表 6f. 三點 poisson 負載掃描：各臂相對 Backfill 之 seed-level 配對 ΔmeanJCT%（負值＝快於 Backfill；每格為 10 seed 配對差之平均 ± 標準差；括號為 Backfill 該負載點之絕對平均 JCT，s）
 
-> 相關材料見 `runs/step3prio_*/ov{4,6}/`（真實 CUDA poisson oversub=4 與 6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_step3.py,aggregate_step3_sweep.py}`；兩點負載掃描由 `aggregate_step3_sweep.py` 彙整。
+| 臂 | oversub=2（Backfill 151.8 s） | oversub=4（Backfill 260.7 s） | oversub=6（Backfill 304.6 s） |
+|---|--:|--:|--:|
+| FCFS | +11.7 ± 10.0 | +10.0 ± 4.5 | +3.3 ± 6.6 |
+| SAC | −0.7 ± 8.2 | −10.2 ± 4.4 | −13.0 ± 3.1 |
+| RDSAC-mean | −0.2 ± 10.9 | −9.4 ± 5.0 | −11.3 ± 1.9 |
+| RDSAC-cvar | −0.2 ± 10.5 | −10.5 ± 3.0 | −12.7 ± 3.4 |
+| RLPD | −0.9 ± 10.3 | −10.4 ± 5.2 | −11.4 ± 4.0 |
+
+**詮釋與界限。** 三點結論：（1）重載下 Backfill 之上的 ordering headroom 不僅存在，且**可被現有學習式策略在真實 CUDA、realistic poisson 到達下捕捉**——前提是 RL 須經由一條原生致動路徑取得對*順序*的控制權。這修正了 §5.2／§5.7 的歸因：placement-only 的負向結果與 2.4 倍尾端，相當程度上是「未賦予 RL 順序控制權」與「進程外綁定／節點綁定致動」之限制，而非「RL 無法貢獻」之證明。（2）此結果亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，學習式策略的 P99 反而**穩定低於** Backfill（10/10）——因為此 regime 的尾端主要來自 Backfill 為衝平均而產生的重排飢餓，正是 RL 排序可避免者。（3）界限須明列：本結果為**三個負載點**（oversub=2／4／6）之量測，構成單調的負載相依曲線（表 6f）——平均 JCT 上，深／中負載（oversub=4、6）學習式顯著勝過 Backfill、優勢隨負載加深擴大，淺負載（oversub=2）則與 Backfill 統計打平（排序對平均無槓桿之門檻）。效益之負載相依性由此確立；惟三點皆於同一 2×1 小叢集、單一 workload 家族（aimix）量得，跨叢集規模與工作負載組成之外推仍待驗證。此外前展所得為策略的 reactive→static 轉換（arrival-aware，與 §5.6 之 FixedPriorityScheduler 同法），是策略順序的一致近似而非逐步反應重放；本節隔離*排序*效益，RL *placement* 之效果另見 §5.2／§5.7。
+
+> 相關材料見 `runs/step3prio_*/ov{2,4,6}/`（真實 CUDA poisson oversub=2／4／6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_step3.py,aggregate_step3_sweep.py}`；三點負載掃描由 `aggregate_step3_sweep.py` 彙整。
 
 ### 5.9 效益邊界小結
 
@@ -433,7 +446,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 然而 §5.8 顯示，當 RL 經一條**原生排序致動路徑（ordering-only）**取得對*順序*的控制權後，在**真實 CUDA、realistic poisson 到達、深負載（oversub=6）**下，所有學習式策略不僅平均 JCT **顯著勝過生產 Backfill 約 11–13%**（Wilcoxon 皆 *p*=0.002），**尾端 P99 亦同勝約 11–13%**（10 seed 中 10/10 的 P99 低於 Backfill）。此結果一方面**實機確認**了 §5.6 天花板分析對「ordering headroom 隨負載上升」的預測（且**可被現有 DRL 策略捕捉**，修正了先前「出現 headroom 但 DRL 未能捕捉」的暫時性判斷），另一方面也指出 §5.2 的負向結果與 2.4 倍尾端相當程度是**致動路徑**（進程外綁定、節點綁定序列化、順序不由 RL 掌握）之限制，而非策略本身無法貢獻。
 
-因此，現有證據支持的、更精確的結論是：**學習式排程的效益取決於 RL 是否掌握*排序*槓桿、致動路徑是否原生、以及負載是否足以形成可重排的 backlog**——三者具備時，重載下平均 JCT *與*尾端 P99 皆可穩健勝過已充分調校的生產 Slurm 排程。此亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。惟效益具**負載相依性**（淺佇列下排序無槓桿，RL 甚至略差），本文僅測單一深負載點（oversub=6），完整的 poisson 負載掃描列為後續工作；placement 消融（§5.7）則因變異過大而無法提供確定歸因。策略效益整體仍取決於工作負載、負載強度、硬體規模與底層資源分配後端。
+因此，現有證據支持的、更精確的結論是：**學習式排程的效益取決於 RL 是否掌握*排序*槓桿、致動路徑是否原生、以及負載是否足以形成可重排的 backlog**——三者具備時，重載下平均 JCT *與*尾端 P99 皆可穩健勝過已充分調校的生產 Slurm 排程。此亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。惟效益具**負載相依性**：完整的 poisson 三點負載掃描（oversub=2／4／6）顯示，平均 JCT 優勢隨佇列加深由淺負載之與 Backfill 打平（≈0%）擴大至中／深負載之 −10%～−12%（表 6f），即排序須有可重排的 backlog 方生槓桿；placement 消融（§5.7）則因變異過大而無法提供確定歸因。策略效益整體仍取決於工作負載、負載強度、硬體規模與底層資源分配後端。
 
 > 相關材料見 `runs/headroom_*/` 與 `runs/ablation_std_*/`
 
@@ -445,7 +458,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 實驗結果顯示，學習式策略的效益取決於其掌握的排程槓桿、致動路徑與負載強度。在僅控制 placement（節點綁定、順序由 Slurm 決定）的實機路徑下，部分學習式策略（SAC、RDSAC-cvar）在平均 JCT 上僅略優於或打平 FCFS／Backfill，且以顯著尾端代價換得（P99 約為 Slurm-native 的兩倍），未形成相對 size-aware 啟發式的穩健優勢。然而，當策略經一條經驗證的**原生排序致動路徑（ordering-only）**（arrival-aware 前展策略取得完整派遣順序，再以固定 Slurm Priority 交由 Slurm 自身 in-process 排程器致動並自由放置）取得對*順序*的控制權後，在**真實 CUDA、poisson 到達、深負載（oversub=6）**下，所有學習式策略的平均 JCT *與*尾端 P99 皆**顯著勝過生產 Backfill 約 11–13%**（Wilcoxon 皆 *p*=0.002，P99 於 10/10 seed 低於 Backfill）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示先前的負向結果相當程度上係致動路徑（進程外綁定、節點綁定序列化）之限制而非策略本身無法貢獻。
 
-此結果亦修正了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。惟效益具負載相依性（淺佇列下排序無槓桿，RL 甚至略差），本文僅測單一深負載點（oversub=6），完整的 poisson 負載掃描（oversub 2／4／6）與較大型叢集之效能仍待後續驗證；placement 消融亦因變異過大而無法形成確定歸因。
+此結果亦修正了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。惟效益具負載相依性：本文之 poisson 三點負載掃描（oversub=2／4／6）顯示平均 JCT 優勢隨佇列加深由與 Backfill 打平（淺負載）擴大至 −10%～−12%（中／深負載），淺佇列下排序對平均無槓桿；跨較大型叢集與其他工作負載組成之外推仍待後續驗證，placement 消融亦因變異過大而無法形成確定歸因。
 
 ### 6.2 未來展望
 
