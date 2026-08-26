@@ -137,11 +137,11 @@ $$
 \begin{aligned}
 r_t \;=&\; \underbrace{\sum_{j \in \mathcal{C}(t)} \left[ -\frac{\mathrm{JCT}_j}{S} \;-\; \lambda_{\mathrm{fair}}\left(\frac{\mathrm{JCT}_j}{S}\right)^{2} \right]}_{\text{工作完成時計入}} \;+\; \underbrace{\big[\, \gamma\,\phi(s_{t+1}) - \phi(s_t) \,\big]}_{\text{每步 potential shaping}}, \\[4pt]
 \phi(s) \;=&\; -\frac{1}{S\,N}\sum_{i \in \mathcal{P}(s)} \mathrm{wait}_i \;-\; \lambda_{\mathrm{bal}}\cdot \mathrm{imbalance}(s), \\[4pt]
-\mathrm{imbalance}(s) \;=&\; \frac{\operatorname{std}_n\!\big(\mathrm{free\_MPS}_n\big)}{\mathrm{MPS\_per\_GPU}},
+\mathrm{imbalance}(s) \;=&\; \frac{\mathrm{std}_n\big(\mathrm{freeMPS}_n\big)}{\mathrm{MPSperGPU}},
 \end{aligned}
 $$
 
-其中 $\mathcal{C}(t)$ 為在第 $t$ 步完成的工作集合、$\mathcal{P}(s)$ 為狀態 $s$ 下的待排（pending）工作集合。訓練參數：**$\lambda_{\mathrm{fair}}=5.0$、$\lambda_{\mathrm{bal}}=5.0$、$\gamma=0.99$、$S=\text{reward\_scale}=20000$、$N=$ 每 episode 工作數**。各項意義如下：
+其中 $\mathcal{C}(t)$ 為在第 $t$ 步完成的工作集合、$\mathcal{P}(s)$ 為狀態 $s$ 下的待排（pending）工作集合。訓練參數：**$\lambda_{\mathrm{fair}}=5.0$、$\lambda_{\mathrm{bal}}=5.0$、$\gamma=0.99$、$S=20000$（reward_scale）、$N=$ 每 episode 工作數**。各項意義如下：
 
 - **完成項**（工作完成時計入）：$-\mathrm{JCT}_j/S$，其中 $\mathrm{JCT}=$ 完成時間 $-$ 提交時間、已含 queue delay，$S$ 使該項落於 $O(0.1)$ 尺度。此為主要吞吐訊號。
 - **公平／抗飢餓項**：$-\lambda_{\mathrm{fair}}(\mathrm{JCT}_j/S)^{2}$，對單一工作 JCT 的**凸（平方）懲罰**。其效果為將目標由純平均改寫為
@@ -153,7 +153,7 @@ $$
   是一個**改變目標**的項（非 optimum-preserving），刻意以少許平均換取有界的最差情況——這正是純平均-JCT reward 無法表達、而 §5.8 尾端結果所需者。
 - **Potential-based shaping** $\gamma\,\phi(s')-\phi(s)$ [31]：提供密集訊號且**不改變最優策略**（Ng et al. 1999）。$\phi$ 含兩部分——(i) 待排工作的累計等待（排入工作即降低總等待 $\to$ 每步正向 bonus）；(ii) **節點負載均衡項** $-\lambda_{\mathrm{bal}}\cdot\mathrm{imbalance}$，懲罰把負載集中於單一節點，於 2×1 異質叢集促進 free-MPS 平衡。
 
-需澄清兩點：其一，早期版本另設一個每步 GPU-util 輔助項（`mo_w_util`），本研究之產出模型將其**權重設為 0**（`mo_w_util=0`）——因其每步累積效果隨 episode 長度漂移，且與吞吐目標高度相關而冗餘，移除後訓練更穩定。其二，**interference（干擾）並非 reward 項而是環境動力學**：訓練環境設 `interference=0.3`，即工作的實際執行時間為
+需澄清一點：**interference（干擾）並非 reward 項而是環境動力學**。訓練環境設 `interference=0.3`，即工作的實際執行時間為
 
 $$
 \mathrm{runtime}_{\text{real}} \;=\; \mathrm{runtime}_{\text{nominal}} \times \big(1 + 0.3\,k\big), \qquad k = \text{同一 GPU 上的共置工作數},
@@ -250,7 +250,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | IQN 分位數 N_QUANT／cosine 維度 | 32／64（RDSAC 臂） |
 | 風險目標／tail mass β | CVaR／0.25（RDSAC-cvar 臂） |
 | 溫度 α | 固定 0.05 |
-| reward（§3.1） | mo：−JCT/S 完成項＋凸公平項 λ_fair=5.0＋potential shaping（等待＋節點均衡 λ_bal=5.0）；mo_w_util=0、S=reward_scale=20000；環境 interference=0.3 |
+| reward（§3.1） | mo：−JCT/S 完成項＋凸公平項 λ_fair=5.0＋potential shaping（等待＋節點均衡 λ_bal=5.0）；S=reward_scale=20000；環境 interference=0.3 |
 | 訓練長度 | 每臂約 1×10⁵ curriculum env-steps |
 
 圖 2 為三個學習臂在 aimix-family 課程訓練下的 episode reward 與 critic loss（跨 seed、rolling window w=80 平滑）。三臂皆使用固定溫度 α=0.05；曲線在課程切換後維持有限值，未出現數值發散。由於不同 critic 的 loss 尺度不可直接比較，圖 2 僅用於檢查訓練穩定性，不據此判定策略優劣。
