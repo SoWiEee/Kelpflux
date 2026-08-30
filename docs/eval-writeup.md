@@ -1,5 +1,7 @@
 # Evaluation Report
 
+> **歷史文件說明。** 本報告為預-RDSAC-rewrite 的評估歷程紀錄，數字與部分結論已被 `docs/paper.md`（尤其 §5.8 排序致動結果）取代。倉庫清理時移除了下列僅供本歷史附錄使用的 harness 腳本，其內文仍以原名引用之，**可由 git 歷史回溯**：`run_aiserve_live.py`、`eval_aiserve.py`、`baseline_switch.py`、`run_live_5arm.sh`、`plot_paper_figures.py`、`sweep_stochastic.py`、`run_heavytail_ab.py`。最終定案的評估 harness 見 `eval/scripts/{run_step3_prio.sh,scontrol_ab.py,aggregate_step3*.py,run_heavy150_aimix_5arm.sh,run_aimix6.sh}`。
+
 整理模擬環境與實機環境的評估報告，清楚比較三種排程方式的行為（啟發式 score、、SAC、RDSAC），並在真實 2 Nodes × 1 GPU 環境中，評估 DRL 排程到底有沒有贏過啟發式演算法。
 
 ## 訓練與評估管線

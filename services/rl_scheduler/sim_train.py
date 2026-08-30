@@ -210,8 +210,6 @@ def sim_train(
     reward_mode: str = "jct_aligned",
     reward_scale: float = 20_000.0,   # base-policy training scale (§5.1). Differs from
     #   gym_env's env default (1000, used by RLPD/live to match the online-log −JCT/1000).
-    mo_w_jct: float = 1.0,
-    mo_w_util: float = 0.05,
     device: str = "cpu",
     log_every: int = 5_000,
     use_iqn: bool = True,
@@ -285,7 +283,6 @@ def sim_train(
         max_steps=active_n_jobs * max_steps_mult,
         reward_mode=reward_mode,
         reward_scale=reward_scale,
-        mo_w_jct=mo_w_jct, mo_w_util=mo_w_util,
         potential_shaping=potential_shaping,
         balance_coef=balance_coef,
         fairness_coef=fairness_coef,
@@ -511,8 +508,8 @@ def main(argv=None) -> int:
     # −JCT completion term + convex fairness penalty (--fairness-coef) + potential
     # shaping (wait + node balance via --balance-coef), learned under co-residency
     # interference (--interference). The old --reward-mode / --mo-w-jct / --mo-w-util
-    # knobs were removed; uxprl/shaped/jct_aligned remain internal (uxprl via --uxprl,
-    # RLPD/eval construct the env directly).
+    # single-vs-multi-objective knobs were removed; the jct_aligned variant remains
+    # internal (RLPD/eval construct the env directly).
     p.add_argument("--reward-scale",  type=float, default=20_000.0,
                    help="divisor on -JCT; larger → smaller returns "
                         "(keeps entropy term competitive with Q, default 20000)")
@@ -528,15 +525,6 @@ def main(argv=None) -> int:
                    help="risk distortion in the RDSAC actor objective")
     p.add_argument("--value-clip",           type=float, default=0.0,
                    help="Duan et al. 2021 target return-clip boundary b (0 = off)")
-    p.add_argument("--uxprl",                action="store_true",
-                   help="UXP-RL (Lin et al. 2025): faithful value-based DQN with "
-                        "ε-greedy + inference-weighted reward. Uses its own lean "
-                        "training loop (no score-warmup/n-step/PER); most other "
-                        "flags are ignored.")
-    p.add_argument("--uxprl-c1",             type=float, default=1.0,
-                   help="UXP-RL reward weight for non-inference tasks")
-    p.add_argument("--uxprl-c2",             type=float, default=2.0,
-                   help="UXP-RL reward weight for inference tasks (c2 > c1)")
     p.add_argument("--risk-beta",            type=float, default=0.25,
                    help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
     # Temperature (entropy) controls
@@ -625,25 +613,6 @@ def main(argv=None) -> int:
 
     traces = args.trace if len(args.trace) > 1 else args.trace[0]
 
-    # ── UXP-RL (Lin et al. 2025): faithful DQN path with its own lean loop ──
-    if args.uxprl:
-        from services.rl_scheduler.uxprl import train_uxprl
-        node_speeds = [float(s) for s in args.node_speeds.split(",") if s.strip()] or None
-        print(f"[sim_train] arch=UXP-RL(DQN)  n={args.n_nodes}×{args.gpus_per_node}  "
-              f"trace={traces}  steps={args.total_steps:,}  n_jobs={args.n_jobs}  "
-              f"c1={args.uxprl_c1} c2={args.uxprl_c2}  "
-              f"curriculum={args.curriculum}  device={device}")
-        train_uxprl(
-            n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
-            trace_family=traces, n_jobs=args.n_jobs,
-            total_steps=args.total_steps, warmup_steps=args.warmup_steps,
-            seed=args.seed, out_dir=Path(args.out_dir), device=device,
-            uxprl_c1=args.uxprl_c1, uxprl_c2=args.uxprl_c2,
-            curriculum=args.curriculum, node_speeds=node_speeds,
-            max_steps_mult=args.max_steps_mult,
-        )
-        return 0
-
     use_iqn = not args.no_iqn
     family = "RDSAC" if use_iqn else "SAC"
     arch = f"{family}+MLP"
@@ -662,7 +631,6 @@ def main(argv=None) -> int:
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
         seed=args.seed, reward_mode="mo",   # single unified reward (no single/multi toggle)
         reward_scale=args.reward_scale,
-        mo_w_jct=1.0, mo_w_util=0.0,
         out_dir=Path(args.out_dir), device=device,
         use_iqn=use_iqn,
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,

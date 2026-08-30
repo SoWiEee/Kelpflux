@@ -48,14 +48,10 @@ from sim.gym_env import (
     env_dims,
 )
 from services.rl_scheduler.dsac import DSACAgent
-from services.rl_scheduler.uxprl import UXPRLAgent
 
 
 def _load_agent(ckpt: Path):
-    """Load the right agent family from a checkpoint. UXP-RL checkpoints carry an
-    ``algo="uxprl"`` marker; everything else is a DSAC-family (SAC/RDSAC) model."""
-    if UXPRLAgent.is_uxprl_checkpoint(ckpt):
-        return UXPRLAgent.load(str(ckpt))
+    """Load the DSAC-family (SAC/RDSAC) agent from a checkpoint."""
     return DSACAgent.load(str(ckpt))
 
 
@@ -477,8 +473,6 @@ class ReloadRequest(BaseModel):
 
 
 def _variant_of(agent) -> str:
-    if isinstance(agent, UXPRLAgent):
-        return "UXP-RL"
     if getattr(agent, "use_iqn", True):
         return f"RDSAC:{getattr(agent, 'risk_mode', 'mean')}"
     return "SAC"

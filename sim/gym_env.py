@@ -246,28 +246,6 @@ def decode_action(a: int) -> Tuple[int, int, int]:
     return job_i, node_j, gpu_k
 
 
-def uxprl_task_reward(jct: float, job_class: str, slo_s: float,
-                      c1: float = 1.0, c2: float = 2.0) -> float:
-    """UXP-RL per-task reward (Lin et al. 2025, IEEE TNSM §IV-B.3).
-
-        r = c1 / T_T                                if non-inference
-        r = c2 / T_T                                if inference, T_T ≤ Δ^I
-        r = c2 / T_T · 1/(T_T − Δ^I + 1)            if inference, T_T > Δ^I
-
-    T_T is the task turnaround (= jct here); inference tasks (``job_class ==
-    "inference"``, the paper's Z=3) earn c2 > c1, and turnaround past the Δ^I
-    deadline (``slo_s``) is damped. An inference task with ``slo_s <= 0`` is
-    treated as having no deadline (Δ^I = ∞ → no penalty).
-    """
-    t_t = max(1e-6, jct)
-    if job_class == "inference":
-        delta = slo_s if slo_s > 0.0 else float("inf")
-        r = c2 / t_t
-        if t_t > delta:
-            r *= 1.0 / (t_t - delta + 1.0)
-        return r
-    return c1 / t_t
-
 
 # ── Run state ─────────────────────────────────────────────────────────────
 
@@ -307,16 +285,12 @@ class KubefluxSchedEnv:
         mps_per_gpu: int = MPS_PER_GPU,
         top_k: int = TOP_K,
         max_steps: int = 50_000,
-        reward_mode: str = "jct_aligned",   # "jct_aligned" | "shaped" | "uxprl"
+        reward_mode: str = "jct_aligned",   # "jct_aligned" (RLPD/eval) | "mo" (training)
         reward_scale: float = 1000.0,   # NOTE: env default = 1000 (used by RLPD/live,
         #   whose online-log logs −JCT/1000). sim_train.py passes 20000 for the base
         #   policy training (§5.1). Keep the two consistent per-pipeline; don't assume
         #   one global scale — mismatching offline↔online reward scales breaks RLPD.
         placement_reward_scale: float = 0.01,
-        uxprl_c1: float = 1.0,   # UXP-RL reward weight for non-inference tasks
-        uxprl_c2: float = 2.0,   # UXP-RL reward weight for inference tasks (c2 > c1)
-        mo_w_jct: float = 1.0,   # reward_mode="mo": weight on the −JCT (throughput) term
-        mo_w_util: float = 0.05, # reward_mode="mo": weight on the per-step GPU-util term
         potential_shaping: bool = False,
         balance_coef: float = 0.0,
         fairness_coef: float = 0.0,   # convex (quadratic) per-job JCT penalty (obj-changing)
@@ -345,7 +319,7 @@ class KubefluxSchedEnv:
             raise ImportError("gymnasium is not installed")
         if ablation_mode not in (None, "placement_only", "job_only"):
             raise ValueError(f"ablation_mode={ablation_mode!r}")
-        if reward_mode not in ("jct_aligned", "shaped", "uxprl", "mo"):
+        if reward_mode not in ("jct_aligned", "mo"):
             raise ValueError(f"reward_mode={reward_mode!r}")
 
         self.jobs_factory           = jobs_factory
@@ -357,15 +331,6 @@ class KubefluxSchedEnv:
         self.reward_mode            = reward_mode
         self.reward_scale           = float(reward_scale)
         self.placement_reward_scale = float(placement_reward_scale)
-        # UXP-RL (Lin et al. 2025) reward weights: inference tasks earn c2 > c1.
-        self.uxprl_c1               = float(uxprl_c1)
-        self.uxprl_c2               = float(uxprl_c2)
-        # Multi-objective (reward_mode="mo") weights: −JCT (finish fast) vs +GPU
-        # utilization (keep cards busy). These genuinely trade off on this cluster —
-        # tight MPS packing raises utilization but its interference raises JCT.
-        self.mo_w_jct               = float(mo_w_jct)
-        self.mo_w_util              = float(mo_w_util)
-        self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
         self.potential_shaping      = potential_shaping
         # P1 (anti-over-concentration): potential-based node-balance shaping.
         # φ gains a −balance_coef·imbalance term so moving toward an even free-MPS
@@ -531,22 +496,15 @@ class KubefluxSchedEnv:
             for j in st.pending:
                 end_charge -= (st.now - j.submit_ts) / self.reward_scale
 
-        if self.reward_mode == "uxprl":
-            # Faithful UXP-RL reward is *only* the completion-based term (positive,
-            # per-task, inference-weighted). No placement shaping, no final-pending
-            # charge, no potential shaping — those belong to other methods.
+        if self.reward_mode == "mo":
+            # The unified training reward: −JCT/scale completion term (+ convex
+            # fairness penalty, both folded into st.completion_reward by _on_job_end)
+            # plus potential shaping (wait + node balance). No placement reward, no
+            # final-pending charge — that is the "mo" flavor the paper models use.
             reward = st.completion_reward
-        elif self.reward_mode == "mo":
-            # Multi-objective scalarization: −w_jct·JCT (completion, throughput) +
-            # w_util·utilization (per step, keep GPUs busy). st.completion_reward
-            # already holds −JCT/scale from _on_job_end (mo branch).
-            reward = (self.mo_w_jct * st.completion_reward
-                      + self.mo_w_util * st.cluster.utilization())
-            # P1 balance shaping also applies under mo (potential-based → optimum-
-            # preserving, Ng et al. 1999); guarded so balance_coef=0 leaves mo unchanged.
             if self.potential_shaping or self.balance_coef > 0.0:
                 reward += 0.99 * self._potential() - phi_prev
-        else:
+        else:  # jct_aligned (RLPD offline prior / ablation / eval rollouts)
             reward = r_place + st.completion_reward + end_charge
             if self.potential_shaping or self.balance_coef > 0.0:
                 reward += 0.99 * self._potential() - phi_prev
@@ -826,25 +784,15 @@ class KubefluxSchedEnv:
         st.jct_sum += jct
         st.jcts.append(jct)
         st.jct_records.append((jid, jct))
-        if self.reward_mode == "uxprl":
-            st.completion_reward += uxprl_task_reward(
-                jct, j.job_class, j.slo_s, self.uxprl_c1, self.uxprl_c2
-            ) / self.reward_scale
-        elif self.reward_mode == "shaped":
-            b_jct, b_slow = self.reward_betas
-            runtime  = max(1.0, j.runtime)
-            slowdown = max(1.0, jct / runtime)
-            st.completion_reward += (b_jct * (-jct / self.reward_scale)
-                                     + b_slow * (-math.log(slowdown)))
-        else:  # jct_aligned / mo
-            st.completion_reward += -jct / self.reward_scale
-            # Fairness/anti-starvation: a CONVEX per-job penalty on JCT. Squaring the
-            # normalized JCT makes the objective min Σ(JCT + fairness·JCT²) = mean + a
-            # tail/variance term. Unlike potential shaping (optimum-preserving), this
-            # CHANGES the objective — trading a little mean for a bounded worst case,
-            # which is exactly what the mean-JCT reward could not express.
-            if self.fairness_coef > 0.0:
-                st.completion_reward += -self.fairness_coef * (jct / self.reward_scale) ** 2
+        # jct_aligned / mo: −JCT/scale + (opt-in) convex fairness penalty.
+        st.completion_reward += -jct / self.reward_scale
+        # Fairness/anti-starvation: a CONVEX per-job penalty on JCT. Squaring the
+        # normalized JCT makes the objective min Σ(JCT + fairness·JCT²) = mean + a
+        # tail/variance term. Unlike potential shaping (optimum-preserving), this
+        # CHANGES the objective — trading a little mean for a bounded worst case,
+        # which is exactly what the mean-JCT reward could not express.
+        if self.fairness_coef > 0.0:
+            st.completion_reward += -self.fairness_coef * (jct / self.reward_scale) ** 2
         # SLO lateness penalty (opt-in): latency-class jobs past deadline.
         if self.slo_penalty > 0.0 and j.slo_s > 0.0 and jct > j.slo_s:
             st.completion_reward += -self.slo_penalty * (jct - j.slo_s) / self.reward_scale

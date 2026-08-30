@@ -40,11 +40,8 @@ def serve(monkeypatch):
             raise AssertionError("tests should inject _holder directly")
 
     fake_dsac.DSACAgent = _UnusedDSACAgent
-    # serve imports uxprl, which imports dsac._build_mlp at module load; provide a
-    # stub so the faked dsac satisfies that import (never called — _holder injected).
     fake_dsac._build_mlp = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "services.rl_scheduler.dsac", fake_dsac)
-    sys.modules.pop("services.rl_scheduler.uxprl", None)
     sys.modules.pop("services.rl_scheduler.serve", None)
     module = importlib.import_module("services.rl_scheduler.serve")
 

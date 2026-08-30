@@ -160,19 +160,6 @@ def test_noop_policy_truncates():
     env.close()
 
 
-def test_shaped_reward_mode():
-    env = KubefluxSchedEnv(_single_gpu_factory(n_jobs=20), reward_mode="shaped")
-    env.reward_betas = (1.0, 0.5)
-    rng = np.random.default_rng(1)
-    obs, _ = env.reset(seed=1)
-    for _ in range(50):
-        legal = np.where(env.action_mask())[0]
-        _, _, terminated, truncated, _ = env.step(int(rng.choice(legal)))
-        if terminated or truncated:
-            break
-    env.close()
-
-
 # ── placement-aware allocation ───────────────────────────────────────────
 
 def test_placement_action_schedules_on_correct_gpu():
