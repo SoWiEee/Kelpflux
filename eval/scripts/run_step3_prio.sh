@@ -127,7 +127,10 @@ run_phases(){ # runs the fcfs/main phases at the current CUR_OVERSUB/CUR_OUT
           for ARM in "${ARMS[@]}"; do
             CKPT=$(ck_for "$ARM" "$SEED")
             if [ -n "$CKPT" ] && [ ! -f "$CKPT" ]; then log "  SKIP $ARM s$SEED (no ckpt)"; continue; fi
-            WARM=priority; [ "$ARM" = "backfill" ] && WARM=backfill
+            # ACTUATION selects how the learned arms are actuated:
+            #   priority (default) = §5.8 static ordering via fixed Slurm Priority
+            #   online             = event-driven Option C (full select+place, run_online_arm)
+            WARM="${ACTUATION:-priority}"; [ "$ARM" = "backfill" ] && WARM=backfill
             run_client "$WARM" "$ARM" "$SEED" "$CKPT"
           done
         done

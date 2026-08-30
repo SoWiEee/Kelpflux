@@ -21,8 +21,10 @@ can't be backfilled elsewhere → ~1 concurrent). Order-only actuation avoids bo
 and — since §5.2/table 6b showed RL *placement* has no robust benefit — isolates
 the pure *ordering* effect.
 
-Arms (``--arm``): ``priority`` (RL order via fixed Priority), ``backfill`` and
-``fcfs`` (Slurm-native controls, no RL), plus legacy ``bind``/``scontrol``.
+Arms (``--arm``): ``priority`` (RL ORDER via fixed Priority — §5.8 static, decision-
+faithful but reacts to a modeled drain), ``online`` (event-driven Option C — the FULL
+joint select+place action actuated against the LIVE cluster, run_online_arm), ``backfill``
+and ``fcfs`` (Slurm-native controls, no RL), plus legacy ``bind``/``scontrol``.
 Workload ``--real-workload`` = real CUDA AiMix (BERT/ResNet/Qwen/cuBLAS); default
 = ``sleep <rt>`` holding ``mps:<req>`` (wait-dominated proxy). Arrival ``--arrival-mode
 poisson`` (mean gap = mean(runtime)/oversub) or ``burst``. Compares JCT / wait
@@ -33,7 +35,7 @@ Usage (driven by run_step3_prio.sh across an oversub load sweep):
       --real-workload --arrival-mode poisson --oversub 6 --out-json out.json
 """
 from __future__ import annotations
-import argparse, json, subprocess, time, sys, urllib.request
+import argparse, json, os, subprocess, time, sys, urllib.request
 import numpy as np
 from sim.loader import generate_by_family
 from services.rl_scheduler.placement_controller import (
@@ -387,6 +389,116 @@ def run_priority_arm(jobs):
     return list(sid_rank)
 
 
+def run_online_arm(jobs, deadline_min=25):
+    """Event-driven Option C: the FULL joint (select job × place GPU) action, actuated
+    ONLINE against live cluster state — the training-faithful deployment the §5.8 static
+    priority arm approximates.
+
+    Why this exists / how it differs from run_scontrol_arm (the FAILED poll version):
+    run_scontrol_arm re-snapshotted on a FIXED ``sleep(2)`` every cycle; that constant
+    idle between a job finishing and the next poll injected the actuation-latency
+    confound that collapsed all arms onto Backfill (~+35%), which is why §5.8 pivoted to
+    static priority. Here the loop is EVENT-DRIVEN: it sleeps only until the next
+    *predicted* completion (we know each job's runtime), capped at ``REACT_CAP`` so a
+    single cheap squeue corrects real-vs-predicted drift — idle is bounded to ≈REACT_CAP
+    + one batched actuate, not a fixed 2 s. Actuation is BATCHED (all placeable held jobs
+    released in one kubectl exec) and GATED on the node being free right now (so a job is
+    never pinned to a busy node → no -w serialization, cf. run_priority_arm).
+
+    Jobs are submitted HELD at their poisson arrival (background thread); the main loop
+    repeatedly asks the policy for (selected_job_id, node_j) over the currently
+    arrived+held top-16 window and releases onto the confirmed-free node via
+    ``scontrol update ReqNodeList=<node>`` + ``scontrol release`` (CLI — the REST
+    required_nodes path is disabled on slurmrestd v0.0.37). RL owns ORDER+NODE, Slurm
+    owns only low-level start; the online reaction is to REAL completion times (and thus
+    real MPS interference), which the static drain cannot model."""
+    import threading
+    REACT_CAP = float(os.environ.get("ONLINE_REACT_CAP", "1.0"))  # max idle past a real completion
+    meta = {}          # sid -> job dict (+ arrival)
+    lock = threading.Lock()
+    submitted_done = {"flag": False}
+
+    def submit_held_one(j):
+        sid = submit(j, held=True)
+        if sid:
+            with lock:
+                meta[sid] = dict(j)
+
+    def submitter():
+        submit_stream(jobs, submit_held_one)
+        submitted_done["flag"] = True
+
+    th = threading.Thread(target=submitter, daemon=True); th.start()
+
+    running = {}       # sid -> (node, predicted_end, mps)
+    deadline = time.time() + deadline_min * 60
+    while time.time() < deadline:
+        held, nodes = squeue_snapshot()          # real free_mps + real held set (drift-correct)
+        with lock:
+            held = [(sid, nm, mps) for (sid, nm, mps) in held if sid in meta]
+        free = {n.name: n.free_mps for n in nodes}
+        # `running` (jobs we released) is only for TIMING the event-driven sleep; prune by
+        # PREDICTED completion (real free_mps below is the source of truth for capacity, so
+        # a wrong prediction only affects sleep length, never causes over-dispatch). Do NOT
+        # prune by "no longer held" — a released job leaves the held set immediately, which
+        # would empty the model and degrade the loop back to fixed-interval polling.
+        now0 = time.time()
+        for sid in [s for s, v in running.items() if v[1] <= now0]:
+            running.pop(sid, None)
+        # exclude jobs we've already released this run (held/running race window)
+        remaining = {sid: mps for (sid, _nm, mps) in held if sid not in running}
+        batch = []
+        while remaining:
+            sjobs = [SlurmJob(job_id=sid, name="x", state="PENDING", reason="JobHeld",
+                              mps_req=meta[sid]["mps"], gpu_count=1, gpu_type=meta[sid]["gtype"],
+                              runtime=meta[sid]["rt"], submit_ts=meta[sid].get("arrival", 0.0))
+                     for sid in remaining]
+            fnodes = [SlurmNode(name=n.name, free_mps=int(free[n.name]), running_jobs=0,
+                                gpu_type=n.gpu_type) for n in nodes]
+            try:
+                act = post_act(build_act_payload(sjobs, fnodes, mps_per_gpu=MPS_PER_GPU),
+                               scheduler_url=SERVE, timeout=10)
+            except Exception:
+                act = {}
+            sel = act.get("selected_job_id"); node_j = act.get("node_j")
+            sid = node = need = None
+            if sel in remaining and node_j is not None and 0 <= int(node_j) < len(NODES):
+                cand_node = NODES[int(node_j)]
+                if free[cand_node] >= remaining[sel]:
+                    sid, node, need = sel, cand_node, remaining[sel]
+            if sid is None:   # RL abstained / no-fit → first-fit oldest-arrived
+                for c in sorted(remaining, key=lambda s: meta[s].get("arrival", 0.0)):
+                    for n in NODES:
+                        if free[n] >= remaining[c]:
+                            sid, node, need = c, n, remaining[c]; break
+                    if sid:
+                        break
+                if sid is None:
+                    break     # nothing fits current free capacity → wait for a completion
+            batch.append((sid, node))
+            free[node] -= need
+            running[sid] = (node, time.time() + meta[sid]["rt"], need)
+            remaining.pop(sid)
+        if batch:
+            cmd = "; ".join(f"scontrol update job={sid} ReqNodeList={node} 2>&1; scontrol release {sid} 2>&1"
+                            for sid, node in batch)
+            _exec(CTL, cmd, timeout=120)
+        # exit when the submitter is done and nothing is held or running in our model
+        with lock:
+            all_in = submitted_done["flag"] and len(meta) >= len(jobs)
+        if all_in and not held and not running:
+            break
+        # EVENT-DRIVEN sleep: until the next predicted completion, capped at REACT_CAP
+        now = time.time()
+        next_end = min((e for _, e, _ in running.values()), default=now + REACT_CAP)
+        time.sleep(max(0.05, min(REACT_CAP, next_end - now)))
+    with lock:
+        ids = list(meta.keys())
+    print(f"[online] event-driven C: {len(ids)} held jobs actuated (select+place, "
+          f"react_cap={REACT_CAP}s)", flush=True)
+    return ids
+
+
 def run_backfill_arm(jobs):
     """Baseline: submit every job UNHELD (no -w, no priority) at its poisson arrival
     time — Slurm's own scheduler picks both order AND node. Used for BOTH the Backfill
@@ -436,7 +548,7 @@ def collect_jct(ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol", "backfill", "priority", "fcfs"], required=True)
+    ap.add_argument("--arm", choices=["bind", "scontrol", "online", "backfill", "priority", "fcfs"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
@@ -472,6 +584,8 @@ def main():
           f"arrival={a.arrival_mode} span={span:.0f}s", flush=True)
     if a.arm == "scontrol":
         ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
+    elif a.arm == "online":
+        ids = run_online_arm(jobs, deadline_min=a.deadline_min)
     elif a.arm == "priority":
         ids = run_priority_arm(jobs)
     elif a.arm in ("backfill", "fcfs"):
