@@ -418,9 +418,17 @@ $$
 | RDSAC-cvar | −0.2 ± 10.5 | −10.5 ± 3.0 | −12.7 ± 3.4 |
 | RLPD | −0.9 ± 10.3 | −10.4 ± 5.2 | −11.4 ± 4.0 |
 
+**學習式策略學到了什麼（排序機制分析）。** 為打開上述行為結果的黑箱，將每個 checkpoint 的派遣順序（以 §5.8 同一 arrival-aware 前展、rolling top-16 介面讀出）與同一工作流上的兩個參考排序比較：FCFS（依到達）與純 SJF（依真實 runtime、短工作優先，亦即 Backfill 短工作重排所近似、且會把長工作餓入尾端者）。結果（四臂型態幾乎一致，10 seed）與負載相依曲線精確吻合：
+
+- **淺負載（oversub=2）**：$\rho(\text{rank},\text{runtime})\approx+0.02$、$\rho(\text{rank},\text{arrival})\approx+0.99$——佇列近空、top-16 視窗過小，策略幾乎無重排自由度，退化為 FCFS。這正是淺載與 Backfill 打平的機制：**無序可排**。
+- **深負載（oversub=6）**：$\rho(\text{rank},\text{runtime})$ 升至 $\approx+0.25$、$\rho(\text{rank},\text{arrival})$ 降至 $\approx0.6\text{–}0.8$——持續 backlog 給出可重排視窗，策略浮現**溫和的 SJF 傾向**（短工作／inference 類最先，per-class rank-pct：inference $\approx0.31$、llm/batch $\approx0.63$），壓低平均 JCT。
+- **關鍵——尾端保護**：最長 20% 工作在 RL 下的平均 rank-percentile $\approx0.54$，而純 SJF 會把它們排到 $\approx0.90$（近佇列末端）。即策略**並非全 SJF**，而是對長工作施加**有界延遲**（$\Delta\approx-0.36$），使其不被餓入尾端。
+
+這解釋了 §5.8 何以能*同時*取得低平均（SJF 傾向）與低尾端（長工作有界延遲）：學習式策略等效於一個**負載自適應、溫和 SJF 但帶尾端上限**的排序——淺載退化為 FCFS，深載在 SJF 與公平之間取一個 Backfill 的貪婪重排達不到的折衷（圖見 `runs/rl_order_analysis/`）。
+
 **詮釋與界限。** 三點結論：（1）重載下 Backfill 之上的 ordering headroom 不僅存在，且**可被現有學習式策略在真實 CUDA、realistic poisson 到達下捕捉**——前提是 RL 須經由一條原生致動路徑取得對*順序*的控制權。這修正了 §5.2／§5.7 的歸因：placement-only 的負向結果與 2.4 倍尾端，相當程度上是「未賦予 RL 順序控制權」與「進程外綁定／節點綁定致動」之限制，而非「RL 無法貢獻」之證明。（2）此結果亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，學習式策略的 P99 反而**穩定低於** Backfill（10/10）——因為此 regime 的尾端主要來自 Backfill 為衝平均而產生的重排飢餓，正是 RL 排序可避免者。（3）界限須明列：本結果為**三個負載點**（oversub=2／4／6）之量測，構成單調的負載相依曲線（表 6f）——平均 JCT 上，深／中負載（oversub=4、6）學習式顯著勝過 Backfill、優勢隨負載加深擴大，淺負載（oversub=2）則與 Backfill 統計打平（排序對平均無槓桿之門檻）。效益之負載相依性由此確立；惟三點皆於同一 2×1 小叢集、單一 workload 家族（aimix）量得，跨叢集規模與工作負載組成之外推仍待驗證。此外前展所得為策略的 reactive→static 轉換（arrival-aware，與 §5.6 之 FixedPriorityScheduler 同法），是策略順序的一致近似而非逐步反應重放；本節隔離*排序*效益，RL *placement* 之效果另見 §5.2／§5.7。
 
-> 相關材料見 `runs/step3prio_*/ov{2,4,6}/`（真實 CUDA poisson oversub=2／4／6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_step3.py,aggregate_step3_sweep.py}`；三點負載掃描由 `aggregate_step3_sweep.py` 彙整。
+> 相關材料見 `runs/step3prio_*/ov{2,4,6}/`（真實 CUDA poisson oversub=2／4／6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_step3.py,aggregate_step3_sweep.py}`；三點負載掃描由 `aggregate_step3_sweep.py` 彙整。排序機制分析（RL order vs SJF/FCFS 的 Spearman、長工作 rank-pct、per-class）由 `eval/scripts/analyze_rl_order.py` 產出至 `runs/rl_order_analysis/`（含散點圖）。
 
 ### 5.9 效益邊界小結
 
