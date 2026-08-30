@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""scontrol-actuated held-job placement A/B — does giving the RL job-SELECTION
-(not just node) via scontrol pin+release reduce the wait tail vs the -w bind path?
+"""Ordering-actuated A/B (paper §5.8) — does giving the RL agent control of the
+dispatch ORDER (not just node) beat Slurm's own Backfill/FCFS ordering?
 
-Slurm 21.08.5's slurmrestd v0.0.37 disables ``required_nodes`` in job updates
-(validated: "Operation not permitted"), but ``scontrol update job=X
-ReqNodeList=Y`` + ``scontrol release`` works. This drives that path.
+FINAL method = ordering-only, native Priority actuation. The served policy is
+rolled forward over a deterministic, arrival-aware two-node drain (in-memory,
+repeated ``/act`` calls; jobs enter the pending set only after their arrival, and
+the policy sees the same rolling top-16 window as the live select interface) to
+read its full dispatch ORDER. Each job is then submitted UNHELD at its arrival
+time and immediately given a fixed administrator ``scontrol update Priority=N``
+(``direct_set_prio`` — sticks only on unheld jobs; setting it while held gets
+recomputed by multifactor). Slurm's OWN in-process backfill scheduler then
+actuates by that priority at native speed and PLACES jobs freely (no ``-w`` pin)
+— RL owns ORDER, Slurm owns PLACEMENT + TIMING.
 
-Two arms, SAME job stream (aimix, runtime scaled to <= --target-max, burst-submitted
-so the scheduler is stressed), workload = ``sleep <rt>`` holding ``mps:<req>`` (the
-tail is wait-dominated, so sleep+MPS reproduces the queueing without real CUDA):
-  bind     : submit all immediately; RL picks node per job (-w); Slurm picks order.
-  scontrol : submit all HELD; loop /act → RL picks (job, node) → scontrol pin+release.
+Why this shape (two confounds removed): (i) an out-of-process hold/poll-release
+loop injects ~30-100 s/cycle of idle actuation latency that collapses every
+policy onto Backfill (~+35%); (ii) pinning RL's node with ``sbatch -w`` under
+poisson arrival serializes the cluster (a high-prio job pinned to a busy node
+can't be backfilled elsewhere → ~1 concurrent). Order-only actuation avoids both
+and — since §5.2/table 6b showed RL *placement* has no robust benefit — isolates
+the pure *ordering* effect.
 
-Usage:
-  python -m eval.scripts.scontrol_ab --arm scontrol --n-jobs 50 --seed 42
-Compares JCT / wait tail from sacct.
+Arms (``--arm``): ``priority`` (RL order via fixed Priority), ``backfill`` and
+``fcfs`` (Slurm-native controls, no RL), plus legacy ``bind``/``scontrol``.
+Workload ``--real-workload`` = real CUDA AiMix (BERT/ResNet/Qwen/cuBLAS); default
+= ``sleep <rt>`` holding ``mps:<req>`` (wait-dominated proxy). Arrival ``--arrival-mode
+poisson`` (mean gap = mean(runtime)/oversub) or ``burst``. Compares JCT / wait
+tail from sacct.
+
+Usage (driven by run_step3_prio.sh across an oversub load sweep):
+  python -m eval.scripts.scontrol_ab --arm priority --n-jobs 150 --seed 42 \
+      --real-workload --arrival-mode poisson --oversub 6 --out-json out.json
 """
 from __future__ import annotations
 import argparse, json, subprocess, time, sys, urllib.request

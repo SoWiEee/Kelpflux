@@ -208,7 +208,8 @@ def sim_train(
     seed: int = 42,
     out_dir: Optional[Path] = None,
     reward_mode: str = "jct_aligned",
-    reward_scale: float = 20_000.0,
+    reward_scale: float = 20_000.0,   # base-policy training scale (§5.1). Differs from
+    #   gym_env's env default (1000, used by RLPD/live to match the online-log −JCT/1000).
     mo_w_jct: float = 1.0,
     mo_w_util: float = 0.05,
     device: str = "cpu",
@@ -506,11 +507,12 @@ def main(argv=None) -> int:
     p.add_argument("--utd-ratio",     type=int, default=4)
     p.add_argument("--batch-size",    type=int, default=256)
     p.add_argument("--seed",          type=int, default=42)
-    p.add_argument("--reward-mode",   default="jct_aligned",
-                   choices=["jct_aligned", "shaped", "mo"],
-                   help="mo = multi-objective: −w_jct·JCT + w_util·GPU-utilization")
-    p.add_argument("--mo-w-jct",  type=float, default=1.0)
-    p.add_argument("--mo-w-util", type=float, default=0.05)
+    # Reward is a single unified design (no single-/multi-objective toggle): the
+    # −JCT completion term + convex fairness penalty (--fairness-coef) + potential
+    # shaping (wait + node balance via --balance-coef), learned under co-residency
+    # interference (--interference). The old --reward-mode / --mo-w-jct / --mo-w-util
+    # knobs were removed; uxprl/shaped/jct_aligned remain internal (uxprl via --uxprl,
+    # RLPD/eval construct the env directly).
     p.add_argument("--reward-scale",  type=float, default=20_000.0,
                    help="divisor on -JCT; larger → smaller returns "
                         "(keeps entropy term competitive with Q, default 20000)")
@@ -658,9 +660,9 @@ def main(argv=None) -> int:
         nstep_n=args.nstep_n, score_warmup=not args.no_score_warmup,
         total_steps=args.total_steps, warmup_steps=args.warmup_steps,
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
-        seed=args.seed, reward_mode=args.reward_mode,
+        seed=args.seed, reward_mode="mo",   # single unified reward (no single/multi toggle)
         reward_scale=args.reward_scale,
-        mo_w_jct=args.mo_w_jct, mo_w_util=args.mo_w_util,
+        mo_w_jct=1.0, mo_w_util=0.0,
         out_dir=Path(args.out_dir), device=device,
         use_iqn=use_iqn,
         fixed_alpha=args.fixed_alpha, init_alpha=args.init_alpha,

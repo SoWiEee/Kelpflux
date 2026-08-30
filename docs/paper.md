@@ -131,7 +131,7 @@ $$
 
 在本研究的 2×1 實驗平台（K=16、2 個 placement）中，動作空間為 16×2+1 = 33 個離散動作，observation 維度為 168。每個工作攜帶自身的 MPS fraction 需求（25%/50%/75%/100%），排程器透過 state 特徵感知、並由 action mask 遮蔽 MPS 剩餘容量不足的放置，因此策略是在符合工作 MPS 需求的前提下做 job 選擇與 placement
 
-**Reward.** Reward 的設計目標是降低使用者感受到的等待與完成時間、同時抑制尾端延遲並促進異質節點間的負載均衡。本研究之產出模型（§5.8 之 fairness-reward checkpoint）以下列每步回報訓練（`reward_mode="mo"`；S 為 `reward_scale`）：
+**Reward.** Reward 的設計目標是降低使用者感受到的等待與完成時間、同時抑制尾端延遲並促進異質節點間的負載均衡。本研究之產出模型（§5.8 之 fairness-reward checkpoint）以下列**單一**每步回報訓練（不再區分單／多目標；S 為 `reward_scale`）：
 
 $$
 \begin{aligned}

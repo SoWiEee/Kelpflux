@@ -31,8 +31,7 @@ declare -A ARM_FLAGS=(
 )
 COMMON=(--n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix
         --n-jobs 50 --curriculum --total-steps "$STEPS" --warmup-steps 2000
-        --device "$DEVICE" --fixed-alpha --init-alpha 0.05
-        --reward-mode mo --mo-w-jct 1.0 --mo-w-util 0.05)
+        --device "$DEVICE" --fixed-alpha --init-alpha 0.05)
 
 train_one(){ local ARM="$1" SEED="$2" OUT="runs/aimix_$1_s$2_${STAMP}"
   [ -f "$CK/${ARM}_s${SEED}.pt" ] && { log "  SKIP ${ARM} s${SEED} (checkpoint exists)"; return 0; }

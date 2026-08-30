@@ -228,19 +228,28 @@ SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 
 > 需要 `.venv-m11`（含 PyTorch），並從 repo 根目錄以 `PYTHONPATH=.` 執行（確保 `sim/`、`services/`、`eval/` 可被找到）。以下為目前的最終工作流。
 
-### 5.1 模擬訓練（目前拓樸 = 2×1，obs_dim=166 / n_actions=33，預設 RDSAC）
+### 5.1 模擬訓練（目前拓樸 = 2×1，obs_dim=168 / n_actions=33，預設 RDSAC）
+
+目前論文（§5.8）採用的產出模型以 **fairness reward** 訓練：`mo` 完成項（−JCT/S）＋凸公平項（`--fairness-coef 5.0`，壓尾端）＋節點均衡 potential shaping（`--balance-coef 5.0`），並在具**共置干擾**的環境（`--interference 0.3`，實際執行時間隨同卡共置數變慢）下學習「打包 vs 干擾」的權衡。`train_aimix_seeds_fair.sh` 一次訓練 3 臂 × 16 seed：
 
 ```bash
-# 改進選項：--balance-coef 反過度集中、--normalize-reward 穩定溫度。
+# 產出 SAC / RDSAC-mean / RDSAC-cvar × 16 seed → runs/ckpts_aimix16_fair/
+# 已用 scripts/gpu-toggle.sh release 釋出本機 4070 時可 DEVICE=cuda；否則 CPU。
+DEVICE=cuda STEPS=100000 MAX=4 SEEDS="42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57" \
+    bash eval/scripts/train_aimix_seeds_fair.sh
+# → runs/ckpts_aimix16_fair/{sac,rdsac_mean,rdsac_cvar}_s{42..57}.pt（48 個 checkpoint）
+```
+
+底層等價的單臂指令（可自行調風險/critic 家族）：
+
+```bash
 PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
-    --n-nodes 2 --gpus-per-node 1 \
-    --trace philly ali \
-    --total-steps 100000 --curriculum --device cuda \
+    --n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix \
+    --n-jobs 50 --total-steps 100000 --curriculum --device cuda \
     --fixed-alpha --init-alpha 0.05 \
-    --balance-coef 5.0 --normalize-reward \
+    --fairness-coef 5.0 --balance-coef 5.0 --interference 0.3 \
     --risk-mode cvar \
     --out-dir runs/dsac_2x1_$(date +%Y%m%d)
-
 # vanilla SAC：加 --no-iqn；風險中立 RDSAC：--risk-mode mean
 ```
 
@@ -253,21 +262,23 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 #    16h 時間界定迴圈送 aimix batch → shadow_logs/transitions_*.jsonl（RLPD 的 raw --online-log）
 DURATION_S=57600 N_JOBS=30 bash eval/scripts/collect_aimix_onlinelog.sh
 
-# 2) 16-seed RLPD 微調：各 warm-start rdsac_cvar_sXX，共用同一份真 online-log。
+# 2) 16-seed RLPD 微調：各 warm-start rdsac_cvar_sXX（同一 CK 目錄的 base），共用同一份真 online-log。
 #    offline sim prior 用 --hetero-cluster（對齊 base/online-log 的 gpu one-hot + free_ram_ratio）；
 #    reward 維持 jct_aligned（RLPD critic 從頭訓練，需 offline↔online reward 一致，online-log 記 −JCT/1000）。
 #    CPU（本機 4070 被 Slurm/DRA 佔用）；~240s/seed。
+#    §5.8 產出模型：CK=runs/ckpts_aimix16_fair（暖啟動自 fairness RDSAC-cvar base）。
+CK=runs/ckpts_aimix16_fair \
 ONLINE_LOG=shadow_logs/transitions_20260814-203143.jsonl \
     bash eval/scripts/train_rlpd_aimix16.sh
-# → runs/ckpts_aimix16/rlpd_cvar_s{42..57}.pt（16 個，serve/eval 可載入）
+# → runs/ckpts_aimix16_fair/rlpd_cvar_s{42..57}.pt（16 個，serve/eval 可載入）
 ```
 
-### 5.3 混合工作負載實機評估
+### 5.3 混合工作負載實機評估（早期 campaign，論文表 6：125 工作／8 seed）
 
-由 30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算 組成**混合真實工作負載**，以**多目標獎勵**（−JCT + GPU 利用率）重新訓練，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。
+由 30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算 組成**混合真實工作負載**，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。此為論文表 6 的 placement-only（RL 綁節點、順序由 Slurm 決定）early campaign；最終 headline 結果見 §5.5（排序致動）。
 
 ```bash
-# ── Step 1：多目標重訓 3 臂 × 8 seed → /tmp/lckpts_aimix/ ──
+# ── Step 1：重訓 3 臂 × 8 seed → /tmp/lckpts_aimix/（早期 mo reward，非 §5.1 的 fairness 版）──
 # 已用 scripts/gpu-toggle.sh release 釋出本機 4070 時可 DEVICE=cuda；否則預設 CPU。
 DEVICE=cuda STEPS=70000 MAX=6 SEEDS="42 43 44 45 46 47 48 49" \
     bash eval/scripts/train_aimix_seeds.sh
@@ -277,14 +288,10 @@ DEVICE=cuda STEPS=70000 MAX=6 SEEDS="42 43 44 45 46 47 48 49" \
 # 需 4070+3080 皆在叢集；gpu-toggle release 後須先 restore 並確認 MPS 恢復。
 SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
     bash eval/scripts/run_aimix6.sh
-# → runs/aimix6_<stamp>_TABLES.md（論文表 6：7 指標 × 6 臂 + Holm）
-
-# ── Step 3：統計穩健性複核（Holm / bootstrap 95% CI / TOST 等價 / n=8 MDE）──
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/stage1_reanalysis.py \
-    --hybrid aimix6 --out runs/aimix6_reanalysis.json
+# → runs/aimix6_<stamp>_TABLES.md（論文表 6：7 指標 × 6 臂，已含 Holm 校正 ΔJCT%）
 ```
 
-### 5.4 重載六臂實機評估（§6.3 headroom 區，基準 = backfill，無 score）
+### 5.4 重載六臂實機評估（placement-only，論文表 6b：150 工作／16 seed，基準 = backfill，無 score）
 
 在 §5.7 ceiling 分析指出 headroom 開窗的重載 regime（n_jobs≈150，2-GPU）複核學習式排程。**六臂**：FCFS / Backfill（Slurm-native，剝除 Lua）+ SAC / RDSAC-mean / RDSAC-cvar / RLPD（學習式落點）。**score 已從評估項目移除**；主要顯著性檢定為 **seed-level 配對 ΔJCT% vs backfill**（backfill = Slurm 預設生產排程器，當基準）。三套 slurm.conf 自動切換，結束以 trap 還原。
 
@@ -303,7 +310,34 @@ CK=runs/ckpts_aimix16 bash eval/scripts/run_heavy150_aimix_5arm.sh
 
 > **節點順序 load-bearing。** `GPU_NODES` 內 index 0 須為快卡（4070），與訓練時的 `node_speeds` 一致；顛倒會使學習臂系統性放到慢卡、結果失真。預設 `slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0` 已正確。
 
-### 5.5 訓練 flags 對照
+### 5.5 排序致動實機評估（論文 §5.8 headline：ordering-only，真實 CUDA + poisson 負載掃描）
+
+論文的最終結果：讓 RL 掌握**派遣順序**（而非只綁節點）。前展服務中的策略取得完整派遣順序（arrival-aware、rolling top-16，與線上 select 介面一致），再以固定 Slurm `Priority` 交由 Slurm 自身 in-process backfill 排程器致動並自由放置——RL 掌握*順序*、Slurm 掌握*放置與時機*。在真實 CUDA aimix、poisson 到達下做 **oversub=2/4/6 三點負載掃描**，證明排序紅利隨佇列深度成長（淺載與 Backfill 打平、中／深載顯著勝 Backfill 約 −10%～−13%，平均與 P99 同勝）。
+
+```bash
+# 前置：本地 168-d serve on :8003（eval 逐臂 /reload 對應 checkpoint）
+SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
+    --policy-dir /tmp/aimix_eval_policy --port 8003 &   # policy-dir 放任一 168-d ckpt 當初始
+
+# 三點負載掃描 × 10 seed × 6 臂（fcfs/backfill/sac/rdsac_mean/rdsac_cvar/rlpd_cvar）
+# 自動切換 fcfs/main 兩套 slurm.conf，結束以 trap 還原；REAL_WORKLOAD=1 用真實 AiMix GPU 工作
+OVERSUBS="2 4 6" SEEDS="42 43 44 45 46 47 48 49 50 51" REAL_WORKLOAD=1 \
+    CK=runs/ckpts_aimix16_fair \
+    bash eval/scripts/run_step3_prio.sh
+# → runs/step3prio_<stamp>/ov{2,4,6}/{arm}_s{seed}.json
+
+# 逐負載點配對統計（ΔmeanJCT% / ΔP95 / ΔP99 / P99<bf / Wilcoxon）
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_step3 \
+    runs/step3prio_<stamp>/ov6
+
+# 跨負載點的 headroom 曲線（arm × oversub 的 ΔmeanJCT%）
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_step3_sweep \
+    runs/step3prio_<stamp>
+```
+
+> **節點順序 load-bearing**（同 §5.4）：`NODES` index 0 須為快卡（4070）。**config 還原脆弱**：若中途以 SIGTERM 打斷腳本，trap 可能來不及還原 `slurm.conf`（卡在 fcfs），需從 `/tmp/slurm.conf.s3porig.*` 備份手動還原並重啟 controller。
+
+### 5.6 訓練 flags 對照
 
 | Flag | 說明 | 預設 |
 |------|------|------|
@@ -312,8 +346,11 @@ CK=runs/ckpts_aimix16 bash eval/scripts/run_heavy150_aimix_5arm.sh
 | `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
 | `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
+| `--fairness-coef` | 凸（平方）per-job JCT 懲罰，壓尾端（改變目標，非 optimum-preserving） | `0`（生效版用 5.0） |
+| `--balance-coef` | 節點 free-MPS 均衡 potential shaping（多節點才生效） | `0`（生效版用 5.0） |
+| `--interference` | 環境動力學：同卡共置每多一個工作，實際執行時間 ×(1+k·此值) | `0`（生效版用 0.3） |
 
-### 5.6 執行單元測試
+### 5.7 執行單元測試
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python -m pytest sim/tests/ -q

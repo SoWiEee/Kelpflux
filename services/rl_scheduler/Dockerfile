@@ -18,7 +18,9 @@ COPY services/__init__.py /app/services/__init__.py
 # Bake the DSAC checkpoint into the image at /models so the container can
 # come up without external storage. Override at runtime by mounting a PVC at
 # /models if a different policy is wanted.
-COPY runs/rdsac_eval_cvar_v2/train/dsac.pt /models/dsac.pt
+# 2×1 / 168-dim RDSAC-cvar checkpoint (§5.1 fairness reward). Rebake or POST /reload
+# to swap; must match live node/GPU topology (2 node × 1 GPU → n_placements=2).
+COPY runs/ckpts_aimix16_fair/rdsac_cvar_s42.pt /models/dsac.pt
 
 ENV PYTHONPATH=/app \
     LOG_LEVEL=INFO \

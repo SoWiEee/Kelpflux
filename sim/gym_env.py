@@ -308,7 +308,10 @@ class KubefluxSchedEnv:
         top_k: int = TOP_K,
         max_steps: int = 50_000,
         reward_mode: str = "jct_aligned",   # "jct_aligned" | "shaped" | "uxprl"
-        reward_scale: float = 1000.0,
+        reward_scale: float = 1000.0,   # NOTE: env default = 1000 (used by RLPD/live,
+        #   whose online-log logs −JCT/1000). sim_train.py passes 20000 for the base
+        #   policy training (§5.1). Keep the two consistent per-pipeline; don't assume
+        #   one global scale — mismatching offline↔online reward scales breaks RLPD.
         placement_reward_scale: float = 0.01,
         uxprl_c1: float = 1.0,   # UXP-RL reward weight for non-inference tasks
         uxprl_c2: float = 2.0,   # UXP-RL reward weight for inference tasks (c2 > c1)

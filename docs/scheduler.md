@@ -320,6 +320,11 @@ Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131
 | **② live 蒐集** | k3s + Slurm + GPU/MPS | shadow-mode 跑 checkpoint，`/act` 記錄真實 `(obs, act, rew, next_obs)` | 訓練初期隨機策略會破壞系統 → 只敢 shadow + fail-safe 回退 score | 真實 transition JSONL | `services/rl_scheduler/live_daemon.py` |
 | **③ RLPD 微調** | 用 ② 的真實 JSONL + sim transition | 以 sim checkpoint 為 prior，混真實資料 fine-tune | 從零 RLPD = 退回 ① 的 sample-complexity 與破壞性探索 | 真實環境策略 | `services/rl_scheduler/rlpd_finetune.py` |
 
+**目前 checkpoint 位置（2×1、168-dim）：**
+- **① sim 訓練產出**：`runs/ckpts_aimix16_fair/{sac,rdsac_mean,rdsac_cvar}_s{42..57}.pt`（§5.1 fairness reward：`--reward-mode mo --fairness-coef 5.0 --balance-coef 5.0 --interference 0.3`，reward_scale=20000）。訓練腳本 `eval/scripts/train_aimix_seeds_fair.sh`。
+- **② live 蒐集產出**：`shadow_logs/transitions_*.jsonl`（168-dim、sacct 真 JCT、rew=−JCT/1000）。蒐集腳本 `eval/scripts/collect_aimix_onlinelog.sh`。
+- **③ RLPD 產出**：`runs/ckpts_aimix16_fair/rlpd_cvar_s{42..57}.pt`（暖啟動自同目錄 `rdsac_cvar` base、微調 reward `jct_aligned` −JCT/1000 以對齊 online-log）。腳本 `eval/scripts/train_rlpd_aimix16.sh`。
+
 sim **不是 live 的替代品**，而是唯一能做大量學習的地方；它的產出是**「機制性洞察 + 一個可用的 warm start」**。對應有**兩種可轉移性差很多的主張**：sim 的**絕對 JCT/勝幅不轉移**（live 1×1 三方打平已印證），只有**機制性結論轉移**（如「auto-α 是壓垮 SAC 的 artifact」「分布式 critic 才是主因、CVaR 是尾部加成」）。完整模擬與實機數據見 `docs/eval-writeup.md`。
 
 #### RLPD 是什麼、怎麼運作
@@ -515,13 +520,18 @@ Predictor response：
 
 ## 8. DSAC Live Scheduler
 
-`rl-scheduler` 是 FastAPI service，載入目前 image 內的 DSAC checkpoint，提供 Slurm Lua hook 查詢。
+`rl-scheduler` 是 FastAPI service（`services/rl_scheduler/serve.py`，容器內 `--policy-dir /models --port 8002`），載入 policy-dir 內的 DSAC checkpoint，提供 Slurm Lua hook 與 controller 查詢。
+
+**目前 checkpoint 狀態。** 研究產出的 checkpoint 為 `runs/ckpts_aimix16_fair/`（2×1 拓樸、**obs_dim=168 / n_actions=33**、§5.1 fairness reward；RLPD 臂 `rlpd_cvar_*` 見 §3.5）。`use_iqn` / `risk_mode` 存在 checkpoint 內，serve 載入時自動偵測（vanilla SAC vs RDSAC-cvar）。image 以 Dockerfile `COPY … /models/dsac.pt` 烘入一個 checkpoint；換 checkpoint 時更新該 COPY 來源後重跑 `bash scripts/deploy-2.sh`，或在跑起來後對 serve `POST /reload` 指定新的絕對路徑（eval 逐臂即用此法熱換）。
 
 | Endpoint | 說明 |
 |----------|------|
-| `GET /healthz` | model readiness、obs/action shape、snapshot age、shadow mode |
+| `GET /healthz` | model readiness、obs/action shape（`obs_dim`/`n_actions`）、snapshot age、shadow mode |
 | `POST /snapshot` | 由 `rl-snapshot-agent` 定期更新 cached cluster snapshot |
-| `POST /decide` | 對提交中的 job 回傳 priority boost / abstain / selected placement |
+| `POST /decide` | 對提交中的 job 回傳 priority boost / abstain / selected placement（submit-time，Lua hook 用） |
+| `POST /act` | 給 controller/eval：回傳解碼後的 `(action, job_i, node_j, gpu_k, selected_job_id, value, entropy)`；`action==TOP_K·n_placements` 為 no-op（abstain） |
+| `POST /reload` | 熱換 checkpoint（指定絕對路徑）；train/eval/serve 三處共用同一 checkpoint 格式 |
+| `POST /shadow` | 切換 shadow mode（只記錄不套用） |
 | `GET /metrics` | Prometheus metrics |
 
 目前 live 介入方式分成兩層：submit-time **priority boost** 是預設低風險路徑；hold-release **hard placement controller** 是正式可用的受控 placement 路徑。
@@ -534,7 +544,7 @@ job_submit.lua -> POST /decide
 
 在 submit-time `/decide` 路徑中，DSAC 不直接執行 `srun --nodelist`，也不在 `job_submit.lua` 內覆蓋 Slurm placement；`node_j` 與 `gpu_k` 會回傳並記錄為 placement intent，實際 placement 仍交給 Slurm `select/cons_tres`。
 
-DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller`**（`services/rl_scheduler/placement_controller.py`，§3.4），它**現在預設常駐啟用**：對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到 GPU worker，透過 slurmrestd job-update 寫 `required_nodes` 並以 `priority=INFINITE` release。注意 checkpoint topology 必須與 live node/GPU topology 一致——不一致時 `/act` 會 abstain，controller 隨即 no-op，Slurm 照常 `select/cons_tres` 放置（fail-safe）。目前 live 仍是舊 192-dim checkpoint，與收斂後的程式維度不符 → `/act` abstain → controller 不會動到 job，直到用新維度重訓重烘 image（見 `docs/intergration.md §7`）。
+DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller`**（`services/rl_scheduler/placement_controller.py`，§3.4），它**現在預設常駐啟用**：對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到 GPU worker，透過 slurmrestd job-update 寫 `required_nodes` 並以 `priority=INFINITE` release。注意 checkpoint topology 必須與 live node/GPU topology 一致——不一致時 `/act` 會 abstain，controller 隨即 no-op，Slurm 照常 `select/cons_tres` 放置（fail-safe）。目前研究產出的 checkpoint 為 2×1 拓樸的 168-dim（`runs/ckpts_aimix16_fair/`）；上線時 image 烘入的 checkpoint 維度與 live node/GPU 拓樸須一致（2 node × 1 GPU → n_placements=2），否則 `/act` abstain、controller 不動 job。換拓樸即需重訓（見 §3.5、`docs/intergration.md §7`）。
 
 ### 8.1 Snapshot Schema
 
