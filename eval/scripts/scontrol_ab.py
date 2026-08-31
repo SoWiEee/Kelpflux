@@ -23,7 +23,8 @@ the pure *ordering* effect.
 
 Arms (``--arm``): ``priority`` (RL ORDER via fixed Priority — §5.8 static, decision-
 faithful but reacts to a modeled drain), ``online`` (event-driven Option C — the FULL
-joint select+place action actuated against the LIVE cluster, run_online_arm), ``backfill``
+joint select+place action actuated against the LIVE cluster, run_online_arm), ``reorder``
+(Option B — the deployable non-blocking periodic re-prioritization, run_reorder_arm), ``backfill``
 and ``fcfs`` (Slurm-native controls, no RL), plus legacy ``bind``/``scontrol``.
 Workload ``--real-workload`` = real CUDA AiMix (BERT/ResNet/Qwen/cuBLAS); default
 = ``sleep <rt>`` holding ``mps:<req>`` (wait-dominated proxy). Arrival ``--arrival-mode
@@ -499,6 +500,76 @@ def run_online_arm(jobs, deadline_min=25):
     return ids
 
 
+def run_reorder_arm(jobs):
+    """Option B — periodic re-prioritization (the DEPLOYABLE production form). Jobs are
+    submitted UNHELD at their poisson arrival (NON-BLOCKING; Slurm runs them normally), and
+    a background loop every ``REORDER_INTERVAL`` s re-ranks the CURRENT pending queue by the
+    RL policy and writes those ranks as fixed ``Priority`` (direct_set_prio — sticks on
+    unheld). Slurm's own backfill then actuates by the current priority at native speed.
+
+    Unlike §5.8 static (precompute the WHOLE order once), B re-evaluates against the LIVE
+    pending set each cycle → it reacts to real completions/arrivals like online-C, but WITHOUT
+    the held-job actuation-latency confound (it only nudges priorities on already-queued jobs,
+    never holds them). Unlike C it is FAIL-SAFE: if the loop dies, jobs keep running under
+    Slurm's own priority — nothing is stuck. Placement is left to Slurm (§5.2: RL placement no
+    robust benefit; -w serializes). See services/rl_scheduler/reorder_daemon.py for the pure
+    loop reused here."""
+    import threading
+    from services.rl_scheduler.reorder_daemon import reorder_loop, RELEASE_BASE as RB, RELEASE_SPACING as RS
+    interval = float(os.environ.get("REORDER_INTERVAL", "3"))
+    meta = {}; lock = threading.Lock(); submitted = {"done": False}
+
+    def submit_one(j):
+        name = f"sc{j['jid'].split('-')[-1]}"
+        wrap, tmin = wrap_and_time(j)
+        sid = _exec(LOGIN, f"sbatch -p gpu --gres=mps:{j['mps']} --time={tmin} -J {name} "
+                           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
+        if sid:
+            with lock:
+                meta[sid] = dict(j)
+
+    def submitter():
+        submit_stream(jobs, submit_one); submitted["done"] = True
+
+    def get_state():
+        _held, snodes = squeue_snapshot()
+        free = {n.name: n.free_mps for n in snodes}
+        out = _exec(CTL, "squeue -h -o '%i|%T|%j' 2>/dev/null")
+        pend = []
+        with lock:
+            for line in out.splitlines():
+                p = line.split("|")
+                if len(p) < 3:
+                    continue
+                jid, state, _name = p
+                if state == "PENDING" and jid in meta:
+                    pend.append((jid, meta[jid]["mps"], meta[jid].get("arrival", 0.0)))
+        return pend, free
+
+    def set_priorities(prio):
+        if prio:
+            _exec(CTL, "; ".join(f"scontrol update jobid={s} Priority={p} 2>&1"
+                                 for s, p in prio.items()), timeout=120)
+
+    def is_done():
+        with lock:
+            if not (submitted["done"] and len(meta) >= len(jobs)):
+                return False
+        live = {l.strip() for l in _exec(CTL, "squeue -h -o '%i' 2>/dev/null").splitlines()}
+        with lock:
+            return not (live & set(meta))
+
+    th = threading.Thread(target=submitter, daemon=True); th.start()
+    reorder_loop(get_state, set_priorities, is_done, interval=interval,
+                 mps_per_gpu=MPS_PER_GPU, nodes=NODES, serve=SERVE,
+                 on_error=lambda e: print(f"[reorder] cycle err (fail-safe): {e}", flush=True))
+    with lock:
+        ids = list(meta.keys())
+    print(f"[reorder] Option B: {len(ids)} jobs re-prioritized live "
+          f"(interval={interval}s, non-blocking, Slurm places)", flush=True)
+    return ids
+
+
 def run_backfill_arm(jobs):
     """Baseline: submit every job UNHELD (no -w, no priority) at its poisson arrival
     time — Slurm's own scheduler picks both order AND node. Used for BOTH the Backfill
@@ -548,7 +619,7 @@ def collect_jct(ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol", "online", "backfill", "priority", "fcfs"], required=True)
+    ap.add_argument("--arm", choices=["bind", "scontrol", "online", "reorder", "backfill", "priority", "fcfs"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
@@ -586,6 +657,8 @@ def main():
         ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
     elif a.arm == "online":
         ids = run_online_arm(jobs, deadline_min=a.deadline_min)
+    elif a.arm == "reorder":
+        ids = run_reorder_arm(jobs)
     elif a.arm == "priority":
         ids = run_priority_arm(jobs)
     elif a.arm in ("backfill", "fcfs"):

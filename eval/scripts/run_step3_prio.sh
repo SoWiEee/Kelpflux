@@ -130,8 +130,12 @@ run_phases(){ # runs the fcfs/main phases at the current CUR_OVERSUB/CUR_OUT
             # ACTUATION selects how the learned arms are actuated:
             #   priority (default) = §5.8 static ordering via fixed Slurm Priority
             #   online             = event-driven Option C (full select+place, run_online_arm)
+            #   reorder            = Option B periodic re-prioritization (non-blocking, run_reorder_arm)
             WARM="${ACTUATION:-priority}"; [ "$ARM" = "backfill" ] && WARM=backfill
-            run_client "$WARM" "$ARM" "$SEED" "$CKPT"
+            # suffix the json label with the actuation so multiple actuation passes (same
+            # seeds/out-dir) don't collide on ${ARM}_sSEED.json (priority keeps the bare name).
+            LABEL="$ARM"; { [ "$WARM" != "priority" ] && [ "$WARM" != "backfill" ]; } && LABEL="${ARM}_${WARM}"
+            run_client "$WARM" "$LABEL" "$SEED" "$CKPT"
           done
         done
         ;;
