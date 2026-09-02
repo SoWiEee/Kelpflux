@@ -79,7 +79,7 @@ demand rises and falls.
 本研究就落在這個空隙，並刻意不做「宣稱 DRL 必勝」的研究，而是回答兩個更誠實的問題：
 
 1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）作為 placement 建議者，透過 Slurm `job_submit.lua` 以**非阻塞、失效即回退**的方式整合進生產路徑——任何服務異常都自動退回既有啟發式，slurmctld 永不被阻塞。此學習式策略與 DRA 並非競爭，而是**互補**：它可在 DRA 的分片機制之上驅動裝置選擇與准入排序。
-2. **這套智慧到底什麼時候才真的有用？** 實機評估面臨「一個 step 即一個跑數分鐘的工作、樣本極稀少、量測易受叢集暖機漂移污染」的根本限制。我們提出一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對信賴區間、兼顧平均與尾端（p95／p99／CVaR）及 SLO 違反率——並誠實回報其規模條件：在 2×1 小規模上排程策略統計打平，**智慧排程的價值需要叢集規模與工作負載競爭方能顯現**。
+2. **這套智慧要以什麼形式、在什麼條件下才真的有用？** 早期只讓 RL **綁定節點**（placement-only、工作*順序*仍由 Slurm 決定）的實機路徑下，學習式策略僅與 Slurm 打平、且以顯著尾端代價換得——但這是**致動路徑**的限制，而非策略無法貢獻。當改讓 RL 掌握**派遣順序**、並以一條可落地的**非阻塞、失效安全的原生致動路徑（Option B：常駐程序週期性重排當前佇列、寫入 Slurm `Priority`，交由 Slurm 原生 backfill 致動）**整合後，在真實 CUDA、poisson 到達的三點負載掃描（oversub=2／4／6）下，學習式策略在**平均 JCT 與尾端 P99 皆穩健顯著勝過生產 Slurm Backfill**（平均約 −11%～−13%，深載尾端 P99 更達 −19%～−22%；配對 Wilcoxon *p*≤0.006、P99 於 10/10 seed 勝過 Backfill）。此實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並精確界定效益條件：**RL 須掌握*排序*槓桿、致動路徑須原生且連續、負載須足以形成可重排的 backlog**。支撐此結論的是一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對顯著性（Wilcoxon）與信賴區間、兼顧平均與尾端（p95／p99／CVaR）。
 
 ---
 
@@ -273,71 +273,33 @@ ONLINE_LOG=shadow_logs/transitions_20260814-203143.jsonl \
 # → runs/ckpts_aimix16_fair/rlpd_cvar_s{42..57}.pt（16 個，serve/eval 可載入）
 ```
 
-### 5.3 混合工作負載實機評估（早期 campaign，論文表 6：125 工作／8 seed）
+### 5.3 實機評估指令
 
-由 30% BERT 推論 / 30% ResNet-50 訓練 / 30% Qwen 微調 / 10% 矩陣運算 組成**混合真實工作負載**，跨 8 workload seed，輸出 7 指標（平均 JCT / P95 / P99 / Makespan / GPU 利用率 / Slowdown / SLA 違反率）與 Holm 校正配對 ΔJCT%。此為論文表 6 的 placement-only（RL 綁節點、順序由 Slurm 決定）early campaign；最終 headline 結果見 §5.5（排序致動）。
-
-```bash
-# ── Step 1：重訓 3 臂 × 8 seed → /tmp/lckpts_aimix/（早期 mo reward，非 §5.1 的 fairness 版）──
-# 已用 scripts/gpu-toggle.sh release 釋出本機 4070 時可 DEVICE=cuda；否則預設 CPU。
-DEVICE=cuda STEPS=70000 MAX=6 SEEDS="42 43 44 45 46 47 48 49" \
-    bash eval/scripts/train_aimix_seeds.sh
-# → /tmp/lckpts_aimix/{sac,rdsac_mean,rdsac_cvar}_s{42..49}.pt（24 個 checkpoint）
-
-# ── Step 2：六臂實機評估（自動換 learned/fcfs/backfill 三套 slurm.conf，結束以 trap 還原）──
-# 需 4070+3080 皆在叢集；gpu-toggle release 後須先 restore 並確認 MPS 恢復。
-SEEDS="42 43 44 45 46 47 48 49" N_JOBS=30 ROUNDS=3 OVERSUB=2.0 \
-    bash eval/scripts/run_aimix6.sh
-# → runs/aimix6_<stamp>_TABLES.md（論文表 6：7 指標 × 6 臂，已含 Holm 校正 ΔJCT%）
-```
-
-### 5.4 重載六臂實機評估（placement-only，論文表 6b：150 工作／16 seed，基準 = backfill，無 score）
-
-在 §5.7 ceiling 分析指出 headroom 開窗的重載 regime（n_jobs≈150，2-GPU）複核學習式排程。**六臂**：FCFS / Backfill（Slurm-native，剝除 Lua）+ SAC / RDSAC-mean / RDSAC-cvar / RLPD（學習式落點）。**score 已從評估項目移除**；主要顯著性檢定為 **seed-level 配對 ΔJCT% vs backfill**（backfill = Slurm 預設生產排程器，當基準）。三套 slurm.conf 自動切換，結束以 trap 還原。
+論文的最終結果：讓 RL 掌握派遣順序（而非只綁節點）。可落地的部署形態為**非阻塞週期性重排**，即工作以 unheld 正常提交，一個常駐程序每數秒讀取當前 pending queue、以策略重排並寫入 Slurm Priority，交由 Slurm 自身 in-process backfill 於原生速度致動並自由放置，RL 掌握順序、Slurm 掌握放置與時機。
 
 ```bash
 # 前置：本地 168-d serve on :8003（eval 逐臂 /reload 對應 checkpoint）
 SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
     --policy-dir /tmp/aimix_eval_policy --port 8003 &   # policy-dir 放任一 168-d ckpt 當初始
 
-# 先 SMOKE 驗 wiring（6 jobs / 1 seed，短），再全量
-SMOKE=1 bash eval/scripts/run_heavy150_aimix_5arm.sh
-
-# 全量：6 臂 × 16 seed × 150 jobs（real-CUDA；learned 輪帶 --no-score）
-CK=runs/ckpts_aimix16 bash eval/scripts/run_heavy150_aimix_5arm.sh
-# → runs/heavy150aimix_<stamp>_TABLES.md（JCT/Makespan/P95/P99 + 對 backfill 的 ΔJCT% / seed_t p）
-```
-
-> **節點順序 load-bearing。** `GPU_NODES` 內 index 0 須為快卡（4070），與訓練時的 `node_speeds` 一致；顛倒會使學習臂系統性放到慢卡、結果失真。預設 `slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx3080-0` 已正確。
-
-### 5.5 排序致動實機評估（論文 §5.8 headline：ordering-only，真實 CUDA + poisson 負載掃描）
-
-論文的最終結果：讓 RL 掌握**派遣順序**（而非只綁節點）。前展服務中的策略取得完整派遣順序（arrival-aware、rolling top-16，與線上 select 介面一致），再以固定 Slurm `Priority` 交由 Slurm 自身 in-process backfill 排程器致動並自由放置——RL 掌握*順序*、Slurm 掌握*放置與時機*。在真實 CUDA aimix、poisson 到達下做 **oversub=2/4/6 三點負載掃描**，證明排序紅利隨佇列深度成長（淺載與 Backfill 打平、中／深載顯著勝 Backfill 約 −10%～−13%，平均與 P99 同勝）。
-
-```bash
-# 前置：本地 168-d serve on :8003（eval 逐臂 /reload 對應 checkpoint）
-SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
-    --policy-dir /tmp/aimix_eval_policy --port 8003 &   # policy-dir 放任一 168-d ckpt 當初始
+# （選用）OOM watchdog：node-2（3080，~7.5GB host RAM）在 real-CUDA LLM 共置下易 OOM，
+# 此 sidecar 會 release 被 requeue-held 的 job、resume 掉線節點，避免評估卡死。
+STOPFILE=/tmp/oom_watchdog.stop bash eval/scripts/oom_watchdog.sh &
 
 # 三點負載掃描 × 10 seed × 6 臂（fcfs/backfill/sac/rdsac_mean/rdsac_cvar/rlpd_cvar）
-# 自動切換 fcfs/main 兩套 slurm.conf，結束以 trap 還原；REAL_WORKLOAD=1 用真實 AiMix GPU 工作
-OVERSUBS="2 4 6" SEEDS="42 43 44 45 46 47 48 49 50 51" REAL_WORKLOAD=1 \
+# ACTUATION=reorder → Option B（非阻塞週期性重排）；自動切換 fcfs/main 兩套 slurm.conf、結束 trap 還原
+ACTUATION=reorder OVERSUBS="2 4 6" SEEDS="42 43 44 45 46 47 48 49 50 51" REAL_WORKLOAD=1 \
     CK=runs/ckpts_aimix16_fair \
     bash eval/scripts/run_step3_prio.sh
-# → runs/step3prio_<stamp>/ov{2,4,6}/{arm}_s{seed}.json
+# → runs/step3prio_<stamp>/ov{2,4,6}/{arm}_reorder_s{seed}.json（learned 臂帶 _reorder 後綴）
+touch /tmp/oom_watchdog.stop   # 停 watchdog
 
-# 逐負載點配對統計（ΔmeanJCT% / ΔP95 / ΔP99 / P99<bf / Wilcoxon）
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_step3 \
-    runs/step3prio_<stamp>/ov6
-
-# 跨負載點的 headroom 曲線（arm × oversub 的 ΔmeanJCT%）
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_step3_sweep \
+# 彙整成論文表 4–7 格式（各臂 平均JCT/P50/P95/P99 ± std、ΔmeanJCT% [95% CI]、Wilcoxon p、P99<bf）
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_optB_deploy \
     runs/step3prio_<stamp>
 ```
 
-> **節點順序 load-bearing**（同 §5.4）：`NODES` index 0 須為快卡（4070）。**config 還原脆弱**：若中途以 SIGTERM 打斷腳本，trap 可能來不及還原 `slurm.conf`（卡在 fcfs），需從 `/tmp/slurm.conf.s3porig.*` 備份手動還原並重啟 controller。
-
-### 5.6 訓練 flags 對照
+### 5.4 訓練 flags 對照
 
 | Flag | 說明 | 預設 |
 |------|------|------|
@@ -350,7 +312,7 @@ PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_step3_sweep \
 | `--balance-coef` | 節點 free-MPS 均衡 potential shaping（多節點才生效） | `0`（生效版用 5.0） |
 | `--interference` | 環境動力學：同卡共置每多一個工作，實際執行時間 ×(1+k·此值) | `0`（生效版用 0.3） |
 
-### 5.7 執行單元測試
+### 5.5 執行單元測試
 
 ```bash
 PYTHONPATH=. .venv-m11/bin/python -m pytest sim/tests/ -q
