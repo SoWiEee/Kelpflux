@@ -104,10 +104,12 @@ run_client(){ # $1=submit-arm(fcfs/backfill/priority)  $2=label(json stem)  $3=s
   log "  [$2] seed $3 (oversub=$CUR_OVERSUB)"
   sweep
   local RELOAD=(); [ -n "$4" ] && RELOAD=(--reload-ckpt "$4")
+  # ORDER_LOG_DIR set → also dump per-job realized dispatch order (§5.8 B-vs-static mechanism)
+  local ORDERFLAG=(); [ -n "${ORDER_LOG_DIR:-}" ] && { mkdir -p "$ORDER_LOG_DIR/ov${CUR_OVERSUB}"; ORDERFLAG=(--order-log "$ORDER_LOG_DIR/ov${CUR_OVERSUB}/${2}_s${3}.jsonl"); }
   .venv-m11/bin/python -m eval.scripts.scontrol_ab \
     --arm "$1" --n-jobs "$N_JOBS" --seed "$3" --target-max "$TARGET_MAX" \
     --arrival-mode "$ARRIVAL_MODE" --oversub "$CUR_OVERSUB" \
-    "${RELOAD[@]}" "${REALFLAG[@]}" --out-json "$OJ" >>"$LOG" 2>&1 || log "  $2 s$3 exit $?"
+    "${RELOAD[@]}" "${REALFLAG[@]}" "${ORDERFLAG[@]}" --out-json "$OJ" >>"$LOG" 2>&1 || log "  $2 s$3 exit $?"
 }
 
 run_phases(){ # runs the fcfs/main phases at the current CUR_OVERSUB/CUR_OUT
@@ -123,19 +125,23 @@ run_phases(){ # runs the fcfs/main phases at the current CUR_OVERSUB/CUR_OUT
         got=""; for i in $(seq 1 20); do got=$(kubectl exec -n $NS $CTL -- scontrol show config 2>/dev/null | grep -oP 'PriorityMaxAge\s*=\s*\K\S+'); [ -n "$got" ] && [ "$got" != "7-00:00:00" ] && break; sleep 6; done
         log "PriorityMaxAge now = $got"
         warmup_caches
+        # ACTUATION may be a SPACE-SEPARATED LIST (e.g. "reorder priority"); for each learned
+        # arm every actuation is run back-to-back WITHIN the seed → drift-robust interleaving
+        # of the actuation comparison (temporal drift hits every actuation equally per seed).
+        read -r -a ACTS_ALL <<< "${ACTUATION:-priority}"
         for SEED in "${SEEDS[@]}"; do
           for ARM in "${ARMS[@]}"; do
             CKPT=$(ck_for "$ARM" "$SEED")
             if [ -n "$CKPT" ] && [ ! -f "$CKPT" ]; then log "  SKIP $ARM s$SEED (no ckpt)"; continue; fi
-            # ACTUATION selects how the learned arms are actuated:
-            #   priority (default) = §5.8 static ordering via fixed Slurm Priority
-            #   online             = event-driven Option C (full select+place, run_online_arm)
-            #   reorder            = Option B periodic re-prioritization (non-blocking, run_reorder_arm)
-            WARM="${ACTUATION:-priority}"; [ "$ARM" = "backfill" ] && WARM=backfill
-            # suffix the json label with the actuation so multiple actuation passes (same
-            # seeds/out-dir) don't collide on ${ARM}_sSEED.json (priority keeps the bare name).
-            LABEL="$ARM"; { [ "$WARM" != "priority" ] && [ "$WARM" != "backfill" ]; } && LABEL="${ARM}_${WARM}"
-            run_client "$WARM" "$LABEL" "$SEED" "$CKPT"
+            # backfill/fcfs have no learned actuation → run once as backfill; learned arms
+            # iterate every ACTUATION (priority=§5.8 static, reorder=Option B, online=Option C).
+            local ACTS=("${ACTS_ALL[@]}"); [ "$ARM" = "backfill" ] && ACTS=(backfill)
+            for WARM in "${ACTS[@]}"; do
+              # suffix the json label with the actuation so multiple actuations (same
+              # seeds/out-dir) don't collide on ${ARM}_sSEED.json (priority keeps the bare name).
+              LABEL="$ARM"; { [ "$WARM" != "priority" ] && [ "$WARM" != "backfill" ]; } && LABEL="${ARM}_${WARM}"
+              run_client "$WARM" "$LABEL" "$SEED" "$CKPT"
+            done
           done
         done
         ;;

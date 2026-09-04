@@ -310,7 +310,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | RLPD | 126.3 ± 23.3 | 125.6 ± 33.6 | 256.4 ± 51.6 | 267.9 ± 52.3 | −13.4 [−17.4, −9.5] | 0.002 | 10/10 |
 
 > [!NOTE]
-> 在淺負載下以可落地的 Option B 致動評估，**所有學習式策略的平均 JCT 顯著勝過 Backfill 約 12.7~14.5%**（皆 *p*=0.002，10/10 seed 皆負），且**尾端 P99 亦大幅同勝**（學習式 P99 ≈ 261~270 s vs Backfill 599.7 s，P99<bf 皆 10/10）。此與靜態致動探針「淺載與 Backfill 打平」的結果不同：學習臂的中位數（P50 ≈ 120 s）其實與 Backfill（115 s）相近，勝出主要來自**避開 Backfill 貪婪短工作重排造成的長工作尾端飢餓**（Backfill P99 高達 600 s、seed 間變異極大 ±185 s），而該尾端飢餓在此 regime 連 Backfill 的*平均*都被拉高——B 的連續重排壓制了此飢餓。FCFS 則顯著慢於 Backfill（+17.7%）。此淺載勝出的**致動 vs 排序機制歸因待 B 路徑之派遣順序重跑補實**（見 §5.8 機制段）。
+> 在淺負載下以可落地的 Option B 致動評估，**所有學習式策略的平均 JCT 顯著勝過 Backfill 約 12.7~14.5%**（皆 *p*=0.002，10/10 seed 皆負），且**尾端 P99 亦大幅同勝**（學習式 P99 ≈ 261~270 s vs Backfill 599.7 s，P99<bf 皆 10/10）。學習臂的中位數（P50 ≈ 120 s）其實與 Backfill（115 s）相近，其平均優勢主要來自**避開 Backfill 貪婪短工作重排造成的長工作尾端飢餓**（Backfill P99 高達 600 s、seed 間變異極大 ±185 s，該飢餓在此 regime 連 Backfill 的*平均*都被拉高）。FCFS 則顯著慢於 Backfill（+17.7%）。一個同-campaign、seed-交錯的三臂對照（§5.8 機制段）確認此淺載優勢：B 顯著勝 Backfill（−13.2%，*p*=0.002），且**B 亦顯著勝靜態致動**（−12.0% 平均、−11.0% P99，*p*≤0.004）——靜態本身於淺載僅與 Backfill 打平（−1.4%，*p*=0.85），B 靠**致動連續性**（持續重申優先序、減少 backfill 於 gap 中偏離所生的碎片）把它拉到 −13%。
 
 表 7. 三點 poisson 負載掃描：各臂相對 Backfill 之 seed-level 配對 ΔmeanJCT%（負值＝快於 Backfill；每格為 10 seed 配對差之平均 ± 標準差；括號為 Backfill 該負載點之絕對平均 JCT，s）
 
@@ -391,24 +391,43 @@ $$
 
 **中／淺負載複核（oversub=4、2）與三點負載掃描。** 為檢驗上述優勢是否為 oversub=6 單一負載點之特例，於同一 Option B 部署路徑、同 10 個 workload seed（42–51）下再取兩個較淺負載點 **oversub=4**（到達比服務快 4 倍）與 **oversub=2**（快 2 倍，佇列近乎不堆積）。中負載結果如**表 5（§5.2）**：**所有學習式策略在 oversub=4 顯著勝過 Backfill**，平均 ΔmeanJCT −10.3% 至 −11.3%（五臂 Wilcoxon 皆 *p*=0.002），尾端亦全數同勝（學習式 P99 ≈ 508–514 s vs Backfill 720 s，P99<bf 皆 10/10）；FCFS 則顯著慢於 Backfill（+7.8%，*p*=0.002）。**淺負載結果如表 6（§5.2）——與早期靜態致動探針的「打平」結論不同**：在可落地的 Option B 下，**四個學習式臂在 oversub=2 亦顯著勝過 Backfill**，平均 ΔmeanJCT −12.7% 至 −14.5%（四臂 Wilcoxon 皆 *p*=0.002，10/10 seed 皆負、95% CI 皆遠離 0），尾端同勝（學習式 P99 ≈ 261–270 s vs Backfill 600 s，P99<bf 皆 10/10）。故三點並置（**表 7**）顯示：**在部署形態（B）下，學習式對 Backfill 的平均 JCT 優勢於三個負載點皆穩健存在**（≈−13% @ oversub=2、≈−11% @ oversub=4、≈−11% @ oversub=6），而非隨負載單調浮現。
 
-**淺載勝出的來源——尾端飢餓規避，而非 SJF 排序 headroom。** 關鍵在於淺載勝出的*機制*與深載不同：學習臂的**中位數**（P50 ≈ 120 s）其實與 Backfill（115 s）相近甚或略高，其平均優勢**幾乎全數來自尾端**——Backfill 於淺佇列的貪婪短工作優先重排把少數長工作餓入極端尾端（P99 高達 600 s、seed 間變異達 ±185 s），而在此 regime 該飢餓工作足以把 Backfill 的*平均*一併拉高；學習式較公平的排序將長工作施以有界延遲、把 P99 壓到 ≈ 265 s，於是*平均*也隨之較低。這也解釋了為何**靜態致動探針**在淺載呈現「打平」而**Option B** 卻顯著勝出：靜態一次性設定的優先序，在淺佇列大量閒置容量下仍會被 Slurm 自身 backfill 於 gap 中重排而**重新引入**飢餓；B 每數秒持續重申優先序，壓縮了 backfill 偏離的空間，使無飢餓的順序真正被執行。此「**致動連續性 vs 排序品質**」的歸因，其定量佐證（B 路徑實際派遣順序的 ρ(rank,runtime) 與長工作 rank-pct）**待 B 路徑之派遣順序重跑補實**（見下方機制段之待補標註）。就 §5.6 天花板分析而言：該分析量測的是*靜態* best-ordering 於*平均 JCT* 上的 headroom（隨負載單調上升，於淺載 n 小時 ≈ 0），仍成立且不受此處影響；Option B 在淺載額外取得的紅利屬*尾端規避*而非靜態排序 headroom，兩者為不同機制。
+**淺載相對 Backfill 之優勢來源——尾端飢餓規避，而非 SJF 排序 headroom。** 學習臂在 ov2 相對 Backfill 的平均優勢並非來自更聰明的短工作重排：其**中位數**（P50 ≈ 120 s）其實與 Backfill（115 s）相近甚或略高，優勢**幾乎全數來自尾端**——Backfill 於淺佇列的貪婪短工作優先重排把少數長工作餓入極端尾端（P99 高達 600 s、seed 間變異達 ±185 s），而在此 regime 該飢餓工作足以把 Backfill 的*平均*一併拉高；學習式較公平、帶尾端上限的排序把 P99 壓到 ≈ 265 s，於是*平均*也隨之較低。就 §5.6 天花板分析而言：該分析量測的是*靜態* best-ordering 於*平均 JCT* 上的 headroom（隨負載單調上升，於淺載 n 小時 ≈ 0），仍成立且不受此處影響；Option B 在淺載相對 Backfill 的紅利屬*尾端規避*而非靜態排序 headroom，兩者為不同機制。**而 B 相對*靜態致動*的額外優勢則在致動層**：一個同-campaign、seed-交錯的三臂對照（下方機制段）顯示 **B 與靜態產生幾乎相同的實際排序、JCT 卻顯著不同**——淺載 B 勝靜態 −12.0% 平均／−11.0% P99（*p*≤0.004），因 B 持續重申優先序、減少一次性靜態優先序被 backfill 於 gap 中偏離所生的碎片與 idle（靜態本身於淺載僅與 Backfill 打平，−1.4%，*p*=0.85）。
 
 （本節 oversub=4／2 與三點掃描之數據表見 §5.2 表 5、表 6、表 7，不在此重列。）
 
 **學習式策略學到了什麼（排序機制分析）。** 為打開上述行為結果的黑箱，將每個 checkpoint 的派遣順序與同一工作流上的兩個參考排序比較：FCFS（依到達）與純 SJF（依真實 runtime、短工作優先，亦即 Backfill 短工作重排所近似、且會把長工作餓入尾端者）。
 
-> [!IMPORTANT]
-> **機制分析路徑待更新（B 路徑重跑待補）。** 以下 ρ 與 rank-pct 係以**靜態致動的 arrival-aware 前展順序**（`analyze_rl_order.py` + `precompute_schedule`）讀出，用以解釋*靜態致動探針*的行為；但本節表格已改採可落地的 **Option B**。由於 B 的實際派遣順序受線上重排與 Slurm backfill 交互影響（尤其淺載 ov2 的勝出疑似源於 B 連續重申優先序、壓制 Backfill 飢餓的**致動連續性**，而非排序 ρ 本身），下列淺載「無序可排 → 打平」的靜態機制**不再對應 B 的淺載勝出**。**B 路徑的實際派遣順序機制分析（記錄真實 start time → ρ(rank,runtime)、長工作 rank-pct，B vs 靜態對照）待補跑**（`collect_jct` 需加 per-job 記錄）。以下靜態結果僅供對照。
+為分離「排序品質」與「致動方式」，並在**同一 campaign、seed-交錯**（drift-robust interleaving，每個 seed 內三臂背對背執行）下量測，做 **Backfill／B（reorder）／靜態（priority）三臂** × rdsac_cvar × {ov2, ov6} × 10 seed 真實 CUDA 對照（`runs/order_mech_ordermech_il_*`）。以每個工作的真實 sacct start time（`scontrol_ab --order-log`）排出實際 dispatch order，讀出下列排序統計（`analyze_order_realized.py`），並計算同-campaign seed-paired 之 JCT 差。
 
-- **淺負載（oversub=2，靜態順序）**：$\rho(\text{rank},\text{runtime})\approx+0.02$、$\rho(\text{rank},\text{arrival})\approx+0.99$——佇列近空、top-16 視窗過小，靜態前展順序近乎 FCFS。此解釋*靜態探針*淺載打平；惟 Option B 於同負載顯著勝出（表 6），差異疑在致動連續性（待 B 路徑重跑確認）。
-- **深負載（oversub=6，靜態順序）**：$\rho(\text{rank},\text{runtime})$ 升至 $\approx+0.25$、$\rho(\text{rank},\text{arrival})$ 降至 $\approx0.6\text{–}0.8$——持續 backlog 給出可重排視窗，策略浮現**溫和的 SJF 傾向**（短工作／inference 類最先，per-class rank-pct：inference $\approx0.31$、llm/batch $\approx0.63$），壓低平均 JCT。
-- **關鍵——尾端保護**：最長 20% 工作在 RL 下的平均 rank-percentile $\approx0.54$，而純 SJF 會把它們排到 $\approx0.90$（近佇列末端）。即策略**並非全 SJF**，而是對長工作施加**有界延遲**（$\Delta\approx-0.36$），使其不被餓入尾端。
+**實際派遣順序（B 與靜態於兩載皆相似）：**
 
-這解釋了 §5.8 何以能*同時*取得低平均（SJF 傾向）與低尾端（長工作有界延遲）：學習式策略等效於一個**負載自適應、溫和 SJF 但帶尾端上限**的排序——深載在 SJF 與公平之間取一個 Backfill 的貪婪重排達不到的折衷（圖見 `runs/rl_order_analysis/`）。深載此機制在靜態與 B 下一致；淺載的 B-vs-靜態差異則待上述重跑補實。
+| 負載 | 致動 | ρ(rank,runtime) | ρ(rank,arrival) | 長工作 rank-pct |
+|---|---|--:|--:|--:|
+| oversub=2 | 靜態 | +0.05 ± 0.05 | +0.97 ± 0.04 | 0.51 ± 0.03 |
+| oversub=2 | **B** | +0.13 ± 0.08 | +0.94 ± 0.03 | 0.52 ± 0.03 |
+| oversub=6 | 靜態 | +0.26 ± 0.05 | +0.70 ± 0.10 | 0.55 ± 0.03 |
+| oversub=6 | **B** | +0.25 ± 0.08 | +0.82 ± 0.05 | 0.54 ± 0.03 |
 
-**詮釋與界限。** 三點結論：（1）重載下 Backfill 之上的 ordering headroom 不僅存在，且**可被現有學習式策略在真實 CUDA、realistic poisson 到達下捕捉**——前提是 RL 須經由一條原生致動路徑取得對*順序*的控制權。這修正了 §5.2／§5.7 的歸因：placement-only 的負向結果與 2.4 倍尾端，相當程度上是「未賦予 RL 順序控制權」與「進程外綁定／節點綁定致動」之限制，而非「RL 無法貢獻」之證明。（2）此結果亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，學習式策略的 P99 反而**穩定低於** Backfill（10/10）——因為此 regime 的尾端主要來自 Backfill 為衝平均而產生的重排飢餓，正是 RL 排序可避免者。（3）界限須明列：本結果為**三個負載點**（oversub=2／4／6）之量測（表 7）——在可落地的 Option B 部署形態下，平均 JCT 上學習式於**三個負載點皆顯著勝過 Backfill**（≈−11% 至 −13%，皆 *p*=0.002/≤0.006），尾端 P99 亦於三點全數同勝。惟勝出*機制*隨負載而異：深／中載主要來自持續 backlog 下的溫和 SJF 排序 headroom（§5.6 之預測對象，該靜態 headroom 隨負載單調上升），淺載則主要來自 B 連續重排對 Backfill 尾端飢餓的規避（**致動連續性**效應，非靜態排序 headroom；此淺載歸因待 B 路徑派遣順序重跑補實）。效益之負載相依性主要體現於*機制*而非*勝負*；惟三點皆於同一 2×1 小叢集、單一 workload 家族（aimix）量得，跨叢集規模與工作負載組成之外推仍待驗證。本節隔離*排序*效益，RL *placement* 之效果另見 §5.2／§5.7。
+- **溫和 SJF 隨負載浮現**：$\rho(\text{rank},\text{runtime})$ 由淺載 $\approx+0.05\text{–}0.13$ 升到深載 $\approx+0.25\text{–}0.26$、$\rho(\text{rank},\text{arrival})$ 由 $\approx0.96$ 降到 $\approx0.7\text{–}0.8$——持續 backlog 給出可重排視窗，策略於深載浮現**溫和的短工作優先傾向**、壓低平均 JCT；淺佇列則因 top-16 視窗小、重排自由度低而近乎 FCFS。此負載相依的 SJF-tilt 在 B 與靜態兩條致動路徑上一致。
+- **尾端保護**：最長 20% 工作的實際 rank-percentile $\approx0.51\text{–}0.55$，遠低於純 SJF 的 $\approx0.90$——策略**並非全 SJF**，而是對長工作施加**有界延遲**，使其不被餓入尾端；此在淺／深載、B／靜態皆成立。
 
-> 相關材料見 `runs/step3prio_*/ov{2,4,6}/`（真實 CUDA poisson oversub=2／4／6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_step3.py,aggregate_step3_sweep.py}`；三點負載掃描由 `aggregate_step3_sweep.py` 彙整。排序機制分析（RL order vs SJF/FCFS 的 Spearman、長工作 rank-pct、per-class）由 `eval/scripts/analyze_rl_order.py` 產出至 `runs/rl_order_analysis/`（含散點圖）。
+**同-campaign seed-paired JCT 對照：**
+
+| 負載 | 對照 | ΔmeanJCT% | Wilcoxon *p* | ΔP99% | *p* |
+|---|---|--:|--:|--:|--:|
+| oversub=2 | B vs Backfill | −13.2 | 0.002 | −54.2 | 0.002 |
+| oversub=2 | 靜態 vs Backfill | −1.4 | 0.846 | −45.9 | 0.004 |
+| oversub=2 | **B vs 靜態** | **−12.0** | **0.002** | **−11.0** | **0.004** |
+| oversub=6 | B vs Backfill | −10.4 | 0.002 | −21.6 | 0.002 |
+| oversub=6 | 靜態 vs Backfill | −11.0 | 0.002 | −9.3 | 0.006 |
+| oversub=6 | **B vs 靜態** | +0.6 | 0.846 | **−13.1** | **0.002** |
+
+> [!NOTE]
+> **B 相對靜態的優勢在*致動層*，非*排序層*。** 上兩表關鍵：**B 與靜態產生幾乎相同的實際排序**（ρ、長工作 rank-pct 皆在雜訊內一致），**卻有顯著的 JCT／P99 差**——故 B 勝靜態不來自「更好的順序」，而來自**致動連續性**：B 每數秒重申優先序，使 Slurm backfill 緊貼該順序執行、減少一次性靜態優先序被 backfill 於 gap 中偏離所生的碎片與 idle。此優勢呈現清楚的負載相依型態：**平均 JCT 上 B 於淺載顯著勝靜態（−12.0%，*p*=0.002）、於深載打平（+0.6%，*p*=0.85）**——淺佇列有可回收的 idle、深佇列本已滿載無 idle 可省；而**尾端 P99 上 B 於兩載皆穩健勝靜態（−11.0%／−13.1%，*p*≤0.004）**——連續重排即時反應完成事件、避免尾端 straggler。附帶佐證：淺載**靜態 vs Backfill 打平**（−1.4%，*p*=0.85，對應 §5.2 靜態探針之「淺載打平」），B 靠致動把它拉到相對 Backfill 的 −13.2%。此對照為同-campaign、seed-交錯量測，故 §5.2 之 ov2 B-vs-Backfill 優勢（−13.2%）亦在同-campaign 下獲確認。
+
+**詮釋與界限。** 三點結論：（1）重載下 Backfill 之上的 ordering headroom 不僅存在，且**可被現有學習式策略在真實 CUDA、realistic poisson 到達下捕捉**——前提是 RL 須經由一條原生致動路徑取得對*順序*的控制權。這修正了 §5.2／§5.7 的歸因：placement-only 的負向結果與 2.4 倍尾端，相當程度上是「未賦予 RL 順序控制權」與「進程外綁定／節點綁定致動」之限制，而非「RL 無法貢獻」之證明。（2）此結果亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，學習式策略的 P99 反而**穩定低於** Backfill（10/10）——因為此 regime 的尾端主要來自 Backfill 為衝平均而產生的重排飢餓，正是 RL 排序可避免者。（3）界限須明列：本結果為**三個負載點**（oversub=2／4／6）之量測（表 7）——在可落地的 Option B 部署形態下，平均 JCT 上學習式於**三個負載點皆顯著勝過 Backfill**（≈−11% 至 −13%，皆 *p*=0.002/≤0.006），尾端 P99 亦於三點全數同勝。惟相對 Backfill 之勝出*機制*隨負載而異：深／中載主要來自持續 backlog 下的溫和 SJF 排序 headroom（§5.6 之預測對象，該靜態 headroom 隨負載單調上升），淺載則主要來自學習式較公平、帶尾端上限的排序對 Backfill 尾端飢餓的規避（非排序 headroom）。一個同-campaign、seed-交錯的三臂對照（機制段）進一步顯示：**B 與靜態致動產生幾乎相同的實際排序，但 B 於 JCT／P99 顯著較優**——淺載 B 勝靜態 −12.0% 平均／−11.0% P99、深載平均打平但 P99 仍勝 −13.1%（*p*≤0.004），故 B 相對靜態的優勢在**致動連續性**而非排序，且 ov2 之 B-vs-Backfill 優勢（−13.2%）於同-campaign 下獲確認。此外三點皆於同一 2×1 小叢集、單一 workload 家族（aimix）量得，跨叢集規模與工作負載組成之外推仍待驗證。本節隔離*排序*效益，RL *placement* 之效果另見 §5.2／§5.7。
+
+> 相關材料見 `runs/step3prio_*/ov{2,4,6}/`（真實 CUDA poisson oversub=2／4／6）與 `eval/scripts/{scontrol_ab.py,run_step3_prio.sh,aggregate_optB_deploy.py}`；Option B 部署表（表 4–7）由 `aggregate_optB_deploy.py` 彙整。**實際派遣順序機制分析**（依真實 sacct start time 重建 dispatch order → ρ(rank,runtime)／ρ(rank,arrival)／長工作 rank-pct，Option B vs 靜態致動對照）由 `scontrol_ab --order-log` 記錄、`eval/scripts/analyze_order_realized.py` 產出至 `runs/order_mech_*/ORDER_MECH_SUMMARY.md`。
 
 ### 5.9 效益邊界小結
 
@@ -416,7 +435,7 @@ $$
 
 然而 §5.8 顯示，當 RL 經一條**原生排序致動路徑**取得對*順序*的控制權、並以可落地的 **Option B（非阻塞週期性重排）**致動後，在**真實 CUDA、realistic poisson 到達、深負載（oversub=6）**下，所有學習式策略不僅平均 JCT **顯著勝過生產 Backfill 約 10–12%**（Wilcoxon 皆 *p*≤0.006），**尾端 P99 亦大幅同勝約 19–22%**（10 seed 中 10/10 的 P99 低於 Backfill）。此結果一方面**實機確認**了 §5.6 天花板分析對「ordering headroom 隨負載上升」的預測（且**可被現有 DRL 策略捕捉**，修正了先前「出現 headroom 但 DRL 未能捕捉」的暫時性判斷），另一方面也指出 §5.2 的負向結果與 2.4 倍尾端相當程度是**致動路徑**（進程外綁定、節點綁定序列化、順序不由 RL 掌握）之限制，而非策略本身無法貢獻。
 
-因此，現有證據支持的、更精確的結論是：**學習式排程的效益取決於 RL 是否掌握*排序*槓桿、致動路徑是否原生、以及負載是否足以形成可重排的 backlog**——三者具備時，重載下平均 JCT *與*尾端 P99 皆可穩健勝過已充分調校的生產 Slurm 排程。此亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。在可落地的 Option B 部署形態下，完整的 poisson 三點負載掃描（oversub=2／4／6）顯示平均 JCT 優勢於**三個負載點皆穩健存在**（≈−11%～−13%，皆顯著；表 7），惟其*機制*隨負載而異——深／中載主要來自 backlog 下的溫和 SJF 排序 headroom（§5.6 之預測對象，隨負載單調上升），淺載則主要來自 B 連續重排對 Backfill 尾端飢餓的規避（致動連續性效應，此淺載歸因待 B 路徑派遣順序重跑補實）；placement 消融（§5.7）則因變異過大而無法提供確定歸因。策略效益整體仍取決於工作負載、負載強度、硬體規模與底層資源分配後端。
+因此，現有證據支持的、更精確的結論是：**學習式排程的效益取決於 RL 是否掌握*排序*槓桿、致動路徑是否原生、以及負載是否足以形成可重排的 backlog**——三者具備時，重載下平均 JCT *與*尾端 P99 皆可穩健勝過已充分調校的生產 Slurm 排程。此亦**修正**了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。在可落地的 Option B 部署形態下，完整的 poisson 三點負載掃描（oversub=2／4／6）顯示相對 Backfill 的平均 JCT 優勢於**三個負載點皆存在**（≈−11%～−13%，同-campaign seed-paired 皆顯著；表 7），惟其*機制*隨負載而異——深／中載主要來自 backlog 下的溫和 SJF 排序 headroom（§5.6 之預測對象，隨負載單調上升），淺載則主要來自學習式帶尾端上限的排序對 Backfill 尾端飢餓的規避；一同-campaign、seed-交錯的三臂對照進一步確認**可落地的 Option B 相對靜態致動於致動層另有優勢**（B 與靜態排序相同但 B 之 JCT／P99 較優：淺載平均勝 −12.0%、兩載 P99 皆勝 −11%／−13%，*p*≤0.004），源於連續重申優先序所減少的碎片與 idle；placement 消融（§5.7）則因變異過大而無法提供確定歸因。策略效益整體仍取決於工作負載、負載強度、硬體規模與底層資源分配後端。
 
 > 相關材料見 `runs/headroom_*/` 與 `runs/ablation_std_*/`
 
@@ -428,7 +447,7 @@ $$
 
 實驗結果顯示，學習式策略的效益取決於其掌握的排程槓桿、致動路徑與負載強度。在僅控制 placement（節點綁定、順序由 Slurm 決定）的實機路徑下，部分學習式策略（SAC、RDSAC-cvar）在平均 JCT 上僅略優於或打平 FCFS／Backfill，且以顯著尾端代價換得（P99 約為 Slurm-native 的兩倍），未形成相對 size-aware 啟發式的穩健優勢。然而，當策略經一條經驗證的**原生排序致動路徑**、並以可落地的 **Option B（非阻塞週期性重排、失效安全）**致動取得對*順序*的控制權後，在**真實 CUDA、poisson 到達、深負載（oversub=6）**下，所有學習式策略的平均 JCT **顯著勝過生產 Backfill 約 10–12%**、尾端 P99 更**大幅同勝約 19–22%**（Wilcoxon 皆 *p*≤0.006，P99 於 10/10 seed 低於 Backfill）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示先前的負向結果相當程度上係致動路徑（進程外綁定、節點綁定序列化）之限制而非策略本身無法貢獻。
 
-此結果亦修正了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。在可落地的 Option B 部署形態下，本文之 poisson 三點負載掃描（oversub=2／4／6）顯示平均 JCT 優勢於**三個負載點皆穩健存在**（≈−11%～−13%，皆顯著），惟勝出*機制*隨負載而異（深／中載為 backlog 下的排序 headroom、淺載為對 Backfill 尾端飢餓的規避，後者之定量歸因待 B 路徑派遣順序重跑補實）；跨較大型叢集與其他工作負載組成之外推仍待後續驗證，placement 消融亦因變異過大而無法形成確定歸因。
+此結果亦修正了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。在可落地的 Option B 部署形態下，本文之 poisson 三點負載掃描（oversub=2／4／6）顯示相對 Backfill 的平均 JCT 優勢於**三個負載點皆存在**（≈−11%～−13%，同-campaign seed-paired 皆顯著），惟勝出*機制*隨負載而異（深／中載為 backlog 下的排序 headroom、淺載為對 Backfill 尾端飢餓的規避）；一同-campaign、seed-交錯的三臂對照另顯示**可落地的 Option B 相對靜態致動於致動層有額外優勢**（兩者排序相同但 B 之 JCT／P99 較優，源於連續重申優先序所減少的碎片）；跨較大型叢集與其他工作負載組成之外推仍待後續驗證，placement 消融亦因變異過大而無法形成確定歸因。
 
 ### 6.2 未來展望
 

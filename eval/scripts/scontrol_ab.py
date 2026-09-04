@@ -599,22 +599,57 @@ def wait_done(ids, timeout=1800):
         time.sleep(10)
 
 
+def _dt(s):
+    from datetime import datetime
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").timestamp()
+    except Exception:
+        return None
+
+
 def collect_jct(ids):
     idcsv = ",".join(ids)
     out = _exec(CTL, f"sacct -X -P -n -j {idcsv} -o JobID,Submit,Start,End,State 2>/dev/null")
     jcts, waits = [], []
-    from datetime import datetime
-    def dt(s):
-        try: return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").timestamp()
-        except: return None
     for line in out.splitlines():
         p = line.split("|")
         if len(p) < 5 or "COMPLETED" not in p[4]:
             continue
-        sub, sta, end = dt(p[1]), dt(p[2]), dt(p[3])
+        sub, sta, end = _dt(p[1]), _dt(p[2]), _dt(p[3])
         if sub and end: jcts.append(end - sub)
         if sub and sta: waits.append(sta - sub)
     return np.array(jcts), np.array(waits)
+
+
+def collect_order_log(ids, jobs, path):
+    """Per-job REALIZED dispatch record for the §5.8 B-vs-static ordering-mechanism analysis.
+    Joins sacct Submit/Start/End (by JobName = sc<jid-suffix>) with each job's KNOWN runtime
+    and arrival (from the deterministic gen_jobs stream), so a downstream analyzer can rank by
+    the ACTUAL start time and correlate that realized order with runtime (SJF-ness) / arrival
+    (FCFS-ness) and measure long-job tail protection — under whichever actuation (reorder/B vs
+    priority/static) produced it. Writes one JSON object per COMPLETED job to ``path``."""
+    name2job = {f"sc{j['jid'].split('-')[-1]}": j for j in jobs}
+    idcsv = ",".join(ids)
+    out = _exec(CTL, f"sacct -X -P -n -j {idcsv} -o JobName,Submit,Start,End,State 2>/dev/null")
+    recs = []
+    for line in out.splitlines():
+        p = line.split("|")
+        if len(p) < 5 or "COMPLETED" not in p[4]:
+            continue
+        name = p[0]
+        j = name2job.get(name)
+        if j is None:
+            continue
+        sub, sta, end = _dt(p[1]), _dt(p[2]), _dt(p[3])
+        if sub is None or sta is None:
+            continue
+        recs.append({"jid": j["jid"], "cls": j.get("cls", "?"), "rt": float(j["rt"]),
+                     "arrival": float(j.get("arrival", 0.0)), "mps": int(j.get("mps", 0)),
+                     "submit": sub, "start": sta, "end": end})
+    with open(path, "w") as fh:
+        for r in recs:
+            fh.write(json.dumps(r) + "\n")
+    print(f"[order-log] wrote {path} (n={len(recs)})", flush=True)
 
 
 def main():
@@ -630,6 +665,10 @@ def main():
                          "(the per-arm RL model for scontrol/bind); empty = no reload")
     ap.add_argument("--out-json", default="",
                     help="write {arm,seed,jct[],wait[]} here for aggregation")
+    ap.add_argument("--order-log", default="",
+                    help="write per-job realized dispatch records (jid,cls,rt,arrival,"
+                         "submit,start,end) as JSONL here — for the §5.8 B-vs-static "
+                         "ordering-mechanism analysis (analyze_order_realized.py)")
     ap.add_argument("--real-workload", action="store_true",
                     help="run real AiMix GPU jobs (BERT/ResNet/Qwen/cuBLAS, §5.2/6b) "
                          "instead of sleep+MPS (§5.8's wait-dominated proxy)")
@@ -680,6 +719,8 @@ def main():
                        "reload_ckpt": a.reload_ckpt,
                        "jct": jct.tolist(), "wait": wait.tolist()}, fh)
         print(f"[out] wrote {a.out_json} (n={len(jct)})", flush=True)
+    if a.order_log:
+        collect_order_log(ids, jobs, a.order_log)
 
 
 if __name__ == "__main__":
