@@ -22,7 +22,7 @@ Actor (Ma et al. §4.1 objective, discrete categorical sum, masked):
 
     J_π(φ) = E_s Σ_a π(a|s) · [ α·log π(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)] ]
 
-where ρ is a risk distortion (mean / cvar / wang / cpw / msd) applied to the
+where ρ is a risk distortion (mean / cvar) applied to the
 reward distribution only — risk is injected into the policy objective, not just at
 action selection. See ``distortion.py`` for the estimators.
 

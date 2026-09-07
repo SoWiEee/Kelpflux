@@ -307,7 +307,7 @@ PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_optB_deploy \
 | `--no-per` | 停用 Prioritized Experience Replay | PER 開 |
 | `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
 | `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
-| `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）/`cvar`/`wang`/`cpw`/`msd`（僅 IQN 生效） | `mean` |
+| `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）或 `cvar`（僅 IQN 生效） | `mean` |
 | `--fairness-coef` | 凸（平方）per-job JCT 懲罰，壓尾端（改變目標，非 optimum-preserving） | `0`（生效版用 5.0） |
 | `--balance-coef` | 節點 free-MPS 均衡 potential shaping（多節點才生效） | `0`（生效版用 5.0） |
 | `--interference` | 環境動力學：同卡共置每多一個工作，實際執行時間 ×(1+k·此值) | `0`（生效版用 0.3） |

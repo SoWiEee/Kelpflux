@@ -79,4 +79,4 @@ def test_variant_helper():
     assert serve._variant_of(DSACAgent(obs_dim=8, n_actions=4, device="cpu",
                                        use_iqn=False)) == "SAC"
     assert serve._variant_of(DSACAgent(obs_dim=8, n_actions=4, device="cpu",
-                                       use_iqn=True, risk_mode="wang")) == "RDSAC:wang"
+                                       use_iqn=True, risk_mode="cvar")) == "RDSAC:cvar"

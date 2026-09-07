@@ -1,6 +1,6 @@
 # Scheduler Production Spec
 
-本文件描述目前 Kelpflux 上線中的排程與 placement 規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、weight tuner、DSAC live scheduler、Kubernetes / NVIDIA GPU stack、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
+本文件描述目前 Kelpflux 上線中的排程與 placement 規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、DSAC live scheduler、Kubernetes / NVIDIA GPU stack、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
 
 Kelpflux 的主要貢獻不是取代 Slurm，而是在 Slurm 前後加入一層可訓練、可觀測、可回退的 ML placement control plane：
 
@@ -20,7 +20,6 @@ Slurm job_submit.lua
     |-- submit helper: 補齊 partition / memory / qos
     |-- score function: MPS / VRAM / fragmentation / runtime signal
     |-- runtime predictor: 可選，用於短工優先與 walltime 建議
-    |-- weight tuner: 可選，載入目前最佳 score 係數
     |-- DSAC scheduler: live 模式時可回傳 priority boost + placement action
     v
 Slurm priority + backfill + select/cons_tres
@@ -226,11 +225,11 @@ cvar_β  : ρ[Z_R] = (1/β)∫₀^β F⁻¹_{Z_R}(u) du               # 下尾 �
           ≈ 取最低 β 比例的分位數取平均  （β = risk_beta，預設 0.25）
 ```
 
-（`wang / cpw / msd` 為另三種 distortion，見 `services/rl_scheduler/distortion.py`。）distortion 同時進 **actor 目標**與 serve 回傳的 `value`：
+distortion 同時進 **actor 目標**與 serve 回傳的 `value`：
 
 ```
 L_π   = E_s Σ_a π(a|s)·[ α·log π(a|s) − ρ[Z_R(s,a)] − α·E[Z_H(s,a)] ]   # actor loss
-value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       # /decide 回傳、餵 §8.3 guardrail
+value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       # /decide 回傳、餵 §7.3 guardrail
 ```
 
 `mean` 退化成穩定性導向的 distributional SAC（有分布、不規避風險）；`cvar` 偏好**下尾較不嚴重**的 placement，對應排程的 straggler / cold worker / long-tail runtime 風險。
@@ -242,7 +241,7 @@ value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       #
 | critic 家族 | scalar twin-Q | 雙 head IQN（`Z_R` + `Z_H`）|
 | 回報表示 | 點估計 `Q(s,a)` | 分位數分布 |
 | Bellman loss | MSE soft-Bellman | quantile Huber（κ=1）|
-| risk 機制 | 無 | distortion `ρ[Z_R]`（cvar/wang/cpw/msd）|
+| risk 機制 | 無 | CVaR distortion `ρ[Z_R]`|
 | actor 目標 | `α logπ − min_i Q_i` | `α logπ − ρ[Z_R] − α E[Z_H]` |
 | flag | `use_iqn=False` | `use_iqn=True`（預設）|
 
@@ -418,8 +417,6 @@ chart 預設係數：
 | Fragmentation cost | δ | `0.20` | 懲罰容易留下 MPS 碎片的 request |
 | Predicted runtime | ε | `0.00` | predictor 啟用且係數非 0 時，短 job 會拿較高分 |
 
-若 `weight-tuner` 啟用，Lua plugin load 時會從 `GET /weights` 載入 `(α, δ, ε)`，`β` 固定，`γ` 維持 chart 設定。
-
 ### 6.2 `f_mps_fit`
 
 衡量 job MPS request 與單 GPU MPS 容量的配適程度。
@@ -500,25 +497,7 @@ Predictor response：
 
 `applyTimeLimit=true` 時，Lua 可把 `job_desc.time_limit` 改成預測值；上線建議只有在 predictor 經過校準後才開啟，避免模型低估造成 job timeout。
 
-## 7. Weight Tuner
-
-`weight-tuner` 是可選 FastAPI service，用 UCB1 在離散 arm 空間中調整 score function 的 `(α, δ, ε)`。
-
-| Endpoint | 說明 |
-|----------|------|
-| `GET /weights` | 回傳目前 best arm 與統計資料 |
-| `POST /feedback` | 以 reward 更新指定 arm |
-| `GET /stats` | 回傳所有 arms 的 pulls 與 mean reward |
-| `GET /healthz` | health check |
-
-行為：
-
-- Lua plugin 只在 load 時抓一次 `/weights`。
-- 抓取失敗時沿用 chart 預設係數。
-- `β` 不由 tuner 調整。
-- live reward 以 completed jobs 的 mean JCT 轉換為負 reward。
-
-## 8. DSAC Live Scheduler
+## 7. DSAC Live Scheduler
 
 `rl-scheduler` 是 FastAPI service（`services/rl_scheduler/serve.py`，容器內 `--policy-dir /models --port 8002`），載入 policy-dir 內的 DSAC checkpoint，提供 Slurm Lua hook 與 controller 查詢。
 
@@ -546,7 +525,7 @@ job_submit.lua -> POST /decide
 
 DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller`**（`services/rl_scheduler/placement_controller.py`，§3.4），它**現在預設常駐啟用**：對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到 GPU worker，透過 slurmrestd job-update 寫 `required_nodes` 並以 `priority=INFINITE` release。注意 checkpoint topology 必須與 live node/GPU topology 一致——不一致時 `/act` 會 abstain，controller 隨即 no-op，Slurm 照常 `select/cons_tres` 放置（fail-safe）。目前研究產出的 checkpoint 為 2×1 拓樸的 168-dim（`runs/ckpts_aimix16_fair/`）；上線時 image 烘入的 checkpoint 維度與 live node/GPU 拓樸須一致（2 node × 1 GPU → n_placements=2），否則 `/act` abstain、controller 不動 job。換拓樸即需重訓（見 §3.5、`docs/intergration.md §7`）。
 
-### 8.1 Snapshot Schema
+### 7.1 Snapshot Schema
 
 ```json
 {
@@ -567,7 +546,7 @@ DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller
 
 `rl-snapshot-agent` 會定期從 Slurm REST API 讀取 jobs/nodes 並 POST `/snapshot`，讓 cached snapshot 保持 fresh。`/decide` 仍會在 snapshot 缺失或超過 `snapshotTtlSeconds` 時 abstain，避免使用過期 cluster state 做 live boost。
 
-### 8.2 Decision Schema
+### 7.2 Decision Schema
 
 Lua hook 送出的 request：
 
@@ -599,9 +578,9 @@ Service response：
 }
 ```
 
-`value` 為策略下的期望 risk-adjusted action value `Σ_a π(a|s)·(ρ[Z_R(s,a)] + α·E[Z_H(s,a)])`（由 `DSACAgent.action_values` 計算，受 `risk_mode` 影響）；`entropy` 為 categorical policy `π(a|s)` 的熵。兩者餵給下方 §8.3 的 `valueAbstain` / `entropyAbstain` guardrail。
+`value` 為策略下的期望 risk-adjusted action value `Σ_a π(a|s)·(ρ[Z_R(s,a)] + α·E[Z_H(s,a)])`（由 `DSACAgent.action_values` 計算，受 `risk_mode` 影響）；`entropy` 為 categorical policy `π(a|s)` 的熵。兩者餵給下方 §7.3 的 `valueAbstain` / `entropyAbstain` guardrail。
 
-### 8.3 Live Safety Gates
+### 7.3 Live Safety Gates
 
 | Gate | 行為 |
 |------|------|
@@ -615,13 +594,12 @@ Service response：
 
 目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。hard placement controller（預設常駐）另以 `/act` 執行 held job placement，**不受 Lua `shadowMode` 控制**；它自己用 `rlScheduler.placementController.shadow`（→ `--shadow / --no-shadow`，預設 `false`）決定是否真的送 slurmrestd job-update。兩條路徑互補：`/decide` 影響 priority 排序，controller 決定 held job 落在哪個 node。
 
-## 9. Boundary Policy
+## 8. Boundary Policy
 
 | Failure | 行為 |
 |---------|------|
 | `job_submit.lua` Lua error | `pcall` 保護；回傳 `slurm.SUCCESS`，priority 不動 |
 | predictor timeout / malformed response | `f_pred_runtime=0.5` |
-| weight tuner unavailable | 使用 chart 預設 weights |
 | RL scheduler unavailable | `rl_apply` no-op；submission 不失敗 |
 | score < 0 | clamp 到 0 |
 | score > 1 | clamp 到 1 |
@@ -632,7 +610,7 @@ Service response：
 | hard placement 選到 unavailable node | controller 過濾 DRAIN/DOWN/NOT_RESPONDING/FAIL，不更新該節點 |
 | operator scale-down during running job | policy/action guard 阻止 scale-down，保留 running/COMPLETING worker |
 
-## 10. Monitoring Metrics
+## 9. Monitoring Metrics
 
 `rl-scheduler` 暴露 Prometheus metrics，Grafana dashboard `Scheduler Live Resource View` 會使用這些指標。
 
@@ -653,7 +631,7 @@ Service response：
 | `rl_scheduler_last_node_index` | 最近一次 selected node index |
 | `rl_scheduler_last_gpu_index` | 最近一次 selected GPU index |
 
-## 11. Deployment Knobs
+## 10. Deployment Knobs
 
 常用 Helm values：
 
@@ -678,8 +656,6 @@ rlScheduler:
   lua:
     enabled: true
 
-weightTuner:
-  enabled: false
 ```
 
 Live smoke check：
@@ -718,7 +694,7 @@ kubectl -n slurm exec deploy/slurm-login -- \
   scontrol show job "$JOB_ID" | grep -E 'ReqNodeList|NodeList|BatchHost|TRES'
 ```
 
-## 12. Files
+## 11. Files
 
 | Path | Purpose |
 |------|---------|
@@ -729,8 +705,7 @@ kubectl -n slurm exec deploy/slurm-login -- \
 | `services/rl_scheduler/placement_controller.py` | Slurm-safe DSAC hard placement controller using hold-release and `ReqNodeList` |
 | `services/rl_scheduler/live_daemon.py` | Direct placement research / legacy prototype; not recommended for Slurm-safe production placement |
 | `services/rl_scheduler/dsac.py` | RDSAC (Ma et al.) — dual Z_R/Z_H IQN critic + categorical actor |
-| `services/rl_scheduler/distortion.py` | Risk distortions (CVaR/Wang/CPW/MSD) |
+| `services/rl_scheduler/distortion.py` | Mean/CVaR risk reduction |
 | `services/runtime_predictor/` | Runtime prediction service |
-| `services/weight_tuner/` | UCB1 weight tuner |
 | `chart/dashboards/scheduler-live.json` | Live scheduler Grafana dashboard |
 | `docs/monitoring.md` | Monitoring metrics and dashboard details |

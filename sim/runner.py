@@ -119,8 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--synth-seed", type=int, default=42)
     p.add_argument("--trace-family", choices=sorted(TRACE_FAMILIES), default="philly")
     p.add_argument("--scheduler",
-                   choices=["fcfs", "multifactor", "score",
-                            "kueue-fairshare", "volcano-binpack"],
+                   choices=["fcfs", "multifactor", "score"],
                    default="fcfs")
     p.add_argument("--nodes", type=int, default=4)
     p.add_argument("--gpus-per-node", type=int, default=4)

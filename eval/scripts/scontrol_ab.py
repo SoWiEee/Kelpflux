@@ -22,10 +22,9 @@ and — since §5.2/table 6b showed RL *placement* has no robust benefit — iso
 the pure *ordering* effect.
 
 Arms (``--arm``): ``priority`` (RL ORDER via fixed Priority — §5.8 static, decision-
-faithful but reacts to a modeled drain), ``online`` (event-driven Option C — the FULL
-joint select+place action actuated against the LIVE cluster, run_online_arm), ``reorder``
-(Option B — the deployable non-blocking periodic re-prioritization, run_reorder_arm), ``backfill``
-and ``fcfs`` (Slurm-native controls, no RL), plus legacy ``bind``/``scontrol``.
+faithful but reacts to a modeled drain), ``reorder`` (Option B — the deployable
+non-blocking periodic re-prioritization, run_reorder_arm), ``backfill`` and ``fcfs``
+(Slurm-native controls, no RL).
 Workload ``--real-workload`` = real CUDA AiMix (BERT/ResNet/Qwen/cuBLAS); default
 = ``sleep <rt>`` holding ``mps:<req>`` (wait-dominated proxy). Arrival ``--arrival-mode
 poisson`` (mean gap = mean(runtime)/oversub) or ``burst``. Compares JCT / wait
@@ -124,16 +123,6 @@ def gen_jobs(n, seed, target_max, arrival_mode="poisson", oversub=2.0, sigma=1.0
     return out
 
 
-def submit(job, held):
-    h = "-H " if held else ""
-    name = f"sc{job['jid'].split('-')[-1]}"
-    wrap, tmin = wrap_and_time(job)
-    cmd = (f"sbatch {h}-p gpu --gres=mps:{job['mps']} --time={tmin} -J {name} "
-           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'")
-    sid = _exec(LOGIN, cmd)
-    return sid.strip()
-
-
 def squeue_snapshot():
     """Return (held_pending list of SlurmJob, node free_mps dict) from squeue."""
     out = _exec(CTL, "squeue -h -o '%i|%T|%r|%b|%N|%V|%j' 2>/dev/null")
@@ -162,100 +151,6 @@ def squeue_snapshot():
                        running_jobs=0, gpu_type="rtx4070" if "4070" in n else "rtx3080")
              for n in NODES]
     return held, nodes
-
-
-def run_scontrol_arm(jobs, deadline_min=25):
-    # submit all HELD; remember slurm-id → job features + a monotone submit_ts
-    meta = {}
-    for i, j in enumerate(jobs):
-        sid = submit(j, held=True)
-        if sid: meta[sid] = {**j, "order": i}
-    print(f"[scontrol] submitted {len(meta)} held jobs", flush=True)
-    # BATCH-DRAIN loop (not one-release-per-1.5s — that serial throttle injected a
-    # ~2-3s/job artificial wait that dominated short jobs and made RL look far worse
-    # than backfill, which bursts all jobs so Slurm fills capacity at once). Each
-    # cycle: snapshot free_mps once, then let RL repeatedly pick its top held job and
-    # place it while capacity remains (RL owns ORDER + NODE), decrementing a LOCAL
-    # free_mps tally; actuate the whole batch in ONE kubectl exec; then wait briefly
-    # for running jobs to free MPS and re-snapshot. This mirrors backfill's fill-now
-    # behaviour so the comparison isolates scheduling quality, not release cadence.
-    deadline = time.time() + deadline_min * 60
-    while time.time() < deadline:
-        held, nodes = squeue_snapshot()
-        held = [(sid, nm, mps) for (sid, nm, mps) in held if sid in meta]
-        if not held:
-            break
-        free = {n.name: n.free_mps for n in nodes}
-        remaining = {sid: (nm, mps) for (sid, nm, mps) in held}
-        batch = []  # (sid, node)
-        # fill available capacity: RL picks order+node; fall back to longest-wait/first-fit
-        while remaining:
-            sjobs = [SlurmJob(job_id=sid, name=nm, state="PENDING", reason="JobHeld",
-                              mps_req=meta[sid]["mps"], gpu_count=1, gpu_type=meta[sid]["gtype"],
-                              runtime=meta[sid]["rt"], submit_ts=meta[sid]["order"])
-                     for sid, (nm, mps) in remaining.items()]
-            fnodes = [SlurmNode(name=n.name, free_mps=int(free[n.name]), running_jobs=0,
-                                gpu_type=n.gpu_type) for n in nodes]
-            try:
-                act = post_act(build_act_payload(sjobs, fnodes, mps_per_gpu=MPS_PER_GPU),
-                               scheduler_url=SERVE, timeout=10)
-            except Exception as e:
-                print("  /act err", e); act = {}
-            sel = act.get("selected_job_id"); node_j = act.get("node_j")
-            if sel in remaining and node_j is not None and 0 <= int(node_j) < len(NODES):
-                sid = sel; node = NODES[int(node_j)]
-            else:
-                sid = None  # RL abstained → fall to first-fit below
-            need = meta[sid]["mps"] if sid else None
-            # if RL's pick doesn't fit its node, or RL abstained, first-fit the
-            # longest-waiting job onto any node with room (keeps capacity full).
-            if sid is None or free.get(node, 0) < need:
-                placed = False
-                for cand in sorted(remaining, key=lambda s: meta[s]["order"]):
-                    for n in NODES:
-                        if free[n] >= meta[cand]["mps"]:
-                            sid, node, need = cand, n, meta[cand]["mps"]; placed = True; break
-                    if placed:
-                        break
-                if not placed:
-                    break  # nothing fits any node right now → wait for capacity
-            batch.append((sid, node)); free[node] -= need; remaining.pop(sid)
-        if batch:
-            cmd = "; ".join(f"scontrol update job={sid} ReqNodeList={node} 2>&1; scontrol release {sid} 2>&1"
-                            for sid, node in batch)
-            _exec(CTL, cmd, timeout=120)
-        time.sleep(2)  # let running jobs free MPS before the next snapshot
-    return list(meta.keys())
-
-
-def run_bind_arm(jobs):
-    # Precompute each job's RL node from the empty-cluster snapshot (so submission is
-    # a fast burst — matching scontrol's all-held-at-once — instead of being spread
-    # by a per-job /act round-trip, which would unfairly de-burst the bind arm).
-    empty = [SlurmNode(name=n, free_mps=MPS_PER_GPU * 2, running_jobs=0,
-                       gpu_type="rtx4070" if "4070" in n else "rtx3080") for n in NODES]
-    plan = []
-    for j in jobs:
-        sjob = SlurmJob(job_id=j["jid"], name="x", state="PENDING", reason="",
-                        mps_req=j["mps"], gpu_count=1, gpu_type=j["gtype"],
-                        runtime=j["rt"], submit_ts=0.0)
-        try:
-            act = post_act(build_act_payload([sjob], empty, mps_per_gpu=MPS_PER_GPU),
-                           scheduler_url=SERVE, timeout=10)
-            nj = act.get("node_j"); node = NODES[int(nj)] if nj is not None and int(nj) < len(NODES) else NODES[0]
-        except Exception:
-            node = NODES[0]
-        plan.append((j, node))
-    # fast burst submit
-    ids = []
-    for j, node in plan:
-        name = f"sc{j['jid'].split('-')[-1]}"
-        wrap, tmin = wrap_and_time(j)
-        sid = _exec(LOGIN, f"sbatch -p gpu -w {node} --gres=mps:{j['mps']} --time={tmin} -J {name} "
-                           f"--wrap '{wrap}' 2>&1 | grep -oE '[0-9]+'").strip()
-        if sid: ids.append(sid)
-    print(f"[bind] submitted {len(ids)} jobs (burst)", flush=True)
-    return ids
 
 
 def precompute_schedule(jobs, serve=SERVE):
@@ -390,116 +285,6 @@ def run_priority_arm(jobs):
     return list(sid_rank)
 
 
-def run_online_arm(jobs, deadline_min=25):
-    """Event-driven Option C: the FULL joint (select job × place GPU) action, actuated
-    ONLINE against live cluster state — the training-faithful deployment the §5.8 static
-    priority arm approximates.
-
-    Why this exists / how it differs from run_scontrol_arm (the FAILED poll version):
-    run_scontrol_arm re-snapshotted on a FIXED ``sleep(2)`` every cycle; that constant
-    idle between a job finishing and the next poll injected the actuation-latency
-    confound that collapsed all arms onto Backfill (~+35%), which is why §5.8 pivoted to
-    static priority. Here the loop is EVENT-DRIVEN: it sleeps only until the next
-    *predicted* completion (we know each job's runtime), capped at ``REACT_CAP`` so a
-    single cheap squeue corrects real-vs-predicted drift — idle is bounded to ≈REACT_CAP
-    + one batched actuate, not a fixed 2 s. Actuation is BATCHED (all placeable held jobs
-    released in one kubectl exec) and GATED on the node being free right now (so a job is
-    never pinned to a busy node → no -w serialization, cf. run_priority_arm).
-
-    Jobs are submitted HELD at their poisson arrival (background thread); the main loop
-    repeatedly asks the policy for (selected_job_id, node_j) over the currently
-    arrived+held top-16 window and releases onto the confirmed-free node via
-    ``scontrol update ReqNodeList=<node>`` + ``scontrol release`` (CLI — the REST
-    required_nodes path is disabled on slurmrestd v0.0.37). RL owns ORDER+NODE, Slurm
-    owns only low-level start; the online reaction is to REAL completion times (and thus
-    real MPS interference), which the static drain cannot model."""
-    import threading
-    REACT_CAP = float(os.environ.get("ONLINE_REACT_CAP", "1.0"))  # max idle past a real completion
-    meta = {}          # sid -> job dict (+ arrival)
-    lock = threading.Lock()
-    submitted_done = {"flag": False}
-
-    def submit_held_one(j):
-        sid = submit(j, held=True)
-        if sid:
-            with lock:
-                meta[sid] = dict(j)
-
-    def submitter():
-        submit_stream(jobs, submit_held_one)
-        submitted_done["flag"] = True
-
-    th = threading.Thread(target=submitter, daemon=True); th.start()
-
-    running = {}       # sid -> (node, predicted_end, mps)
-    deadline = time.time() + deadline_min * 60
-    while time.time() < deadline:
-        held, nodes = squeue_snapshot()          # real free_mps + real held set (drift-correct)
-        with lock:
-            held = [(sid, nm, mps) for (sid, nm, mps) in held if sid in meta]
-        free = {n.name: n.free_mps for n in nodes}
-        # `running` (jobs we released) is only for TIMING the event-driven sleep; prune by
-        # PREDICTED completion (real free_mps below is the source of truth for capacity, so
-        # a wrong prediction only affects sleep length, never causes over-dispatch). Do NOT
-        # prune by "no longer held" — a released job leaves the held set immediately, which
-        # would empty the model and degrade the loop back to fixed-interval polling.
-        now0 = time.time()
-        for sid in [s for s, v in running.items() if v[1] <= now0]:
-            running.pop(sid, None)
-        # exclude jobs we've already released this run (held/running race window)
-        remaining = {sid: mps for (sid, _nm, mps) in held if sid not in running}
-        batch = []
-        while remaining:
-            sjobs = [SlurmJob(job_id=sid, name="x", state="PENDING", reason="JobHeld",
-                              mps_req=meta[sid]["mps"], gpu_count=1, gpu_type=meta[sid]["gtype"],
-                              runtime=meta[sid]["rt"], submit_ts=meta[sid].get("arrival", 0.0))
-                     for sid in remaining]
-            fnodes = [SlurmNode(name=n.name, free_mps=int(free[n.name]), running_jobs=0,
-                                gpu_type=n.gpu_type) for n in nodes]
-            try:
-                act = post_act(build_act_payload(sjobs, fnodes, mps_per_gpu=MPS_PER_GPU),
-                               scheduler_url=SERVE, timeout=10)
-            except Exception:
-                act = {}
-            sel = act.get("selected_job_id"); node_j = act.get("node_j")
-            sid = node = need = None
-            if sel in remaining and node_j is not None and 0 <= int(node_j) < len(NODES):
-                cand_node = NODES[int(node_j)]
-                if free[cand_node] >= remaining[sel]:
-                    sid, node, need = sel, cand_node, remaining[sel]
-            if sid is None:   # RL abstained / no-fit → first-fit oldest-arrived
-                for c in sorted(remaining, key=lambda s: meta[s].get("arrival", 0.0)):
-                    for n in NODES:
-                        if free[n] >= remaining[c]:
-                            sid, node, need = c, n, remaining[c]; break
-                    if sid:
-                        break
-                if sid is None:
-                    break     # nothing fits current free capacity → wait for a completion
-            batch.append((sid, node))
-            free[node] -= need
-            running[sid] = (node, time.time() + meta[sid]["rt"], need)
-            remaining.pop(sid)
-        if batch:
-            cmd = "; ".join(f"scontrol update job={sid} ReqNodeList={node} 2>&1; scontrol release {sid} 2>&1"
-                            for sid, node in batch)
-            _exec(CTL, cmd, timeout=120)
-        # exit when the submitter is done and nothing is held or running in our model
-        with lock:
-            all_in = submitted_done["flag"] and len(meta) >= len(jobs)
-        if all_in and not held and not running:
-            break
-        # EVENT-DRIVEN sleep: until the next predicted completion, capped at REACT_CAP
-        now = time.time()
-        next_end = min((e for _, e, _ in running.values()), default=now + REACT_CAP)
-        time.sleep(max(0.05, min(REACT_CAP, next_end - now)))
-    with lock:
-        ids = list(meta.keys())
-    print(f"[online] event-driven C: {len(ids)} held jobs actuated (select+place, "
-          f"react_cap={REACT_CAP}s)", flush=True)
-    return ids
-
-
 def run_reorder_arm(jobs):
     """Option B — periodic re-prioritization (the DEPLOYABLE production form). Jobs are
     submitted UNHELD at their poisson arrival (NON-BLOCKING; Slurm runs them normally), and
@@ -508,7 +293,7 @@ def run_reorder_arm(jobs):
     unheld). Slurm's own backfill then actuates by the current priority at native speed.
 
     Unlike §5.8 static (precompute the WHOLE order once), B re-evaluates against the LIVE
-    pending set each cycle → it reacts to real completions/arrivals like online-C, but WITHOUT
+    pending set each cycle → it reacts to real completions/arrivals without
     the held-job actuation-latency confound (it only nudges priorities on already-queued jobs,
     never holds them). Unlike C it is FAIL-SAFE: if the loop dies, jobs keep running under
     Slurm's own priority — nothing is stuck. Placement is left to Slurm (§5.2: RL placement no
@@ -654,15 +439,12 @@ def collect_order_log(ids, jobs, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["bind", "scontrol", "online", "reorder", "backfill", "priority", "fcfs"], required=True)
+    ap.add_argument("--arm", choices=["reorder", "backfill", "priority", "fcfs"], required=True)
     ap.add_argument("--n-jobs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--target-max", type=float, default=20.0)
-    ap.add_argument("--deadline-min", type=float, default=25.0,
-                    help="scontrol drain deadline (min); scale up with --n-jobs")
     ap.add_argument("--reload-ckpt", default="",
-                    help="POST /reload this checkpoint into serve before the run "
-                         "(the per-arm RL model for scontrol/bind); empty = no reload")
+                    help="POST /reload this checkpoint into serve before the run; empty = no reload")
     ap.add_argument("--out-json", default="",
                     help="write {arm,seed,jct[],wait[]} here for aggregation")
     ap.add_argument("--order-log", default="",
@@ -692,18 +474,12 @@ def main():
     span = max((j.get("arrival", 0.0) for j in jobs), default=0.0)
     print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s "
           f"arrival={a.arrival_mode} span={span:.0f}s", flush=True)
-    if a.arm == "scontrol":
-        ids = run_scontrol_arm(jobs, deadline_min=a.deadline_min)
-    elif a.arm == "online":
-        ids = run_online_arm(jobs, deadline_min=a.deadline_min)
-    elif a.arm == "reorder":
+    if a.arm == "reorder":
         ids = run_reorder_arm(jobs)
     elif a.arm == "priority":
         ids = run_priority_arm(jobs)
     elif a.arm in ("backfill", "fcfs"):
         ids = run_backfill_arm(jobs)
-    else:
-        ids = run_bind_arm(jobs)
     wait_done(ids)
     jct, wait = collect_jct(ids)
     if len(jct):

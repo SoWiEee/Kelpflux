@@ -17,7 +17,7 @@
 # later ablation isolates which knob mattered.
 # Interference also gives RDSAC's return distribution genuine spread → its risk
 # machinery (CVaR) is no longer idle (see [[project-sim-stochasticity-rdsac]]).
-# Everything else matches train_aimix_seeds.sh (hetero 2×1, aimix, curriculum, fixed-α).
+# Heterogeneous 2×1 AiMix training with curriculum and fixed α.
 #
 # Arms: SAC (--no-iqn), RDSAC-mean, RDSAC-cvar. 16 seeds → 48 checkpoints.
 # GPU when the 4070 is released (DEVICE=cuda); else CPU.

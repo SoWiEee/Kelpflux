@@ -16,7 +16,7 @@ PARTITION="${PARTITION:-cpu}"
 JOB_WRAP="${JOB_WRAP:-true}"
 JOB_PREFIX="${JOB_PREFIX:-chaos-submit}"
 OUT_DIR="${OUT_DIR:-/tmp/kelpflux-submit-chaos-$(date +%Y%m%d-%H%M%S)}"
-SERVICES=(rl-scheduler runtime-predictor weight-tuner)
+SERVICES=(rl-scheduler runtime-predictor)
 
 log() { printf '[submit-chaos] %s\n' "$*"; }
 warn() { printf '[submit-chaos][WARN] %s\n' "$*" >&2; }

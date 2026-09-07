@@ -6,8 +6,6 @@ Distorted expectation over a sampled quantile representation:
 """
 from __future__ import annotations
 
-import math
-
 import pytest
 
 pytest.importorskip("torch")
@@ -47,38 +45,6 @@ def test_cvar_monotone_in_beta_for_increasing_return():
     vals = [distorted_values(q, taus, mode="cvar", beta=b).item()
             for b in (0.1, 0.25, 0.5, 1.0)]
     assert vals == sorted(vals)  # smaller beta = more pessimistic = smaller
-
-
-def test_wang_beta_zero_equals_mean():
-    q, taus = _sorted_quantiles()
-    out = distorted_values(q, taus, mode="wang", beta=0.0)
-    assert torch.allclose(out, q.mean(), atol=1e-3)
-
-
-def test_wang_positive_beta_is_risk_averse():
-    q, taus = _sorted_quantiles()
-    out = distorted_values(q, taus, mode="wang", beta=0.75)
-    assert out.item() < q.mean().item()
-
-
-def test_cpw_endpoints_preserved():
-    # CPW distortion g(tau) must satisfy g(0)=0, g(1)=1.
-    from services.rl_scheduler.distortion import _cpw_g
-    taus = torch.tensor([0.0, 1.0], dtype=torch.float64)
-    g = _cpw_g(taus, beta=0.71)
-    assert torch.allclose(g, torch.tensor([0.0, 1.0], dtype=torch.float64), atol=1e-6)
-
-
-def test_msd_beta_zero_equals_mean():
-    q, taus = _sorted_quantiles()
-    out = distorted_values(q, taus, mode="msd", beta=0.0)
-    assert torch.allclose(out, q.mean(), atol=1e-6)
-
-
-def test_msd_penalizes_downside():
-    q, taus = _sorted_quantiles()
-    out = distorted_values(q, taus, mode="msd", beta=1.0)
-    assert out.item() < q.mean().item()
 
 
 def test_batched_reduces_last_axis():

@@ -96,7 +96,7 @@ def test_per_weights_change_critic_loss():
     assert np.isfinite(base) and np.isfinite(down)
 
 
-@pytest.mark.parametrize("mode", ["mean", "cvar", "wang", "cpw", "msd"])
+@pytest.mark.parametrize("mode", ["mean", "cvar"])
 def test_runs_under_each_risk_mode(mode):
     agent = _agent(risk_mode=mode, risk_beta=0.25)
     rng = np.random.default_rng(4)

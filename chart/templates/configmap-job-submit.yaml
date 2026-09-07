@@ -24,8 +24,6 @@ Reference: docs/scheduler.md.
 {{- $pr := $js.predictor | default dict }}
 {{- $rls := .Values.rlScheduler | default dict }}
 {{- $rll := $rls.lua | default dict }}
-{{- $wt := .Values.weightTuner | default dict }}
-{{- $wtl := $wt.lua | default dict }}
 {{- $hlp := $js.helper | default dict }}
 {{- $hlpMem := $hlp.memory | default dict }}
 {{- $hlpPart := $hlp.partition | default dict }}
@@ -52,49 +50,11 @@ data:
     local MPS_PER_NODE        = {{ default 100 $js.mpsPerNode }}
 
     -- Coefficients (kept in sync with values.yaml jobSubmit.scoreWeights).
-    -- These locals are upvalues: the weight-tuner pull below may
-    -- overwrite A, D, E at plugin-load time if weightTuner.lua.enabled=true.
     local A = {{ default 0.40 $w.mpsFit }}        -- α
     local B = {{ default 0.20 $w.vramFit }}       -- β
     local G = {{ default 0.00 $w.topology }}      -- γ
     local D = {{ default 0.20 $w.fragmentation }} -- δ
     local E = {{ default 0.00 $w.predRuntime }}   -- ε
-
-    -- ------------------------------------------------------------------
-    -- Weight-tuner: pull (α, δ, ε) from UCB1 bandit at plugin
-    -- load time (once per slurmctld start). Failures are silently ignored
-    -- so chart-default weights remain in effect. B (vramFit) is not tuned.
-    -- ------------------------------------------------------------------
-    local WT_ENABLED  = {{ if $wtl.enabled }}true{{ else }}false{{ end }}
-    local WT_URL      = {{ default "http://weight-tuner:8003/weights" $wtl.url | quote }}
-    local WT_TIMEOUT  = {{ default 0.5 $wtl.timeoutSeconds }}
-
-    if WT_ENABLED then
-      pcall(function()
-        local cmd = string.format(
-          "curl -fsS --max-time %.2f %s 2>/dev/null", WT_TIMEOUT, WT_URL)
-        local h = io.popen(cmd, "r")
-        if not h then return end
-        local body = h:read("*a") or ""
-        h:close()
-        -- Parse "arm":[α,δ,ε] from JSON (minimal, no deps).
-        local arr = string.match(body, '"arm"%s*:%s*%[([^%]]+)%]')
-        if not arr then return end
-        local vals = {}
-        for v in string.gmatch(arr, "%-?%d+%.?%d*") do
-          vals[#vals + 1] = tonumber(v)
-        end
-        if #vals >= 3 then
-          A = vals[1]
-          D = vals[2]
-          E = vals[3]
-          if slurm and slurm.log_info then
-            slurm.log_info(string.format(
-              "[weight-tuner] loaded arm α=%.3f δ=%.3f ε=%.3f", A, D, E))
-          end
-        end
-      end)
-    end
 
     -- VRAM tiers (sorted ascending) — used by f_vram_fit.
     local VRAM_TIERS = {

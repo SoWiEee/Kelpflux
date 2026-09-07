@@ -526,7 +526,7 @@ def main(argv=None) -> int:
     p.add_argument("--value-clip",           type=float, default=0.0,
                    help="Duan et al. 2021 target return-clip boundary b (0 = off)")
     p.add_argument("--risk-beta",            type=float, default=0.25,
-                   help="risk parameter (CVaR tail mass, Wang/CPW shape, MSD weight)")
+                   help="CVaR lower-tail mass")
     # Temperature (entropy) controls
     p.add_argument("--fixed-alpha",          action="store_true",
                    help="pin the entropy temperature α (disables auto-tuning)")
