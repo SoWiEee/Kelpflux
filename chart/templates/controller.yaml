@@ -87,11 +87,10 @@ spec:
               until scontrol ping >/dev/null 2>&1; do sleep 2; done
               # lifespan=315360000 (10 years) avoids the daemon losing its auth
               # context after the default 24-hour token expiry.
-              # openapi/v0.0.37 matches Slurm 21.08 (Ubuntu 22.04 base). When
-              # Slurm is upgraded (see review.md R13) bump this to v0.0.40.
+              # Slurm 23.11 uses the v0.0.39 REST plugin.
               SLURM_JWT=$(scontrol token username=root lifespan=315360000 | sed 's/SLURM_JWT=//') \
                 SLURMRESTD_SECURITY=disable_user_check \
-                /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
+                /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.39 0.0.0.0:6820 &
               wait $CTLD_PID
           # K1 (v5 review): explicit requests/limits → Guaranteed QoS. slurmctld
           # in-memory state grows with queue depth; default 2Gi limit covers

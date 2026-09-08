@@ -1,28 +1,30 @@
 # DRA 遷移方案：以 NVIDIA DRA driver 取代 device-plugin + MPS stack
 
-> 研究性規劃文件（2026-07-08）。目標：用 Kubernetes DRA（`resource.k8s.io/v1`，v1.34 GA）+
+> 實機遷移記錄（2026-07-08 執行，2026-09-08 版本升級後複核）。目標：用 Kubernetes DRA（`resource.k8s.io/v1`，v1.34 GA）+
 > `kubernetes-sigs/dra-driver-nvidia-gpu` 取代目前脆弱的 gpu-operator device-plugin ＋
 > mps-control-daemon ＋ CDI `/mps` 注入路徑（該路徑的失效模式見
-> `~/.claude` memory `project-mps-recovery-after-gaming`）。**尚未執行**；先在單節點 pilot。
+> `~/.claude` memory `project-mps-recovery-after-gaming`）。目前 live cluster 已採用此路徑。
 
 ## 0. Readiness（Kelpflux 已滿足全部前置，2026-07-08 實測）
 
 | 前置 | 需求 | Kelpflux | 狀態 |
 |---|---|---|---|
-| Kubernetes | ≥ v1.34.2（DRA GA） | v1.34.6+k3s1 | ✅ |
+| Kubernetes | ≥ v1.34.2（DRA GA） | v1.35.8+k3s1 | ✅ |
 | DRA API | `resource.k8s.io/v1` | deviceclasses/resourceclaims/resourceslices 已在線 | ✅ |
 | feature gate | `DynamicResourceAllocation` | `kubernetes_feature_enabled{...}=1` | ✅ |
-| CDI | containerd 2.0+（預設開） | containerd v2.2.2；`/var/run/cdi/` 已在用 | ✅ |
-| NVIDIA driver | ≥ v565（GPU 分配） | acane 580.167.08 / node-2 580.159.03 | ✅ |
+| CDI | containerd 2.0+（預設開） | containerd v2.2.7-k3s1；`/var/run/cdi/` 已在用 | ✅ |
+| NVIDIA driver | ≥ v565（GPU 分配） | acane 580.167.08 / node-2 580.173.02 | ✅ |
 | NFD | GPU 節點標籤 | gpu-operator-node-feature-discovery 已部署 | ✅ |
 | Helm | ≥ v3.8 | （確認本機 helm 版本） | ⏳ |
 
-**結論：不需升級 k3s 或任何元件，DRA 現在就能裝。**
+**當時結論（1.34.6）：不需先升級 k3s 或其他元件，DRA 即可安裝。**
+本次後續維運在 2026-09 將 live cluster 升至 k3s v1.35.8+k3s1；DRA API、claims
+與 GPU worker 驗證均維持通過。
 
 ### 0.1 版本澄清：核心 DRA 是 v1.34 GA（不是 1.35）
 
 常見混淆：DRA 不是單一開關，而是一「家子」feature gate。**核心 `DynamicResourceAllocation`
-在 v1.34 就 GA + 預設啟用**；1.35/1.36 是**進階子功能**畢業的時間。Kelpflux 1.34.6 實測（逐 gate）：
+在 v1.34 就 GA + 預設啟用**；1.35/1.36 是**進階子功能**畢業的時間。升級前以 Kelpflux 1.34.6 實測（逐 gate）：
 
 | stage | gate | 預設 |
 |---|---|---|
@@ -232,7 +234,7 @@ slurm-platform 會還原）——正式落地需把 DRA claim 寫進 slurm-platf
 
 1. **DRA driver 擴到 node-2**：`helm upgrade dra-driver-nvidia-gpu`（移除 node-1-only
    `kubeletPlugin.nodeSelector`）→ kubelet-plugin 在兩節點皆 Running；node-2 advertise
-   ResourceSlice（gpu-0, Ampere = 3080）。node-2 前置同樣滿足（containerd 2.2.2、k3s 1.34.6、driver 580）。
+   ResourceSlice（gpu-0, Ampere = 3080）。這是升級前的 node-2 前置紀錄（containerd 2.2.2、k3s 1.34.6、driver 580）；目前 live 環境已升至 containerd 2.2.7-k3s1、k3s 1.35.8。
 2. **chart-ify rtx3080**：`values-2x1.yaml` rtx3080 pool `useDra: true` + `draMpsMemLimit: 9Gi`
    （3080=10GB VRAM）。keepalive 保留——實測 host RSS 極小（worker pod 總記憶體 265Mi），node-2 的
    7.5GB 扛得住。`helm upgrade slurm-platform`（REV 64）。

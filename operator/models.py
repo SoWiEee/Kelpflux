@@ -56,7 +56,7 @@ class Config:
     # HTTP instead of kubectl exec, eliminating fork overhead and exec timeouts.
     # Leave empty to fall back to the legacy kubectl exec path.
     slurm_rest_url: str = os.getenv("SLURM_REST_URL", "")
-    slurm_rest_api_version: str = os.getenv("SLURM_REST_API_VERSION", "v0.0.37")
+    slurm_rest_api_version: str = os.getenv("SLURM_REST_API_VERSION", "v0.0.39")
     # Path to the HS256 key file used to sign JWT tokens for slurmrestd.
     # Must match AuthAltParameters=jwt_key in slurm.conf.
     slurm_jwt_key_path: str = os.getenv("SLURM_JWT_KEY_PATH", "")

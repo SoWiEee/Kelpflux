@@ -32,7 +32,7 @@ class SlurmRestClient:
 
     _BUSY_STATES = {"allocated", "mixed", "completing"}
 
-    def __init__(self, base_url: str, api_version: str = "v0.0.37",
+    def __init__(self, base_url: str, api_version: str = "v0.0.39",
                  username: str = "root", timeout: int = 10,
                  jwt_key_path: str = ""):
         self.base_url = base_url.rstrip("/")

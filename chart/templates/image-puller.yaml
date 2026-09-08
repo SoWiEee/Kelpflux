@@ -3,7 +3,7 @@
 Image-puller DaemonSet (R2 fix).
 
 The first time the operator scales up a worker pool, kubelet has to pull
-slurm-worker:latest (CUDA + OpenMPI + Lmod, multi-GB layers) from the
+slurm-worker:23.11.4 (CUDA + OpenMPI + Lmod, multi-GB layers) from the
 local containerd. That cold pull adds 30–60 s to the end-to-end scale-up
 latency, which the user perceives as `sbatch` → "node still PROVISIONING"
 even after the operator has already patched StatefulSet replicas.

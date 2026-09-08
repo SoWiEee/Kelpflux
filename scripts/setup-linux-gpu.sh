@@ -12,6 +12,7 @@
 set -euo pipefail
 
 INSTALL_K3S=${INSTALL_K3S:-false}
+K3S_VERSION=${K3S_VERSION:-v1.35.8+k3s1}
 for arg in "$@"; do
   case "$arg" in
     --k3s) INSTALL_K3S=true ;;
@@ -80,16 +81,25 @@ echo "containerd configured for NVIDIA (k3s path)"
 if [[ "$INSTALL_K3S" == "true" ]]; then
   echo ""
   echo "=== [4] Installing k3s ==="
+  current_k3s=""
   if command -v k3s >/dev/null 2>&1; then
-    echo "k3s already installed: $(k3s --version | head -1)"
-  else
-    # Install k3s pointing at containerd and disable default traefik.
+    current_k3s="$(k3s --version | awk 'NR==1 {print $3}')"
+    echo "k3s installed: ${current_k3s}"
+  fi
+  if [[ "$current_k3s" != "$K3S_VERSION" ]]; then
+    echo "Installing/upgrading k3s to $K3S_VERSION"
     # INSTALL_K3S_EXEC passes flags to k3s server.
     # Note: do NOT pass --kube-apiserver-arg feature-gates=... here;
     # kube-apiserver 1.28+ fatals on unknown gate names.
+    INSTALL_K3S_VERSION="$K3S_VERSION" \
     INSTALL_K3S_EXEC="--container-runtime-endpoint unix:///run/containerd/containerd.sock \
       --disable traefik" \
       curl -sfL https://get.k3s.io | sh -
+  else
+    echo "k3s already matches target: $K3S_VERSION"
+  fi
+
+  if [[ "$current_k3s" != "$K3S_VERSION" ]]; then
 
     # Allow non-root kubectl.
     # WARNING: running as root (sudo), so HOME=/root. The kubeconfig lands at

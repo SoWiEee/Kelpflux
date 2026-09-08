@@ -23,7 +23,7 @@ spec:
             - name: SLURM_REST_URL
               value: "http://slurm-restapi.slurm.svc.cluster.local:6820"
             - name: SLURM_REST_API_VERSION
-              value: "v0.0.37"
+              value: "v0.0.39"
             - name: SLURM_JWT_KEY_PATH
               value: "/slurm-jwt/jwt_hs256.key"
             - name: SCRAPE_INTERVAL_SECONDS

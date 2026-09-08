@@ -217,7 +217,7 @@ def run_once(*, rest_url: str, api_version: str, scheduler_url: str, jwt_key: by
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rest-url", default=os.getenv("SLURM_REST_URL", "http://slurm-restapi.slurm.svc.cluster.local:6820"))
-    parser.add_argument("--api-version", default=os.getenv("SLURM_REST_API_VERSION", "v0.0.37"))
+    parser.add_argument("--api-version", default=os.getenv("SLURM_REST_API_VERSION", "v0.0.39"))
     parser.add_argument("--scheduler-url", default=os.getenv("RL_SCHEDULER_URL", "http://rl-scheduler:8002"))
     parser.add_argument("--jwt-key-path", default=os.getenv("SLURM_JWT_KEY_PATH", ""))
     parser.add_argument("--interval", type=float, default=float(os.getenv("SNAPSHOT_INTERVAL_SECONDS", "10")))

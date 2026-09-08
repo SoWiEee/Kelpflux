@@ -223,9 +223,9 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | 節點 2（工作節點） | Intel Core i7-9700、8 GB RAM、NVIDIA RTX 3080 |
 | 作業系統 | Ubuntu 24.04.4 LTS（kernel 7.0.0 / 6.8.0） |
 | NVIDIA driver／CUDA | 580.167.08／CUDA 13.0 |
-| 容器平台 | k3s v1.34.6、containerd 2.2.2；僅負責容器部署與服務生命週期 [5] |
+| 容器平台 | k3s v1.35.8、containerd 2.2.7-k3s1；僅負責容器部署與服務生命週期 [5] |
 | GPU 資源宣告 | Kubernetes Dynamic Resource Allocation (DRA) driver v0.4.1 [32] |
-| 排程器 | Slurm 23.11.7 with GRES/TRES and MPS（slurmrestd REST API v0.0.37）[4] |
+| 排程器 | Slurm 23.11.4 with GRES/TRES and MPS（slurmrestd REST API v0.0.39）[4] |
 | GPU sharing | NVIDIA MPS，MPS fraction 為 25%、50%、75%、100% [3] |
 | 深度學習框架 | PyTorch |
 | 網路 | 同一區域網路，節點間 RTT ≈ 0.16 ms（ping 量測，可忽略） |

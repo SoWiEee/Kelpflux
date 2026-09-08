@@ -36,7 +36,7 @@
 
 ## 1. 架構總覽
 
-實機是 **2-node × 1-GPU 異質叢集**，兩台都跑 **Ubuntu 24.04 + k3s v1.34 + NVIDIA driver 580**，由
+實機是 **2-node × 1-GPU 異質叢集**，兩台目標跑 **Ubuntu 24.04 + k3s v1.35.8 + Slurm 23.11.4 + NVIDIA driver 580**，由
 **Helm chart `chart/`** 搭配 **`chart/values-2x1.yaml` overlay** 一鍵部署整個 Slurm 平台。
 單張 RTX 4070 demo（`values-k3s.yaml`）與 Kind / Docker Desktop（`values.yaml` 預設值）仍然支援作為開發 baseline。
 
@@ -66,12 +66,12 @@
 | logical CPU | 16 | 20 |
 | RAM | ~62.6 GiB（65677412 Ki） | ~7.4 GiB（7718660 Ki） |
 | OS | Ubuntu 24.04.4 LTS | Ubuntu 24.04.4 LTS（由 22.04 升級） |
-| Kernel | 6.17.0-35-generic | 6.8.0-124-generic |
-| k3s version | v1.34.6+k3s1 | v1.34.6+k3s1 |
-| NVIDIA driver | 580.167.08 | 580.159.03 |
-| CUDA runtime | 13.0 | 13.0 |
-| Container runtime | containerd 2.2.2 | containerd 2.2.2 |
-| InternalIP | 192.168.0.111 | 192.168.0.104 |
+| Kernel | 7.0.0-31-generic | 6.8.0-136-generic |
+| k3s version | v1.35.8+k3s1 | v1.35.8+k3s1 |
+| NVIDIA driver | 580.167.08 | 580.173.02 |
+| CUDA runtime / image | 13.0 host label / 12.6.3 worker image | 13.0 host label / 12.6.3 worker image |
+| Container runtime | containerd 2.2.7-k3s1 | containerd 2.2.7-k3s1 |
+| InternalIP | 192.168.0.111 | 192.168.0.103 |
 | sim 相對速度 | 1.0×（基準） | ~0.25× |
 
 > 兩台的 GPU 存取皆已改走 DRA：`gpu-kubelet-plugin` 各自 advertise 一份 `ResourceSlice`（`gpu.nvidia.com`），
@@ -193,18 +193,19 @@ graph TD
 
 | Namespace | 用途 | PSS Enforce | 建立者 |
 |-----------|------|------------|--------|
-| `slurm` | Slurm 控制平面 + workers + login + operator + exporter + slurmdbd + mysql | `baseline` | chart `templates/namespace.yaml`（`resource-policy: keep`） |
+| `slurm` | Slurm 控制平面 + workers + login + operator + exporter + slurmdbd + mysql | `enforce=privileged`；`audit/warn=baseline`（k3s host-cgroup overlay） | chart `templates/namespace.yaml`（`resource-policy: keep`） |
 | `gpu-operator` | NVIDIA GPU Operator（僅 NFD + dcgm-exporter + validators；device-plugin/mps-control-daemon 已停用） | `privileged` | chart `templates/gpu/gpu-operator-namespace.yaml`（與 GPU Operator helm release 共享） |
 | `dra-driver-nvidia-gpu` | NVIDIA DRA driver（`gpu-kubelet-plugin` DaemonSet，兩 GPU 節點各一份） | `privileged` | `scripts/deploy-2.sh` 的 `install_dra_driver`（Helm OCI chart，獨立 release） |
 | `monitoring` | Prometheus、Grafana、Alertmanager、kube-state-metrics | （未強制） | chart `templates/monitoring/namespace.yaml` |
 | `nfs-provisioner` | NFS subdir external provisioner Deployment | （未強制） | chart `templates/storage.yaml`（同樣 `keep`） |
 
-> **為何 `slurm` 用 baseline 而非 restricted？**
-> Worker pod 的 GPU 存取現在完全透過 DRA `ResourceClaim` + CDI 完成，不再需要
-> `runtimeClassName: nvidia` 或特權模式；`slurm` namespace 維持 baseline 是因為
-> controller/worker/login pod 需要以特定能力執行 `sshd`／`munged` 等系統服務，
-> 不滿足 restricted profile 的限制。監控堆疊 / provisioner / GPU operator / DRA
-> driver 各自拆 namespace 是為了 NetworkPolicy 與 RBAC 邊界更乾淨。
+> **為何 live `slurm` 使用 enforce=privileged？**
+> GPU 存取透過 DRA `ResourceClaim` + CDI 完成，但 Slurm 23.11 的 cgroup/v2
+> 初始化仍需 worker 看到 host systemd/DBus、host PID namespace 與可寫 cgroup。
+> 因此 k3s overlay 將 `slurm` 設為 `enforce=privileged`，同時保留
+> `audit/warn=baseline`；只有 `workers.yaml` 的 worker templates 請求這些權限。
+> 預設 Kind/development values 仍維持 baseline。監控堆疊 / provisioner /
+> GPU operator / DRA driver 各自拆 namespace 是為了 NetworkPolicy 與 RBAC 邊界更乾淨。
 
 > **為何 namespace 不掛 helm hook？**
 > 之前的版本曾在 namespace 上掛 `helm.sh/hook: pre-install`，搭配預設
@@ -228,7 +229,7 @@ graph TD
 
 | 項目 | 值 |
 |------|-----|
-| Image | `slurm-controller:latest` |
+| Image | `slurm-controller:23.11.4` |
 | 主程序 | `slurmctld` + `slurmrestd`（同 pod） + `sshd` + `munged` |
 | 容器 Port | 6817 (slurmctld), 6820 (slurmrestd), 22 (SSH) |
 | 啟動順序 | munged → 等 slurmdbd:6819 TCP 通 → 啟 `slurmctld` → 等 `scontrol ping` 成功 → 用 `scontrol token` 拿 JWT 起 `slurmrestd` |
@@ -240,7 +241,7 @@ graph TD
 
 | 項目 | 值 |
 |------|-----|
-| Image | `slurm-worker:latest` |
+| Image | `slurm-worker:23.11.4` |
 | Features | `cpu`（partition `cpu`，預設） |
 | Gres | 無 |
 | 縮放 | Operator 依 pending CPU job 數量 patch replicas |
@@ -249,7 +250,7 @@ graph TD
 
 | 項目 | 值 |
 |------|-----|
-| Image | `slurm-worker:latest` |
+| Image | `slurm-worker:23.11.4` |
 | GPU 存取 | DRA `resourceClaims: [{name: gpu}]` → `ResourceClaimTemplate slurm-worker-gpu-rtx4070-mps`（無 `runtimeClassName`，無 `nvidia.com/gpu` resource limit） |
 | `nodeSelector` | `gpu-host-class: rtx4070`（釘到 Node 1 `acane`） |
 | Features | `gpu, gpu-rtx4070, topology-2x1` |
@@ -264,7 +265,7 @@ graph TD
 
 | 項目 | 值 |
 |------|-----|
-| Image | `slurm-worker:latest` |
+| Image | `slurm-worker:23.11.4` |
 | GPU 存取 | DRA `resourceClaims: [{name: gpu}]` → `ResourceClaimTemplate slurm-worker-gpu-rtx3080-mps` |
 | `nodeSelector` | `gpu-host-class: rtx3080`（釘到 Node 2 `nutnadmin-e500-g9-ws760t`） |
 | Features | `gpu, gpu-rtx3080, topology-2x1` |
@@ -284,7 +285,7 @@ graph TD
 
 | 項目 | 值 |
 |------|-----|
-| Image | `slurm-worker:latest`（共用 worker image） |
+| Image | `slurm-worker:23.11.4`（共用 worker image） |
 | 主程序 | `munged` + `sshd`（無 slurmd） |
 | 用途 | 使用者透過 `kubectl exec deploy/slurm-login -- bash` 進入並 `sbatch` |
 | 特別掛載 | `slurm-ddp-runtime` ConfigMap → `/opt/slurm-runtime-src` |
@@ -343,7 +344,7 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 關鍵欄位（皆來自 `values.yaml::slurm`）：
 
 - `SelectType=select/cons_tres` / `SelectTypeParameters=CR_Core`：CPU 以 core 為單位可消耗
-- `TaskPlugin=task/none`、`ProctrackType=proctrack/linuxproc`：Slurm 21.08（Ubuntu 22.04 image）對 cgroup v2 支援不完整，GPU 隔離改由 DRA `ResourceClaim` + CDI 處理
+- `TaskPlugin=task/affinity`、`ProctrackType=proctrack/linuxproc`：Slurm 23.11.4（Ubuntu 24.04 image）；GPU 隔離由 DRA `ResourceClaim` + CDI 處理。23.11.4 的 `slurmd` 仍會初始化 cgroup/v2，live k3s worker 透過核准的 host-cgroup overlay（namespace `enforce=privileged`、`audit/warn=baseline`）註冊。
 - `AuthAltTypes=auth/jwt`、`AuthAltParameters=jwt_key=/slurm-secrets/jwt_hs256.key`：slurmrestd 認證
 - `AccountingStorageType=accounting_storage/slurmdbd` + `AccountingStorageTRES=gres/gpu,gres/mps`：把 GPU / MPS 用量記入 sacct
 - `CompleteWait=0`：避免 worker pod 在 epilog 期間被驅逐後 job 卡在 COMPLETING
@@ -414,7 +415,7 @@ Python operator 監看 Slurm 佇列並 patch worker StatefulSet replicas。原�
 flowchart TD
     A[每 15s tick] --> B[collector：對每個 pool 算\npending / running / busy_nodes]
     B --> C{REST API 通?}
-    C -- 是 --> D[GET /slurm/v0.0.37/jobs\n/slurm/v0.0.37/nodes]
+    C -- 是 --> D[GET /slurm/v0.0.39/jobs\n/slurm/v0.0.39/nodes]
     C -- 否 --> E[fallback: kubectl exec\ncontroller -- squeue/sinfo]
     D --> F[policy：算 ScalingDecision]
     E --> F
@@ -514,7 +515,7 @@ node-2（Node 2）：
   gpu-host-class=rtx3080
   nvidia.com/gpu.product=NVIDIA-GeForce-RTX-3080
   nvidia.com/gpu.family=ampere         nvidia.com/gpu.memory=10240
-  nvidia.com/cuda.driver-version.full=580.159.03
+  nvidia.com/cuda.driver-version.full=580.173.02
 
 兩台共同：
   nvidia.com/gpu.count=1
@@ -697,7 +698,7 @@ flowchart LR
         REST["slurmrestd :6820"]
     end
 
-    EXP -- "JWT-auth GET<br/>/slurm/v0.0.37/jobs,nodes" --> REST
+    EXP -- "JWT-auth GET<br/>/slurm/v0.0.39/jobs,nodes" --> REST
 
     PROM -- "scrape :9341" --> EXP
     PROM -- "scrape :8000" --> OP
@@ -940,7 +941,7 @@ bash scripts/setup-linux-gpu.sh
 curl -sfL https://get.k3s.io | \
   K3S_URL=https://<SERVER_IP>:6443 \
   K3S_TOKEN=<NODE_TOKEN> \
-  INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx4070' \
+  INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx3080' \
   sh -
 ```
 
@@ -948,7 +949,7 @@ curl -sfL https://get.k3s.io | \
 
 ```bash
 kubectl get nodes -o wide
-kubectl label node <second-node-name> gpu-host-class=rtx4070 --overwrite
+kubectl label node <second-node-name> gpu-host-class=rtx3080 --overwrite
 kubectl get nodes --show-labels | grep gpu-host-class
 ```
 
@@ -959,10 +960,14 @@ kubectl get nodes --show-labels | grep gpu-host-class
 ```bash
 bash scripts/deploy-2.sh
 kubectl -n gpu-operator get daemonset,pod
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+kubectl get resourceslices.resource.k8s.io \
+  -o jsonpath='{range .items[?(@.spec.driver=="gpu.nvidia.com")]}{.spec.nodeName}{"\t"}{range .spec.devices[*]}{.name}{"\n"}{end}{end}'
 ```
 
-若 GPU Operator 的 MPS sharing 以 replicas 方式廣告 `nvidia.com/gpu`，Kubernetes 只能看到 share slots，不一定保證一個 pod 的兩個 slots 落在兩張不同 physical GPUs。若要嚴格做「每個 Slurm node 兩張 physical GPUs」，建議用兩張 GPU 的 worker host 搭配 exclusive allocation，或把每張 GPU 建成獨立 Slurm worker pod，並在 simulator evaluation 中明確標註拓撲差異。
+目前預設走 NVIDIA DRA：每個 GPU node 由 `ResourceSlice` advertise physical device，worker 以
+`ResourceClaim` 取得 GPU，再由 Slurm `gres/mps:N` 管理 MPS slots。只有明確設定
+`SKIP_DRA=1` 回退 device-plugin 時，Kubernetes 才會看到 `nvidia.com/gpu` share slots；
+該 legacy 路徑不保證一個 pod 的多個 slots 落在不同 physical GPUs。
 
 ### 12.3 部署 2×2 overlay
 
@@ -973,7 +978,7 @@ helm upgrade slurm-platform ./chart \
   -n slurm
 
 kubectl -n slurm rollout status sts/slurm-controller --timeout=180s
-kubectl -n slurm get sts slurm-worker-gpu-rtx4070 -o yaml | grep -E 'replicas:|nvidia.com/gpu'
+kubectl -n slurm get sts slurm-worker-gpu-rtx4070 -o yaml | grep -E 'replicas:|resourceClaims:|claims:'
 ```
 
 確認 Slurm node / GRES：
@@ -996,7 +1001,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
   --out-dir runs/dsac_2x2_$(date +%Y%m%d)
 ```
 
-訓練完成後，將 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指到新的 checkpoint，重新 build/import `slurm-rl-scheduler:m11`，再套用 Helm。live snapshot collector 或手動 `/snapshot` payload 也必須送：
+訓練完成後，將 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指到新的 checkpoint，重新 build/import `slurm-rl-scheduler:htab2x1`，再套用 Helm。live snapshot collector 或手動 `/snapshot` payload 也必須送：
 
 ```json
 {"n_nodes":2,"gpus_per_node":2,"mps_per_gpu":100}

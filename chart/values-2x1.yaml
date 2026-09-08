@@ -17,8 +17,8 @@
 #
 # Requirements before applying (see docs/intergration.md):
 #   - host-1 labelled  gpu-host-class=rtx4070 ; host-2 labelled gpu-host-class=rtx3080
-#   - each GPU node carries nvidia.com/device-plugin.config (auto via nodeAssignments
-#     / nfdRules below, or label it manually) so MPS sharing → 4 slots is applied
+#   - NVIDIA DRA driver is installed on both GPU nodes; each worker claims one
+#     physical GPU and Slurm subdivides it with the mps:100 GRES
 #   - host-2 (RTX 3080) NFD PCI id confirmed (GA102 10 GB is usually 2206 — verify
 #     with `lspci -nn | grep -i NVIDIA` and adjust nfdRules below if different)
 #
@@ -67,6 +67,10 @@ pools:
     coresPerSocket: 2
     threadsPerCore: 2
     maxNodes: 4
+    # Keep the small CPU-only pool off the 7.5 GiB GPU agent so the 7 GiB
+    # GPU worker request remains schedulable.
+    nodeSelector:
+      kubernetes.io/hostname: acane
     features: [cpu]
     gres: []
     matchGres: []
@@ -137,23 +141,24 @@ pools:
         type: rtx3080
         count: 1
       - name: mps
-        count: 100          # same 4-slot split as the 4070 (jobs request mps:25)
+        count: 100          # jobs request mps:25/50/75/100; 25 permits four-way sharing
     matchGres: ["gpu:rtx3080", "mps"]
     devicePluginConfig: rtx3080-mps
     # DRA migration Stage B (2026-07-08). draMpsMemLimit=9Gi ≤ 3080 VRAM (10GB).
     # node-2 host RAM is only 7.5GB but the MPS keepalive is GPU-side (~265Mi host,
-    # measured) so it stays on. Requires gpu-operator device-plugin operands OFF on
-    # this node (nvidia.com/gpu.deploy.operands=false) so DRA owns the GPU's MPS.
+    # measured) so it stays on. GPU Operator device-plugin operands stay disabled
+    # so DRA owns the GPU's MPS lifecycle.
     useDra: true
     draMpsMemLimit: 9Gi
 
-# --- GPU device-plugin: 4 MPS slots per card, per type -----------------------
+# --- GPU compatibility configuration (legacy device-plugin fallback) ---------
 gpu:
   enabled: true
+  # DRA is the live path. Keep these maps so SKIP_DRA=1 can still render the
+  # legacy device-plugin configuration during rollback or isolated testing.
   deviceConfigs:
-    # rtx3080 also splits into 4 MPS slots (same as rtx4070-mps). The default
-    # + rtx4070-mps + rtx4080-exclusive entries from values.yaml are kept via
-    # map-merge; this only ADDS the 3080 config.
+    # The default + rtx4070-mps + rtx4080-exclusive entries from values.yaml
+    # are kept via map-merge; this only ADDS the 3080 fallback config.
     rtx3080-mps:
       version: v1
       sharing:
@@ -200,4 +205,6 @@ slurm:
             partition: "gpu-rtx4070"
 
 rlScheduler:
+  image:
+    tag: htab2x1
   snapshotTtlSeconds: 30

@@ -582,7 +582,7 @@ slurmd log 出現 `Zero Bytes were transmitted or received`，直覺往認證/�
 
 ```
 chart/
-  Chart.yaml                ← appVersion = Slurm 版本（如 23.11.7）；無 dependencies
+  Chart.yaml                ← appVersion = Slurm 版本（如 23.11.4）；無 dependencies
   values.yaml               ← 預設值（Kind 開發環境基準）
   values-dev.yaml           ← Kind override（無 GPU，File=/dev/null）
   values-k3s.yaml           ← k3s override（real GPU、namespace baseline label）
@@ -687,7 +687,7 @@ serve.py 與 Operator 之間沒有同步呼叫，需要一個帶外（out-of-ban
 
 [Operator polling loop]
   → 首次從 squeue 看到 job_id 時：
-      1. 呼叫 slurmrestd GET /slurm/v0.0.40/job/{job_id} 取得 admin_comment
+      1. 呼叫 slurmrestd GET /slurm/v0.0.39/job/{job_id} 取得 admin_comment
       2. 解析 "otel={traceparent}" → 還原 trace_id + parent_span_id
       3. 用還原的 context 建立 queue_wait span（child of job_submit）
       4. 後續所有 span（scale_up_decision、k8s_provisioning、job_running）

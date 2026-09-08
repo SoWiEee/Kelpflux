@@ -358,7 +358,7 @@ def drain_and_apply(*, max_placements: int = 256, **kwargs) -> list[PlacementDec
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply DSAC hard placement via slurmrestd hold/release.")
     parser.add_argument("--rest-url", default=os.getenv("SLURM_REST_URL", "http://slurm-restapi.slurm.svc.cluster.local:6820"))
-    parser.add_argument("--api-version", default=os.getenv("SLURM_REST_API_VERSION", "v0.0.37"))
+    parser.add_argument("--api-version", default=os.getenv("SLURM_REST_API_VERSION", "v0.0.39"))
     parser.add_argument("--scheduler-url", default=os.getenv("RL_SCHEDULER_URL", "http://rl-scheduler:8002"))
     parser.add_argument("--jwt-key-path", default=os.getenv("SLURM_JWT_KEY_PATH", ""))
     parser.add_argument("--node-name", action="append", default=None, help="Restrict to these Slurm GPU worker node names; repeat for multiple. Omit to auto-discover from /nodes.")

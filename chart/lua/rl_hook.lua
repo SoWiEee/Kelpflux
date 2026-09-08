@@ -119,7 +119,7 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
   -- Submit-time explicit placement (opt-in via RL_PLACEMENT). When RL selected
   -- THIS job and returned a node choice, pin it via job_desc.req_nodes. Slurm
   -- honours submit-time required nodes (unlike a post-submit re-pin, which
-  -- slurmrestd v0.0.37 does not apply), so this is the validated placement
+  -- post-submit REST updates are not relied on, so this is the validated placement
   -- path — the same node binding the live A/B (§4.2) exercises via `sbatch -w`.
   -- Fail-safe: unknown node_j / missing mapping → skip, Slurm places normally.
   if RL_PLACEMENT and rl.rl_selected and rl.node_j ~= nil and rl.node_j >= 0

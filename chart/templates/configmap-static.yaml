@@ -26,7 +26,7 @@ data:
   proctrackType keeps PSS=baseline pods clean while still letting a
   privileged overlay opt in.
   */}}
-  {{- if or (eq .Values.slurm.proctrackType "proctrack/cgroup") (contains "task/cgroup" .Values.slurm.taskPlugin) }}
+  {{- if or (eq .Values.slurm.proctrackType "proctrack/cgroup") (contains "task/cgroup" .Values.slurm.taskPlugin) .Values.slurm.slurmdParameters }}
   cgroup.conf: |
 {{ include "slurm-platform.cgroupConf" . | indent 4 }}
   {{- end }}

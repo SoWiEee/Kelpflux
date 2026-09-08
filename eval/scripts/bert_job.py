@@ -9,7 +9,7 @@ Parameterised by ``--n`` (inference batches / training steps) so the harness can
 target a runtime; ``--seed`` keeps CRN across arms.
 
 Run via the pytorch Lmod module:
-  module use /shared/modulefiles && module load cuda/12.4 pytorch
+  module use /shared/modulefiles && module load cuda/12.6 pytorch
   python3 /shared/scripts/bert_job.py --mode infer --n 60 --batch-size 16
 """
 import argparse

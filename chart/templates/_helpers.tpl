@@ -161,6 +161,9 @@ StateSaveLocation={{ $s.stateSaveLocation }}
 SwitchType={{ $s.switchType }}
 TaskPlugin={{ $s.taskPlugin }}
 ProctrackType={{ $s.proctrackType }}
+{{- if $s.slurmdParameters }}
+SlurmdParameters={{ $s.slurmdParameters }}
+{{- end }}
 {{- if $s.taskProlog }}
 TaskProlog={{ $s.taskProlog }}
 {{- end }}
@@ -265,6 +268,8 @@ ConstrainCores={{ default "yes" $c.constrainCores }}
 ConstrainRAMSpace={{ default "yes" $c.constrainRamSpace }}
 ConstrainDevices={{ default "yes" $c.constrainDevices }}
 ConstrainSwapSpace={{ default "no" $c.constrainSwapSpace }}
+IgnoreSystemd={{ default "no" $c.ignoreSystemd }}
+IgnoreSystemdOnFailure={{ default "no" $c.ignoreSystemdOnFailure }}
 {{- end -}}
 
 {{/*

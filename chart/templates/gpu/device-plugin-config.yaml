@@ -14,7 +14,7 @@ Notes:
   - rtx4070-mps replicas=4 means the device-plugin advertises 4
     nvidia.com/gpu slots per physical GPU. Slurm uses --gres=mps:N to
     pick SM percentages within those slots.
-  - On v26.3.1 of gpu-operator, sharing.mps starts a separate
+  - On the pinned GPU Operator release, sharing.mps starts a separate
     mps-control-daemon DaemonSet (foreground -f mode), which is the whole
     reason we switched off the bundled `sharing.mps` in
     nvidia-device-plugin (it had a daemonize spawn race; see migration.md).

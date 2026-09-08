@@ -31,7 +31,7 @@ SKIP_WAIT="${SKIP_WAIT:-0}"
 HELM_RELEASE="${HELM_RELEASE:-slurm-platform}"
 VALUES_FILE="${VALUES_FILE:-chart/values-k3s.yaml}"
 HELM_TIMEOUT="${HELM_TIMEOUT:-10m}"
-RL_IMAGE="${RL_IMAGE:-slurm-rl-scheduler:m11}"
+RL_IMAGE="${RL_IMAGE:-slurm-rl-scheduler:htab2x1}"
 
 GPU_OPERATOR_NAMESPACE="${GPU_OPERATOR_NAMESPACE:-gpu-operator}"
 GPU_OPERATOR_RELEASE="${GPU_OPERATOR_RELEASE:-gpu-operator}"

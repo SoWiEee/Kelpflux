@@ -23,7 +23,7 @@ metadata:
   name: {{ .Values.cluster.namespace }}
   labels:
     {{- include "slurm-platform.labels" . | nindent 4 }}
-    pod-security.kubernetes.io/enforce: {{ .Values.cluster.podSecurity }}
+    pod-security.kubernetes.io/enforce: {{ default .Values.cluster.podSecurity .Values.cluster.podSecurityEnforce }}
     pod-security.kubernetes.io/audit: {{ .Values.cluster.podSecurity }}
     pod-security.kubernetes.io/warn: {{ .Values.cluster.podSecurity }}
   annotations:

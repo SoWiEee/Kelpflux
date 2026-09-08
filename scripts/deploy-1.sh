@@ -35,8 +35,8 @@ REGENERATE_SECRETS="${REGENERATE_SECRETS:-false}"
 SECRET_WORKDIR=""
 
 IMAGES=(
-  "slurm-controller:latest|docker/controller/Dockerfile|docker/controller"
-  "slurm-worker:latest|docker/worker/Dockerfile|docker/worker"
+  "slurm-controller:23.11.4|docker/controller/Dockerfile|docker/controller"
+  "slurm-worker:23.11.4|docker/worker/Dockerfile|docker/worker"
   "slurm-elastic-operator:latest|docker/operator/Dockerfile|."
   "slurm-exporter:latest|docker/slurm-exporter/Dockerfile|docker/slurm-exporter"
 )

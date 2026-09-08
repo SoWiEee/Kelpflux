@@ -124,6 +124,8 @@ metadata:
 data:
   slurmdbd.conf: |
     AuthType=auth/munge
+    AuthAltTypes=auth/jwt
+    AuthAltParameters=jwt_key=/etc/slurm/jwt_hs256.key
     DbdAddr=slurmdbd.slurm.svc.cluster.local
     DbdHost=slurmdbd
     DbdPort=6819
@@ -155,7 +157,7 @@ spec:
       hostname: slurmdbd
       containers:
         - name: slurmdbd
-          image: slurm-controller:latest
+          image: slurm-controller:23.11.4
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -171,6 +173,7 @@ spec:
               chmod 0700 /etc/munge /var/lib/munge /var/log/munge
               chmod 0711 /run/munge
               install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              install -o root -g root -m 0400 /slurm-secrets/jwt_hs256.key /etc/slurm/jwt_hs256.key
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
@@ -212,6 +215,11 @@ spec:
                   items:
                     - key: munge.key
                       path: munge.key
+              - secret:
+                  name: slurm-jwt-secret
+                  items:
+                    - key: jwt_hs256.key
+                      path: jwt_hs256.key
         - name: slurmdbd-config
           configMap:
             name: slurmdbd-config

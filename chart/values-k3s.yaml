@@ -4,14 +4,18 @@
 # Layer over values.yaml:
 #   helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm
 #
-# Reflects the configuration verified end-to-end on 2026-04-27 in commit
-# 3eec54f (Ubuntu 24.04 + k3s v1.34 + RTX 4070 + driver 535.288.01). Stage A
+# Target configuration for the live Ubuntu 24.04 + k3s v1.35 + Slurm 23.11
+# environment (RTX 4070 + driver 580).
+# Stage A
 # only renders slurm.conf / gres.conf — the other overrides here are inert
 # until later stages wire them up.
 
 cluster:
   runtime: k3s
   podSecurity: baseline
+  # Slurm 23.11 workers need privileged host cgroup access. Keep audit/warn at
+  # baseline while explicitly authorizing only this namespace's enforcement.
+  podSecurityEnforce: privileged
 
 # Stage D enables this; values.yaml::gpu-operator subchart override (driver +
 # toolkit disabled) takes over because the host already has nvidia-driver-535 +
@@ -32,6 +36,22 @@ storage:
   mountInPods: true                  # /shared on controller/workers/login
   nfsServer: 192.168.0.111
   nfsPath: /srv/nfs/k8s
+
+slurm:
+  # Slurm 23.11 cgroup/v2 needs host systemd to create a delegated scope.
+  # This enables hostPID + privileged host-cgroup access on worker pods only.
+  # The namespace uses enforce=privileged with audit/warn=baseline; only the
+  # worker templates request host-level permissions.
+  workerHostCgroup: true
+  slurmdParameters: config_overrides
+  cgroup:
+    plugin: autodetect
+    ignoreSystemd: "no"
+    ignoreSystemdOnFailure: "no"
+    constrainCores: "yes"
+    constrainRamSpace: "yes"
+    constrainDevices: "yes"
+    constrainSwapSpace: "no"
 
 monitoring:
   enabled: true

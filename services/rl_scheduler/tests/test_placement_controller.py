@@ -100,7 +100,7 @@ def test_apply_hard_placement_posts_required_nodes_and_release(monkeypatch):
     monkeypatch.setattr(pc, "http_json", fake_http_json)
 
     pc.apply_hard_placement(
-        rest_base="http://rest/slurm/v0.0.37",
+        rest_base="http://rest/slurm/v0.0.39",
         jwt_key=b"k",
         job_id="99",
         node_name="gpu-0",
@@ -110,7 +110,7 @@ def test_apply_hard_placement_posts_required_nodes_and_release(monkeypatch):
     assert calls == [
         (
             "POST",
-            "http://rest/slurm/v0.0.37/job/99",
+            "http://rest/slurm/v0.0.39/job/99",
             b"k",
             {"required_nodes": "gpu-0", "priority": pc.RELEASE_PRIORITY},
         )
@@ -125,7 +125,7 @@ def test_apply_hard_placement_shadow_omits_priority_when_no_release(monkeypatch)
     )
 
     pc.apply_hard_placement(
-        rest_base="http://rest/slurm/v0.0.37", jwt_key=None,
+        rest_base="http://rest/slurm/v0.0.39", jwt_key=None,
         job_id="5", node_name="gpu-0", release=False,
     )
 
@@ -165,7 +165,7 @@ def test_choose_and_apply_actuates_when_not_shadow(monkeypatch):
     updates = _stub_http(monkeypatch, jobs=jobs, nodes=nodes, act=act)
 
     decision = pc.choose_and_apply(
-        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        rest_url="http://rest", api_version="v0.0.39", scheduler_url="http://rl",
         jwt_key=b"k", shadow=False, auto_trim_model_topology=False,
     )
 
@@ -173,7 +173,7 @@ def test_choose_and_apply_actuates_when_not_shadow(monkeypatch):
     assert decision.node_name == "gpu-0"
     assert decision.reason == "applied"
     assert updates == [(
-        "http://rest/slurm/v0.0.37/job/7",
+        "http://rest/slurm/v0.0.39/job/7",
         {"required_nodes": "gpu-0", "priority": pc.RELEASE_PRIORITY},
     )]
 
@@ -188,7 +188,7 @@ def test_choose_and_apply_shadow_does_not_post_update(monkeypatch):
     updates = _stub_http(monkeypatch, jobs=jobs, nodes=nodes, act=act)
 
     decision = pc.choose_and_apply(
-        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        rest_url="http://rest", api_version="v0.0.39", scheduler_url="http://rl",
         jwt_key=b"k", shadow=True, auto_trim_model_topology=False,
     )
 
@@ -229,7 +229,7 @@ def test_drain_and_apply_places_all_held_jobs_in_one_cycle(monkeypatch):
     monkeypatch.setattr(pc, "http_json", fake_http_json)
 
     decisions = pc.drain_and_apply(
-        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        rest_url="http://rest", api_version="v0.0.39", scheduler_url="http://rl",
         jwt_key=b"k", shadow=False, auto_trim_model_topology=False,
     )
 
@@ -260,7 +260,7 @@ def test_drain_and_apply_shadow_does_one_passive_cycle(monkeypatch):
     monkeypatch.setattr(pc, "http_json", fake_http_json)
 
     decisions = pc.drain_and_apply(
-        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        rest_url="http://rest", api_version="v0.0.39", scheduler_url="http://rl",
         jwt_key=b"k", shadow=True, auto_trim_model_topology=False,
     )
 
@@ -279,7 +279,7 @@ def test_choose_and_apply_abstains_on_dsac_no_op(monkeypatch):
     updates = _stub_http(monkeypatch, jobs=jobs, nodes=nodes, act=act)
 
     decision = pc.choose_and_apply(
-        rest_url="http://rest", api_version="v0.0.37", scheduler_url="http://rl",
+        rest_url="http://rest", api_version="v0.0.39", scheduler_url="http://rl",
         jwt_key=b"k", shadow=False, auto_trim_model_topology=False,
     )
 

@@ -31,15 +31,18 @@ MODE="${1:-status}"
 show_status() {
   echo "── ${NODE} / RTX 4070 (DRA) status ──"
   nvidia-smi --query-gpu=name,compute_mode,memory.used --format=csv,noheader 2>/dev/null | sed 's/^/  GPU: /'
-  local cord phase
+  local cord phase ready
   cord=$(kubectl get node "$NODE" -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
   phase=$(kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.phase}' 2>/dev/null)
+  ready=$(kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)
   echo "  cordoned: ${cord:-false}"
-  echo "  worker pod: ${phase:-<none>}"
+  echo "  worker pod: ${phase:-<none>} (ready=${ready:-false})"
   echo "  compute apps:"
   nvidia-smi --query-compute-apps=process_name,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/    /' || echo "    (none)"
   if [ "${cord:-false}" = "true" ] || [ -z "$phase" ] || [ "$phase" != "Running" ]; then
     echo "  → released for gaming"
+  elif [ "${ready:-false}" != "true" ]; then
+    echo "  → worker is not ready; GPU claim may still be active"
   else
     echo "  → owned by the cluster (DRA claim active)"
   fi

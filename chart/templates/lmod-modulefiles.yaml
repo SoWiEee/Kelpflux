@@ -105,15 +105,15 @@ metadata:
   labels:
     {{- include "slurm-platform.labels" . | nindent 4 }}
 data:
-  12.4.lua: |
-    whatis("CUDA 12.4 — NVIDIA CUDA compiler and toolkit")
+  12.6.lua: |
+    whatis("CUDA 12.6 — NVIDIA CUDA compiler and toolkit")
 
     help([[
-    CUDA toolkit from the nvidia/cuda:12.4.1-devel-ubuntu22.04 worker image.
+    CUDA toolkit from the nvidia/cuda:12.6.3-devel-ubuntu24.04 worker image.
 
     Example:
       source /etc/profile.d/lmod.sh
-      module load gcc/11 cuda/12.4
+      module load gcc/11 cuda/12.6
       nvcc vector_add.cu -o vector_add
     ]])
 

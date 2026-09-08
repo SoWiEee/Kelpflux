@@ -15,7 +15,10 @@ cluster:
   namespace: slurm
   runtime: kind              # kind | k3s — affects taskPlugin defaults and
                              # gres.conf File path (k3s → /dev/nvidia0).
-  podSecurity: baseline      # baseline | restricted | privileged.
+  podSecurity: baseline      # audit/warn baseline by default.
+  # Optional enforce level for workloads that need host integration. Keep this
+  # empty unless the deployment explicitly authorizes privileged admission.
+  podSecurityEnforce: ""
 
 # Partition definitions in slurm.conf order. Each pool below references one
 # of these by name via `pool.partition`.
@@ -146,30 +149,30 @@ slurm:
   # CompleteWait=0 prevents COMPLETING-stuck jobs when a worker pod is evicted
   # mid-epilog (see docs/note.md mps-migration debug record).
   completeWait: 0
-  # R9 / R13 status (2026-05-05 — both deferred):
-  # An attempt to upgrade Slurm 21.08 → 23.11 (Ubuntu 22.04 → 24.04 base)
-  # exposed multiple new incompatibilities with PSS=baseline pods:
+  # Slurm 23.11 baseline (Ubuntu 24.04 image):
+  # The previous 21.08 deployment exposed these upgrade requirements:
   #   1. Slurm 23.11 slurmstepd ALWAYS calls org.freedesktop.systemd1 over
   #      dbus to create a transient cgroup scope, even when TaskPlugin is
   #      task/affinity (no opt-out). Without /run/dbus mounted, slurmd
   #      refuses to start → "cgroup_dbus_attach_to_scope: cannot connect".
   #   2. JWT key file mode is enforced as 0400/0600 (was 0644 in 21.08).
-  #   3. openapi/v0.0.37 was removed; slurmrestd needs v0.0.40 plugin.
+  #   3. openapi/v0.0.37 was removed; slurmrestd uses the v0.0.39 plugin.
   #   4. auth_jwt.so was split out to slurm-wlm-jwt-plugin package.
   #   5. slurmdbd state file format changed (incompatible PVC migration).
-  # The dbus / systemd-scope dependency (#1) is the blocker — it requires
-  # PSS=privileged + hostPath dbus or a systemd init container, which
-  # widens the attack surface beyond what fits the academic demo. We stay
-  # on Slurm 21.08 + task/affinity + proctrack/linuxproc until the chart
-  # gets a privileged overlay. R9 (clean process-tree kill via cgroup) is
-  # therefore deferred until R13 (Slurm version upgrade) lands.
+  # The default remains task/affinity + proctrack/linuxproc. Slurm 23.11's
+  # slurmd still initializes its cgroup/v2 interface; a baseline k3s pod has
+  # no host systemd scope, so compute workers require a separately approved
+  # host-cgroup overlay before they can register.
   taskPlugin: task/affinity
   proctrackType: proctrack/linuxproc
+  slurmdParameters: ""
   # cgroup.conf is still emitted (Slurm reads it whenever any cgroup plugin
   # is referenced, including from accounting/JobAcctGather). Defaults are
   # safe even when no cgroup task plugin is active.
   cgroup:
     plugin: autodetect
+    ignoreSystemd: "no"
+    ignoreSystemdOnFailure: "no"
     constrainCores: "yes"
     constrainRamSpace: "yes"
     constrainDevices: "yes"
@@ -344,8 +347,8 @@ slurm:
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:
-  controller: slurm-controller:latest
-  worker: slurm-worker:latest
+  controller: slurm-controller:23.11.4
+  worker: slurm-worker:23.11.4
   operator: slurm-elastic-operator:latest
   pullPolicy: IfNotPresent
 
@@ -500,7 +503,7 @@ rlScheduler:
   enabled: false
   image:
     repository: slurm-rl-scheduler
-    tag: m11
+    tag: htab2x1
     pullPolicy: IfNotPresent
   service:
     port: 8002
@@ -518,7 +521,7 @@ rlScheduler:
     enabled: true         # keep /snapshot fresh so live /decide does not stale-abstain
     intervalSeconds: 10   # must stay below snapshotTtlSeconds
     slurmRestUrl: ""      # defaults to slurm-restapi.<namespace>.svc:6820
-    slurmRestApiVersion: v0.0.37
+    slurmRestApiVersion: v0.0.39
     rlSchedulerUrl: "http://rl-scheduler:8002"
     mpsPerGpu: 100
     gpusPerNode: 1
@@ -539,7 +542,7 @@ rlScheduler:
     shadow: false          # false = actually POST job updates; true = log only
     intervalSeconds: 5
     slurmRestUrl: ""       # defaults to slurm-restapi.<namespace>.svc:6820
-    slurmRestApiVersion: v0.0.37
+    slurmRestApiVersion: v0.0.39
     rlSchedulerUrl: "http://rl-scheduler:8002"
     mpsPerGpu: 100
     defaultMps: 100
@@ -646,9 +649,8 @@ monitoring:
     image: slurm-exporter:latest
     pullPolicy: IfNotPresent
     restUrl: ""                                    # defaults to slurm-restapi.<ns>.svc:6820
-    # Pin to v0.0.37 to match Slurm 21.08 (Ubuntu 22.04). When R13 is
-    # finally executed (Slurm 23.11+), bump to v0.0.40.
-    restApiVersion: v0.0.37
+    # Slurm 23.11 REST plugin.
+    restApiVersion: v0.0.39
     scrapeIntervalSeconds: 15
   # R5: scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
   # Tensor Core utilisation. The DCGM DaemonSet is enabled by
@@ -669,7 +671,7 @@ monitoring:
     image: "quay.io/prometheus/node-exporter:v1.8.2"
     nodes:
       acane: 192.168.0.111
-      nutnadmin-e500-g9-ws760t: 192.168.0.104
+      nutnadmin-e500-g9-ws760t: 192.168.0.103
   # Phase 7-A: OpenTelemetry distributed tracing (Tempo + OTel Collector).
   # Set enabled: true to deploy Tempo + otel-collector and wire Grafana datasource.
   otel:

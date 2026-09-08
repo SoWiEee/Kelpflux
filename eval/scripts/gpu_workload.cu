@@ -21,7 +21,7 @@
 //   seed    deterministic fill (CRN: pass the job_id so the same logical job is
 //           byte-identical across arms).
 //
-// Build (inside a worker pod, nvidia/cuda:12.4.1-devel — has nvcc + cuBLAS):
+// Build (inside a worker pod, nvidia/cuda:12.6.3-devel-ubuntu24.04 — has nvcc + cuBLAS):
 //   nvcc -O3 -o /shared/bin/gpu_workload /shared/src/gpu_workload.cu -lcublas
 //
 // Usage:

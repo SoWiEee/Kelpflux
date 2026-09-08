@@ -1,7 +1,7 @@
 {{/*
 Slurm login pod — entry point for users to submit jobs.
 
-Same image as worker (slurm-worker:latest) since it needs the Slurm client
+Same image as worker (slurm-worker:23.11.4) since it needs the Slurm client
 binaries (sbatch, srun, squeue, scontrol). Runs sshd + munged but NOT
 slurmd, so it can sit outside the partition graph.
 

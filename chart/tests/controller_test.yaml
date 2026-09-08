@@ -62,12 +62,12 @@ tests:
           path: kind
           value: StatefulSet
 
-  - it: slurmrestd pins openapi version (v0.0.37 for Slurm 21.08; bump on R13)
+  - it: slurmrestd pins openapi version for Slurm 23.11
     template: controller.yaml
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: "openapi/v0.0.37"
+          pattern: "openapi/v0.0.39"
         documentSelector:
           path: kind
           value: StatefulSet

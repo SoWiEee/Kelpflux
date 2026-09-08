@@ -23,7 +23,7 @@ SLURM_REST_URL: str = os.environ.get(
     "SLURM_REST_URL",
     "http://slurm-restapi.slurm.svc.cluster.local:6820",
 ).rstrip("/")
-SLURM_REST_API_VERSION: str = os.environ.get("SLURM_REST_API_VERSION", "v0.0.37")
+SLURM_REST_API_VERSION: str = os.environ.get("SLURM_REST_API_VERSION", "v0.0.39")
 SLURM_JWT_KEY_PATH: str = os.environ.get("SLURM_JWT_KEY_PATH", "")
 SCRAPE_INTERVAL_SECONDS: int = int(os.environ.get("SCRAPE_INTERVAL_SECONDS", "15"))
 METRICS_PORT: int = int(os.environ.get("METRICS_PORT", "9341"))

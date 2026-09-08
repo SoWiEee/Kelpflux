@@ -23,7 +23,7 @@ tests:
           count: 2
       - equal:
           path: spec.template.spec.containers[0].image
-          value: slurm-rl-scheduler:m11
+          value: slurm-rl-scheduler:htab2x1
         documentSelector:
           path: kind
           value: Deployment

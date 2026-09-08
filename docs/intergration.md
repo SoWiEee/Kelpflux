@@ -24,7 +24,7 @@
 
 > ⚠ obs_dim 已從舊的 192 收斂為 **160/166**（GPU 字母表縮成 `{rtx4070, rtx3080}`，`JOB_FEAT_DIM` 11→9）。現有 1×1 live checkpoint（192-dim）已不相容、`/decide` fail-safe 退回 score，直到用新維度重訓（§7）。
 
-> **chart 設定走單一 overlay：`chart/values-2x1.yaml`**（已建好）。它把整件事做成**宣告式、低維護**：異質 4070 + 3080、每張卡切 **4 個 MPS slot**、兩種卡**各自獨立 partition** 並用 `nodeSelector` 釘到對應實體機，device-plugin 的 MPS 設定由 **NFD 規則自動套用**（PCI 比對、node 重建也會自動收斂，不靠一次性手動 label）。DSAC 訓練帶 `--n-nodes 2 --gpus-per-node 1`。後面 §5/§6/§7 都以這個 overlay 為主軸。
+> **chart 設定走單一 overlay：`chart/values-2x1.yaml`**（已建好）。它把整件事做成**宣告式、低維護**：異質 4070 + 3080、每張卡由 DRA 取得並以 Slurm `mps:100` 細分、兩種卡**各自獨立 partition** 並用 `nodeSelector` 釘到對應實體機，GPU 型別由 **NFD 規則自動維護**（PCI 比對、node 重建也會自動收斂，不靠一次性手動 label）。DSAC 訓練帶 `--n-nodes 2 --gpus-per-node 1`。後面 §5/§6/§7 都以這個 overlay 為主軸。
 >
 > （repo 另有的 `values-2x2.yaml` 是「每台 2 張卡」的另一種拓樸，**與你的硬體無關**，本指南不再使用它。）
 
@@ -73,7 +73,7 @@ kubectl get nodes -o wide
 
 ## 3. 在第二台安裝 GPU runtime 並加入 k3s
 
-> 以下是 **2026-06 實際在 RTX 3080（`192.168.0.104`, Ubuntu 22.04）上驗證通過**的流程。
+> 以下是 **2026-06 的歷史升級紀錄**（當時 RTX 3080 為 `192.168.0.103`、Ubuntu 22.04）；目前 node-2 已升至 Ubuntu 24.04、k3s v1.35.8、Slurm 23.11.4。
 > 四個關卡照順序做完才會成功：**(1) server 防火牆 → (2) node-2 前置 → (3) 版本釘選 join → (4) NFS/映像/部署**。
 > 每一關都有對應的踩雷紀錄，照做可一次到位。
 
@@ -118,15 +118,15 @@ sudo ufw reload
 ```bash
 # 在 acane 上先抓「現在」的 server token 與版本：
 sudo cat /var/lib/rancher/k3s/server/node-token
-kubectl version --short | grep Server      # 例：v1.34.6+k3s1
+kubectl version -o json | jq -r '.serverVersion.gitVersion'  # 例：v1.35.8+k3s1
 ```
 
 ```bash
 # 在 node-2 上 join。INSTALL_K3S_VERSION 要等於 server 版本，不要用 stable channel。
-# gpu-host-class 必須反映真實硬體（3080 用 rtx3080），device-plugin MPS config 與 score 的
-# VRAM 假設都靠它。
+# gpu-host-class 必須反映真實硬體（3080 用 rtx3080）；DRA worker selector 與 score
+# 的 VRAM 假設都靠它。
 curl -sfL https://get.k3s.io | \
-  INSTALL_K3S_VERSION=v1.34.6+k3s1 \
+  INSTALL_K3S_VERSION=v1.35.8+k3s1 \
   K3S_URL=https://192.168.0.111:6443 \
   K3S_TOKEN='<上一步的 node-token>' \
   INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx3080' \
@@ -182,13 +182,14 @@ sudo exportfs -v   # 確認第二台 subnet 有列出來
 
 > chart 的 NFS server / path 來自 `chart/values-k3s.yaml:33-34`（`nfsServer: 192.168.0.111`、`nfsPath: /srv/nfs/k8s`），由 `chart/templates/storage.yaml:148-158` 注入 PV/provisioner。NFS server 本身仍在第一台。
 
-## 5. GPU Operator 與 3080 的 4-slot MPS 設定（宣告式，低維護）
+## 5. GPU Operator、NFD 與 NVIDIA DRA（宣告式，低維護）
 
-`deploy-2.sh` 會安裝 GPU Operator。**3080 要切成 4 個 MPS slot 的設定，已經宣告在 `values-2x1.yaml` 裡，不需要每台手動 label**：
+`deploy-2.sh` 會安裝 GPU Operator 與 NVIDIA DRA driver。**3080 的 GPU claim 與型別標籤已宣告在 `values-2x1.yaml` 裡，不需要每台手動 label**：
 
-- `deviceConfigs.rtx3080-mps`：`sharing.mps … replicas: 4` → 每張 3080 切 4 個 share（對齊 4070 的 `rtx4070-mps`、`MPS_PER_GPU=4`）。
+- `pool.useDra: true`：每個 GPU worker 以 `ResourceClaimTemplate` 取得一張 physical GPU；DRA 的 MPS server 保持 thread%=100。
+- Slurm GRES：每張卡宣告 `mps:100`，job 以 `--gres=mps:25/50/75/100` 取得邏輯配額。
 - `nfdRules`：用 **PCI device ID 自動**把 `rtx3080-mps` 套到 3080 node（Ampere GA102 10 GB 通常是 `2206`）。NFD 會在 node 重建 / k3s 重裝後**自動收斂**，不靠一次性 hook——這就是低維護的關鍵。
-- `nodeAssignments`：保留為非 NFD 叢集的 fallback（與 NFD 並存，衝突時 NFD 優先）。
+- `nodeAssignments`：保留為非 NFD 叢集的 GPU 型別 fallback（與 NFD 並存，衝突時 NFD 優先）。
 
 **唯一的一次性人工步驟：確認 3080 的 PCI ID**（板型不同可能是 `2206`/`2216`/`2208`），對不上就改 `values-2x1.yaml` 的 `nfdRules`：
 
@@ -198,19 +199,19 @@ ssh host-2 'lspci -nn | grep -i NVIDIA'
 # 例：... [10de:2206] ...  → 對應 values-2x1.yaml nfdRules 的 "2206"，相符即可
 ```
 
-套用 overlay（§6.2 會一起部署）後，確認 device-plugin 已把 3080 切成 4 share：
+套用 overlay（§6.2 會一起部署）後，確認 NVIDIA DRA 已 advertise 3080 physical device：
 
 ```bash
-kubectl -n gpu-operator rollout status daemonset/nvidia-device-plugin-daemonset --timeout=180s
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-# 兩個 GPU node 的 allocatable nvidia.com/gpu 應各為 4（= 4 MPS share）
+kubectl -n dra-driver-nvidia-gpu get pods -l app.kubernetes.io/name=gpu-kubelet-plugin
+kubectl get resourceslices.resource.k8s.io \
+  -o jsonpath='{range .items[?(@.spec.driver=="gpu.nvidia.com")]}{.spec.nodeName}{"\t"}{range .spec.devices[*]}{.name}{"\n"}{end}{end}'
+# 每個 GPU node 應 advertise 一個 physical device；MPS slots 由 Slurm GRES 管理。
 ```
 
-> **fallback（只在 NFD 沒生效時用）**：手動把 config label 補上 ——
-> `kubectl label node <host-2> nvidia.com/device-plugin.config=rtx3080-mps --overwrite`。
-> 但正常情況下 NFD 規則會自動處理，**不需要**這一步。
+> **fallback（只在 NFD 沒生效時用）**：手動補 `gpu-host-class=rtx3080` label。
+> 正常情況下 NFD 規則會自動處理，**不需要**這一步。
 
-> 注意：MPS sharing 會讓 `nvidia.com/gpu` 顯示 share slots（這裡是 4），不等於 physical GPU 張數（1）。Slurm GRES（`mps:100`，job 要 `mps:25`）與 DSAC topology（2×1）才是「資源單位」的權威來源。
+> 注意：目前 DRA 模式下 `nvidia.com/gpu` allocatable 為 0，不再顯示 share slots。Slurm GRES（`mps:100`，job 要 `mps:25`）與 DSAC topology（2×1）才是「資源單位」的權威來源。
 
 ## 6. Slurm worker pool 調整
 
@@ -235,7 +236,8 @@ kubectl -n slurm exec slurm-controller-0 -- sinfo -Nel
 
 - `partitions`：`cpu` + `gpu-rtx4070` + `gpu-rtx3080`（兩種卡各一個 partition）。
 - `pools`：`gpu-rtx4070` / `gpu-rtx3080` 兩個 GPU pool，各 `count: 1` / `mps: 100` / `replicas: 1`，並用 **`nodeSelector: {gpu-host-class: …}` 釘到對應實體機**（4070→host-1、3080→host-2）。
-- `gpu.deviceConfigs.rtx3080-mps`（`replicas: 4`）+ `nfdRules`（PCI 自動套用）+ `nodeAssignments`（fallback）。
+- `useDra: true`：每個 GPU worker 以 DRA claim 取得一張 physical GPU，Slurm 以 `mps:100` 管理共享配額；`nfdRules` 以 PCI ID 自動維護 GPU 型別。
+- `gpu.deviceConfigs.rtx3080-mps` 僅保留給 `SKIP_DRA=1` 的 legacy device-plugin fallback，`nodeAssignments` 亦同。
 - `slurm.jobSubmit.helper.partition.rules`：多一條 `gpu:rtx3080 → gpu-rtx3080` 路由。
 
 > **為什麼是這份而不是 `values-2x2.yaml`**：`values-2x2.yaml` 是「每台 2 張卡」（`count: 2`、`mps: 200`、178/65）的另一種拓樸，跟你的單卡硬體無關。`values-2x1.yaml` 才對齊 166/33。
@@ -280,21 +282,21 @@ helm upgrade --install slurm-platform ./chart \
 ```bash
 # 在 acane 匯出（worker 是 CUDA base，整包約 4–5 GB）
 sudo k3s ctr -n k8s.io images export /tmp/slurm-images.tar \
-  docker.io/library/slurm-worker:latest \
-  docker.io/library/slurm-controller:latest \
+  docker.io/library/slurm-worker:23.11.4 \
+  docker.io/library/slurm-controller:23.11.4 \
   docker.io/library/slurm-exporter:latest \
   docker.io/library/slurm-elastic-operator:latest \
-  docker.io/library/slurm-rl-scheduler:m11
+  docker.io/library/slurm-rl-scheduler:htab2x1
 sudo chmod 644 /tmp/slurm-images.tar
 
 # 傳到 node-2 並匯入它的 k3s containerd
-scp /tmp/slurm-images.tar <user>@192.168.0.104:/tmp/
-ssh <user>@192.168.0.104 'sudo k3s ctr -n k8s.io images import /tmp/slurm-images.tar'
+scp /tmp/slurm-images.tar <user>@192.168.0.103:/tmp/
+ssh <user>@192.168.0.103 'sudo k3s ctr -n k8s.io images import /tmp/slurm-images.tar'
 
 # 驗證 + 清理
-ssh <user>@192.168.0.104 "sudo k3s ctr -n k8s.io images ls | grep slurm-"
+ssh <user>@192.168.0.103 "sudo k3s ctr -n k8s.io images ls | grep slurm-"
 sudo rm -f /tmp/slurm-images.tar
-ssh <user>@192.168.0.104 'sudo rm -f /tmp/slurm-images.tar'
+ssh <user>@192.168.0.103 'sudo rm -f /tmp/slurm-images.tar'
 ```
 
 > 之後每次 rebuild 這些映像都要重做一次 import。長期低維護的解法是架一個兩台都連得到的**本地 registry**，讓 `imagePullPolicy` 正常運作；在那之前，export→import 是最務實的做法。
@@ -427,7 +429,7 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 |------|------|------|
 | 套錯 overlay（拿 `values-2x2.yaml`）| checkpoint(178/65) 與 snapshot(166/33) 永遠對不上，`/decide` 一律 abstain | 用 `values-2x1.yaml`（166/33）+ 訓練帶 `--gpus-per-node 1`（見 §0、§6.2）|
 | 拿舊 192-dim checkpoint 配收斂後的 160-dim 程式 | obs 寬度不符 → `/decide` shape mismatch → 一律 abstain 退回 score | 用新維度（1×1=160 / 2×1=166）重訓並重烘 image（§7）；3080 字母表建模本身已完成（§0.1）|
-| 3080 沒被切成 4 MPS slot | `nvidia.com/gpu` allocatable 顯示 1 而非 4 → 沒有 share | 多半是 **NFD PCI ID 沒對上**：用 `lspci -nn` 確認 3080 的 id 並更新 `values-2x1.yaml` 的 `nfdRules`（§5）；NFD 沒生效才手動補 `device-plugin.config=rtx3080-mps` label |
+| 3080 DRA claim 無法分配 | `ResourceSlice` 缺少 3080 device 或 worker claim 卡住 | 多半是 **NFD PCI ID 沒對上**：用 `lspci -nn` 確認 3080 id 並更新 `values-2x1.yaml` 的 `nfdRules`（§5）；再檢查 `kubectl -n dra-driver-nvidia-gpu get pods` 與 `kubectl -n slurm get resourceclaims` |
 | GPU worker 落錯機器（4070 job 跑到 3080）| 卡別/VRAM 假設失準 | 已由 `values-2x1.yaml` 的獨立 partition + `nodeSelector` 解決（§0.1、§6.2）；確認兩台都有 `gpu-host-class` label |
 | NFS 不通 | worker pod 卡 `ContainerCreating` 或 `/shared` 讀寫失敗 | `/etc/exports` 含第二台 **LAN subnet**（§4）；node-2 裝 `nfs-common`（§3.0）；acane ufw 開 `2049/tcp`（§3.1）|
 | node 加不進來 / Slurm node `DOWN` | join 時 `Failed to validate connection`；或 node Ready 但 Slurm `Not responding` | acane ufw 缺埠：`6443/8472/10250/2049` + **`default allow routed` + pod/svc CIDR**（§3.1）。`deny routed` 會擋跨 node 轉發 |
@@ -444,7 +446,7 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 1. 第二台（Ubuntu 24.04 + RTX 3080）跑 `setup-linux-gpu.sh`。
 2. 第二台用 k3s agent join 第一台（`--node-label gpu-host-class=rtx3080`）。
-3. 確認 host-1 也有 `gpu-host-class=rtx4070` label（nodeSelector / nodeAssignments 都靠它）。3080 的 device-plugin config 走 `values-2x1.yaml` 的 NFD 自動套用，不必手動 label。
+3. 確認 host-1 也有 `gpu-host-class=rtx4070` label（nodeSelector / nodeAssignments 都靠它）。3080 的 GPU 型別標籤走 `values-2x1.yaml` 的 NFD 自動套用，不必手動 label。
 4. **回第一台把第二台 LAN subnet 加進 `/etc/exports`**，確認 NFS 可 mount。
 5. 跑 `bash scripts/deploy-2.sh`。
 6. 跑 `bash scripts/verify-live.sh`。
@@ -460,6 +462,9 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 ## 12. node-2 OS 升級：Ubuntu 22.04 → 24.04（修 3080 MPS）
 
+> 本節保留 2026-06 的 device-plugin 時代升級紀錄；目前 live 叢集已改用
+> NVIDIA DRA，沒有 `config-manager` sidecar，請以本文前面的 DRA 驗證流程為準。
+
 **動機（為什麼要升）**：node-2 被裝成 **Ubuntu 22.04**，但 acane 是 **24.04**。結果 node-2 的 **device-plugin MPS 控制 daemon 的 `config-manager` sidecar 一直 CrashLoopBackOff**（Go panic `index out of range [0]` at `findPidToSignal`），3080 的 MPS 因此**無法多工**——並行 CUDA job 只有 1/N 成功、其餘 `CUDA-capable device(s) is/are busy`。根因是環境差異：
 
 | | acane（node-1, 4070） | node-2（3080） |
@@ -470,13 +475,13 @@ kubectl -n slurm exec "$LOGIN_POD" -- \
 
 `580.167.08` **沒有為 22.04 打包**（只在 24.04 repo），所以單純對齊 driver 不可行；要對齊就得升 OS。升完 24.04 會順帶把 host driver 帶到 580.167.08。詳見 `docs/eval-writeup.md` §4.2 / §5.1 第 4 項與 memory `project-mps-never-functional`。
 
-> ⚠️ **高風險操作**：`do-release-upgrade` 在遠端機（node-2 = `nutn-admin@192.168.0.104`）上跑會 reboot、且可能中途失敗 → 機器可能變不可達。**強烈建議在能實體接觸/有 console（IPMI/螢幕鍵盤）時做**。一定要在 `tmux`/`screen` 裡跑，並讓 release-upgrade 開第二個 sshd（port 1022）當 fallback。
+> ⚠️ **高風險操作**：`do-release-upgrade` 在遠端機（node-2 = `nutn-admin@192.168.0.103`）上跑會 reboot、且可能中途失敗 → 機器可能變不可達。**強烈建議在能實體接觸/有 console（IPMI/螢幕鍵盤）時做**。一定要在 `tmux`/`screen` 裡跑，並讓 release-upgrade 開第二個 sshd（port 1022）當 fallback。
 
 ### 12.1 升級前檢查清單（逐項打勾）
 
 **A. 備份 / 記錄當前狀態（在 node-2 上，存到 `/shared` 讓 acane 也讀得到）**
 ```bash
-ssh nutn-admin@192.168.0.104
+ssh nutn-admin@192.168.0.103
 sudo mkdir -p /shared/node2-preupgrade && cd /shared/node2-preupgrade
 # OS / kernel / driver / k3s 版本
 { lsb_release -a; uname -a; cat /proc/driver/nvidia/version; k3s --version; } > versions.txt 2>&1
@@ -492,7 +497,7 @@ nvidia-smi -q > nvidia-smi-q.txt 2>&1
 ```
 
 **B. 相容性確認（升級後要用的版本，先查清楚）**
-- [ ] **k3s 版本**：server（acane）是 `v1.34.6+k3s1`。agent 升級後 **kubelet 不能比 apiserver 新**（§3.2、§10）。24.04 上要**重裝 k3s agent 並釘同一版本**：`curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.34.6+k3s1 K3S_URL=... K3S_TOKEN=... sh -`（token/URL 用 §2 的；node-label `gpu-host-class=rtx3080`）。
+- [ ] **k3s 版本**：server（acane）與 agent 皆為 `v1.35.8+k3s1`。agent 升級後 **kubelet 不能比 apiserver 新**（§3.2、§10）。24.04 上要**重裝 k3s agent 並釘同一版本**：`curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.35.8+k3s1 K3S_URL=... K3S_TOKEN=... sh -`（token/URL 用 §2 的；node-label `gpu-host-class=rtx3080`）。
 - [ ] **NVIDIA driver**：24.04 repo 有 `nvidia-driver-580 580.167.08-1ubuntu1`（= acane）。升完用 `apt-cache policy nvidia-driver-580` 確認 candidate 是 580.167.08。
 - [ ] **gpu-operator**：`driver.enabled=false`（用 host driver），所以重點是 host driver + nvidia-container-toolkit 在 24.04 上裝好；gpu-operator 的 MPS daemonset 會自己 reconcile。
 - [ ] **NFS client**：24.04 要重裝 `nfs-common`（§3.0），否則 `/shared` PVC 掛不上 → worker `ContainerCreating`。
@@ -500,7 +505,7 @@ nvidia-smi -q > nvidia-smi-q.txt 2>&1
 
 **C. 叢集側的事前準備（在 acane 上）**
 - [ ] **drain / cordon node-2**，避免升級期間排程到它：`kubectl cordon nutnadmin-e500-g9-ws760t && kubectl drain nutnadmin-e500-g9-ws760t --ignore-daemonsets --delete-emptydir-data --force`。
-- [ ] **記下當前 rl-scheduler image**（目前是實驗用 `slurm-rl-scheduler:htabp1p2`；升級這段可先還原 production `m11`，避免實驗 image 卡住）。
+- [ ] **記下當前 rl-scheduler image**（目前 live 2×1 使用 `slurm-rl-scheduler:htab2x1`；升級後需以相同 tag 或明確指定新 checkpoint）。
 - [ ] **確認 acane（control-plane）健康**，升級期間 4070 + 控制面要能獨撐：`kubectl get nodes`、`scontrol ping`。
 
 **D. 回滾方案（先想好）**
@@ -511,7 +516,7 @@ nvidia-smi -q > nvidia-smi-q.txt 2>&1
 
 ```bash
 # 在 node-2，務必在 tmux 裡（SSH 斷了 upgrade 不會死）
-ssh nutn-admin@192.168.0.104
+ssh nutn-admin@192.168.0.103
 tmux new -s osupg
 sudo apt update && sudo apt full-upgrade -y      # 先把 22.04 內更新到最新
 sudo apt install -y update-manager-core
@@ -523,7 +528,7 @@ sudo do-release-upgrade -d   # -d：22.04→24.04 走第一個釋出階段；會
 
 ```bash
 # 1) node-2 回來、OS/driver 已對齊
-ssh nutn-admin@192.168.0.104 'lsb_release -rs; cat /proc/driver/nvidia/version | head -1'
+ssh nutn-admin@192.168.0.103 'lsb_release -rs; cat /proc/driver/nvidia/version | head -1'
 #   期望：24.04 ；NVRM 580.167.08
 
 # 2) 重裝/確認 k3s agent（釘 server 版本），nfs-common，nvidia-container-toolkit
@@ -559,8 +564,8 @@ kubectl -n slurm exec "$LOGIN" -- bash -c '
 
 | 風險 | 現象 | 處理 |
 |------|------|------|
-| k3s agent 比 server 新 | node `NotReady`、kubelet 報版本錯 | 重裝 agent 釘 `INSTALL_K3S_VERSION=v1.34.6+k3s1`（§3.2）|
-| driver 沒升到 580.167 | `nvidia-smi` 仍 580.159 或裝不起來 | `apt-cache policy nvidia-driver-580` 確認 24.04 candidate；`apt install nvidia-driver-580` + reboot |
+| k3s agent 比 server 新 | node `NotReady`、kubelet 報版本錯 | 重裝 agent 釘 `INSTALL_K3S_VERSION=v1.35.8+k3s1`（§3.2）|
+| NVIDIA driver 不相容 | `nvidia-smi` 失敗或 DRA ResourceSlice 不更新 | 確認 24.04 host driver 580.x、`nvidia-container-toolkit` 與 k3s agent 正常，再重啟 `gpu-kubelet-plugin` |
 | nfs-common 沒了 | worker 卡 `ContainerCreating`、`/shared` 掛不上 | `apt install nfs-common`（§3.0）|
 | Slurm node phantom gres | `AllocTRES=gres/mps=100` 但無 job、新 job `PENDING Resources` | restart slurmctld（`kubectl delete pod slurm-controller-0`）重建 alloc 狀態 |
 | ufw 被重置 | 跨 node pod/slurmd 不通、node `Not responding` | 對照 §3.1 重開埠 + `default allow routed` |

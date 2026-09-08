@@ -61,13 +61,13 @@ module avail
 | `gcc/11` | GNU C/C++/Fortran compiler；OpenMP 使用 `-fopenmp` |
 | `openmpi/4.1` | OpenMPI 4.1，設定 `MPI_HOME`、MPI wrapper、`SLURM_MPI_TYPE=pmi2` |
 | `python3/3.10` | Ubuntu 22.04 system Python |
-| `cuda/12.4` | CUDA toolkit / `nvcc` |
+| `cuda/12.6` | CUDA toolkit / `nvcc` |
 
 互動式檢查：
 
 ```bash
 source /etc/profile.d/lmod.sh
-module load gcc/11 openmpi/4.1 cuda/12.4
+module load gcc/11 openmpi/4.1 cuda/12.6
 module list
 which gcc
 which mpicc
@@ -168,7 +168,7 @@ cat > /shared/tutorial/cuda-test.sh << 'EOF'
 #SBATCH -o /shared/tutorial/cuda-%j.out
 
 source /etc/profile.d/lmod.sh
-module load gcc/11 cuda/12.4
+module load gcc/11 cuda/12.6
 
 cat > hello_cuda.cu <<'SRC'
 #include <cstdio>
@@ -497,7 +497,7 @@ cat /shared/tutorial/*<jobid>*.out
 ```bash
 source /etc/profile.d/lmod.sh
 module avail
-module load gcc/11 openmpi/4.1 cuda/12.4
+module load gcc/11 openmpi/4.1 cuda/12.6
 which gcc
 which mpicc
 which nvcc

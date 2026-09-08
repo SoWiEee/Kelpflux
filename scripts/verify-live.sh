@@ -222,9 +222,20 @@ wait_for_gpu_pod() {
 check_gpu() {
   [[ "$SKIP_GPU" == "1" ]] && { warn "SKIP_GPU=1; skipping GPU checks"; return; }
   log "gpu"
-  local gpu_total
+  local gpu_total dra_total
   gpu_total=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}' 2>/dev/null | awk 'NF{s+=$1} END{print s+0}')
-  [[ "${gpu_total:-0}" -gt 0 ]] && pass "cluster advertises ${gpu_total} GPU(s)" || fail "cluster advertises no nvidia.com/gpu capacity"
+  if [[ "${gpu_total:-0}" -gt 0 ]]; then
+    pass "cluster advertises ${gpu_total} nvidia.com/gpu device(s)"
+  else
+    # DRA-backed workers intentionally do not expose the legacy device-plugin
+    # allocatable. Count physical devices advertised by NVIDIA ResourceSlices.
+    dra_total=$(kubectl get resourceslices.resource.k8s.io \
+      -o jsonpath='{range .items[?(@.spec.driver=="gpu.nvidia.com")]}{range .spec.devices[*]}{.name}{"\n"}{end}{end}' \
+      2>/dev/null | awk 'NF{n++} END{print n+0}')
+    [[ "${dra_total:-0}" -gt 0 ]] \
+      && pass "DRA advertises ${dra_total} gpu.nvidia.com device(s)" \
+      || fail "cluster advertises no NVIDIA GPU capacity via device-plugin or DRA"
+  fi
 
   login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null || true" >/dev/null 2>&1 || true
 
@@ -313,7 +324,7 @@ check_dsac_smoke() {
 check_lmod() {
   [[ "$SKIP_LMOD" == "1" ]] && { warn "SKIP_LMOD=1; skipping Lmod checks"; return; }
   log "Lmod and user toolchains"
-  if login_exec "source /etc/profile.d/lmod.sh; module avail >/tmp/verify-live-module-avail.txt 2>&1; module load gcc/11; command -v gcc; command -v g++; command -v gfortran; printf '#include <omp.h>\nint main(){return omp_get_max_threads()<1;}\n' >/tmp/verify-live-omp.c; gcc -fopenmp /tmp/verify-live-omp.c -o /tmp/verify-live-omp; module load openmpi/4.1; test -n "\$MPI_HOME"; test "\$SLURM_MPI_TYPE" = pmi2; command -v mpicc; module load cuda/12.4; test -n "\$CUDA_HOME"; command -v nvcc; nvcc --version >/tmp/verify-live-nvcc.txt; module purge" >/tmp/verify-live-lmod.out 2>/tmp/verify-live-lmod.err; then
+  if login_exec "source /etc/profile.d/lmod.sh; module avail >/tmp/verify-live-module-avail.txt 2>&1; module load gcc/11; command -v gcc; command -v g++; command -v gfortran; printf '#include <omp.h>\nint main(){return omp_get_max_threads()<1;}\n' >/tmp/verify-live-omp.c; gcc -fopenmp /tmp/verify-live-omp.c -o /tmp/verify-live-omp; module load openmpi/4.1; test -n "\$MPI_HOME"; test "\$SLURM_MPI_TYPE" = pmi2; command -v mpicc; module load cuda/12.6; test -n "\$CUDA_HOME"; command -v nvcc; nvcc --version >/tmp/verify-live-nvcc.txt; module purge" >/tmp/verify-live-lmod.out 2>/tmp/verify-live-lmod.err; then
     pass "Lmod gcc/OpenMP/OpenMPI/CUDA modules work in login pod"
   else
     fail "Lmod gcc/OpenMP/OpenMPI/CUDA module check failed in login pod"

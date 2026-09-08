@@ -122,7 +122,7 @@ spec:
             - name: SLURM_REST_URL
               value: "http://slurm-restapi.{{ .Values.cluster.namespace }}.svc.cluster.local:6820"
             - name: SLURM_REST_API_VERSION
-              value: "v0.0.37"
+              value: "v0.0.39"
             - name: SLURM_JWT_KEY_PATH
               value: "/slurm-jwt/jwt_hs256.key"
             # Phase 6 M7: fragmentation detector + requeue decider.
