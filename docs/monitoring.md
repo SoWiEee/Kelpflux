@@ -105,9 +105,12 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 --set dcgmExporter.serviceMonitor.enabled=false
 ```
 
-ServiceMonitor 維持關閉，因為本專案使用 chart 內建 Prometheus；Prometheus 透過
-`chart/templates/monitoring/prometheus.yaml` 的 static scrape job 抓：
-`nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400`。
+ServiceMonitor 維持關閉，因為本專案使用 chart 內建 Prometheus。Prometheus 透過
+`chart/templates/monitoring/prometheus.yaml` 使用 Kubernetes EndpointSlice
+discovery，直接抓取 GPU Operator namespace 中每個 `nvidia-dcgm-exporter` pod
+的 `9400` port，因此兩張異質 GPU 都會被納入，而不是只抓 Service ClusterIP。
+Prometheus 使用 `monitoring/prometheus` ServiceAccount，並由 GPU Operator
+namespace 的 Role/RoleBinding 只授予讀取 Service、Pod 與 EndpointSlice 的權限。
 
 Chart 開關：
 

@@ -197,7 +197,7 @@ class ScaleActionsMixin:
             self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
             for node_name in sorted(nodes_to_drain):
                 try:
-                    self.client.down_slurm_node(node_name, reason="operator-scale-down")
+                    self.client.future_slurm_node(node_name, reason="operator-scale-down")
                 except Exception:  # noqa: BLE001
                     pass
             self._draining_nodes.pop(key, None)
@@ -215,7 +215,7 @@ class ScaleActionsMixin:
                 pending_jobs=state.pending_jobs,
                 running_jobs=state.running_jobs,
                 busy_nodes=state.busy_nodes,
-                slurm_nodes_down=sorted(nodes_to_drain),
+                slurm_nodes_future=sorted(nodes_to_drain),
             )
         else:
             _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="draining").inc()

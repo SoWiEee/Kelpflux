@@ -45,7 +45,25 @@ tests:
           pattern: "job_name: dcgm-exporter"
       - matchRegex:
           path: data["prometheus.yml"]
-          pattern: "nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400"
+          pattern: "role: endpointslice"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "__meta_kubernetes_service_name"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "nvidia-dcgm-exporter"
+
+  - it: Prometheus uses the ServiceAccount needed for DCGM discovery
+    template: monitoring/prometheus.yaml
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: prometheus
 
   - it: DCGM scrape job suppressed when monitoring.dcgmExporter.enabled=false (R5)
     template: monitoring/prometheus.yaml

@@ -73,6 +73,7 @@ class SlurmRestClient:
                 if self._jwt_key is not None:
                     req.add_header("X-SLURM-USER-TOKEN", self._make_token())
                 req.add_header("Accept", "application/json")
+                req.add_header("Connection", "close")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode())
             except Exception as exc:
@@ -89,6 +90,7 @@ class SlurmRestClient:
             req.add_header("X-SLURM-USER-TOKEN", self._make_token())
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
+        req.add_header("Connection", "close")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return _json.loads(resp.read().decode()) if resp.length else {}
 

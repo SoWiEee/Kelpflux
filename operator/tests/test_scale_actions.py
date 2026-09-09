@@ -16,6 +16,7 @@ class FakeClient:
         self.resumed: list[str] = []
         self.drained: list[str] = []
         self.down: list[tuple[str, str]] = []
+        self.future: list[tuple[str, str]] = []
         self.annotations: list[tuple[str, str, str, str]] = []
         self.cpu_alloc: dict[str, int] = defaultdict(int)
 
@@ -27,6 +28,9 @@ class FakeClient:
 
     def down_slurm_node(self, node_name: str, reason: str = "") -> None:
         self.down.append((node_name, reason))
+
+    def future_slurm_node(self, node_name: str, reason: str = "") -> None:
+        self.future.append((node_name, reason))
 
     def get_node_cpu_alloc(self, node_name: str) -> int:
         return self.cpu_alloc[node_name]
@@ -110,7 +114,7 @@ def test_scale_up_resumes_target_ordinals_before_patching_replicas():
     assert "slurm-worker-gpu-rtx4070" not in h._draining_nodes
 
 
-def test_scale_down_marks_removed_idle_nodes_down_after_patch():
+def test_scale_down_marks_removed_idle_nodes_future_after_patch():
     h = Harness()
 
     h._do_scale_down(
@@ -127,12 +131,12 @@ def test_scale_down_marks_removed_idle_nodes_down_after_patch():
         "slurm-worker-gpu-rtx4070-1",
     ]
     assert h.actuator.patches == [("slurm-worker-gpu-rtx4070", 0)]
-    assert sorted(h.client.down) == [
+    assert sorted(h.client.future) == [
         ("slurm-worker-gpu-rtx4070-0", "operator-scale-down"),
         ("slurm-worker-gpu-rtx4070-1", "operator-scale-down"),
     ]
     scale_events = [fields for event, fields in h.logger.events if event == "scale_action"]
-    assert scale_events[-1]["slurm_nodes_down"] == [
+    assert scale_events[-1]["slurm_nodes_future"] == [
         "slurm-worker-gpu-rtx4070-0",
         "slurm-worker-gpu-rtx4070-1",
     ]

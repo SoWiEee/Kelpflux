@@ -52,8 +52,9 @@ case "$MODE" in
   release|game|free)
     echo "Releasing ${NODE}'s 4070 for gaming (DRA)…"
     kubectl cordon "$NODE"
-    # Drain the Slurm node first so no job lands mid-release.
-    kubectl exec -n "$NS" "$CTL" -- scontrol update nodename="$POD" state=drain reason=gaming 2>/dev/null || true
+    # FUTURE prevents slurmctld/slurmrestd from resolving the absent pod DNS
+    # while the GPU is released. It also blocks new allocations.
+    kubectl exec -n "$NS" "$CTL" -- scontrol update nodename="$POD" state=future reason=gaming 2>/dev/null || true
     # Evict the worker pod → releases the DRA claim → DRA tears down the MPS server.
     kubectl delete pod -n "$NS" "$POD" --grace-period=10 2>/dev/null || true
     echo "  waiting for the DRA claim / MPS to release…"
@@ -63,6 +64,9 @@ case "$MODE" in
       sleep 5
     done
     sleep 3
+    # The worker preStop hook may race the release update with a final DRAIN;
+    # re-assert FUTURE after the pod is gone so slurmrestd never probes its DNS.
+    kubectl exec -n "$NS" "$CTL" -- scontrol update nodename="$POD" state=future reason=gaming 2>/dev/null || true
     sudo nvidia-smi -c 0 >/dev/null 2>&1 || true   # DEFAULT compute mode for gaming
     echo "✅ released."
     show_status

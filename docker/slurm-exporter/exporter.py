@@ -33,6 +33,17 @@ _BUSY_STATES: frozenset[str] = frozenset({"allocated", "mixed", "completing"})
 _IDLE_STATES: frozenset[str] = frozenset({"idle"})
 _DOWN_STATES: frozenset[str] = frozenset({"down", "drain", "not_responding"})
 
+
+def _classify_node_state(state_tokens: set[str]) -> str | None:
+    """Return the metric bucket for a node, with unavailable states winning."""
+    if state_tokens & _DOWN_STATES:
+        return "down"
+    if state_tokens & _BUSY_STATES:
+        return "alloc"
+    if state_tokens & _IDLE_STATES:
+        return "idle"
+    return None
+
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
@@ -141,6 +152,7 @@ def _http_get(url: str, jwt_key: bytes | None) -> dict:
     headers = {
         "X-SLURM-USER-NAME": "root",
         "Accept": "application/json",
+        "Connection": "close",
     }
     if jwt_key is not None:
         token = _make_jwt_token(jwt_key, username="root")
@@ -221,12 +233,13 @@ def scrape(jwt_key: bytes | None) -> None:
         else:
             state_tokens = {s.lower() for s in raw_state.split()}
 
-        if state_tokens & _BUSY_STATES:
-            alloc += 1
-        elif state_tokens & _IDLE_STATES:
-            idle += 1
-        elif state_tokens & _DOWN_STATES:
+        bucket = _classify_node_state(state_tokens)
+        if bucket == "down":
             down += 1
+        elif bucket == "alloc":
+            alloc += 1
+        elif bucket == "idle":
+            idle += 1
 
         # DRAIN is an overlay flag: node accepts no new jobs but may still be running some.
         # It can co-exist with idle/alloc/down states, so we track it separately.

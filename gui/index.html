@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Kelpflux | Job Monitor</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">K</span>
+          <div>
+            <p class="eyebrow">Kelpflux control plane</p>
+            <h1>Job monitor</h1>
+          </div>
+        </div>
+        <div class="connection-status" aria-live="polite">
+          <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting</span>
+          <span class="status-divider" aria-hidden="true"></span>
+          <span id="last-updated">Waiting for data</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="toolbar" aria-label="Monitor controls">
+          <form class="api-form" id="api-form">
+            <label for="api-base">API base</label>
+            <div class="api-entry">
+              <input id="api-base" name="api-base" type="text" inputmode="url" spellcheck="false" autocomplete="off" placeholder="/api or https://gateway.example/slurm/v0.0.39">
+              <button type="submit">Apply</button>
+            </div>
+            <p class="control-hint">Jobs are polled every 4 seconds from <code>/jobs</code>.</p>
+          </form>
+          <button class="refresh-button" id="refresh-button" type="button">Refresh now</button>
+        </section>
+
+        <section class="summary-grid" aria-label="Queue summary">
+          <article class="summary-card summary-card--accent">
+            <p class="summary-label">Total jobs</p>
+            <p class="summary-value" id="total-jobs">--</p>
+            <p class="summary-meta" id="total-meta">Waiting for API</p>
+          </article>
+          <article class="summary-card">
+            <p class="summary-label">Running</p>
+            <p class="summary-value" id="running-jobs">--</p>
+            <p class="summary-meta">Active allocations</p>
+          </article>
+          <article class="summary-card">
+            <p class="summary-label">Pending</p>
+            <p class="summary-value" id="pending-jobs">--</p>
+            <p class="summary-meta">Waiting in queue</p>
+          </article>
+          <article class="summary-card">
+            <p class="summary-label">MPS requested</p>
+            <p class="summary-value" id="requested-mps">--</p>
+            <p class="summary-meta" id="mps-meta">Across reported jobs</p>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="queue-panel panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Live queue</p>
+                <h2>Jobs</h2>
+              </div>
+              <span class="poll-chip"><span class="pulse-ring" aria-hidden="true"></span>Polling</span>
+            </div>
+
+            <div class="notice notice--error" id="error-notice" role="alert" hidden>
+              <strong>Backend unavailable.</strong>
+              <span id="error-message">The queue could not be loaded.</span>
+            </div>
+            <div class="notice notice--stale" id="stale-notice" role="status" hidden>
+              Showing the last successful response while the API reconnects.
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">Current Slurm job queue and resource allocations</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Job ID</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Placement</th>
+                    <th scope="col">MPS</th>
+                    <th scope="col">Resource usage</th>
+                    <th scope="col">Submitted</th>
+                  </tr>
+                </thead>
+                <tbody id="jobs-body">
+                  <tr class="placeholder-row">
+                    <td colspan="6">
+                      <div class="empty-state empty-state--loading">
+                        <span class="loading-line" aria-hidden="true"></span>
+                        <strong>Connecting to the queue</strong>
+                        <span>Waiting for the first response.</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="empty-state" id="empty-state" hidden>
+              <div class="empty-icon" aria-hidden="true">0</div>
+              <strong>No active jobs</strong>
+              <span>The API is reachable, but it returned an empty queue.</span>
+            </div>
+          </article>
+
+          <aside class="info-rail">
+            <section class="panel rail-panel">
+              <div class="panel-heading panel-heading--compact">
+                <div>
+                  <p class="eyebrow">Allocation view</p>
+                  <h2>Cluster signal</h2>
+                </div>
+              </div>
+              <dl class="signal-list">
+                <div>
+                  <dt>Nodes in jobs</dt>
+                  <dd id="node-count">--</dd>
+                </div>
+                <div>
+                  <dt>GPUs in jobs</dt>
+                  <dd id="gpu-count">--</dd>
+                </div>
+                <div>
+                  <dt>MPS allocated</dt>
+                  <dd id="allocated-mps">--</dd>
+                </div>
+                <div>
+                  <dt>Usage reporting</dt>
+                  <dd id="usage-signal">Not reported</dd>
+                </div>
+              </dl>
+            </section>
+            <section class="panel note-panel">
+              <p class="eyebrow">Data boundary</p>
+              <h2>Allocation is not utilization</h2>
+              <p>Requested and allocated MPS values come from the job response. Per-job SM usage is shown only when the configured API reports it.</p>
+              <p class="note-foot">No utilization is inferred from Slurm allocation.</p>
+            </section>
+          </aside>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>Kelpflux monitoring</span>
+        <span id="api-label">API base: /api</span>
+      </footer>
+    </div>
+  </body>
+</html>

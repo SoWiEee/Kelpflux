@@ -13,6 +13,47 @@ rules port to a non-default namespace by changing values.yaml only.
 {{- $mNs := .Values.monitoring.namespace -}}
 {{- $sNs := .Values.cluster.namespace -}}
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+---
+{{- if .Values.monitoring.dcgmExporter.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-dcgm-discovery
+  namespace: {{ .Values.monitoring.dcgmExporter.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-dcgm-discovery
+  namespace: {{ .Values.monitoring.dcgmExporter.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: {{ $mNs }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-dcgm-discovery
+{{- end }}
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: prometheus-config
@@ -65,11 +106,21 @@ data:
       # Provides DCGM_FI_DEV_GPU_UTIL (real SM%), DCGM_FI_DEV_FB_USED (VRAM
       # bytes), DCGM_FI_PROF_PIPE_TENSOR_ACTIVE (Tensor Core busy ratio) —
       # these replace the misleading "GPU utilisation = Slurm-allocated count"
-      # panel in Grafana.
+      # panel in Grafana. EndpointSlice discovery keeps one target per exporter
+      # pod instead of sending every scrape through the Service ClusterIP.
       - job_name: dcgm-exporter
-        static_configs:
-          - targets:
-              - '{{ .Values.monitoring.dcgmExporter.serviceName }}.{{ .Values.monitoring.dcgmExporter.namespace }}.svc.cluster.local:{{ .Values.monitoring.dcgmExporter.port }}'
+        kubernetes_sd_configs:
+          - role: endpointslice
+            namespaces:
+              names:
+                - '{{ .Values.monitoring.dcgmExporter.namespace }}'
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: '{{ .Values.monitoring.dcgmExporter.serviceName }}'
+          - source_labels: [__meta_kubernetes_endpointslice_port]
+            action: keep
+            regex: '{{ .Values.monitoring.dcgmExporter.port }}'
       {{- end }}
 ---
 apiVersion: v1
@@ -234,6 +285,7 @@ spec:
         {{- include "slurm-platform.labels" . | nindent 8 }}
         app: prometheus
     spec:
+      serviceAccountName: prometheus
       containers:
         - name: prometheus
           image: {{ .Values.monitoring.prometheus.image }}

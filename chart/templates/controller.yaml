@@ -46,6 +46,17 @@ spec:
         checksum/config-job-submit: {{ include (print $.Template.BasePath "/configmap-job-submit.yaml") . | sha256sum }}
         {{- end }}
     spec:
+      # Predeclared scale-to-zero node names legitimately return NXDOMAIN.
+      # Keep failed lookups bounded so slurmrestd does not hold REST workers
+      # while the cluster DNS resolver retries them.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: timeout
+            value: "1"
+          - name: attempts
+            value: "1"
       containers:
         - name: slurm-controller
           image: {{ .Values.image.controller }}
@@ -85,12 +96,26 @@ spec:
               # slurmrestd needs SLURM_JWT set (from scontrol token) so its
               # rest_auth/jwt plugin can bootstrap a valid auth context.
               until scontrol ping >/dev/null 2>&1; do sleep 2; done
+              # Predeclared StatefulSet ordinals do not have DNS records until
+              # their pod exists. FUTURE is the only Slurm state that skips
+              # address validation; this prevents slurmrestd from busy-looping
+              # on absent scale-to-zero or cordoned worker pods. A worker's
+              # startup RESUME command activates the node when it returns.
+              while read -r node addr; do
+                if ! getent hosts "$addr" >/dev/null 2>&1 && scontrol show node "$node" >/dev/null 2>&1; then
+                  scontrol update NodeName="$node" State=DOWN Reason=unresolved-dns >/dev/null 2>&1 || true
+                  scontrol update NodeName="$node" State=FUTURE Reason=unresolved-dns >/dev/null 2>&1 || true
+                fi
+              done < <(awk '{node=""; addr=""; for (i=1; i<=NF; i++) { if ($i ~ /^NodeName=/) node=substr($i,10); if ($i ~ /^NodeAddr=/) addr=substr($i,10) } if (node != "" && addr != "") print node, addr}' /etc/slurm/slurm.nodes.conf)
               # lifespan=315360000 (10 years) avoids the daemon losing its auth
               # context after the default 24-hour token expiry.
               # Slurm 23.11 uses the v0.0.39 REST plugin.
+              # Keep the REST worker pool bounded: the controller exposes a
+              # small internal API surface and an unbounded pool can amplify
+              # DNS failures into a slurmrestd CPU storm.
               SLURM_JWT=$(scontrol token username=root lifespan=315360000 | sed 's/SLURM_JWT=//') \
                 SLURMRESTD_SECURITY=disable_user_check \
-                /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.39 0.0.0.0:6820 &
+                /usr/sbin/slurmrestd -t 2 --max-connections 4 -a rest_auth/jwt -s openapi/v0.0.39 0.0.0.0:6820 &
               wait $CTLD_PID
           # K1 (v5 review): explicit requests/limits → Guaranteed QoS. slurmctld
           # in-memory state grows with queue depth; default 2Gi limit covers
@@ -112,7 +137,7 @@ spec:
               name: rest
           readinessProbe:
             exec:
-              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null"]
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null && pgrep -x slurmrestd >/dev/null"]
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:

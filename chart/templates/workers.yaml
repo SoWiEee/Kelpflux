@@ -158,7 +158,9 @@ spec:
               # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
               # state and blocks new jobs. ReturnToService=2 clears DOWN but not
               # DRAIN, so we clear it explicitly here while munge is already up.
-              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
+              until scontrol update nodename="$(hostname)" state=resume >/dev/null 2>&1; do
+                sleep 2
+              done
               {{- if $useDra }}
               # DRA MPS cold-start mitigation: the per-pod MPS server (started by the
               # DRA driver) exits when it has no clients, so a burst of jobs racing a
@@ -193,8 +195,9 @@ spec:
                   - /bin/sh
                   - -c
                   - >-
+                    if ! scontrol show node $(hostname) 2>/dev/null | grep -q 'State=.*FUTURE'; then
                     scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
-                    2>/dev/null || true; sleep 10
+                    2>/dev/null || true; fi; sleep 10
           volumeMounts:
             {{- if $useHostCgroup }}
             # Slurm writes only its systemd-delegated subtree; dbus itself is

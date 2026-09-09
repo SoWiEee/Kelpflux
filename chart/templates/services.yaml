@@ -1,10 +1,8 @@
 {{/*
 Services for the Slurm cluster.
 
-  - slurm-controller : headless Service for slurmctld; publishNotReadyAddresses
-                       so DNS resolves before the pod becomes Ready (slurmctld
-                       readiness probe waits for slurmdbd, which can take 30+s
-                       on cold start).
+  - slurm-controller : headless Service for slurmctld; endpoints are published
+                       only after the controller and slurmrestd are Ready.
   - slurm-restapi    : ClusterIP for slurmrestd on :6820, used by the operator
                        to query job/node state.
   - per-pool worker  : headless Service per pool, named after the pool's
@@ -22,7 +20,7 @@ metadata:
     {{- include "slurm-platform.labels" . | nindent 4 }}
 spec:
   clusterIP: None
-  publishNotReadyAddresses: true
+  publishNotReadyAddresses: false
   selector:
     app: slurm-controller
   ports:

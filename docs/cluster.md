@@ -46,7 +46,7 @@
 
 各層職責：
 
-- **Slurm**：HPC 排程器，靜態預宣告所有節點到 `maxNodes`；scaling 只改 K8s replicas，不重新生成 `slurm.conf`
+- **Slurm**：HPC 排程器，靜態預宣告所有節點到 `maxNodes`；節點初始為 `FUTURE`，worker 啟動後以 `scontrol update State=RESUME` 啟用，scaling 不重新生成 `slurm.conf`
 - **Kubernetes (k3s)**：管理 Pod 生命週期、Service DNS、Volume、NetworkPolicy
 - **Elastic Operator**：Python 控制迴圈，輪詢 slurmrestd 並 patch worker StatefulSet replicas
 - **NVIDIA DRA Driver（`dra-driver-nvidia-gpu` namespace）**：以 Kubernetes DRA（`resource.k8s.io/v1`，v1.34 GA）取代 device-plugin。`DeviceClass gpu.nvidia.com` + `ResourceClaimTemplate`（`GpuConfig` sharing=MPS）把整張 GPU 以 MPS 共享模式配給長壽 worker pod；`gpu-kubelet-plugin` DaemonSet 跑在兩個 GPU 節點，各自 advertise 一張 GPU 的 `ResourceSlice`，並由 CDI 注入 `/dev/nvidia0` + `/tmp/nvidia-mps`
@@ -232,9 +232,10 @@ graph TD
 | Image | `slurm-controller:23.11.4` |
 | 主程序 | `slurmctld` + `slurmrestd`（同 pod） + `sshd` + `munged` |
 | 容器 Port | 6817 (slurmctld), 6820 (slurmrestd), 22 (SSH) |
-| 啟動順序 | munged → 等 slurmdbd:6819 TCP 通 → 啟 `slurmctld` → 等 `scontrol ping` 成功 → 用 `scontrol token` 拿 JWT 起 `slurmrestd` |
-| Readiness | `pgrep slurmctld && pgrep munged` |
+| 啟動順序 | munged → 等 slurmdbd:6819 TCP 通 → 啟 `slurmctld` → 等 `scontrol ping` 成功 → 用 `scontrol token` 拿 JWT 起 `slurmrestd`（`-t 2 --max-connections 4`） |
+| Readiness | `pgrep slurmctld && pgrep munged && pgrep slurmrestd` |
 | Liveness | `pgrep slurmctld && pgrep slurmrestd`（initialDelay 60s） |
+| DNS 容錯 | controller Pod 使用 `ndots=2 timeout=1 attempts=1`，避免 scale-to-zero 節點的 NXDOMAIN 佔滿 REST worker |
 | PVC | `slurm-ctld-state` 1Gi RWO（`StateSaveLocation`，跨重啟保住 job queue） |
 
 #### StatefulSet `slurm-worker-cpu`（replicas 1–4）

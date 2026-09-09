@@ -37,12 +37,15 @@ tests:
           path: data["slurm.conf"]
           pattern: "AccountingStorageType="
 
-  - it: emits NodeName lines for each pool in maxNodes order
+  - it: emits FUTURE NodeName lines for each pool in maxNodes order
     template: configmap-nodes.yaml
     asserts:
       - matchRegex:
           path: data["slurm.nodes.conf"]
-          pattern: "NodeName=slurm-worker-cpu-0 .*State=UNKNOWN"
+          pattern: "NodeName=slurm-worker-cpu-0 .*State=FUTURE"
+      - matchRegex:
+          path: data["slurm.nodes.conf"]
+          pattern: "NodeName=slurm-worker-cpu-1 .*State=FUTURE"
       - matchRegex:
           path: data["slurm.nodes.conf"]
           pattern: "NodeName=slurm-worker-gpu-rtx4070-0 .*Gres=gpu:rtx4070:1,mps:100"

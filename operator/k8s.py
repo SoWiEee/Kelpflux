@@ -133,6 +133,16 @@ class K8sClient:
             f"scontrol update NodeName={node_name} State=DOWN Reason='{reason}' || true"
         )
 
+    def future_slurm_node(self, node_name: str, reason: str = "operator-scale-down") -> None:
+        """Hide a removed node from Slurm until its worker pod returns.
+
+        FUTURE nodes are not contacted or DNS-resolved by slurmctld. RESUME on
+        scale-up activates the predeclared node again.
+        """
+        self.exec_in_controller(
+            f"scontrol update NodeName={node_name} State=FUTURE Reason='{reason}' || true"
+        )
+
     def get_node_cpu_alloc(self, node_name: str) -> int:
         """Return the number of CPUs currently allocated on a node (0 = safe to remove)."""
         output = self.exec_in_controller(

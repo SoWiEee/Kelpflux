@@ -48,7 +48,7 @@ def _read_jwt_key(path: str) -> bytes | None:
 
 def http_json(method: str, url: str, *, jwt_key: bytes | None = None, body: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode()
-    headers = {"Accept": "application/json", "X-SLURM-USER-NAME": "root"}
+    headers = {"Accept": "application/json", "Connection": "close", "X-SLURM-USER-NAME": "root"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     if jwt_key is not None:

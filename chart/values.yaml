@@ -445,10 +445,10 @@ operator:
   # paths that still call `time.sleep(poll_interval)` directly. The
   # event-driven loop (default since R21) does not block on this.
   pollIntervalSeconds: 15
-  # R21: how often the slurm-diff thread re-runs squeue/sinfo and emits
-  # a reconcile event when state changed. 1s is fine on REST-API mode;
-  # raise to 5s for very large clusters (>100 pods).
-  slurmPollIntervalSeconds: 1
+  # R21: how often the slurm-diff thread re-runs REST jobs/nodes queries and
+  # emits a reconcile event when state changes. Keep this above 1s to avoid
+  # lock contention in slurmctld when several clients poll concurrently.
+  slurmPollIntervalSeconds: 5
   # R21: safety-net full reconcile if no event arrived. Catches the rare
   # case where every watcher missed an event.
   reconcilePeriodSeconds: 60
@@ -655,8 +655,8 @@ monitoring:
   # R5: scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
   # Tensor Core utilisation. The DCGM DaemonSet is enabled by
   # scripts/deploy-2.sh (`--set dcgmExporter.enabled=true`); this
-  # block only wires Prometheus to the Service it creates. Disable if running
-  # without GPUs.
+  # block wires Prometheus to the Service's EndpointSlices so each exporter
+  # pod is scraped directly. Disable if running without GPUs.
   dcgmExporter:
     enabled: true
     namespace: gpu-operator

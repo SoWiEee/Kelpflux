@@ -78,7 +78,7 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: SLURM_POLL_INTERVAL_SECONDS
-            value: "1"
+            value: "5"
         documentSelector:
           path: kind
           value: Deployment

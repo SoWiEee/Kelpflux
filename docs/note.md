@@ -768,7 +768,7 @@ NodePort :30022 → slurm-login pod
 ## FAQ
 
 **為什麼 Slurm node 要預先全部宣告？**
-所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
+所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，但一律以 `State=FUTURE` 開始；worker 啟動後才以 `scontrol update State=RESUME` 註冊。Operator 只調整 StatefulSet replica 數，而不重寫 Slurm 設定檔；controller 的 DNS resolver 也將失敗查詢限制為 1 秒，避免 scale-to-zero 節點造成 REST 延遲。
 
 **為什麼 Operator 不用 Kopf 或 CRD？**
 刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。

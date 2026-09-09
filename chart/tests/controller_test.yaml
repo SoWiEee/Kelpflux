@@ -71,3 +71,33 @@ tests:
         documentSelector:
           path: kind
           value: StatefulSet
+
+  - it: slurmrestd worker pool is bounded
+    template: controller.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "slurmrestd -t 2 --max-connections 4"
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller bounds DNS retries for absent scale-to-zero nodes
+    template: controller.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.dnsConfig.options
+          content:
+            name: timeout
+            value: "1"
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - contains:
+          path: spec.template.spec.dnsConfig.options
+          content:
+            name: attempts
+            value: "1"
+        documentSelector:
+          path: kind
+          value: StatefulSet
