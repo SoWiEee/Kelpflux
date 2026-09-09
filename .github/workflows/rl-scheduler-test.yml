@@ -32,6 +32,9 @@ jobs:
             --with "pydantic==2.9.2" \
             --with "prometheus-client==0.21.0" \
             --with "numpy==1.26.4" \
+            --with "torch==2.5.1+cpu" \
+            --with "gymnasium==0.29.1" \
             pytest services/rl_scheduler/tests/ -v --tb=short
         env:
           PYTHONPATH: .
+          UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
