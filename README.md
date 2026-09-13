@@ -1,5 +1,5 @@
 <div align="center">
-  
+
 # 〰️ Kelpflux
  
 ### Elastic Slurm scheduling on Kubernetes for shared GPU AI workloads.
@@ -40,7 +40,7 @@ continuous flow of compute demand through GPU pools. Together they describe
 exactly what Kelpflux does — independent worker pools sharing a common Slurm
 control plane, with job throughput flowing dynamically across resources as
 demand rises and falls.
- 
+
 </div>
 
 ---
@@ -81,272 +81,49 @@ demand rises and falls.
 1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）作為 placement 建議者，透過 Slurm `job_submit.lua` 以**非阻塞、失效即回退**的方式整合進生產路徑——任何服務異常都自動退回既有啟發式，slurmctld 永不被阻塞。此學習式策略與 DRA 並非競爭，而是**互補**：它可在 DRA 的分片機制之上驅動裝置選擇與准入排序。
 2. **這套智慧要以什麼形式、在什麼條件下才真的有用？** 早期只讓 RL **綁定節點**（placement-only、工作*順序*仍由 Slurm 決定）的實機路徑下，學習式策略僅與 Slurm 打平、且以顯著尾端代價換得——但這是**致動路徑**的限制，而非策略無法貢獻。當改讓 RL 掌握**派遣順序**、並以一條可落地的**非阻塞、失效安全的原生致動路徑（Option B：常駐程序週期性重排當前佇列、寫入 Slurm `Priority`，交由 Slurm 原生 backfill 致動）**整合後，在真實 CUDA、poisson 到達的三點負載掃描（oversub=2／4／6）下，學習式策略在**平均 JCT 與尾端 P99 皆穩健顯著勝過生產 Slurm Backfill**（平均約 −11%～−13%，深載尾端 P99 更達 −19%～−22%；配對 Wilcoxon *p*≤0.006、P99 於 10/10 seed 勝過 Backfill）。此實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並精確界定效益條件：**RL 須掌握*排序*槓桿、致動路徑須原生且連續、負載須足以形成可重排的 backlog**。支撐此結論的是一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對顯著性（Wilcoxon）與信賴區間、兼顧平均與尾端（p95／p99／CVaR）。
 
----
+## Getting Started
 
-# 🚀 Getting Started
+### Requirements
 
-部署統一使用 Helm；目前實機部署固定以 Linux + k3s + GPU 為目標，主要 values 使用 `chart/values-k3s.yaml`。`chart/values.yaml` 保留為 chart default，不作為目前的實際部署路徑。
+The tested end-to-end deployment targets Linux, k3s, Helm, Docker, and NVIDIA GPU workers. A host NVIDIA driver and GPU runtime must be available; configure an NFS server if using shared storage. The exact cluster versions and hardware are listed in [cluster.md](docs/cluster.md).
 
-> Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，透過 `scripts/deploy-2.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
+The scripts below automate the repository's k3s deployment. Other Kubernetes distributions may require adapting the values and GPU/storage integration; see the [user guide](docs/tutorial.md) before deploying.
 
-> 目標驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.35.8+k3s1 + Slurm 23.11.4 + RTX 4070/3080 + NVIDIA driver 580。
+### Deploy
 
-## 1. 準備 k3s/GPU 部署前置資源
-
-`deploy-1.sh` 會整合原本部署步驟 1~4，並輸出時間戳 log：
-
-- 檢查 Linux、NVIDIA driver、Docker、k3s、kubectl、Helm 與 kubeconfig
-- 建置 controller、worker、operator、slurm-exporter 映像
-- 匯入映像到 k3s containerd
-- 建立或重用 munge、ssh、JWT secrets（由 deploy-1.sh 內建處理）
-- 套用 NVIDIA RuntimeClass 與 Slurm accounting backend（mysql + slurmdbd）
+From the repository root, point `KUBECONFIG` at the target cluster and run:
 
 ```bash
 export KUBECONFIG=~/.kube/config
 bash scripts/deploy-1.sh
-```
-
-若主機尚未完成 Linux + k3s + GPU 基礎安裝，先執行 `sudo bash scripts/setup-linux-gpu.sh --k3s`。一般重跑部署時可用下列環境變數略過已完成的階段：
-
-```bash
-SKIP_BUILD=1 SKIP_IMPORT=1 bash scripts/deploy-1.sh
-SKIP_SECRETS=1 SKIP_PREREQS=1 bash scripts/deploy-1.sh
-REGENERATE_SECRETS=true SKIP_BUILD=1 SKIP_IMPORT=1 SKIP_PREREQS=1 bash scripts/deploy-1.sh
-```
-
-## 2. 主機 NFS server + LAN exports (Optional)
-
-```bash
-sudo bash scripts/setup-nfs-server.sh
-cat /etc/exports                       # 必須含 pod CIDR (10.0.0.0/8) AND LAN subnet
-sudo exportfs -ra
-```
-
-## 3. 部署平台、GPU Operator 與 DSAC Scheduler
-
-`deploy-2.sh` 會把平台主體、GPU Operator 與 live DSAC scheduler 一次收斂到最終狀態。它會先 build/import `slurm-rl-scheduler:htab2x1`，再用一次 `helm upgrade --install` 部署 `slurm-platform`，直接開啟 DSAC live 設定與 `rl-snapshot-agent` 常駐 snapshot 更新，最後用一次 Helm install/upgrade 收斂 NVIDIA GPU Operator；不需要額外 rollout restart。
-
-```bash
-export KUBECONFIG=~/.kube/config
 bash scripts/deploy-2.sh
-```
-
-一般重跑時可用下列環境變數略過已完成的階段：
-
-```bash
-SKIP_BUILD=1 SKIP_IMPORT=1 bash scripts/deploy-2.sh
-SKIP_GPU_OPERATOR=1 bash scripts/deploy-2.sh
-SKIP_WAIT=1 bash scripts/deploy-2.sh
-```
-
-DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`。`rl-snapshot-agent` 會每 10 秒從 Slurm REST API 讀取 jobs/nodes，推送 `/snapshot`，避免 snapshot stale 後所有 decision 都被 guardrail 擋掉。`valueAbstain=-100000` 與 `snapshotTtlSeconds=86400` 是目前單機 live 實驗設定，用來避免 checkpoint value scale 造成誤擋。
-
-目前 `deploy-2.sh` 啟用的是 production-safe 的 DSAC live scheduling：RL 會影響 queue priority，實際 node / GPU / MPS placement 仍由 Slurm `select/cons_tres`、GRES、Kubernetes worker pool 與 NVIDIA runtime 執行。若要讓 DSAC hard-bind placement，可使用 hold-release controller：先讓 job 以 held 狀態進入 queue，controller 呼叫 `/act` 取得 `(job_i, node_j, gpu_k)`，再用 `scontrol update ReqNodeList=<node>` 與 `scontrol release` 讓 Slurm 原生執行該 placement。
-
-```bash
-# 1) 確認 production DSAC live boost 已啟用
-kubectl -n slurm exec slurm-controller-0 -- \
-  curl -fsS http://rl-scheduler:8002/healthz
-
-kubectl -n slurm logs deploy/rl-snapshot-agent --tail=20
-
-kubectl -n slurm exec slurm-controller-0 -- \
-  curl -fsS http://rl-scheduler:8002/metrics | grep -E \
-  'rl_scheduler_shadow_mode|rl_scheduler_last_node_index|rl_scheduler_last_gpu_index'
-
-# 2) 使用者提交 held GPU/MPS job，讓 controller 做 hard placement 後再 release
-kubectl -n slurm exec deploy/slurm-login -- \
-  sbatch --hold --parsable -J dsac-place-test \
-  -p gpu-rtx4070 --gres=mps:10 --time=00:03:00 \
-  --wrap 'hostname; sleep 10'
-
-# 3) Shadow run：只看 DSAC 選到哪個 held job / node / gpu，不更新 Slurm
-PYTHONPATH=. python -m services.rl_scheduler.placement_controller \
-  --once --job-name-prefix dsac-place-test \
-  --node-name slurm-worker-gpu-rtx4070-0 \
-  --node-name slurm-worker-gpu-rtx4070-1 \
-  --scheduler-url http://rl-scheduler:8002 \
-  --scheduler-exec-prefix 'kubectl -n slurm exec pod/slurm-controller-0 --' \
-  --slurm-exec-prefix 'kubectl -n slurm exec deploy/slurm-login --'
-
-# 4) Live hard placement：寫入 ReqNodeList 並 release held job
-PYTHONPATH=. python -m services.rl_scheduler.placement_controller \
-  --once --no-shadow --job-name-prefix dsac-place-test \
-  --node-name slurm-worker-gpu-rtx4070-0 \
-  --node-name slurm-worker-gpu-rtx4070-1 \
-  --scheduler-url http://rl-scheduler:8002 \
-  --scheduler-exec-prefix 'kubectl -n slurm exec pod/slurm-controller-0 --' \
-  --slurm-exec-prefix 'kubectl -n slurm exec deploy/slurm-login --'
-```
-
-> Hard placement controller 目前不是 `deploy-2.sh` 的預設常駐元件。它只處理 held pending jobs，會排除 `DRAIN` / `DOWN` / `NOT_RESPONDING` 節點，並依 `/healthz` 的 `n_actions` 自動修剪 node list 以符合 checkpoint topology。目前 live checkpoint 是 1 node × 1 GPU，因此只能 hard-bind 到一個有效 placement slot；若要讓 DSAC 在兩台 GPU worker 或 2×2 cluster 中真正選擇，必須部署相同 topology 訓練出的 checkpoint。
-
-預設行為（k3s overlay）：
-
-- `gpu.enabled=true`：保留 GPU Operator 的相容設定；live 2×1 以 NVIDIA DRA claims 取得 GPU，device-plugin ConfigMap 僅供 `SKIP_DRA=1` 回退
-- `monitoring.enabled=true`：Prometheus + Alertmanager + Grafana + kube-state-metrics + slurm-exporter（namespace `monitoring`）
-- `storage.enabled=true` + `nfsServer=192.168.0.111`：NFS subdir provisioner + StorageClass `slurm-shared-nfs` + 20Gi RWX PVC
-
-LAN IP 不一樣時用 `VALUES_FILE=<your-values.yaml>` 或 Helm values 檔調整 `storage.nfsServer`。GPU Operator 使用 `driver.enabled=false` 與 `toolkit.enabled=false`，因為 host 已經由 `setup-linux-gpu.sh` 裝好驅動與 NVIDIA Container Toolkit。
-
-> 注意：目前 `slurm-rl-scheduler:htab2x1` 映像會載入 `runs/ckpts_aimix16_fair/rdsac_cvar_s42.pt`（2×1 topology）。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新執行 `bash scripts/deploy-2.sh`。
-
-**選用功能**（在 `chart/values-k3s.yaml` 開啟）：
-
-| 功能 | 設定 | 說明 |
-|------|------|------|
-| SSH Login | `login.ssh.authorizedKeys: \|` + 公鑰 | `ssh -p 30022 root@192.168.0.111` |
-| OpenTelemetry | `monitoring.otel.enabled: true` | 部署 Tempo + OTel Collector，Grafana 自動加 datasource |
-
-```bash
-# 快速加 SSH key（不需重新 helm install）
-bash scripts/add-ssh-key.sh add "ssh-ed25519 AAAA... user@laptop"
-
-# 啟用 OTel（helm upgrade）
-helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
-  --set monitoring.otel.enabled=true
-```
-
-## 4. 驗證 live cluster
-
-`verify-live.sh` 會在 Linux + k3s + GPU live 環境一次完成部署後驗證，涵蓋 chart render、核心 workload rollout、NFS RWX、GPU/GRES、Prometheus/Grafana、DSAC smoke job 與 Lmod 基本檢查。
-
-```bash
-export KUBECONFIG=~/.kube/config
 bash scripts/verify-live.sh
 ```
 
-需要略過特定驗證時可用環境變數：
+`deploy-1.sh` prepares the host resources and application images. `deploy-2.sh` installs or upgrades the platform Helm release, NVIDIA GPU components, and scheduler services. `verify-live.sh` checks the resulting cluster, including GPU scheduling and monitoring.
+
+The deployment uses `chart/values-k3s.yaml`. Review its storage address and access settings before applying it to a different environment. For detailed prerequisites, optional NFS setup, manual recovery, or full teardown, use the [user guide](docs/tutorial.md) and [cluster notes](docs/cluster.md).
+
+### Scheduler behavior
+
+`deploy-2.sh` enables the RL scheduler. In the chart, `rlScheduler.placementController.enabled` defaults to `true` and `shadow` defaults to `false` when the RL scheduler is enabled. Ordinary jobs enter Slurm's queue; the submit hook may adjust their priority, while Slurm chooses their resources. The placement controller only processes held jobs submitted with `sbatch --hold`. See [scheduler.md](docs/scheduler.md) before changing these settings.
+
+### Check the deployment
 
 ```bash
-SKIP_HELM_RENDER=1 bash scripts/verify-live.sh
-SKIP_STORAGE=1 SKIP_GPU=1 bash scripts/verify-live.sh
-SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
-```
-
-## 5. 訓練與評估
-
-> 需要 `.venv-m11`（含 PyTorch），並從 repo 根目錄以 `PYTHONPATH=.` 執行（確保 `sim/`、`services/`、`eval/` 可被找到）。以下為目前的最終工作流。
-
-### 5.1 模擬訓練（目前拓樸 = 2×1，obs_dim=168 / n_actions=33，預設 RDSAC）
-
-目前論文（§5.8）採用的產出模型以 **fairness reward** 訓練：`mo` 完成項（−JCT/S）＋凸公平項（`--fairness-coef 5.0`，壓尾端）＋節點均衡 potential shaping（`--balance-coef 5.0`），並在具**共置干擾**的環境（`--interference 0.3`，實際執行時間隨同卡共置數變慢）下學習「打包 vs 干擾」的權衡。`train_aimix_seeds_fair.sh` 一次訓練 3 臂 × 16 seed：
-
-```bash
-# 產出 SAC / RDSAC-mean / RDSAC-cvar × 16 seed → runs/ckpts_aimix16_fair/
-# 已用 scripts/gpu-toggle.sh release 釋出本機 4070 時可 DEVICE=cuda；否則 CPU。
-DEVICE=cuda STEPS=100000 MAX=4 SEEDS="42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57" \
-    bash eval/scripts/train_aimix_seeds_fair.sh
-# → runs/ckpts_aimix16_fair/{sac,rdsac_mean,rdsac_cvar}_s{42..57}.pt（48 個 checkpoint）
-```
-
-底層等價的單臂指令（可自行調風險/critic 家族）：
-
-```bash
-PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
-    --n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix \
-    --n-jobs 50 --total-steps 100000 --curriculum --device cuda \
-    --fixed-alpha --init-alpha 0.05 \
-    --fairness-coef 5.0 --balance-coef 5.0 --interference 0.3 \
-    --risk-mode cvar \
-    --out-dir runs/dsac_2x1_$(date +%Y%m%d)
-# vanilla SAC：加 --no-iqn；風險中立 RDSAC：--risk-mode mean
-```
-
-### 5.2 實機微調（RLPD，忠於 Ball et al. 2023）
-
-以 shadow-safe 的 `live_daemon` 旁觀收集真實 transition（記錄 Slurm 實際落點 + **sacct 真 JCT**，不干擾生產），再做 RLPD 微調（對稱 50/50 offline/online、LayerNorm 集成 critic、fixed-α 避免離散 SAC 溫度發散）。`live_daemon` 的 obs 直接重用 `gym_env` 的 canonical 特徵抽取（單一真相源，避免 168-d 漂移）；reward 用 sacct `End−Submit`（避開 `MinJobAge` squeue 滯留造成的 JCT 灌水）。
-
-```bash
-# 1) 旁觀收集真實 168-d online-log（serve :8003 跑 rdsac_cvar 當 behavior + daemon shadow 記錄）
-#    16h 時間界定迴圈送 aimix batch → shadow_logs/transitions_*.jsonl（RLPD 的 raw --online-log）
-DURATION_S=57600 N_JOBS=30 bash eval/scripts/collect_aimix_onlinelog.sh
-
-# 2) 16-seed RLPD 微調：各 warm-start rdsac_cvar_sXX（同一 CK 目錄的 base），共用同一份真 online-log。
-#    offline sim prior 用 --hetero-cluster（對齊 base/online-log 的 gpu one-hot + free_ram_ratio）；
-#    reward 維持 jct_aligned（RLPD critic 從頭訓練，需 offline↔online reward 一致，online-log 記 −JCT/1000）。
-#    CPU（本機 4070 被 Slurm/DRA 佔用）；~240s/seed。
-#    §5.8 產出模型：CK=runs/ckpts_aimix16_fair（暖啟動自 fairness RDSAC-cvar base）。
-CK=runs/ckpts_aimix16_fair \
-ONLINE_LOG=shadow_logs/transitions_20260814-203143.jsonl \
-    bash eval/scripts/train_rlpd_aimix16.sh
-# → runs/ckpts_aimix16_fair/rlpd_cvar_s{42..57}.pt（16 個，serve/eval 可載入）
-```
-
-### 5.3 實機評估指令
-
-論文的最終結果：讓 RL 掌握派遣順序（而非只綁節點）。可落地的部署形態為**非阻塞週期性重排**，即工作以 unheld 正常提交，一個常駐程序每數秒讀取當前 pending queue、以策略重排並寫入 Slurm Priority，交由 Slurm 自身 in-process backfill 於原生速度致動並自由放置，RL 掌握順序、Slurm 掌握放置與時機。
-
-```bash
-# 前置：本地 168-d serve on :8003（eval 逐臂 /reload 對應 checkpoint）
-SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
-    --policy-dir /tmp/aimix_eval_policy --port 8003 &   # policy-dir 放任一 168-d ckpt 當初始
-
-# （選用）OOM watchdog：node-2（3080，~7.5GB host RAM）在 real-CUDA LLM 共置下易 OOM，
-# 此 sidecar 會 release 被 requeue-held 的 job、resume 掉線節點，避免評估卡死。
-STOPFILE=/tmp/oom_watchdog.stop bash eval/scripts/oom_watchdog.sh &
-
-# 三點負載掃描 × 10 seed × 6 臂（fcfs/backfill/sac/rdsac_mean/rdsac_cvar/rlpd_cvar）
-# ACTUATION=reorder → Option B（非阻塞週期性重排）；自動切換 fcfs/main 兩套 slurm.conf、結束 trap 還原
-ACTUATION=reorder OVERSUBS="2 4 6" SEEDS="42 43 44 45 46 47 48 49 50 51" REAL_WORKLOAD=1 \
-    CK=runs/ckpts_aimix16_fair \
-    bash eval/scripts/run_step3_prio.sh
-# → runs/step3prio_<stamp>/ov{2,4,6}/{arm}_reorder_s{seed}.json（learned 臂帶 _reorder 後綴）
-touch /tmp/oom_watchdog.stop   # 停 watchdog
-
-# 彙整成論文表 4–7 格式（各臂 平均JCT/P50/P95/P99 ± std、ΔmeanJCT% [95% CI]、Wilcoxon p、P99<bf）
-PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_optB_deploy \
-    runs/step3prio_<stamp>
-```
-
-### 5.4 訓練 flags 對照
-
-| Flag | 說明 | 預設 |
-|------|------|------|
-| `--curriculum` | n_jobs 從 10→30→50 漸進 | 關 |
-| `--no-per` | 停用 Prioritized Experience Replay | PER 開 |
-| `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
-| `--no-iqn` | 改用 scalar twin-Q critic（vanilla SAC）；不加則為預設的 IQN distributional critic | IQN/RDSAC 開 |
-| `--risk-mode` | RDSAC 風險扭曲：`mean`（risk-neutral）或 `cvar`（僅 IQN 生效） | `mean` |
-| `--fairness-coef` | 凸（平方）per-job JCT 懲罰，壓尾端（改變目標，非 optimum-preserving） | `0`（生效版用 5.0） |
-| `--balance-coef` | 節點 free-MPS 均衡 potential shaping（多節點才生效） | `0`（生效版用 5.0） |
-| `--interference` | 環境動力學：同卡共置每多一個工作，實際執行時間 ×(1+k·此值) | `0`（生效版用 0.3） |
-
-### 5.5 執行單元測試
-
-```bash
-PYTHONPATH=. .venv-m11/bin/python -m pytest sim/tests/ -q
-```
-
----
-
-## 🗑️ 清理環境
-
-```bash
-helm uninstall slurm-platform -n slurm
-helm uninstall gpu-operator   -n gpu-operator
-kubectl delete -f manifests/core/slurm-accounting.yaml
-kubectl delete namespace slurm gpu-operator monitoring nfs-provisioner
-# 主機層
-/usr/local/bin/k3s-uninstall.sh
-sudo systemctl stop nfs-kernel-server
-```
-
-> StorageClass 與 gpu-operator namespace 都帶 `helm.sh/resource-policy=keep` 註記，所以 `helm uninstall` 不會自動把它們連同 PV/PVC 拔掉；手動 `kubectl delete namespace` 才會清乾淨。
-
----
-
-## 部署監控
-
-`monitoring.enabled=true`（k3s overlay 預設打開；chart default 預設關閉）。
-
-```bash
-# 存取 Grafana
+kubectl -n slurm get pods
+kubectl -n slurm exec deploy/slurm-login -- sinfo
 kubectl -n monitoring port-forward svc/grafana 3000:3000
-
-# 驗證 Prometheus 抓得到 slurm-exporter / operator / kube-state-metrics
-bash scripts/verify-live.sh
 ```
+
+Grafana is then available at `http://127.0.0.1:3000`. See [monitoring.md](docs/monitoring.md) for dashboards and metrics.
+
+## Development and Research
+
+- [Scheduler implementation and configuration](docs/scheduler.md)
+- [Evaluation methods and results](docs/eval-writeup.md)
+- [Paper draft](docs/paper.md)
+- [Cluster architecture and operations](docs/cluster.md)
 
 ---
 

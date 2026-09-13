@@ -4,7 +4,6 @@ __pycache__/
 _docx_unpack/
 .pytest_cache/
 .ruff_cache/
-CLAUDE.md
 .mcp.json
 sim/data/out/
 sim/data/philly_subsample.json
