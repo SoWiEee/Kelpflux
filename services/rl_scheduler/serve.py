@@ -609,6 +609,15 @@ def decide(req: DecideRequest):
             value=0.0, entropy=0.0, shadow=SHADOW_MODE,
             otel_traceparent=traceparent or None,
         )
+    if snap.n_nodes <= 0 or not snap.nodes:
+        _set_last_decision(result="abstain", value=0.0, entropy=0.0, boost=0)
+        return DecideResponse(
+            priority_boost=0, rl_selected=False, abstain=True,
+            abstain_reason="no_available_gpu_nodes",
+            rl_selected_job_id=None, node_j=None, gpu_k=None,
+            value=0.0, entropy=0.0, shadow=SHADOW_MODE,
+            otel_traceparent=traceparent or None,
+        )
 
     # Fuse submitting job into snapshot's pending list
     fused = list(snap.pending_jobs)

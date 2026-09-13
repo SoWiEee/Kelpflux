@@ -57,6 +57,22 @@ def test_parse_nodes_computes_free_mps_and_skips_cpu():
     assert nodes[0].available is True
 
 
+def test_parse_nodes_reads_tres_used_from_current_slurm_rest():
+    doc = {
+        "nodes": [{
+            "name": "slurm-worker-gpu-rtx4070-0",
+            "state": ["MIXED"],
+            "tres": "gres/gpu=1,gres/mps=100",
+            "tres_used": "gres/mps=75",
+        }]
+    }
+
+    nodes = pc.parse_nodes(doc, mps_per_gpu=100)
+
+    assert len(nodes) == 1
+    assert nodes[0].free_mps == 25
+
+
 def test_parse_nodes_marks_drained_node_unavailable():
     doc = {
         "nodes": [

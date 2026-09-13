@@ -183,6 +183,24 @@ def test_decide_stale_snapshot_abstains_even_with_loaded_model(serve, client):
     assert body["rl_selected"] is False
 
 
+def test_decide_abstains_when_snapshot_has_no_available_gpu_nodes(serve, client):
+    serve._holder = _FakeHolder(action=0, value=5.0, entropy=0.0)
+    client.post(
+        "/snapshot",
+        json={"now": 10.0, "pending_jobs": [], "nodes": [], "n_nodes": 0,
+              "gpus_per_node": 1, "mps_per_gpu": 100},
+    )
+
+    res = client.post("/decide", json=_decide_payload("job-1"))
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["abstain"] is True
+    assert body["abstain_reason"] == "no_available_gpu_nodes"
+    assert body["priority_boost"] == 0
+    assert serve._holder.seen_obs is None
+
+
 def test_decide_low_value_abstains(serve, client):
     serve._holder = _FakeHolder(action=0, value=-5.0, entropy=0.0)
     serve.VALUE_ABSTAIN = -1.0

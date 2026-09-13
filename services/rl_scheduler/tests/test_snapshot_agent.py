@@ -43,7 +43,7 @@ def test_build_snapshot_extracts_pending_jobs_and_node_mps():
     assert [g["free_mps"] for g in snap["nodes"][0]["gpus"]] == [100]
 
 
-def test_build_snapshot_filters_down_nodes_and_falls_back():
+def test_build_snapshot_does_not_invent_gpu_when_no_nodes_are_available():
     snap = agent.build_snapshot(
         {"jobs": []},
         {"nodes": [{"name": "bad", "state": "DOWN", "gres": "gpu:rtx4070:1,mps:100"}]},
@@ -51,9 +51,8 @@ def test_build_snapshot_filters_down_nodes_and_falls_back():
         mps_per_gpu=100,
     )
 
-    assert snap["n_nodes"] == 1
-    assert snap["nodes"][0]["gpus"][0]["free_mps"] == 100
-    assert snap["nodes"][0]["gpus"][0]["gpu_type"] == "rtx4070"
+    assert snap["n_nodes"] == 0
+    assert snap["nodes"] == []
 
 
 def test_job_view_defaults_missing_gpu_request_to_full_mps():

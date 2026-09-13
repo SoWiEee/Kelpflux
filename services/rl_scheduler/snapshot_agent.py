@@ -191,8 +191,6 @@ def build_snapshot(
         view for node in nodes_doc.get("nodes", [])
         if (view := node_view(node, mps_per_gpu=mps_per_gpu, default_gpus_per_node=default_gpus_per_node)) is not None
     ]
-    if not nodes:
-        nodes = [{"gpus": [{"free_mps": mps_per_gpu, "running_jobs": 0, "gpu_type": "rtx4070"}]}]
     gpus_per_node = max((len(n.get("gpus", [])) for n in nodes), default=default_gpus_per_node)
     return {
         "ts": now,

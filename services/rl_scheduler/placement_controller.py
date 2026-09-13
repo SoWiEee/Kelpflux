@@ -52,7 +52,7 @@ RELEASE_PRIORITY = 0xFFFFFFFF
 # Node config TRES keys that may carry the gpu/mps counts across slurmrestd
 # versions (mirrors snapshot_agent.node_view).
 _NODE_CFG_KEYS = ("tres", "cfg_tres", "gres", "gres_detail")
-_NODE_ALLOC_KEYS = ("alloc_tres", "alloc_gres")
+_NODE_ALLOC_KEYS = ("alloc_tres", "alloc_gres", "tres_used")
 
 
 @dataclass(frozen=True)
