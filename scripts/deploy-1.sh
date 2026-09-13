@@ -2,7 +2,7 @@
 # deploy-1.sh - Linux + k3s + GPU prerequisite deployment.
 #
 # This consolidates README deployment steps 1-4 for the current target
-# environment. It intentionally does not support Kind.
+# environment.
 #
 # What it does:
 #   1. Validate host prerequisites: Linux, NVIDIA driver, Docker, k3s, kubectl, Helm.

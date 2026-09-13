@@ -62,47 +62,10 @@ record_cmd() {
   fi
 }
 
-wait_seconds() {
-  local t="$1"
-  if [[ "$t" =~ ^[0-9]+s$ ]]; then echo "${t%s}"; return; fi
-  if [[ "$t" =~ ^[0-9]+m$ ]]; then echo "$(( ${t%m} * 60 ))"; return; fi
-  echo 300
-}
-
-wait_statefulset_ready() {
-  local name="$1" ns="${2:-$NAMESPACE}"
-  local timeout_s deadline replicas ready
-  timeout_s=$(wait_seconds "$ROLLOUT_TIMEOUT")
-  deadline=$(( $(date +%s) + timeout_s ))
-  while true; do
-    replicas=$(kubectl -n "$ns" get statefulset "$name" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
-    ready=$(kubectl -n "$ns" get statefulset "$name" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-    replicas=${replicas:-0}
-    ready=${ready:-0}
-    if [[ "$ready" == "$replicas" ]]; then
-      pass "statefulset ${ns}/${name} ready ${ready}/${replicas}"
-      return
-    fi
-    if (( $(date +%s) >= deadline )); then
-      fail "statefulset ${ns}/${name} ready ${ready}/${replicas}"
-      return
-    fi
-    sleep 3
-  done
-}
-
 wait_rollout() {
   local kind="$1" name="$2" ns="${3:-$NAMESPACE}"
-  if ! kubectl -n "$ns" get "$kind/$name" >/dev/null 2>&1; then
-    fail "missing ${ns}/${kind}/${name}"
-    return
-  fi
-  if [[ "$kind" == "statefulset" ]]; then
-    wait_statefulset_ready "$name" "$ns"
-  else
-    record_cmd "rollout ${ns}/${kind}/${name}" \
-      kubectl -n "$ns" rollout status "$kind/$name" --timeout="$ROLLOUT_TIMEOUT"
-  fi
+  record_cmd "rollout ${ns}/${kind}/${name}" \
+    kubectl -n "$ns" rollout status "$kind/$name" --timeout="$ROLLOUT_TIMEOUT"
 }
 
 pod_ready() {

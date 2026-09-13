@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-INSTALL_K3S=${INSTALL_K3S:-false}
+INSTALL_K3S=false
 K3S_VERSION=${K3S_VERSION:-v1.35.8+k3s1}
 for arg in "$@"; do
   case "$arg" in
@@ -101,12 +101,6 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
 
   if [[ "$current_k3s" != "$K3S_VERSION" ]]; then
 
-    # Allow non-root kubectl.
-    # WARNING: running as root (sudo), so HOME=/root. The kubeconfig lands at
-    # /root/.kube/config, not the invoking user's home. Copy it manually:
-    #   sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-    #   mkdir -p ~/.kube && cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-    #   chmod 600 ~/.kube/config
     mkdir -p "${HOME}/.kube"
     cp /etc/rancher/k3s/k3s.yaml "${HOME}/.kube/config"
     chown "$(id -u):$(id -g)" "${HOME}/.kube/config"

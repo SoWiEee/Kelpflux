@@ -164,19 +164,13 @@ touch /mnt/kelpflux-nfs-test/node2-write-test
 sudo umount /mnt/kelpflux-nfs-test
 ```
 
-**已知地雷（重要）：`/etc/exports` 的 allowed clients 必須涵蓋第二台的 LAN subnet，不能只放 pod CIDR。**
-`scripts/setup-nfs-server.sh:15` 預設 `NFS_EXPORT_CLIENTS=172.16.0.0/12`（給 Kind/Docker bridge），這個範圍**不包含**第二台的 LAN IP（例如 `192.168.0.0/24`）。第二台的 kubelet 會用實體 LAN IP 連 NFS，若 exports 沒放它的 subnet，mount 會直接被拒、worker pod 卡在 `ContainerCreating`。
+`/etc/exports` 的 allowed clients 必須涵蓋第二台的 LAN subnet，不能只放 pod CIDR。kubelet 會用實體 LAN IP 連 NFS，因此 subnet 不符時，mount 會被拒、worker pod 卡在 `ContainerCreating`。
 
-回第一台調整 `/etc/exports`，把第二台的 LAN subnet 加進 allowed clients（保留原本的 pod/bridge subnet）：
+`scripts/setup-nfs-server.sh` 預設 `NFS_EXPORT_CLIENTS=192.168.0.0/24`。若節點使用其他 LAN subnet，回第一台重跑腳本並覆寫：
 
 ```bash
-# 直接編 /etc/exports，或用 setup script 重跑並帶上多個 subnet：
 sudo NFS_EXPORT_CLIENTS="192.168.0.0/24" bash scripts/setup-nfs-server.sh
-# 若要同時保留原本的 bridge subnet，/etc/exports 可放多行或多個 client：
-#   /srv/nfs/k8s 192.168.0.0/24(rw,sync,no_subtree_check,no_root_squash,insecure)
-#   /srv/nfs/k8s 172.16.0.0/12(rw,sync,no_subtree_check,no_root_squash,insecure)
 
-sudo exportfs -ra
 sudo exportfs -v   # 確認第二台 subnet 有列出來
 ```
 
