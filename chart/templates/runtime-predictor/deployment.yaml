@@ -1,14 +1,13 @@
 {{/*
-Phase 6 M5 — runtime-predictor service.
+Runtime predictor service.
 
   PVC          → /models, RWO, holds predictor.pkl + .bak
   Deployment   → uvicorn FastAPI on :8080 (cold-start fallback baked in)
   Service      → ClusterIP, port 8080, scraped at /metrics by Prometheus
                  when monitoring is enabled (handled in network-policy.yaml)
 
-Disabled by default. The M2 lua plugin (M6) reads
-slurm.predictor.url and falls back gracefully when this Deployment is
-absent — see docs/scheduler.md.
+Disabled by default. The Lua plugin reads slurm.predictor.url and falls
+back gracefully when this Deployment is absent — see docs/scheduler.md.
 */}}
 {{- if .Values.runtimePredictor.enabled }}
 {{- $rp := .Values.runtimePredictor -}}

@@ -1,4 +1,4 @@
-suite: job_submit lua plugin (Phase 6 M2 + M3)
+suite: Slurm job submit Lua plugin
 templates:
   - configmap-job-submit.yaml
   - configmap-static.yaml
@@ -68,7 +68,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "DEBUG_LOG           = false"
 
-  - it: M3 default scoreApply=true and weights inline (mpsFit=0.40, vramFit=0.20)
+  - it: scoreApply defaults to true with configured weights
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -86,7 +86,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "local D = 0\\.2"
 
-  - it: M3 vramTiers list inlines into VRAM_TIERS
+  - it: VRAM tiers are inlined into Lua configuration
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -96,7 +96,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "VRAM_TIERS = \\{\\s*8, 16, 40"
 
-  - it: M3 scoreApply=false (shadow mode) preserves apply=false in scaffold
+  - it: score shadow mode preserves apply=false in the rendered hook
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -106,7 +106,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "SCORE_APPLY         = false"
 
-  - it: M3 mpsPerNode override flows through
+  - it: mpsPerNode override reaches the rendered hook
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -153,7 +153,7 @@ tests:
           path: kind
           value: StatefulSet
 
-  - it: M6 predictor disabled by default — PRED_ENABLED=false in lua
+  - it: runtime predictor is disabled by default
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -162,7 +162,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "PRED_ENABLED          = false"
 
-  - it: M6 predictor enabled — URL + timeout + fallback inlined
+  - it: runtime predictor URL, timeout, and fallback are rendered
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -184,7 +184,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "PRED_FALLBACK_HOURS   = 6"
 
-  - it: M6 predictor applyTimeLimit=false leaves walltime untouched
+  - it: runtime predictor can leave walltime unchanged
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true
@@ -195,7 +195,7 @@ tests:
           path: data["job_submit.lua"]
           pattern: "PRED_APPLY_TIME_LIMIT = false"
 
-  - it: M6 predictor defaultGpuType propagates to lua
+  - it: runtime predictor default GPU type reaches Lua
     template: configmap-job-submit.yaml
     set:
       slurm.jobSubmit.enabled: true

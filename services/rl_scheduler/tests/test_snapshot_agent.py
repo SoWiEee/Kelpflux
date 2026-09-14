@@ -85,3 +85,47 @@ def test_build_snapshot_skips_cpu_nodes_when_gpu_nodes_exist():
 
     assert snap["n_nodes"] == 1
     assert snap["snapshot" if False else "nodes"][0]["gpus"][0]["gpu_type"] == "rtx4070"
+
+
+def test_run_once_sends_snapshot_bearer_token_only_to_scheduler(monkeypatch):
+    calls = []
+
+    def fake_http_json(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if url.endswith("/jobs"):
+            return {"jobs": []}
+        if url.endswith("/nodes"):
+            return {"nodes": []}
+        return {"ok": True}
+
+    monkeypatch.setattr(agent, "http_json", fake_http_json)
+
+    agent.run_once(
+        rest_url="http://slurmrestd",
+        api_version="v0.0.39",
+        scheduler_url="http://rl-scheduler:8002",
+        jwt_key=b"jwt-key",
+        snapshot_token=b"snapshot-secret",
+        mps_per_gpu=100,
+        default_gpus_per_node=1,
+        default_runtime=600,
+    )
+
+    assert calls[0][2].get("bearer_token") is None
+    assert calls[1][2].get("bearer_token") is None
+    assert calls[2][1] == "http://rl-scheduler:8002/snapshot"
+    assert calls[2][2]["bearer_token"] == b"snapshot-secret"
+
+
+def test_read_bearer_token_requires_a_nonempty_ascii_file(tmp_path):
+    token_file = tmp_path / "api-token"
+    token_file.write_bytes(b"api-secret\n")
+    assert agent._read_bearer_token(str(token_file)) == b"api-secret"
+
+    token_file.write_bytes(b"\n")
+    try:
+        agent._read_bearer_token(str(token_file))
+    except RuntimeError as exc:
+        assert "empty" in str(exc)
+    else:
+        raise AssertionError("empty API token must fail closed")

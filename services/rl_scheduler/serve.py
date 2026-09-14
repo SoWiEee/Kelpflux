@@ -20,6 +20,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import hmac
 import math
 import os
 import sys
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
@@ -129,7 +130,7 @@ class DecideResponse(BaseModel):
     rl_selected_job_id: Optional[str]
     node_j:             Optional[int]    # placement: node index (0-based)
     gpu_k:              Optional[int]    # placement: gpu index (0-based)
-    otel_traceparent:   Optional[str] = None  # W3C traceparent for Phase 7-A OTel
+    otel_traceparent:   Optional[str] = None  # W3C traceparent for OTel
     value:              float
     entropy:            float
     shadow:             bool
@@ -344,6 +345,49 @@ VALUE_ABSTAIN   = float(os.environ.get("VALUE_ABSTAIN", "-1.0"))
 ENTROPY_ABSTAIN = float(os.environ.get("ENTROPY_ABSTAIN", "2.5"))
 PRIORITY_BOOST  = int(os.environ.get("PRIORITY_BOOST", "1000"))
 
+
+def _load_configured_token(env_name: str) -> Optional[bytes]:
+    path = os.environ.get(env_name)
+    if not path:
+        return None
+    try:
+        token = Path(path).read_bytes().strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read token file configured by {env_name}: {path}") from exc
+    if not token:
+        raise RuntimeError(f"token file configured by {env_name} is empty: {path}")
+    return token
+
+
+_API_TOKEN = _load_configured_token("RL_API_TOKEN_FILE")
+_SNAPSHOT_TOKEN = _load_configured_token("RL_SNAPSHOT_TOKEN_FILE")
+_CONTROL_TOKEN = _load_configured_token("RL_CONTROL_TOKEN_FILE")
+
+
+def _authorize(expected: Optional[bytes], authorization: Optional[str]) -> None:
+    if expected is None:
+        return
+    scheme, separator, supplied = (authorization or "").partition(" ")
+    if (not separator or scheme.lower() != "bearer"
+            or not hmac.compare_digest(expected, supplied.encode())):
+        raise HTTPException(
+            status_code=401,
+            detail="unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _require_api_token(authorization: Optional[str] = Header(default=None)) -> None:
+    _authorize(_API_TOKEN, authorization)
+
+
+def _require_snapshot_token(authorization: Optional[str] = Header(default=None)) -> None:
+    _authorize(_SNAPSHOT_TOKEN, authorization)
+
+
+def _require_control_token(authorization: Optional[str] = Header(default=None)) -> None:
+    _authorize(_CONTROL_TOKEN, authorization)
+
 _holder:   Optional[_AgentHolder] = None
 _snapshot: Optional[Snapshot]     = None
 
@@ -482,7 +526,7 @@ def _variant_of(agent) -> str:
     return "SAC"
 
 
-@app.post("/reload")
+@app.post("/reload", dependencies=[Depends(_require_control_token)])
 def reload_checkpoint(req: ReloadRequest):
     """Hot-swap the served DSAC checkpoint (heavy-tail live A/B arm switch, §4.4).
 
@@ -528,7 +572,7 @@ class ShadowRequest(BaseModel):
     shadow: bool
 
 
-@app.post("/shadow")
+@app.post("/shadow", dependencies=[Depends(_require_control_token)])
 def set_shadow(req: ShadowRequest):
     """Toggle shadow mode at runtime — the heavy-tail A/B score arm (§4.4) needs
     boost OFF (shadow=true) while learned arms run boost ON (shadow=false), without
@@ -547,7 +591,7 @@ def metrics():
     return Response(generate_latest(METRICS_REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/snapshot")
+@app.post("/snapshot", dependencies=[Depends(_require_snapshot_token)])
 def push_snapshot(snap: Snapshot):
     global _snapshot
     _snapshot = snap
@@ -559,7 +603,7 @@ def push_snapshot(snap: Snapshot):
             "pending": len(snap.pending_jobs), "nodes": len(snap.nodes)}
 
 
-@app.post("/act", response_model=ActResponse)
+@app.post("/act", response_model=ActResponse, dependencies=[Depends(_require_api_token)])
 def act(req: ActRequest):
     if _holder is None:
         raise HTTPException(status_code=503, detail="model not loaded")
@@ -603,7 +647,7 @@ def _decide_traceparent(req: DecideRequest) -> str:
         return tp
 
 
-@app.post("/decide", response_model=DecideResponse)
+@app.post("/decide", response_model=DecideResponse, dependencies=[Depends(_require_api_token)])
 def decide(req: DecideRequest):
     traceparent = _decide_traceparent(req)
     snap = _snapshot

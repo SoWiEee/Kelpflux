@@ -1,8 +1,12 @@
 suite: RL scheduler service
 templates:
   - rl-scheduler/deployment.yaml
+  - rl-scheduler/snapshot-agent.yaml
+  - rl-scheduler/placement-controller.yaml
+  - rl-scheduler/reorder-daemon.yaml
 tests:
   - it: renders the service by default
+    template: rl-scheduler/deployment.yaml
     asserts:
       - hasDocuments:
           count: 3
@@ -19,3 +23,163 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+
+  - it: leaves scheduler API auth disabled in generic installs
+    template: rl-scheduler/deployment.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_SNAPSHOT_TOKEN_FILE
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_CONTROL_TOKEN_FILE
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+      - notExists:
+          path: spec.template.spec.volumes
+
+  - it: leaves snapshot-agent API auth disabled in generic installs
+    template: rl-scheduler/snapshot-agent.yaml
+    documentSelector:
+      path: metadata.name
+      value: rl-snapshot-agent
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_SNAPSHOT_TOKEN_FILE
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-snapshot-token
+
+  - it: production scheduler mounts distinct API and control secrets
+    template: rl-scheduler/deployment.yaml
+    values:
+      - ../values-k3s.yaml
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/api-token
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_SNAPSHOT_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/snapshot-token
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_CONTROL_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/control-token
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-api-token
+            secret:
+              secretName: rl-scheduler-api-token
+              defaultMode: 0400
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-snapshot-token
+            secret:
+              secretName: rl-scheduler-snapshot-token
+              defaultMode: 0400
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-control-token
+            secret:
+              secretName: rl-scheduler-control-token
+              defaultMode: 0400
+
+  - it: production snapshot agent gets snapshot access but no scheduler API token
+    template: rl-scheduler/snapshot-agent.yaml
+    values:
+      - ../values-k3s.yaml
+    documentSelector:
+      path: metadata.name
+      value: rl-snapshot-agent
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_SNAPSHOT_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/snapshot-token
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_CONTROL_TOKEN_FILE
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-snapshot-token
+            secret:
+              secretName: rl-scheduler-snapshot-token
+              defaultMode: 0400
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-control-token
+
+  - it: production placement controller receives the API token file
+    template: rl-scheduler/placement-controller.yaml
+    values:
+      - ../values-k3s.yaml
+      - ../values-2x1.yaml
+    documentSelector:
+      path: metadata.name
+      value: rl-placement-controller
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/api-token
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-api-token
+            secret:
+              secretName: rl-scheduler-api-token
+              defaultMode: 0400
+
+  - it: production reorder daemon receives the API token file
+    template: rl-scheduler/reorder-daemon.yaml
+    values:
+      - ../values-k3s.yaml
+      - ../values-2x1.yaml
+    documentSelector:
+      path: metadata.name
+      value: rl-reorder-daemon
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/api-token
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-api-token
+            secret:
+              secretName: rl-scheduler-api-token
+              defaultMode: 0400

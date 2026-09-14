@@ -18,7 +18,7 @@ class PartitionConfig:
     checkpoint_path: str = ""
     max_checkpoint_age_seconds: int = 600
     checkpoint_grace_seconds: int = 0
-    # R1: Once a node has been DRAINed for this many seconds, the operator force-kills
+    # Once a node has been DRAINed for this many seconds, the operator force-kills
     # remaining jobs on it (scancel --nodelist) and marks it DOWN, so a hung srun step
     # cannot keep the pool pinned at max replicas forever.
     drain_timeout_seconds: int = 1800
@@ -34,7 +34,7 @@ class Config:
     namespace: str = os.getenv("NAMESPACE", "slurm")
     controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
     poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
-    # R21: event-driven loop. `slurm_poll_interval` is the diff cadence for
+    # Event-driven loop. `slurm_poll_interval` is the diff cadence for
     # squeue/sinfo state (Slurm 21.08 has no event stream); `reconcile_period`
     # is the timer-driven full reconcile that runs even when no events arrive,
     # acting as a safety net so a missed watch event cannot leave a pool

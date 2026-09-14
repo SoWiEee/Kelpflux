@@ -1,11 +1,11 @@
-# Lmod modulefile ConfigMaps for Slurm-on-K8s (Phase 5)
+# Lmod modulefile ConfigMaps for Slurm-on-Kubernetes.
 #
 # Each ConfigMap becomes one module family mounted at:
 #   /opt/modulefiles/<family>/   (e.g. openmpi/, python3/)
 #
 # Workers and the login pod mount these via volumes (see slurm-static.yaml
-# rendered with --with-lmod).  The ConfigMap is declared optional so Phase 1
-# pods start even when this manifest has not been applied.
+# rendered with --with-lmod). The ConfigMap is optional so pods start even
+# when this manifest has not been applied.
 #
 # Usage inside a job script (or login shell):
 #   source /etc/profile.d/lmod.sh    # ensure 'module' command is available

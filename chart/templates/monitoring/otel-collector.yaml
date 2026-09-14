@@ -1,6 +1,6 @@
 {{/*
 OpenTelemetry Collector — receives OTLP from Operator and RL Scheduler,
-forwards to Grafana Tempo. Phase 7-A.
+forwards to Grafana Tempo.
 Enabled by .Values.monitoring.otel.enabled (default: false).
 */}}
 {{- if .Values.monitoring.otel.enabled }}

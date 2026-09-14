@@ -1,4 +1,4 @@
-"""Phase 6 M7 — fragmentation detector + decider unit tests."""
+"""Fragmentation detector and decider unit tests."""
 from __future__ import annotations
 
 import os
@@ -56,7 +56,7 @@ class TestDetector:
         assert not snap.has_actionable_fragmentation
 
     def test_acceptance_scenario_4x25_blocks_one_50(self):
-        """The M7 acceptance scenario from scheduler.md."""
+        """A large pending job can be unblocked by requeuing smaller work."""
         det = FragmentationDetector(mps_per_node=100)
         jobs = [
             _job("r1", state="RUNNING", prio=100, mps=25, nodes=("n1",)),

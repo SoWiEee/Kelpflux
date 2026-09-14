@@ -15,7 +15,7 @@
 #   SKIP_BUILD=1          Skip docker build.
 #   SKIP_IMPORT=1         Skip k3s ctr image import.
 #   SKIP_SECRETS=1        Skip secret creation.
-#   REGENERATE_SECRETS=true Recreate munge/ssh/JWT secrets even if present.
+#   REGENERATE_SECRETS=true Recreate all generated secrets even if present.
 #   SKIP_PREREQS=1        Skip RuntimeClass/accounting apply.
 #   NAMESPACE=slurm       Target namespace for secrets/accounting.
 #   KUBECONFIG=...        Defaults to ~/.kube/config if present, otherwise k3s default.
@@ -175,6 +175,9 @@ create_secrets() {
   openssl rand -out "$workdir/munge.key" 1024
   ssh-keygen -t ed25519 -N '' -f "$workdir/id_ed25519" >/dev/null
   openssl rand 32 > "$workdir/jwt_hs256.key"
+  openssl rand -hex 32 > "$workdir/rl_scheduler_api_token"
+  openssl rand -hex 32 > "$workdir/rl_scheduler_snapshot_token"
+  openssl rand -hex 32 > "$workdir/rl_scheduler_control_token"
 
   create_or_keep_secret slurm-munge-key "Munge" \
     --from-file=munge.key="$workdir/munge.key"
@@ -183,6 +186,12 @@ create_secrets() {
     --from-file=id_ed25519.pub="$workdir/id_ed25519.pub"
   create_or_keep_secret slurm-jwt-secret "JWT HS256" \
     --from-file=jwt_hs256.key="$workdir/jwt_hs256.key"
+  create_or_keep_secret rl-scheduler-api-token "RL scheduler API" \
+    --from-file=token="$workdir/rl_scheduler_api_token"
+  create_or_keep_secret rl-scheduler-snapshot-token "RL scheduler snapshot API" \
+    --from-file=token="$workdir/rl_scheduler_snapshot_token"
+  create_or_keep_secret rl-scheduler-control-token "RL scheduler control API" \
+    --from-file=token="$workdir/rl_scheduler_control_token"
 }
 
 apply_prereqs() {

@@ -51,7 +51,7 @@ tests:
           path: metadata.annotations["helm.sh/hook"]
           value: "post-install,post-upgrade"
 
-  - it: NFD NodeFeatureRule renders for declared GPU classes (R4)
+  - it: NFD NodeFeatureRule renders for declared GPU classes
     template: gpu/node-feature-rule.yaml
     set:
       gpu.enabled: true

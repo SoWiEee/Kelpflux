@@ -4,10 +4,10 @@
 # This file is the development baseline. For production k3s + real GPU, layer
 # `values-k3s.yaml` on top via `helm install ... -f values-k3s.yaml`.
 #
-# Stage A scope: only `cluster`, `partitions`, `pools`, and `slurm` are wired
+# Only `cluster`, `partitions`, `pools`, and `slurm` are wired
 # into templates. Other top-level keys (image, gpu, operator, monitoring,
 # storage, secrets, networkPolicy) are pre-declared per docs/note.md §5-A so
-# values overlays can be authored once and stay valid through Stages B–F.
+# values overlays can be authored once and stay valid as templates are enabled.
 
 cluster:
   name: kind-slurm           # Slurm ClusterName; kept as kind-slurm to match
@@ -121,7 +121,7 @@ pools:
     devicePluginConfig: rtx4080-exclusive
 
 slurm:
-  # K1 (v5 review): slurmctld in-memory state grows with queue depth. 2Gi limit
+  # slurmctld in-memory state grows with queue depth. A 2Gi limit
   # covers ~10k concurrent jobs; raise for larger deployments. Pinned to
   # Guaranteed QoS so slurmctld is not the first thing evicted under pressure.
   controllerResources:
@@ -131,9 +131,8 @@ slurm:
     limits:
       cpu: "2"
       memory: "2Gi"
-  # Header values for slurm.conf. Defaults match the current
-  # render-core.py output verbatim, so Stage A produces a byte-equivalent
-  # ConfigMap. Override per-environment in values-k3s.yaml / values-dev.yaml.
+  # Header values for slurm.conf. Override per environment in values-k3s.yaml
+  # or values-dev.yaml.
   controllerHost: slurm-controller-0
   controllerService: slurm-controller
   authType: auth/munge
@@ -177,7 +176,7 @@ slurm:
     constrainRamSpace: "yes"
     constrainDevices: "yes"
     constrainSwapSpace: "no"
-  # Daemon log levels (R12 fix). Replaces hardcoded `slurmctld -Dvvv` /
+  # Daemon log levels replace hardcoded `slurmctld -Dvvv` /
   # `slurmd -Dvvv` startup args. Values: quiet | fatal | error | info |
   # verbose | debug | debug2 | debug3 | debug4 | debug5. `info` is plenty
   # for production; bump to `debug` only when troubleshooting.
@@ -208,15 +207,15 @@ slurm:
     storageTres: ["gres/gpu", "gres/mps"]          # AccountingStorageTRES
   jwt:
     keyPath: /slurm-secrets/jwt_hs256.key
-    lifespanSeconds: 86400                         # used by Stage B+ controller scripts
+    lifespanSeconds: 86400                         # used by controller scripts
   fairshare:
-    enabled: false                                 # P1+ feature
-  # M1 (Phase 6): Slurm built-in scheduling knobs. The defaults below match
+    enabled: false                                 # reserved for future fair-share configuration
+  # Slurm built-in scheduling knobs. The defaults below match
   # Slurm's built-in behaviour for selectTypeParameters (CR_Core, no Pack)
   # and turn on backfill + multifactor priority — both already on in stock
   # Slurm 21.08, just made explicit here so values.yaml is the single source
-  # of truth. Preempt is OFF by default (M7 turns it on after the
-  # checkpoint-aware requeue lands). See docs/scheduler.md §5.1.
+  # of truth. Preempt is OFF by default until checkpoint-aware requeue
+  # lands. See docs/scheduler.md §5.1.
   scheduling:
     # sched/backfill is strictly better than sched/builtin for our mixed
     # workload (long DDP + short cpu jobs). Override to sched/builtin only
@@ -234,7 +233,7 @@ slurm:
       partition: 1000     # partition.PriorityTier still dominates
       qos: 2000           # QOS dominates jobSize/age
     preempt:
-      enabled: false      # M7 flips this on after checkpoint+requeue plumb
+      enabled: false      # enable after checkpoint-aware requeue is wired
       type: preempt/qos
       mode: REQUEUE
   # Lua submit plugin. Disabled by default — when enabled, slurm.conf gets
@@ -345,14 +344,14 @@ slurm:
           #   qos: "low"
           []
 
-# -- Image references (used Stage B onwards) ---------------------------------
+# -- Image references --------------------------------------------------------
 image:
   controller: slurm-controller:23.11.4
   worker: slurm-worker:23.11.4
   operator: slurm-elastic-operator:latest
   pullPolicy: IfNotPresent
 
-# -- GPU subsystem (used Stage D onwards) ------------------------------------
+# -- GPU subsystem -----------------------------------------------------------
 # This chart only renders the device-plugin-config ConfigMap and the
 # post-install Job that labels GPU nodes. NVIDIA GPU Operator itself is
 # installed separately into its own namespace via
@@ -391,7 +390,7 @@ gpu:
     - selector:
         gpu-host-class: rtx4080
       config: rtx4080-exclusive
-  # R4 medium-term fix: declarative NFD NodeFeatureRule that re-applies
+  # Declarative NFD NodeFeatureRule that re-applies
   # `nvidia.com/device-plugin.config=<key>` on every node based on hardware
   # detection. NFD watches PCI devices and existing labels; the rule
   # converges automatically after node rebuild, k3s reinstall, etc — no
@@ -414,7 +413,7 @@ gpu:
         pciDevices: ["2704", "2702", "2782"]
         config: rtx4080-exclusive
 
-# -- Image-puller DaemonSet (R2 fix) ----------------------------------------
+# -- Image-puller DaemonSet -------------------------------------------------
 # Pre-pulls the worker image onto every potential worker node so that the
 # first scale-up does NOT eat 30–60s on `crictl pull`. The DaemonSet runs
 # `pause` (no real workload, cgroup overhead negligible), but kubelet still
@@ -429,9 +428,9 @@ imagePuller:
   nodeSelector: {}
   tolerations: []
 
-# -- Operator (Stage C) ------------------------------------------------------
+# -- Operator ---------------------------------------------------------------
 operator:
-  # K1 (v5 review): Guaranteed-QoS resource pinning. Defaults sized for the
+  # Guaranteed-QoS resource pinning. Defaults are sized for the
   # 1×GPU dev cluster; multi-pool deployments should raise limits.cpu to ≥1
   # and limits.memory to ≥1Gi (operator caches partition state in memory).
   resources:
@@ -441,15 +440,15 @@ operator:
     limits:
       cpu: "500m"
       memory: "512Mi"
-  # R21: legacy polling cadence — kept for backwards-compat, used by code
+  # Legacy polling cadence, kept for backwards compatibility and used by code
   # paths that still call `time.sleep(poll_interval)` directly. The
-  # event-driven loop (default since R21) does not block on this.
+  # event-driven loop does not block on this.
   pollIntervalSeconds: 15
-  # R21: how often the slurm-diff thread re-runs REST jobs/nodes queries and
+  # How often the slurm-diff thread re-runs REST jobs/nodes queries and
   # emits a reconcile event when state changes. Keep this above 1s to avoid
   # lock contention in slurmctld when several clients poll concurrently.
   slurmPollIntervalSeconds: 5
-  # R21: safety-net full reconcile if no event arrived. Catches the rare
+  # Safety-net full reconcile if no event arrived. Catches the rare
   # case where every watcher missed an event.
   reconcilePeriodSeconds: 60
   scaleDownCooldownSeconds: 60
@@ -460,13 +459,13 @@ operator:
     enabled: true
     maxAgeSeconds: 600
     graceSeconds: 300
-  # Phase 6 M7: fragmentation detector + requeue decider. Disabled by
+  # Fragmentation detector + requeue decider. Disabled by
   # default; even when enabled, ``shadowMode`` defaults true so the
   # decider runs end-to-end (logs + metrics) without actually requeueing
   # any job. Flip to false only after a release cycle of shadow data
   # confirms the decisions are sane.
   #
-  # IMPORTANT — M8 evaluation (2026-05-11, 3 traces × 5 seeds, see
+  # IMPORTANT — evaluation (2026-05-11, 3 traces × 5 seeds, see
   # docs/eval-writeup.md) found the current victim-selection policy
   # produces a statistically significant mean-JCT regression on all three
   # synthetic workloads (philly +33%, burst +61%, ali +6%, vs the
@@ -497,13 +496,15 @@ operator:
     # means "all partitions present in PARTITIONS_JSON".
     partitions: []
 
-# -- RL scheduler serve (M11 Phase D) ----------------------------------------
+# -- RL scheduler serve ------------------------------------------------------
 # FastAPI service that holds the trained policy and serves /decide and /act.
 # The service is enabled by default; fail-safe paths preserve Slurm scheduling
 # when the model or service is unavailable. Topology-specific controllers are
 # enabled separately by the selected values overlay.
 rlScheduler:
   enabled: true
+  auth:
+    enabled: false        # production overlay enables token-file authentication
   image:
     repository: slurm-rl-scheduler
     tag: htab2x1
@@ -592,9 +593,9 @@ rlScheduler:
                           #   MUST match the serve snapshot node order (currently
                           #   [slurm-worker-gpu-rtx3080-0, slurm-worker-gpu-rtx4070-0]).
 
-# -- Runtime predictor (Phase 6 M5) ------------------------------------------
+# -- Runtime predictor -------------------------------------------------------
 # Optional FastAPI + LightGBM service that returns predicted runtime to the
-# M2 Lua plugin (M6 wires the call). Disabled by default; the lua plugin
+# Lua plugin. Disabled by default; the lua plugin
 # falls back gracefully when the predictor is unreachable (`pcall` + 200ms
 # timeout; see docs/scheduler.md).
 runtimePredictor:
@@ -636,12 +637,12 @@ runtimePredictor:
   networkPolicy:
     enabled: true
 
-# -- NetworkPolicy (Stage C) -------------------------------------------------
+# -- NetworkPolicy -----------------------------------------------------------
 networkPolicy:
   enabled: true
   apiServerPorts: [443, 6443]                      # both Kind (443) and k3s (6443)
 
-# -- Monitoring add-on (Stage E) ---------------------------------------------
+# -- Monitoring add-on -------------------------------------------------------
 # Enabled in values-k3s.yaml. The monitoring stack (Prometheus / Alertmanager /
 # Grafana / kube-state-metrics) lives in its own namespace; slurm-exporter
 # lives in cluster.namespace (it talks to slurmrestd over JWT).
@@ -674,7 +675,7 @@ monitoring:
     # Slurm 23.11 REST plugin.
     restApiVersion: v0.0.39
     scrapeIntervalSeconds: 15
-  # R5: scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
+  # Scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
   # Tensor Core utilisation. The DCGM DaemonSet is enabled by
   # scripts/deploy-2.sh (`--set dcgmExporter.enabled=true`); this
   # block wires Prometheus to the Service's EndpointSlices so each exporter
@@ -694,7 +695,7 @@ monitoring:
     nodes:
       acane: 192.168.0.111
       nutnadmin-e500-g9-ws760t: 192.168.0.104
-  # Phase 7-A: OpenTelemetry distributed tracing (Tempo + OTel Collector).
+  # OpenTelemetry distributed tracing (Tempo + OTel Collector).
   # Set enabled: true to deploy Tempo + otel-collector and wire Grafana datasource.
   otel:
     enabled: false
@@ -702,14 +703,11 @@ monitoring:
     tempoImage: "grafana/tempo:2.4.2"
     tempoStorage: "5Gi"
 
-# -- Shared storage add-on (Stage E) -----------------------------------------
+# -- Shared storage add-on ---------------------------------------------------
 # Deploys the NFS subdir external provisioner (in its own namespace) and a
-# StorageClass + RWX PVC named `slurm-shared-rwx` in cluster.namespace. The
-# core Slurm controller/worker StatefulSets do NOT mount this PVC by default
-# in the chart yet (parity with manifests/core/slurm-static.yaml requires
-# explicit opt-in via a future `slurm.sharedStorage.mount: true` flag — left
-# for Stage F so /shared mount stays consistent across both Helm and legacy
-# bootstrap paths).
+# StorageClass + RWX PVC named `slurm-shared-rwx` in cluster.namespace.
+# `mountInPods` independently controls whether controller, worker, and login
+# pods mount that PVC at /shared.
 storage:
   enabled: false
   # When true, controller / workers / login mount the shared PVC at /shared.
@@ -739,13 +737,16 @@ secrets:
   munge: slurm-munge-key
   jwt: slurm-jwt-secret
   ssh: slurm-ssh-key
+  rlSchedulerApiToken: rl-scheduler-api-token
+  rlSchedulerSnapshotToken: rl-scheduler-snapshot-token
+  rlSchedulerControlToken: rl-scheduler-control-token
 
-# Login pod external SSH access (Phase 7-B).
+# Login pod external SSH access.
 # Set nodePort to a value > 0 to expose SSH as NodePort (users can then
 # connect with: ssh -p <nodePort> root@<k3s-host-ip>).
 # Paste one public key per line into authorizedKeys to grant access.
 login:
-  # K1 (v5 review): bound user-shell blast radius. Comfortable for an
+  # Bound user-shell blast radius. Comfortable for an
   # interactive session (4 CPU, 8Gi) but stops a fork bomb from taking
   # the node down. Raise for shared multi-user hosts.
   resources:

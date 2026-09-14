@@ -1,5 +1,5 @@
 {{/*
-Grafana Tempo — single-binary trace backend for Phase 7-A.
+Grafana Tempo — single-binary trace backend for distributed traces.
 Enabled by .Values.monitoring.otel.enabled (default: false).
 Data is stored in a PVC (monitoring.otel.tempoStorage, default: 5Gi).
 */}}

@@ -1,4 +1,4 @@
--- M11 Phase C-3 — unit tests for chart/lua/rl_hook.lua.
+-- Unit tests for chart/lua/rl_hook.lua.
 --
 -- Pure-lua. Run from repo root:
 --   lua5.2 tests/lua/rl_hook_test.lua
@@ -73,6 +73,33 @@ it("rl_call_decide parses priority_boost + flags from JSON", function()
   assert(rl.abstain == false)
   assert(math.abs(rl.value - 0.65) < 1e-6, "value=" .. rl.value)
   assert(rl.rl_selected_job_id == "42")
+end)
+
+it("rl_call_decide sends the configured bearer token", function()
+  RL_ENABLED = true
+  RL_URL = "http://x"
+  RL_TIMEOUT_S = 0.1
+  local original_getenv, original_open = os.getenv, io.open
+  local command
+  os.getenv = function(name)
+    if name == "RL_API_TOKEN_FILE" then return "/run/token" end
+    return original_getenv(name)
+  end
+  io.open = function(path, mode)
+    assert(path == "/run/token" and mode == "r")
+    return {
+      read = function() return "api-secret\n" end,
+      close = function() return true end,
+    }
+  end
+  _rl_io_popen = function(cmd, mode)
+    command = cmd
+    return mock_popen('{"priority_boost":0}')(cmd, mode)
+  end
+  local ok = rl_call_decide({job_id=42}, 4, 1, 60)
+  os.getenv, io.open = original_getenv, original_open
+  assert(ok, "expected token-authenticated call to succeed")
+  assert(string.find(command, "-H 'Authorization: Bearer api-secret'", 1, true))
 end)
 
 it("rl_apply mutates job_desc.priority when boost > 0 and not abstaining",

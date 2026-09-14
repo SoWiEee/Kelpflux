@@ -413,15 +413,15 @@ def load_live_trace_rollouts(
 
 def load_live_shadow_log(paths: list[str], *, obs_dim: int,
                           n_actions: int, capacity: int) -> ReplayBuffer:
-    """Parse Phase D shadow-mode log lines (one JSON per /decide call) and
+    """Parse shadow-mode log lines (one JSON object per /decide call) and
     materialise them as transitions.
 
-    Expected line schema (emitted by Phase D log shipper — TBD):
+    Expected line schema:
         {"obs": [...], "act": int, "rew": float,
          "next_obs": [...], "done": bool, "mask": [bool ...]}
 
     Real-cluster reward is computed offline by joining each /decide row
-    with the eventual JCT of the selected job (see Phase D pipeline)."""
+    with the selected job's eventual JCT."""
     buf = ReplayBuffer(capacity=capacity, obs_dim=obs_dim, n_actions=n_actions)
     files = []
     for p in paths:
@@ -459,7 +459,7 @@ def mixed_batch(*, offline: ReplayBuffer, online: ReplayBuffer,
                 batch_size: int, online_ratio: float,
                 rng: np.random.Generator) -> dict:
     """RLPD core: each batch is online_ratio from live, rest from sim.
-    If online is empty (e.g. cold-start before Phase D), fall back to
+    If online is empty (for example, before live data is available), fall back to
     100% offline."""
     if len(online) == 0:
         return offline.sample(batch_size, rng)

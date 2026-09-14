@@ -254,7 +254,7 @@ spec:
         - protocol: TCP
           port: 2049
     {{- if and .Values.runtimePredictor.enabled .Values.slurm.jobSubmit.predictor.enabled }}
-    # M6: lua job_submit plugin calls predictor on :8080 via curl.
+    # The lua job_submit plugin calls predictor on :8080 via curl.
     # Gated on BOTH runtimePredictor being deployed AND the plugin
     # wiring being enabled, so a disabled predictor doesn't leave a
     # stale rule behind.
@@ -267,7 +267,7 @@ spec:
           port: 8080
     {{- end }}
     {{- if and .Values.rlScheduler.enabled .Values.rlScheduler.lua.enabled }}
-    # M11 Phase D: lua job_submit plugin calls rl-scheduler on :8002 via curl.
+    # The lua job_submit plugin calls rl-scheduler on :8002 via curl.
     - to:
         - podSelector:
             matchLabels:
@@ -448,6 +448,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+          podSelector:
+            matchLabels:
+              app: prometheus
       ports:
         - protocol: TCP
           port: 8002

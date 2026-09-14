@@ -1,4 +1,4 @@
-"""Fragmentation reconcile loop (Phase 6 M7).
+"""Fragmentation reconciliation loop.
 
 Pulls JobView/NodeView from slurmrestd, feeds them to
 FragmentationDetector + RequeueDecider, and optionally requeues via
@@ -8,7 +8,6 @@ scaling reconcile.
 
 Mixin pattern: reads ``self.rest``, ``self.partition_cfgs``,
 ``self._fragmentation_*`` state, ``self.logger`` from OperatorApp.
-Split out of operator/app.py in v5 review C2.
 """
 from __future__ import annotations
 

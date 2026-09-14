@@ -1,4 +1,4 @@
--- R19 (v5 review) — unit tests for chart/lua/submit_helper.lua.
+-- Unit tests for chart/lua/submit_helper.lua.
 --
 -- Pure-lua. Run from repo root:
 --   luajit tests/lua/submit_helper_test.lua

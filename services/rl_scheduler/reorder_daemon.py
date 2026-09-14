@@ -23,6 +23,7 @@ from services.rl_scheduler.placement_controller import (
 from services.rl_scheduler.snapshot_agent import (
     _number,
     _parse_tres_int,
+    _read_bearer_token,
     _read_jwt_key,
     _state_tokens,
     http_json,
@@ -294,7 +295,7 @@ def _restore_cycle_priorities(rest_base, jwt_key, original_priorities):
 def reorder_cycle(
     *, rest_base, jwt_key, scheduler_url, node_names, gpu_partitions,
     mps_per_gpu=100, max_jobs=MAX_PENDING_JOBS, deadline_seconds=RANK_DEADLINE_SECONDS,
-    default_runtime=600.0, job_name_prefix="", shadow=False,
+    default_runtime=600.0, job_name_prefix="", shadow=False, api_token=None,
 ):
     if not 1 <= max_jobs <= MAX_PENDING_JOBS:
         raise ValueError(f"max_jobs must be between 1 and {MAX_PENDING_JOBS}")
@@ -323,6 +324,7 @@ def reorder_cycle(
         post=lambda payload, scheduler_url: post_act(
             payload, scheduler_url=scheduler_url,
             timeout=max(0.1, min(2.0, deadline - time.monotonic())),
+            api_token=api_token,
         ),
     )
     if time.monotonic() >= deadline:
@@ -396,6 +398,7 @@ def main(argv=None):
     jwt_key = _read_jwt_key(args.jwt_key_path)
     if not jwt_key:
         parser.error("a readable Slurm JWT key is required")
+    api_token = _read_bearer_token(os.getenv("RL_API_TOKEN_FILE", ""))
     rest_base = _slurm_base(args.rest_url, args.api_version)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -412,6 +415,7 @@ def main(argv=None):
                     mps_per_gpu=args.mps_per_gpu, max_jobs=args.max_jobs,
                     deadline_seconds=args.deadline_seconds,
                     job_name_prefix=args.job_name_prefix, shadow=args.shadow,
+                    api_token=api_token,
                 )
                 if order:
                     LOG.info("ranked %d pending GPU/MPS jobs; top=%s", len(order), order[:5])

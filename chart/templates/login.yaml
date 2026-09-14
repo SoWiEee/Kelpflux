@@ -14,9 +14,8 @@ Volumes:
     sample-ddp-job.sh) bind-mounted into /opt/slurm-runtime via the startup
     init step.
 
-The startup script copies SSH keys to /root/.ssh + authorized_keys so the
-operator and workers can ssh in for srun step launches; this is identical
-to scripts/render-core.py to preserve verified behavior.
+The startup command copies SSH keys to /root/.ssh and authorized_keys so
+workers can connect for srun step launches, then starts Munge and SSH.
 */}}
 apiVersion: apps/v1
 kind: Deployment
@@ -92,7 +91,7 @@ spec:
               /usr/sbin/sshd
               echo "[login] ready: munged+sshd running"
               tail -f /dev/null
-          # K1 (v5 review): login pod is the user shell home. Without limits a
+          # Login is the user shell home. Without limits a
           # fork bomb or accidental large allocation can OOM the entire node
           # and take down the controller alongside. Defaults sized to allow a
           # comfortable interactive session (4 CPU, 8Gi) while still bounding

@@ -10,3 +10,25 @@ tests:
       - contains:
           path: spec.ingress[0].from[0].podSelector.matchExpressions[0].values
           content: rl-reorder-daemon
+
+  - it: allows only Prometheus pods in the monitoring namespace to scrape the scheduler
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: allow-prometheus-scrape-rl-scheduler
+    asserts:
+      - equal:
+          path: spec.ingress[0].from[0]
+          value:
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: monitoring
+            podSelector:
+              matchLabels:
+                app: prometheus
+      - equal:
+          path: spec.ingress[0].ports
+          value:
+            - protocol: TCP
+              port: 8002

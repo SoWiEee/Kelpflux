@@ -344,9 +344,11 @@ check_dsac_smoke() {
     fail "rl-scheduler snapshot is stale or missing (${snapshot_age:-empty}s)"
   fi
 
-  if kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS -X POST http://rl-scheduler:8002/decide \
-      -H 'Content-Type: application/json' \
-      -d '{"job_id":"verify-live-direct","mps_req":25,"gpu_count":1,"gpu_type":"rtx4070","runtime":60,"submit_ts":0}' \
+  if kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -lc \
+      'curl -fsS -X POST http://rl-scheduler:8002/decide \
+        -H "Authorization: Bearer $(cat "$RL_API_TOKEN_FILE")" \
+        -H "Content-Type: application/json" \
+        -d '\''{"job_id":"verify-live-direct","mps_req":25,"gpu_count":1,"gpu_type":"rtx4070","runtime":60,"submit_ts":0}'\''' \
       | grep -q '"priority_boost"'; then
     pass "rl-scheduler /decide returns a decision response"
   else

@@ -12,7 +12,7 @@ Endpoints:
                       bootstrap-with-prior is in effect
   GET  /metrics     — Prometheus exposition
 
-Cold-start fallback (per scheduler.md M5 risk note):
+Cold-start fallback:
   When ``MIN_TRAIN_SAMPLES`` (default 100) is not yet satisfied or the
   model file does not exist, ``/predict`` returns
   ``min(user_time_limit_seconds, 4*3600)`` and sets

@@ -2,6 +2,48 @@ suite: elastic operator
 templates:
   - operator.yaml
 tests:
+  - it: operator RBAC is read-only for pods and writes only chart worker pools
+    template: operator.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods/exec"]
+            resourceNames: ["slurm-controller-0"]
+            verbs: ["get", "create"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["statefulsets"]
+            verbs: ["get", "list", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["statefulsets"]
+            resourceNames:
+              - "slurm-worker-cpu"
+              - "slurm-worker-gpu-rtx4070"
+              - "slurm-worker-gpu-rtx4080"
+            verbs: ["patch"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list", "watch", "create"]
+
   - it: PARTITIONS_JSON contains all configured pools
     asserts:
       - matchRegex:
@@ -36,7 +78,7 @@ tests:
           path: kind
           value: Deployment
 
-  - it: DRAIN_TIMEOUT_SECONDS env + per-pool drain_timeout_seconds in PARTITIONS_JSON (R1)
+  - it: drain timeout defaults reach the operator and each pool
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -87,7 +129,7 @@ tests:
           path: kind
           value: Deployment
 
-  - it: drainTimeoutSeconds value override flows to env + PARTITIONS_JSON (R1)
+  - it: drain timeout override reaches the operator and each pool
     set:
       operator.drainTimeoutSeconds: 600
     asserts:
@@ -106,7 +148,7 @@ tests:
           path: kind
           value: Deployment
 
-  - it: event-driven loop env wired (R21)
+  - it: event-driven reconciliation settings reach the operator
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -134,7 +176,7 @@ tests:
           path: kind
           value: Service
 
-  - it: M7 fragmentation env disabled by default
+  - it: fragmentation environment is disabled by default
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -153,7 +195,7 @@ tests:
           path: kind
           value: Deployment
 
-  - it: M7 fragmentation env wires through chart values
+  - it: fragmentation environment follows chart values
     set:
       operator.fragmentation.enabled: true
       operator.fragmentation.shadowMode: false

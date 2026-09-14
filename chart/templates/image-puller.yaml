@@ -1,6 +1,6 @@
 {{- if .Values.imagePuller.enabled -}}
 {{/*
-Image-puller DaemonSet (R2 fix).
+Image-puller DaemonSet.
 
 The first time the operator scales up a worker pool, kubelet has to pull
 slurm-worker:23.11.4 (CUDA + OpenMPI + Lmod, multi-GB layers) from the

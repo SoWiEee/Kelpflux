@@ -47,7 +47,7 @@ data:
 {{- if .Values.operator.fragmentation.enabled }}
   20-resume-helper.sh: |
     #!/bin/sh
-    # Phase 6 M7: ship a resume helper into the user's job environment.
+    # Ship a resume helper into the user's job environment.
     # The actual resume logic lives in checkpoint-aware user code; this
     # prolog drops a shell function library onto the worker's per-job
     # tmpdir and exports its path so the sbatch script can `source` it.

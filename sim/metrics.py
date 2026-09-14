@@ -8,7 +8,7 @@ Tracks (submit, start, end) times for each job and emits:
 - **makespan**  — last end minus first submit
 - **utilization** — mean MPS-slots-used over the makespan
 - **bf_rate**   — fraction of jobs that started while an earlier-submitted
-  job was still pending (a coarse backfill proxy used for §M6 later)
+  job was still pending (a coarse backfill proxy)
 """
 from __future__ import annotations
 

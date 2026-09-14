@@ -38,6 +38,7 @@ from services.rl_scheduler.snapshot_agent import (
     _node_tres_text,
     _number,
     _parse_tres_int,
+    _read_bearer_token,
     _read_jwt_key,
     _state_tokens,
     http_json,
@@ -240,8 +241,14 @@ def build_act_payload(
     }
 
 
-def post_act(payload: dict[str, Any], *, scheduler_url: str, timeout: float = 10.0) -> dict[str, Any]:
-    return http_json("POST", scheduler_url.rstrip("/") + "/act", body=payload, timeout=timeout)
+def post_act(
+    payload: dict[str, Any], *, scheduler_url: str, timeout: float = 10.0,
+    api_token: bytes | None = None,
+) -> dict[str, Any]:
+    kwargs = {"body": payload, "timeout": timeout}
+    if api_token is not None:
+        kwargs["bearer_token"] = api_token
+    return http_json("POST", scheduler_url.rstrip("/") + "/act", **kwargs)
 
 
 def get_scheduler_healthz(*, scheduler_url: str, timeout: float = 10.0) -> dict[str, Any]:
@@ -304,6 +311,7 @@ def choose_and_apply(
     api_version: str,
     scheduler_url: str,
     jwt_key: bytes | None,
+    api_token: bytes | None = None,
     node_names: Sequence[str] | None = None,
     node_name_prefix: str = "",
     job_id: str | None = None,
@@ -356,7 +364,11 @@ def choose_and_apply(
     nodes_by_name = {n.name: n for n in available}
     nodes = [nodes_by_name[name] for name in effective_names]
 
-    act = post_act(build_act_payload(jobs, nodes, mps_per_gpu=mps_per_gpu), scheduler_url=scheduler_url)
+    act = post_act(
+        build_act_payload(jobs, nodes, mps_per_gpu=mps_per_gpu),
+        scheduler_url=scheduler_url,
+        api_token=api_token,
+    )
 
     selected_id = act.get("selected_job_id")
     node_index = act.get("node_j")
@@ -439,12 +451,14 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
     jwt_key = _read_jwt_key(args.jwt_key_path)
+    api_token = _read_bearer_token(os.getenv("RL_API_TOKEN_FILE", ""))
 
     cycle_kwargs = dict(
         rest_url=args.rest_url,
         api_version=args.api_version,
         scheduler_url=args.scheduler_url,
         jwt_key=jwt_key,
+        api_token=api_token,
         node_names=args.node_name,
         node_name_prefix=args.node_name_prefix,
         job_id=args.job_id or None,

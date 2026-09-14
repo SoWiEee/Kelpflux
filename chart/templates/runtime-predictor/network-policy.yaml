@@ -2,7 +2,7 @@
 NetworkPolicy: lock predictor:8080 to in-namespace clients only.
 
 Ingress allowed from:
-  - slurm-controller pod (lua plugin will POST /predict — M6 wiring)
+  - slurm-controller pod (Lua plugin posts to /predict)
   - monitoring namespace (Prometheus scrape /metrics) when monitoring is on
 
 Egress allowed:

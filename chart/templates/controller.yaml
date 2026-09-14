@@ -12,9 +12,8 @@ Volumes:
   - slurm-secrets        → /slurm-secrets              (projected: munge + ssh + jwt)
   - ctld-state           → /var/spool/slurmctld        (PVC, persists job queue)
 
-The startup script is deliberately kept identical to scripts/render-core.py
-output so a Stage B `helm install` produces a controller pod with the same
-behavior verified in the mps-migration commit (3eec54f).
+The startup sequence waits for accounting and Slurm readiness before starting
+slurmrestd, keeping its authentication context tied to the controller process.
 */}}
 apiVersion: apps/v1
 kind: StatefulSet
@@ -36,7 +35,7 @@ spec:
         {{- include "slurm-platform.labels" . | nindent 8 }}
         app: slurm-controller
       annotations:
-        # R3 fix: roll the controller pod whenever slurm.conf / cgroup.conf /
+        # Roll the controller pod whenever slurm.conf / cgroup.conf /
         # nodes/gres.conf content changes. helm upgrade picks this up
         # automatically; manual `kubectl edit configmap` won't (acceptable —
         # we don't support out-of-band edits).
@@ -61,6 +60,11 @@ spec:
         - name: slurm-controller
           image: {{ .Values.image.controller }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.rlScheduler.auth.enabled }}
+          env:
+            - name: RL_API_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/api-token
+          {{- end }}
           command:
             - /bin/bash
             - -lc
@@ -87,8 +91,8 @@ spec:
                 done
                 echo "[controller] slurmdbd is up"
               fi
-              # Daemon log level is driven by SlurmctldDebug in slurm.conf
-              # (R12 fix); the -D flag here only keeps slurmctld in foreground
+              # Daemon log level is driven by SlurmctldDebug in slurm.conf;
+              # the -D flag here only keeps slurmctld in foreground
               # so the container PID 1 stays attached.
               exec slurmctld -D &
               CTLD_PID=$!
@@ -117,7 +121,7 @@ spec:
                 SLURMRESTD_SECURITY=disable_user_check \
                 /usr/sbin/slurmrestd -t 2 --max-connections 4 -a rest_auth/jwt -s openapi/v0.0.39 0.0.0.0:6820 &
               wait $CTLD_PID
-          # K1 (v5 review): explicit requests/limits → Guaranteed QoS. slurmctld
+          # Explicit requests/limits give slurmctld Guaranteed QoS. Its
           # in-memory state grows with queue depth; default 2Gi limit covers
           # ~10k concurrent jobs. Raise `.Values.slurm.controllerResources` for
           # larger deployments.
@@ -170,6 +174,12 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            {{- if .Values.rlScheduler.auth.enabled }}
+            - name: rl-scheduler-api-token
+              mountPath: /run/secrets/rl-scheduler/api-token
+              subPath: token
+              readOnly: true
+            {{- end }}
             - name: ctld-state
               mountPath: /var/spool/slurmctld
             {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
@@ -211,6 +221,12 @@ spec:
                       # Slurm 23.11 enforces 0400/0600 on JWT key files
                       # (auth/jwt fatal if mode looser than 0644).
                       mode: 0400
+        {{- if .Values.rlScheduler.auth.enabled }}
+        - name: rl-scheduler-api-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerApiToken }}
+            defaultMode: 0400
+        {{- end }}
         - name: ctld-state
           persistentVolumeClaim:
             claimName: slurm-ctld-state

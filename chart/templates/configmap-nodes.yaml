@@ -3,8 +3,8 @@ slurm-config-nodes — NodeName / PartitionName lines + gres.conf body.
 
 Mounted at /etc/slurm/slurm.nodes.conf and /etc/slurm/gres.conf via
 subPath. Changes here come from a `helm upgrade` that touches `pools` or
-`partitions`, e.g. resizing maxNodes or adding a new pool. Once Stage B
-completes, this is the only ConfigMap that should change on a pool resize.
+`partitions`, e.g. resizing maxNodes or adding a new pool. Pool resize changes
+are isolated to this ConfigMap.
 */}}
 apiVersion: v1
 kind: ConfigMap

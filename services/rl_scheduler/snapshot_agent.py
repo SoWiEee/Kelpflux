@@ -17,6 +17,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger("rl_snapshot_agent")
@@ -46,13 +47,31 @@ def _read_jwt_key(path: str) -> bytes | None:
         return None
 
 
-def http_json(method: str, url: str, *, jwt_key: bytes | None = None, body: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
+def _read_bearer_token(path: str) -> bytes | None:
+    if not path:
+        return None
+    try:
+        token = Path(path).read_bytes().strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read API token file: {path}") from exc
+    if not token:
+        raise RuntimeError(f"API token file is empty: {path}")
+    try:
+        token.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"API token file is not ASCII: {path}") from exc
+    return token
+
+
+def http_json(method: str, url: str, *, jwt_key: bytes | None = None, bearer_token: bytes | None = None, body: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode()
     headers = {"Accept": "application/json", "Connection": "close", "X-SLURM-USER-NAME": "root"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     if jwt_key is not None:
         headers["X-SLURM-USER-TOKEN"] = make_jwt_token(jwt_key)
+    if bearer_token is not None:
+        headers["Authorization"] = "Bearer " + bearer_token.decode("ascii")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
@@ -203,12 +222,17 @@ def build_snapshot(
     }
 
 
-def run_once(*, rest_url: str, api_version: str, scheduler_url: str, jwt_key: bytes | None, mps_per_gpu: int, default_gpus_per_node: int, default_runtime: float) -> dict[str, Any]:
+def run_once(*, rest_url: str, api_version: str, scheduler_url: str, jwt_key: bytes | None, snapshot_token: bytes | None = None, mps_per_gpu: int, default_gpus_per_node: int, default_runtime: float) -> dict[str, Any]:
     base = f"{rest_url.rstrip('/')}/slurm/{api_version}"
     jobs = http_json("GET", f"{base}/jobs", jwt_key=jwt_key)
     nodes = http_json("GET", f"{base}/nodes", jwt_key=jwt_key)
     snap = build_snapshot(jobs, nodes, mps_per_gpu=mps_per_gpu, default_gpus_per_node=default_gpus_per_node, default_runtime=default_runtime)
-    http_json("POST", scheduler_url.rstrip("/") + "/snapshot", body=snap)
+    http_json(
+        "POST",
+        scheduler_url.rstrip("/") + "/snapshot",
+        bearer_token=snapshot_token,
+        body=snap,
+    )
     return snap
 
 
@@ -218,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-version", default=os.getenv("SLURM_REST_API_VERSION", "v0.0.39"))
     parser.add_argument("--scheduler-url", default=os.getenv("RL_SCHEDULER_URL", "http://rl-scheduler:8002"))
     parser.add_argument("--jwt-key-path", default=os.getenv("SLURM_JWT_KEY_PATH", ""))
+    parser.add_argument("--snapshot-token-path", default=os.getenv("RL_SNAPSHOT_TOKEN_FILE", ""))
     parser.add_argument("--interval", type=float, default=float(os.getenv("SNAPSHOT_INTERVAL_SECONDS", "10")))
     parser.add_argument("--mps-per-gpu", type=int, default=int(os.getenv("MPS_PER_GPU", "100")))
     parser.add_argument("--gpus-per-node", type=int, default=int(os.getenv("GPUS_PER_NODE", "1")))
@@ -227,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     jwt_key = _read_jwt_key(args.jwt_key_path)
+    snapshot_token = _read_bearer_token(args.snapshot_token_path)
     while True:
         try:
             snap = run_once(
@@ -234,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_version=args.api_version,
                 scheduler_url=args.scheduler_url,
                 jwt_key=jwt_key,
+                snapshot_token=snapshot_token,
                 mps_per_gpu=args.mps_per_gpu,
                 default_gpus_per_node=args.gpus_per_node,
                 default_runtime=args.default_runtime,

@@ -35,15 +35,26 @@ metadata:
   labels:
     {{- include "slurm-platform.labels" . | nindent 4 }}
 rules:
-  # pods + pods/exec: fallback path when slurmrestd is unavailable, the
-  # operator falls back to `kubectl exec slurm-controller-0 -- scontrol show ...`.
+  # Pod reads support the operator's event/watch reconciliation.
   - apiGroups: [""]
-    resources: ["pods", "pods/exec"]
-    verbs: ["get", "list", "watch", "create"]
-  # statefulsets: scaling target — patch replica count.
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Slurm commands are executed only in the controller pod.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: [{{ .Values.slurm.controllerHost | quote }}]
+    verbs: ["get", "create"]
+  # Read all pools, but mutate only chart-defined worker StatefulSets.
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames:
+      {{- range $pool := .Values.pools }}
+      - {{ $pool.statefulset | quote }}
+      {{- end }}
+    verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -98,7 +109,7 @@ spec:
                 {{ include "slurm-platform.partitionsJson" . | trim }}
             - name: POLL_INTERVAL_SECONDS
               value: {{ .Values.operator.pollIntervalSeconds | quote }}
-            # R21: event-driven loop. Slurm diff cadence (1s default) +
+            # Event-driven loop. Slurm diff cadence (1s default) +
             # safety-net reconcile timer (60s default). With the K8s watch
             # threads handling sts/pod events, POLL_INTERVAL_SECONDS is
             # only used by legacy code paths and can be raised.
@@ -112,7 +123,7 @@ spec:
               value: {{ .Values.operator.provisioningTimeoutSeconds | quote }}
             - name: PROVISIONING_RETRY_SECONDS
               value: {{ .Values.operator.provisioningRetrySeconds | quote }}
-            # R1: cluster-wide default. Per-pool override via PARTITIONS_JSON.
+            # Cluster-wide default; per-pool override via PARTITIONS_JSON.
             - name: DRAIN_TIMEOUT_SECONDS
               value: {{ .Values.operator.drainTimeoutSeconds | quote }}
             - name: CHECKPOINT_GUARD_ENABLED
@@ -129,7 +140,7 @@ spec:
               value: "v0.0.39"
             - name: SLURM_JWT_KEY_PATH
               value: "/slurm-jwt/jwt_hs256.key"
-            # Phase 6 M7: fragmentation detector + requeue decider.
+            # Fragmentation detector and requeue decider.
             {{- with .Values.operator.fragmentation }}
             - name: FRAGMENTATION_ENABLED
               value: {{ .enabled | quote }}
@@ -156,7 +167,7 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://otel-collector.{{ .Values.monitoring.namespace }}.svc.cluster.local:4317"
             {{- end }}
-          # K1 (v5 review): explicit requests/limits put the pod into the
+          # Explicit requests/limits put the pod into the
           # Guaranteed QoS class so it's not the first thing evicted when
           # the k3s host is under pressure. Defaults sized for a single-host
           # 1×GPU cluster; raise limits for multi-pool deployments.

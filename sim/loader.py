@@ -15,10 +15,10 @@ Two formats supported:
    normalises into format (1).
 
 The Philly trace itself does **not** include MPS data (jobs are scheduled
-in whole-GPU units). To exercise the M3 score factors we *augment* a
+in whole-GPU units). To exercise fractional-MPS score factors we *augment* a
 configurable fraction of single-GPU jobs by lowering ``mps_req`` to a
-random tier such as {25, 50, 75}. This is documented in §M4 of
-``docs/scheduler.md`` (risk note).
+random tier such as {25, 50, 75}. This is documented in the evaluation
+methodology in ``docs/eval-writeup.md``.
 """
 from __future__ import annotations
 

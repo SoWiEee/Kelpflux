@@ -8,8 +8,8 @@ NFS subdir external provisioner + RWX shared PVC.
 Direct port of manifests/storage/nfs-subdir-provisioner.tmpl.yaml +
 shared-storage.yaml. The provisioner Deployment is namespaced
 (.Values.storage.provisionerNamespace, default `nfs-provisioner`); the
-StorageClass is cluster-scoped; the PVC lives in cluster.namespace so the
-core Slurm pods can mount it once Stage F wires that up.
+StorageClass is cluster-scoped; the shared PVC lives in cluster.namespace
+and mounts at /shared when storage.mountInPods is enabled.
 
 Why a separate namespace: the provisioner needs an emptyDir-like host
 mount for the NFS root, while the chart-managed storage namespace keeps

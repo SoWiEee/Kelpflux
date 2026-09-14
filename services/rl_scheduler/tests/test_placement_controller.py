@@ -329,3 +329,21 @@ def test_choose_and_apply_abstains_on_dsac_no_op(monkeypatch):
     assert decision.reason == "dsac_no_op"
     assert decision.applied is False
     assert updates == []
+
+
+def test_post_act_sends_api_bearer_token(monkeypatch):
+    calls = []
+
+    def fake_http_json(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(pc, "http_json", fake_http_json)
+
+    assert pc.post_act(
+        {"now": 1}, scheduler_url="http://rl-scheduler:8002", api_token=b"api-secret",
+    ) == {"ok": True}
+    assert calls == [(
+        "POST", "http://rl-scheduler:8002/act",
+        {"body": {"now": 1}, "timeout": 10.0, "bearer_token": b"api-secret"},
+    )]

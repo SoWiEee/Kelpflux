@@ -99,7 +99,7 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
-  - it: workers carry checksum annotations for ConfigMap content (R3)
+  - it: workers carry checksum annotations for ConfigMap content
     template: workers.yaml
     asserts:
       - exists:
@@ -113,7 +113,7 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
-  - it: workers do NOT mount cgroup.conf in default (PSS=baseline) profile (R9)
+  - it: workers do not mount cgroup.conf in the baseline profile
     template: workers.yaml
     asserts:
       - notContains:
@@ -126,7 +126,7 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
-  - it: workers carry CPU+memory requests/limits matching pool.cpus / realMemory (R7)
+  - it: worker resource requests and limits match the Slurm pool values
     template: workers.yaml
     set:
       cluster.runtime: k3s
@@ -170,7 +170,7 @@ tests:
           path: metadata.name
           value: slurm-worker-gpu-rtx4070
 
-  - it: workers use OnDelete updateStrategy so helm upgrade does not kill running jobs (R10)
+  - it: workers use OnDelete so upgrades do not kill running jobs
     template: workers.yaml
     asserts:
       - equal:
@@ -186,7 +186,7 @@ tests:
           path: metadata.name
           value: slurm-worker-gpu-rtx4070
 
-  - it: slurmd command no longer hardcodes -Dvvv (R12)
+  - it: slurmd command uses configured debug settings
     template: workers.yaml
     asserts:
       - notMatchRegex:
@@ -202,13 +202,32 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
-  - it: M7 task-prolog 20-resume-helper.sh omitted when fragmentation disabled (default)
+  - it: DRA MPS keepalive uses the image-baked CUDA helper, not shared Python
+    template: workers.yaml
+    values:
+      - ../values-k3s.yaml
+      - ../values-2x1.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "/usr/local/bin/mps-keepalive"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "/shared/py/bin/python3"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
+  - it: task-prolog resume helper is omitted when fragmentation is disabled
     template: configmap-task-prolog.yaml
     asserts:
       - notExists:
           path: data["20-resume-helper.sh"]
 
-  - it: M7 task-prolog 20-resume-helper.sh present when fragmentation enabled
+  - it: task-prolog resume helper is present when fragmentation is enabled
     template: configmap-task-prolog.yaml
     set:
       operator.fragmentation.enabled: true

@@ -1,15 +1,11 @@
 # =============================================================================
-# slurm-platform — k3s + RTX 4070 production override (mps-migration verified)
+# slurm-platform — k3s production overlay
 # =============================================================================
 # Layer over values.yaml:
 #   helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm
 #
 # Target configuration for the live Ubuntu 24.04 + k3s v1.35 + Slurm 23.11
 # environment (RTX 4070 + driver 580).
-# Stage A
-# only renders slurm.conf / gres.conf — the other overrides here are inert
-# until later stages wire them up.
-
 cluster:
   runtime: k3s
   podSecurity: baseline
@@ -17,20 +13,16 @@ cluster:
   # baseline while explicitly authorizing only this namespace's enforcement.
   podSecurityEnforce: privileged
 
-# Stage D enables this; values.yaml::gpu-operator subchart override (driver +
-# toolkit disabled) takes over because the host already has nvidia-driver-535 +
-# nvidia-container-toolkit installed by setup-linux-gpu.sh.
+# The host already provides the NVIDIA driver and container toolkit.
 gpu:
   enabled: true
   autoLabel: true
 
-# Real GPU isolation needs the NVIDIA container runtime; the worker pod
-# templates (Stage B) already gate `runtimeClassName: nvidia` on
+# Real GPU isolation needs the NVIDIA container runtime; worker pods gate
+# `runtimeClassName: nvidia` on
 # `cluster.runtime == "k3s"` AND `pool` having GPU gres.
 
-# Storage on k3s defaults to the NFS subdir provisioner (LAN-mounted to host
-# 192.168.0.111). Stage E wires this in; setting it now keeps the override
-# stable.
+# Storage on k3s uses the NFS subdir provisioner on host 192.168.0.111.
 storage:
   enabled: true
   mountInPods: true                  # /shared on controller/workers/login
@@ -53,17 +45,20 @@ slurm:
     constrainDevices: "yes"
     constrainSwapSpace: "no"
 
+rlScheduler:
+  auth:
+    enabled: true
+
 monitoring:
   enabled: true
-  # Phase 7-A: OpenTelemetry distributed tracing.
+  # OpenTelemetry distributed tracing.
   # Set otel.enabled: true to deploy Tempo + OTel Collector and wire Grafana.
   # Operator and rl-scheduler will auto-receive OTEL_ENABLED env when enabled.
   otel:
     enabled: true
     tempoStorage: "5Gi"
 
-# Phase 7-B: SSH Login — expose login pod via NodePort so users can SSH in
-# without kubectl. Add public keys under authorizedKeys (one per line).
+# SSH login is exposed via NodePort; add public keys under authorizedKeys.
 # Connect with: ssh -p 30022 root@192.168.0.111
 # Private key: ~/.ssh/slurm_login_key
 login:

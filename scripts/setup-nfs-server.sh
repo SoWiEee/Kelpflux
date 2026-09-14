@@ -5,8 +5,8 @@ set -euo pipefail
 
 NFS_EXPORT_PATH=${NFS_EXPORT_PATH:-/srv/nfs/k8s}
 
-# Override this for a different node LAN subnet.
-NFS_EXPORT_CLIENTS=${NFS_EXPORT_CLIENTS:-192.168.0.0/24}
+# Comma-separated node IPs/CIDRs; override when the cluster membership changes.
+NFS_EXPORT_CLIENTS=${NFS_EXPORT_CLIENTS:-192.168.0.111,192.168.0.104}
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root: sudo bash scripts/setup-nfs-server.sh" >&2
@@ -18,9 +18,17 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server
 
 mkdir -p "$NFS_EXPORT_PATH"
 chown nobody:nogroup "$NFS_EXPORT_PATH"
-chmod 0777 "$NFS_EXPORT_PATH"
+chmod 0755 "$NFS_EXPORT_PATH"
 
-exports_line="${NFS_EXPORT_PATH} ${NFS_EXPORT_CLIENTS}(rw,sync,no_subtree_check,no_root_squash)"
+IFS=',' read -r -a export_clients <<< "$NFS_EXPORT_CLIENTS"
+exports_line="$NFS_EXPORT_PATH"
+for client in "${export_clients[@]}"; do
+  if [[ ! "$client" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+    echo "Invalid NFS export client: $client" >&2
+    exit 1
+  fi
+  exports_line+=" ${client}(rw,sync,no_subtree_check,root_squash)"
+done
 
 if ! grep -qE "^\s*${NFS_EXPORT_PATH}\s" /etc/exports; then
   echo "$exports_line" >> /etc/exports

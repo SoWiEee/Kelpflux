@@ -9,8 +9,8 @@ import tempfile
 
 import pytest
 
-# Reuse the synthetic Philly-like generator from M4 so both milestones
-# train against the same trace shape.
+# Reuse the synthetic Philly-like generator so both training paths use
+# the same trace shape.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from sim.loader import generate_philly_like  # noqa: E402
 

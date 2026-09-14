@@ -49,5 +49,5 @@ fi
 /usr/sbin/sshd
 
 install -d -m 0755 /var/spool/slurmctld /var/log/slurm
-# Foreground only; verbosity comes from SlurmctldDebug in slurm.conf (R12).
+# Foreground only; verbosity comes from SlurmctldDebug in slurm.conf.
 exec slurmctld -D

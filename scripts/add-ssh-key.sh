@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # add-ssh-key.sh — Add or remove an external user public key from the
-# slurm-login pod (Phase 7-B SSH Login).
+# slurm-login pod.
 #
 # Usage:
 #   bash scripts/add-ssh-key.sh add    "ssh-ed25519 AAAA... user@host"

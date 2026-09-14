@@ -67,7 +67,7 @@ _CIRCUIT_BREAKER_ERRORS = Gauge(
     "slurm_operator_consecutive_errors",
     "Consecutive error count in main poll loop — non-zero means circuit is open",
 )
-# R21: event-driven operator metrics.
+# Event-driven operator metrics.
 _EVENT_LAG_SECONDS = Histogram(
     "slurm_operator_event_lag_seconds",
     "Seconds from when an event was enqueued (K8s watch / Slurm diff / timer) "
@@ -86,7 +86,7 @@ _QUEUE_DEDUP_DROPS = Counter(
     "Times an event was dropped because the pool already had a pending reconcile",
     ["pool", "source"],
 )
-# Phase 6 M7: fragmentation detector + requeue decider metrics. The gauge
+# Fragmentation detector and requeue decider metrics. The gauge
 # is populated each fragmentation reconcile pass; the counter increments
 # only on successful (non-rate-limited) requeue decisions.
 _FRAGMENTATION_SCORE = Gauge(

@@ -1,4 +1,4 @@
--- R19 (v5 review) — sbatch submit helper.
+-- sbatch submit helper.
 --
 -- Standalone module so it can be unit-tested without rendering the chart.
 -- The chart's configmap-job-submit.yaml declares the HLP_* config globals

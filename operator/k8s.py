@@ -106,7 +106,7 @@ class K8sClient:
     def cancel_jobs_on_node(self, node_name: str) -> None:
         """Force-cancel every job currently running on `node_name`.
 
-        Used by the drain-timeout path (R1): once a node has been DRAINed past
+        Used by the drain-timeout path: once a node has been DRAINed past
         the configured timeout we no longer wait for the job to checkpoint —
         we kill it so the pool can shrink instead of staying pinned forever.
         """

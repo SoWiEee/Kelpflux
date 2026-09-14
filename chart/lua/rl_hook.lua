@@ -1,4 +1,4 @@
--- M11 Phase C-3 — RL scheduler client for job_submit.lua.
+-- RL scheduler client for job_submit.lua.
 --
 -- Standalone module so it can be unit-tested without rendering the chart.
 -- The chart's configmap-job-submit.yaml `dofile`s the rendered copy and
@@ -15,11 +15,11 @@
 --   RL_ENABLED    : bool  -- master kill-switch
 --   RL_URL        : str   -- e.g. http://rl-scheduler:8002/decide
 --   RL_TIMEOUT_S  : float -- curl --max-time
+--   RL_API_TOKEN_FILE: str -- optional bearer token file for protected deployments
 --   RL_PLACEMENT  : bool  -- opt-in: apply submit-time explicit placement
 --                            (set job_desc.req_nodes from /decide's node_j).
---                            This is the validated production placement path
---                            (the async slurmrestd placement controller cannot
---                            re-pin post-submit on Slurm 21.08). Default off.
+--                            Keep disabled unless submit-time placement is
+--                            explicitly enabled in the deployment.
 --   RL_NODE_NAMES : table -- 1-indexed Slurm node names; node_j (0-indexed) →
 --                            RL_NODE_NAMES[node_j+1]. Required when RL_PLACEMENT.
 --
@@ -67,10 +67,23 @@ function rl_call_decide(job_desc, mps_req, gpu_count, runtime_s)
   if not RL_ENABLED then return false, nil, "disabled" end
   local body   = _build_body(job_desc, mps_req, gpu_count, runtime_s)
   local body_q = "'" .. string.gsub(body, "'", "'\\''") .. "'"
+  local auth_header = ""
+  local token_path = os.getenv("RL_API_TOKEN_FILE")
+  if token_path and token_path ~= "" then
+    local token_file = io.open(token_path, "r")
+    if token_file then
+      local token = string.gsub(token_file:read("*a") or "", "%s+$", "")
+      token_file:close()
+      if token ~= "" then
+        local header = "Authorization: Bearer " .. token
+        auth_header = " -H '" .. string.gsub(header, "'", "'\\''") .. "'"
+      end
+    end
+  end
   local cmd = string.format(
     "curl -fsS --max-time %.3f -X POST -H 'Content-Type: application/json' " ..
-    "-d %s %q 2>/dev/null",
-    RL_TIMEOUT_S or 0.15, body_q, RL_URL or "")
+    "%s -d %s %q 2>/dev/null",
+    RL_TIMEOUT_S or 0.15, auth_header, body_q, RL_URL or "")
   local popen = _rl_io_popen or io.popen
   local fh = popen(cmd, "r")
   if not fh then return false, nil, "popen-failed" end
@@ -111,7 +124,7 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
                        rl.value, rl.entropy))
     return false, rl
   end
-  -- Phase 7-A: write OTel traceparent into admin_comment so the Operator
+  -- Write OTel traceparent into admin_comment so the Operator
   -- can continue the trace when it first sees this job in squeue.
   if rl.otel_traceparent and rl.otel_traceparent ~= "" then
     job_desc.admin_comment = "otel=" .. rl.otel_traceparent

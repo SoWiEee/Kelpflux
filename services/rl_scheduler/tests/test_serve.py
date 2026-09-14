@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import time
 import types
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -52,6 +54,9 @@ def serve(monkeypatch):
     module.VALUE_ABSTAIN = -100000.0
     module.ENTROPY_ABSTAIN = 1.5
     module.PRIORITY_BOOST = 1000
+    module._API_TOKEN = None
+    module._SNAPSHOT_TOKEN = None
+    module._CONTROL_TOKEN = None
     module.RL_SHADOW_MODE.set(0.0)
     module.RL_READY.set(0.0)
     return module
@@ -154,6 +159,101 @@ def test_snapshot_endpoint_updates_prometheus_metrics(client):
     metrics = client.get("/metrics").text
     assert "rl_scheduler_snapshot_free_mps 75.0" in metrics
     assert "rl_scheduler_snapshot_pending_jobs 0.0" in metrics
+
+
+def test_configured_token_files_fail_closed(serve, monkeypatch, tmp_path):
+    monkeypatch.setenv("TEST_TOKEN_FILE", str(tmp_path / "missing"))
+    with pytest.raises(RuntimeError, match="cannot read token file"):
+        serve._load_configured_token("TEST_TOKEN_FILE")
+
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"\n")
+    monkeypatch.setenv("TEST_TOKEN_FILE", str(empty))
+    with pytest.raises(RuntimeError, match="is empty"):
+        serve._load_configured_token("TEST_TOKEN_FILE")
+
+
+def test_mutation_endpoints_are_open_without_token_configuration(
+    serve, monkeypatch, tmp_path,
+):
+    checkpoint = tmp_path / "agent.pt"
+    checkpoint.write_bytes(b"test")
+    monkeypatch.setattr(
+        serve._AgentHolder,
+        "from_checkpoint",
+        classmethod(lambda cls, path: _FakeHolder(action=0)),
+    )
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=serve.app),
+            base_url="http://test",
+        ) as client:
+            assert (await client.post("/snapshot", json=_snapshot_payload())).status_code == 200
+            serve._holder = _FakeHolder(action=0)
+            assert (await client.post("/act", json=_snapshot_payload())).status_code == 200
+            assert (await client.post("/decide", json=_decide_payload())).status_code == 200
+            assert (await client.post(
+                "/reload", json={"checkpoint": str(checkpoint)},
+            )).status_code == 200
+            assert (await client.post("/shadow", json={"shadow": True})).status_code == 200
+
+    asyncio.run(exercise())
+
+
+def test_mutation_endpoints_require_their_configured_bearer_tokens(
+    serve, monkeypatch, tmp_path,
+):
+    checkpoint = tmp_path / "agent.pt"
+    checkpoint.write_bytes(b"test")
+    monkeypatch.setattr(
+        serve._AgentHolder,
+        "from_checkpoint",
+        classmethod(lambda cls, path: _FakeHolder(action=0)),
+    )
+    serve._API_TOKEN = b"api-secret"
+    serve._SNAPSHOT_TOKEN = b"snapshot-secret"
+    serve._CONTROL_TOKEN = b"control-secret"
+    requests = (
+        ("/snapshot", _snapshot_payload(), "snapshot-secret", "api-secret", 200),
+        ("/act", _snapshot_payload(), "api-secret", "snapshot-secret", 200),
+        ("/decide", _decide_payload(), "api-secret", "control-secret", 200),
+        ("/reload", {"checkpoint": str(checkpoint)}, "control-secret", "api-secret", 200),
+        ("/shadow", {"shadow": True}, "control-secret", "snapshot-secret", 200),
+    )
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=serve.app),
+            base_url="http://test",
+        ) as client:
+            for path, payload, _, foreign_token, _ in requests:
+                assert (await client.post(path, json=payload)).status_code == 401
+                assert (await client.post(
+                    path,
+                    json=payload,
+                    headers={"Authorization": "Bearer wrong"},
+                )).status_code == 401
+                assert (await client.post(
+                    path,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {foreign_token}"},
+                )).status_code == 401
+
+            assert serve._snapshot is None
+            assert serve._holder is None
+            assert serve.SHADOW_MODE is False
+            assert (await client.get("/healthz")).status_code == 200
+            assert (await client.get("/metrics")).status_code == 200
+            serve._holder = _FakeHolder(action=0)
+            for path, payload, token, _, expected_status in requests:
+                assert (await client.post(
+                    path,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                )).status_code == expected_status
+
+    asyncio.run(exercise())
 
 
 def test_decide_abstains_when_snapshot_missing(client):

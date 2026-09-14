@@ -181,7 +181,7 @@ data:
 
     -- Best-effort GPU-type derivation from --constraint features. Falls
     -- back to PRED_DEFAULT_GPU_TYPE so the predictor always receives a
-    -- non-empty alphabet member (the M5 model one-hots over a fixed set
+    -- non-empty alphabet member (the runtime model one-hots over a fixed set
     -- and routes anything unknown to the "other" bucket).
     function predictor_gpu_type(features)
       if not features or features == "" then return PRED_DEFAULT_GPU_TYPE end
@@ -272,7 +272,7 @@ data:
     end
 
     -- ------------------------------------------------------------------
-    -- R19 (v5 review) — submit helper. Auto-completes --mem / --partition
+    -- Submit helper. Auto-completes --mem / --partition
     -- / --qos when the user didn't set them. Each helper silently no-ops
     -- when disabled or when job_desc already carries a user-provided
     -- value, so this never overrides explicit user intent.
@@ -342,13 +342,13 @@ data:
     function slurm_job_submit(job_desc, part_list, submit_uid)
       log_summary("submit", job_desc)
 
-      -- R19 — submit helper runs FIRST so subsequent steps (score factors,
+      -- Submit helper runs first so subsequent steps (score factors,
       -- predictor, RL) see fully populated job_desc fields. Each helper
       -- is a no-op if the user already set the field, so this never
       -- overrides explicit user intent.
       pcall(apply_submit_helpers, job_desc)
 
-      -- Demo path (kept from M2 for plumbing tests).
+      -- Demo path for plumbing tests.
       if DEMO_BOOST_PRIORITY > 0
          and job_desc.name
          and string.sub(job_desc.name, 1, 11) == "score-demo-" then

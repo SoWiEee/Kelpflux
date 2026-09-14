@@ -1,4 +1,4 @@
-"""Operator application — event-driven reconcile loop (R21).
+"""Operator application — event-driven reconciliation loop.
 
 OperatorApp wires together all components and runs three watcher threads
 plus a single reconcile consumer:
@@ -169,7 +169,7 @@ class OperatorApp(
         # Drain-then-scale: pool → set of node names that have been drained and are
         # waiting for running jobs to finish before replicas are patched down.
         self._draining_nodes: dict[str, set[str]] = {}
-        # R1: pool → {node_name → epoch when it first entered DRAIN}.  Used to
+        # pool → {node_name → epoch when it first entered DRAIN}. Used to
         # force-kill jobs once drain_timeout_seconds elapses so a hung srun step
         # cannot pin the pool at max_replicas indefinitely.
         self._draining_started: dict[str, dict[str, float]] = {}
@@ -184,7 +184,7 @@ class OperatorApp(
         self._job_running_trace: dict[str, Any] = {}
         # Circuit-breaker state: tracks consecutive loop-level errors for exponential backoff.
         self._consecutive_errors: int = 0
-        # R21: event-driven plumbing.
+        # Event-driven reconciliation state.
         self._event_queue = _PoolEventQueue()
         self._cfg_by_key: dict[str, PartitionConfig] = {p.worker_statefulset: p for p in self.partition_cfgs}
         self._slurm_state_cache: dict[str, PartitionState] = {}
@@ -247,7 +247,7 @@ class OperatorApp(
             except (TypeError, ValueError):
                 self._provisioning_retry_at.pop(_p.worker_statefulset, None)
 
-        # Phase 6 M7: fragmentation reconciler (default disabled, default
+        # Fragmentation reconciler (default disabled, default
         # shadow=true even when enabled — flip FRAGMENTATION_SHADOW_MODE=false
         # only after observing decisions in shadow mode for a release cycle).
         self._fragmentation_interval = float(
@@ -324,7 +324,7 @@ class OperatorApp(
                         pool=_p.worker_statefulset,
                     )
         start_http_server(8000)
-        # R21: spawn watcher threads. They are daemon threads so a clean
+        # Spawn watcher threads. They are daemon threads so a clean
         # shutdown of the consumer loop tears them down implicitly.
         for thread_target, name in (
             (self._watch_statefulsets, "k8s-sts-watch"),
@@ -334,7 +334,7 @@ class OperatorApp(
         ):
             t = threading.Thread(target=thread_target, name=name, daemon=True)
             t.start()
-        # M7: separate fragmentation reconcile thread. Stays out of the
+        # Keep fragmentation reconciliation separate. It stays out of the
         # main reconcile queue so a slow scontrol requeue can't delay
         # scale-up / scale-down decisions, and so its rate-limit window
         # is independent of pool reconciles.

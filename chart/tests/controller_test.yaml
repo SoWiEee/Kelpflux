@@ -4,7 +4,31 @@ templates:
   - configmap-static.yaml
   - configmap-nodes.yaml
 tests:
-  - it: controller carries checksum annotations for ConfigMap content (R3)
+  - it: production controller reads the API token from a read-only secret mount
+    template: controller.yaml
+    values:
+      - ../values-k3s.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RL_API_TOKEN_FILE
+            value: /run/secrets/rl-scheduler/api-token
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rl-scheduler-api-token
+            secret:
+              secretName: rl-scheduler-api-token
+              defaultMode: 0400
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller carries checksum annotations for ConfigMap content
     template: controller.yaml
     asserts:
       - exists:
@@ -18,7 +42,7 @@ tests:
           path: kind
           value: StatefulSet
 
-  - it: controller mounts cgroup.conf only when cgroup plugin is enabled (R9)
+  - it: controller mounts cgroup.conf only when cgroup support is enabled
     template: controller.yaml
     asserts:
       - notContains:
@@ -46,7 +70,7 @@ tests:
           path: kind
           value: StatefulSet
 
-  - it: slurmctld command no longer hardcodes -Dvvv (R12)
+  - it: slurmctld command uses configured debug settings
     template: controller.yaml
     asserts:
       - notMatchRegex:

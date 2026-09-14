@@ -112,7 +112,7 @@ tests:
           path: data["gres.conf"]
           pattern: "Cores="
 
-  - it: emits SlurmctldDebug and SlurmdDebug from values (R12)
+  - it: emits SlurmctldDebug and SlurmdDebug from values
     template: configmap-static.yaml
     set:
       slurm.slurmctldDebug: debug
@@ -138,7 +138,7 @@ tests:
           path: data["slurm.conf"]
           pattern: "SlurmdDebug=info"
 
-  - it: cgroup.conf is suppressed when no cgroup plugin is in use (R9 default)
+  - it: cgroup.conf is suppressed when no cgroup plugin is in use
     template: configmap-static.yaml
     asserts:
       - notExists:
@@ -160,7 +160,7 @@ tests:
           path: data["cgroup.conf"]
           pattern: "ConstrainDevices=yes"
 
-  - it: M1 default emits backfill + multifactor scheduler knobs
+  - it: default emits backfill and multifactor scheduler knobs
     template: configmap-static.yaml
     asserts:
       - matchRegex:
@@ -182,7 +182,7 @@ tests:
           path: data["slurm.conf"]
           pattern: "PriorityWeightQOS=2000"
 
-  - it: M1 preempt block omitted when disabled (default)
+  - it: preemption block is omitted when disabled
     template: configmap-static.yaml
     asserts:
       - notMatchRegex:
@@ -192,7 +192,7 @@ tests:
           path: data["slurm.conf"]
           pattern: "PreemptMode="
 
-  - it: M1 preempt block emitted when slurm.scheduling.preempt.enabled
+  - it: preemption block is emitted when enabled
     template: configmap-static.yaml
     set:
       slurm.scheduling.preempt.enabled: true
@@ -204,7 +204,7 @@ tests:
           path: data["slurm.conf"]
           pattern: "PreemptMode=REQUEUE"
 
-  - it: M1 CR_Pack_Nodes opt-in via slurm.selectTypeParameters override
+  - it: CR_Pack_Nodes can be enabled through the select type override
     template: configmap-static.yaml
     set:
       slurm.selectTypeParameters: "CR_Core,CR_Pack_Nodes"
@@ -213,7 +213,7 @@ tests:
           path: data["slurm.conf"]
           pattern: "SelectTypeParameters=CR_Core,CR_Pack_Nodes"
 
-  - it: M1 schedulerParameters override flows through
+  - it: schedulerParameters override reaches slurm.conf
     template: configmap-static.yaml
     set:
       slurm.scheduling.schedulerParameters: "bf_window=1440,bf_resolution=60"
@@ -222,11 +222,11 @@ tests:
           path: data["slurm.conf"]
           pattern: "SchedulerParameters=bf_window=1440,bf_resolution=60"
 
-  - it: TaskPlugin / ProctrackType default for PSS=baseline pods (R9 known limit)
+  - it: TaskPlugin and ProctrackType match the baseline pod profile
     template: configmap-static.yaml
     asserts:
       # cgroup/v2 plugin needs dbus+systemd which our baseline pods don't have.
-      # See values.yaml comment under R9 for the upgrade path.
+      # See the values.yaml comment for the upgrade path.
       - matchRegex:
           path: data["slurm.conf"]
           pattern: "TaskPlugin=task/affinity"

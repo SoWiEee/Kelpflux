@@ -33,5 +33,9 @@ RUN mkdir -p /var/run/sshd /var/run/munge /var/lib/munge /var/log/munge /var/spo
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+COPY mps-keepalive.cu /tmp/mps-keepalive.cu
+RUN nvcc -O2 -o /usr/local/bin/mps-keepalive /tmp/mps-keepalive.cu \
+    && rm /tmp/mps-keepalive.cu
+
 EXPOSE 22 6818
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

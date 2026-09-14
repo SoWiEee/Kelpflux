@@ -1,4 +1,4 @@
-"""OTel helpers for serve.py (Phase 7-A).
+"""OTel helpers for serve.py.
 
 Same pattern as operator/otel.py but with service.name = "slurm-rl-scheduler".
 Activated by OTEL_ENABLED=true + OTEL_EXPORTER_OTLP_ENDPOINT env vars.

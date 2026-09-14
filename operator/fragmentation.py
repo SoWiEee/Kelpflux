@@ -1,4 +1,4 @@
-"""Phase 6 M7 — fragmentation detector + requeue decider.
+"""Fragmentation detector and requeue decider.
 
 The operator's existing scaling loop only adds nodes; it never *moves*
 jobs around. When the cluster is full of small low-priority jobs and a

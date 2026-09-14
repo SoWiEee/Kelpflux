@@ -28,6 +28,11 @@ spec:
         - name: reorder-daemon
           image: "{{ $rl.image.repository }}:{{ $rl.image.tag }}"
           imagePullPolicy: {{ $rl.image.pullPolicy }}
+          {{- if $rl.auth.enabled }}
+          env:
+            - name: RL_API_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/api-token
+          {{- end }}
           command:
             - python
             - -m
@@ -70,11 +75,23 @@ spec:
               mountPath: /slurm-jwt/jwt_hs256.key
               subPath: jwt_hs256.key
               readOnly: true
+            {{- if $rl.auth.enabled }}
+            - name: rl-scheduler-api-token
+              mountPath: /run/secrets/rl-scheduler/api-token
+              subPath: token
+              readOnly: true
+            {{- end }}
       volumes:
         - name: slurm-jwt-secret
           secret:
             secretName: {{ .Values.secrets.jwt }}
             defaultMode: 0400
+        {{- if $rl.auth.enabled }}
+        - name: rl-scheduler-api-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerApiToken }}
+            defaultMode: 0400
+        {{- end }}
 {{- if and .Values.networkPolicy.enabled $rd.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

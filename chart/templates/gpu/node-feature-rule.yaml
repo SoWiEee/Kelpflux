@@ -1,6 +1,6 @@
 {{- if and .Values.gpu.enabled .Values.gpu.nfdRules.enabled -}}
 {{/*
-NodeFeatureRule for nvidia.com/device-plugin.config (R4 medium-term fix).
+NodeFeatureRule for nvidia.com/device-plugin.config.
 
 Replaces the one-shot post-install Job (node-labeler-job.yaml) with a
 declarative NFD rule that re-applies the device-plugin config label

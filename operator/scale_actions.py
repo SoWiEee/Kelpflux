@@ -182,7 +182,7 @@ class ScaleActionsMixin:
                 target_replicas=decision.target_replicas,
             )
 
-        # R1: force-kill any node whose drain has exceeded drain_timeout_seconds.
+        # Force-kill any node whose drain has exceeded drain_timeout_seconds.
         # Otherwise a hung srun step keeps cpu_alloc != 0 forever and the pool
         # never shrinks.
         timeout = partition_cfg.drain_timeout_seconds

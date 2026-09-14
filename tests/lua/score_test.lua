@@ -1,4 +1,4 @@
--- Phase 6 M3: unit tests for chart/templates/configmap-job-submit.yaml
+-- Unit tests for chart/templates/configmap-job-submit.yaml
 --
 -- Pure-lua, no busted / luarocks dependency. Run via:
 --   lua tests/lua/score_test.lua
@@ -179,7 +179,7 @@ it("whole-node mps=100 + vram-12g exact > mps=50 + vram-13g over-prov", function
   gt(sA, sB, "well-fit beats half-frag + over-prov")
 end)
 
--- ---- predictor helpers (M6) ----------------------------------------------
+-- ---- predictor helpers ----------------------------------------------------
 print("predictor helpers")
 
 if parse_predict_response and build_predict_body then

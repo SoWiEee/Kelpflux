@@ -35,6 +35,10 @@ spec:
               value: "/slurm-jwt/jwt_hs256.key"
             - name: RL_SCHEDULER_URL
               value: {{ default "http://rl-scheduler:8002" $agent.rlSchedulerUrl | quote }}
+            {{- if $rl.auth.enabled }}
+            - name: RL_SNAPSHOT_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/snapshot-token
+            {{- end }}
             - name: SNAPSHOT_INTERVAL_SECONDS
               value: {{ $agent.intervalSeconds | quote }}
             - name: MPS_PER_GPU
@@ -50,11 +54,23 @@ spec:
               mountPath: /slurm-jwt/jwt_hs256.key
               subPath: jwt_hs256.key
               readOnly: true
+            {{- if $rl.auth.enabled }}
+            - name: rl-scheduler-snapshot-token
+              mountPath: /run/secrets/rl-scheduler/snapshot-token
+              subPath: token
+              readOnly: true
+            {{- end }}
       volumes:
         - name: slurm-jwt-secret
           secret:
             secretName: {{ .Values.secrets.jwt }}
             defaultMode: 0400
+        {{- if $rl.auth.enabled }}
+        - name: rl-scheduler-snapshot-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerSnapshotToken }}
+            defaultMode: 0400
+        {{- end }}
 {{- if and .Values.networkPolicy.enabled $agent.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

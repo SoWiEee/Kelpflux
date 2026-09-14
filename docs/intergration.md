@@ -166,12 +166,14 @@ touch /mnt/kelpflux-nfs-test/node2-write-test
 sudo umount /mnt/kelpflux-nfs-test
 ```
 
-`/etc/exports` 的 allowed clients 必須涵蓋第二台的 LAN subnet，不能只放 pod CIDR。kubelet 會用實體 LAN IP 連 NFS，因此 subnet 不符時，mount 會被拒、worker pod 卡在 `ContainerCreating`。
+`/etc/exports` 只需允許會掛載 NFS 的節點 LAN IP，不能只放 pod CIDR。kubelet 會用實體 LAN IP 連 NFS，因此 client 不符時，mount 會被拒、worker pod 卡在 `ContainerCreating`。
 
-`scripts/setup-nfs-server.sh` 預設 `NFS_EXPORT_CLIENTS=192.168.0.0/24`。若節點使用其他 LAN subnet，回第一台重跑腳本並覆寫：
+`scripts/setup-nfs-server.sh` 預設允許兩個節點 `192.168.0.111`、`192.168.0.104`，並啟用 `root_squash`。若節點 IP 或成員改變，回第一台以逗號分隔覆寫允許清單：
+
+若 export 內已有資料，先檢查在舊 `no_root_squash` 設定下建立的 root-owned 目錄；`root_squash` 會將客戶端 root 映射為 `nobody`，權限較緊的既有目錄可能因此無法存取。腳本不會遞迴變更既有資料的 owner 或 mode，必要時應依資料用途先規劃遷移。
 
 ```bash
-sudo NFS_EXPORT_CLIENTS="192.168.0.0/24" bash scripts/setup-nfs-server.sh
+sudo NFS_EXPORT_CLIENTS="192.168.0.111,192.168.0.104" bash scripts/setup-nfs-server.sh
 
 sudo exportfs -v   # 確認第二台 subnet 有列出來
 ```

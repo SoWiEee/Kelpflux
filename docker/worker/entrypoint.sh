@@ -47,5 +47,5 @@ fi
 /usr/sbin/sshd
 
 install -d -m 0755 /var/spool/slurmd /var/log/slurm /run/slurmd
-# Foreground only; verbosity comes from SlurmdDebug in slurm.conf (R12).
+# Foreground only; verbosity comes from SlurmdDebug in slurm.conf.
 exec slurmd -D -N "$(hostname)"

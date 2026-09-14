@@ -1,5 +1,5 @@
 {{/*
-M11 Phase D — RL scheduler serve endpoint (FastAPI /decide + /snapshot).
+RL scheduler serve endpoint (FastAPI /decide + /snapshot).
 
   Deployment   → uvicorn FastAPI on :8002, policy baked into image at /models
   Service      → ClusterIP, port 8002
@@ -47,6 +47,14 @@ spec:
               value: {{ $rl.entropyAbstain | quote }}
             - name: PRIORITY_BOOST
               value: {{ $rl.priorityBoost | quote }}
+            {{- if $rl.auth.enabled }}
+            - name: RL_API_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/api-token
+            - name: RL_SNAPSHOT_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/snapshot-token
+            - name: RL_CONTROL_TOKEN_FILE
+              value: /run/secrets/rl-scheduler/control-token
+            {{- end }}
             {{- if .Values.monitoring.otel.enabled }}
             - name: OTEL_ENABLED
               value: "true"
@@ -69,6 +77,36 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml $rl.resources | nindent 12 }}
+          {{- if $rl.auth.enabled }}
+          volumeMounts:
+            - name: rl-scheduler-api-token
+              mountPath: /run/secrets/rl-scheduler/api-token
+              subPath: token
+              readOnly: true
+            - name: rl-scheduler-snapshot-token
+              mountPath: /run/secrets/rl-scheduler/snapshot-token
+              subPath: token
+              readOnly: true
+            - name: rl-scheduler-control-token
+              mountPath: /run/secrets/rl-scheduler/control-token
+              subPath: token
+              readOnly: true
+          {{- end }}
+      {{- if $rl.auth.enabled }}
+      volumes:
+        - name: rl-scheduler-api-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerApiToken }}
+            defaultMode: 0400
+        - name: rl-scheduler-snapshot-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerSnapshotToken }}
+            defaultMode: 0400
+        - name: rl-scheduler-control-token
+          secret:
+            secretName: {{ .Values.secrets.rlSchedulerControlToken }}
+            defaultMode: 0400
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -103,7 +141,7 @@ spec:
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
-        # Only the three legitimate callers of :8002:
+        # Only the intended callers of :8002:
         #   /decide   ← job_submit.lua inside slurmctld (slurm-controller)
         #   /snapshot ← rl-snapshot-agent
         #   /act      ← placement and reorder controllers

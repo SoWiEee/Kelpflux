@@ -1,4 +1,4 @@
-# Alertmanager for Phase 4 SLO alerting.
+# Alertmanager configuration for service-level objective alerts.
 #
 # The default receiver is "dev-null" — alerts are routed and grouped but not
 # forwarded to any external channel. Replace the receiver definition with

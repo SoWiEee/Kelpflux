@@ -1,4 +1,4 @@
-"""Watcher threads — R21 event-driven plumbing.
+"""Watcher threads for event-driven reconciliation.
 
 Each watcher runs in its own daemon thread spawned by OperatorApp.run().
 They feed pool-keyed events into the same ``_PoolEventQueue`` the main
@@ -8,8 +8,7 @@ the same pool key in close succession only trigger one reconcile.
 Mixin pattern: these methods read ``self.client``, ``self.cfg``,
 ``self._cfg_by_key``, ``self._event_queue``, ``self._slurm_state_cache``,
 ``self.collector``, and ``self.logger`` from the OperatorApp instance.
-Split out of operator/app.py in v5 review C2 to keep each concern in its
-own ≤200 LoC module.
+Kept separate from operator/app.py to isolate the watch and polling logic.
 """
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-suite: image-puller DaemonSet (R2)
+suite: image-puller DaemonSet
 templates:
   - image-puller.yaml
 tests:

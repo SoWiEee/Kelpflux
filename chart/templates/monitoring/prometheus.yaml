@@ -102,7 +102,7 @@ data:
           {{- end }}
       {{- end }}
       {{- if .Values.monitoring.dcgmExporter.enabled }}
-      # R5: DCGM exporter (deployed by GPU Operator into gpu-operator namespace).
+      # DCGM exporter (deployed by GPU Operator into gpu-operator namespace).
       # Provides DCGM_FI_DEV_GPU_UTIL (real SM%), DCGM_FI_DEV_FB_USED (VRAM
       # bytes), DCGM_FI_PROF_PIPE_TENSOR_ACTIVE (Tensor Core busy ratio) —
       # these replace the misleading "GPU utilisation = Slurm-allocated count"

@@ -7,8 +7,7 @@ Uses the cluster default StorageClass (local-path on Kind, or whatever
 NFS / EBS provisioner is set as default in the target cluster). 1Gi is
 ample for state — Slurm's StateSaveLocation is small (KB-scale per job).
 
-Stage E may add `storage.enabled` for an additional /shared NFS PVC; that
-lives in templates/storage.yaml, not here.
+The optional shared /shared PVC is defined separately in templates/storage.yaml.
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim

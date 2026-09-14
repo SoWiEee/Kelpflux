@@ -1,4 +1,4 @@
-"""OpenTelemetry helpers for the Slurm Operator (Phase 7-A).
+"""OpenTelemetry helpers for the Slurm Operator.
 
 Provides a thin wrapper around the OTel SDK so the rest of the operator
 can call `get_tracer()` and `extract_context(traceparent)` without

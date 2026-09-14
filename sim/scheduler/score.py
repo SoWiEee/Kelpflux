@@ -1,4 +1,4 @@
-"""Phase 6 M3 score, applied as a priority kicker on top of multifactor.
+"""Score-based priority adjustment on top of multifactor.
 
 The Lua plugin in ``chart/templates/configmap-job-submit.yaml`` evaluates
 the same factors at sbatch time. Here we reimplement them in Python so
@@ -211,7 +211,7 @@ class ScoreScheduler(MultifactorScheduler):
         return min(1.0, 0.5 * local + 0.5 * spread)
 
     def f_runtime_short(self, j: Job) -> float:
-        # SJF kicker fed by the M5 predictor. Sim assumes a perfect predictor
+        # SJF kicker fed by the runtime predictor. Sim assumes a perfect prediction
         # (uses j.runtime as the prediction); E4 ablation only flips epsilon.
         # 1.0 for an instant job, decays to ~0 for a job >> runtime_horizon.
         if j.runtime <= 0 or self.runtime_horizon <= 0:

@@ -32,7 +32,7 @@ tests:
           path: data["prometheus.yml"]
           pattern: "job_name: kube-state-metrics"
 
-  - it: prometheus scrapes DCGM exporter when monitoring.dcgmExporter.enabled (R5)
+  - it: Prometheus scrapes DCGM exporter when enabled
     template: monitoring/prometheus.yaml
     set:
       monitoring.enabled: true
@@ -65,7 +65,7 @@ tests:
           path: spec.template.spec.serviceAccountName
           value: prometheus
 
-  - it: DCGM scrape job suppressed when monitoring.dcgmExporter.enabled=false (R5)
+  - it: DCGM scrape job is suppressed when disabled
     template: monitoring/prometheus.yaml
     set:
       monitoring.enabled: true

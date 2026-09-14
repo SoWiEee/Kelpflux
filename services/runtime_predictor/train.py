@@ -18,8 +18,7 @@ artifact bundle to disk:
 
 CronJob rotation: when ``--rotate`` is set and ``<output>`` already
 exists, the trainer renames the existing artifact to ``<output>.bak``
-before writing — exactly one previous model is kept (acceptance bullet
-#3 in scheduler.md M5).
+before writing — exactly one previous model is kept.
 """
 from __future__ import annotations
 
