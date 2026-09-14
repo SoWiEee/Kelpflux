@@ -9,10 +9,56 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from k8s import K8sClient
 from models import Config, PartitionConfig, PartitionState
 from slurm import SlurmRestClient
+
+_MEMORY_TRES = re.compile(r"^(\d+(?:\.\d+)?)([KMGTPE]?)([cn]?)$", re.IGNORECASE)
+
+
+def _tres_per_node_fits(tres: str, partition: PartitionConfig) -> bool:
+    """Reject scale-ups that cannot make an oversized per-node request fit."""
+    requested_cpu = 0
+    memory_tres: tuple[str, str, str] | None = None
+    for item in tres.split(","):
+        key, sep, value = item.partition("=")
+        if not sep:
+            continue
+        if key == "cpu":
+            try:
+                requested_cpu = int(value)
+            except ValueError:
+                pass
+        elif key == "mem":
+            match = _MEMORY_TRES.fullmatch(value)
+            if not match:
+                continue
+            memory_tres = match.groups()
+
+    requested_memory_mb = 0.0
+    if memory_tres:
+        amount, unit, scope = memory_tres
+        factor = {"": 1, "K": 1 / 1024, "M": 1, "G": 1024,
+                  "T": 1024**2, "P": 1024**3, "E": 1024**4}[unit.upper()]
+        requested_memory_mb = float(amount) * factor
+        if scope.lower() == "c":
+            requested_memory_mb *= max(requested_cpu, 1)
+
+    return not (
+        (partition.cpus_per_node > 0 and requested_cpu > partition.cpus_per_node)
+        or (partition.memory_mb_per_node > 0
+            and requested_memory_mb > partition.memory_mb_per_node)
+    )
+
+
+def _can_scale_for_job(fields: dict[str, str], partition: PartitionConfig) -> bool:
+    reason = fields.get("Reason", "").strip().strip("()").lower()
+    return (
+        reason == "resources"
+        and _tres_per_node_fits(fields.get("TresPerNode", ""), partition)
+    )
 
 
 class PartitionConfigLoader:
@@ -60,6 +106,8 @@ class PartitionConfigLoader:
                     )),
                     match_features=tuple(item.get("match_features", [])),
                     match_gres=tuple(item.get("match_gres", [])),
+                    cpus_per_node=int(item.get("cpus_per_node", 0)),
+                    memory_mb_per_node=int(item.get("memory_mb_per_node", 0)),
                     fallback=bool(item.get("fallback", False)),
                 )
             )
@@ -132,7 +180,7 @@ class ClusterStateCollector:
 
     def _jobs_by_pool_and_state_rest(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
         result: dict[str, dict[str, list[dict[str, str]]]] = {
-            p.worker_statefulset: {"PENDING": [], "RUNNING": []}
+            p.worker_statefulset: {"PENDING": [], "SCALE_PENDING": [], "RUNNING": []}
             for p in self.partition_cfgs
             if p.partition == partition
         }
@@ -144,16 +192,21 @@ class ClusterStateCollector:
             pool = self._classify_job(fields)
             if pool is None:
                 continue
-            bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
-            bucket["RUNNING" if state == "COMPLETING" else state].append(fields)
+            bucket = result.setdefault(
+                pool.worker_statefulset, {"PENDING": [], "SCALE_PENDING": [], "RUNNING": []}
+            )
+            normalized_state = "RUNNING" if state == "COMPLETING" else state
+            bucket[normalized_state].append(fields)
+            if normalized_state == "PENDING" and _can_scale_for_job(fields, pool):
+                bucket["SCALE_PENDING"].append(fields)
         return result
 
     def _jobs_by_pool_and_state_exec(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
         output = self.client.exec_in_controller(
-            f"squeue -h -p {partition} -t PENDING,RUNNING,COMPLETING -o '%i|%T|%N|%f|%b' || true"
+            f"squeue -h -p {partition} -t PENDING,RUNNING,COMPLETING -o '%i|%T|%N|%f|%b|%R' || true"
         )
         result: dict[str, dict[str, list[dict[str, str]]]] = {
-            p.worker_statefulset: {"PENDING": [], "RUNNING": []}
+            p.worker_statefulset: {"PENDING": [], "SCALE_PENDING": [], "RUNNING": []}
             for p in self.partition_cfgs
             if p.partition == partition
         }
@@ -161,21 +214,27 @@ class ClusterStateCollector:
             line = line.strip()
             if not line:
                 continue
-            parts = line.split("|", 4)
-            if len(parts) < 5:
+            parts = line.split("|", 5)
+            if len(parts) < 6:
                 continue
-            _jobid, state, nodelist, features, tres_per_node = parts
+            _jobid, state, nodelist, features, tres_per_node, reason = parts
             fields = {
                 "NodeList": nodelist,
                 "Features": features,
                 "TresPerNode": tres_per_node,
+                "Reason": reason,
             }
             pool = self._classify_job(fields)
             if pool is None:
                 continue
-            bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
+            bucket = result.setdefault(
+                pool.worker_statefulset, {"PENDING": [], "SCALE_PENDING": [], "RUNNING": []}
+            )
             if state in ("PENDING", "RUNNING", "COMPLETING"):
-                bucket["RUNNING" if state == "COMPLETING" else state].append(fields)
+                normalized_state = "RUNNING" if state == "COMPLETING" else state
+                bucket[normalized_state].append(fields)
+                if normalized_state == "PENDING" and _can_scale_for_job(fields, pool):
+                    bucket["SCALE_PENDING"].append(fields)
         return result
 
     def get_busy_nodes(self, partition_cfg: PartitionConfig) -> int:
@@ -240,6 +299,9 @@ class ClusterStateCollector:
                     jobs_by_partition[p.partition].get(p.worker_statefulset, {}).get("RUNNING", [])
                 ),
                 busy_nodes=self.get_busy_nodes(p),
+                scale_pending_jobs=len(
+                    jobs_by_partition[p.partition].get(p.worker_statefulset, {}).get("SCALE_PENDING", [])
+                ),
             )
             for p in self.partition_cfgs
         }

@@ -58,7 +58,9 @@ pools:
     workerClass: cpu-standard
     partition: cpu
     minReplicas: 1
-    maxReplicas: 4
+    # With the 4070 worker and system pod requests on acane, less than 4 CPUs
+    # remain for another CPU worker; keep this pool within measured capacity.
+    maxReplicas: 1
     replicas: 1
     scaleCooldownSeconds: 60
     cpus: 4
@@ -66,7 +68,7 @@ pools:
     sockets: 1
     coresPerSocket: 2
     threadsPerCore: 2
-    maxNodes: 4
+    maxNodes: 1
     # Keep the small CPU-only pool off the 7.5 GiB GPU agent so the 7 GiB
     # GPU worker request remains schedulable.
     nodeSelector:

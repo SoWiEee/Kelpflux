@@ -34,7 +34,7 @@ scancel <jobid>  # 取消 job
 | `cpu` | CPU / OpenMP / MPI CPU job | `#SBATCH -p cpu` |
 | `gpu-rtx4070` | RTX 4070 GPU job | `#SBATCH -p gpu-rtx4070` + `--gres=gpu:1` 或 `--gres=mps:25` |
 
-CPU/GPU worker 由 Kelpflux operator 依 pending jobs 擴縮。也就是說，使用者 submit job 後，對應 worker pod 可能才會被啟動；但 worker image 應在部署階段完成 build/import/pre-pull，不會在 submit 時才 build。
+CPU/GPU worker 由 Kelpflux operator 依 pool 設定的 min/max replicas 擴縮；只有因 `Resources` 等待、且單節點需求可容納的工作會觸發擴容。使用者 submit job 後，對應 worker pod 可能才會被啟動；worker image 則在部署階段完成 build/import/pre-pull。2×1 實機 profile 的 CPU pool 受主機容量限制，固定維持 1 個 worker。
 
 ## 2. 共享工作目錄
 

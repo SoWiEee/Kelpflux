@@ -60,8 +60,9 @@ class Harness(ScaleActionsMixin):
         self.client = FakeClient()
         self.actuator = FakeActuator()
         self.cfg = SimpleNamespace(policy_name="checkpoint_aware_queue")
-        self.last_scale_up_at = defaultdict(float)
+        self.last_scale_action_at = defaultdict(float)
         self._provisioning = {}
+        self._provisioning_retry_at = {}
         self._draining_nodes = {}
         self._draining_started = {}
         self.logger = FakeLogger()
@@ -112,6 +113,10 @@ def test_scale_up_resumes_target_ordinals_before_patching_replicas():
     ]
     assert h.actuator.patches == [("slurm-worker-gpu-rtx4070", 2)]
     assert "slurm-worker-gpu-rtx4070" not in h._draining_nodes
+    assert h.last_scale_action_at["slurm-worker-gpu-rtx4070"] == 123.0
+    assert h._provisioning["slurm-worker-gpu-rtx4070"][:3] == (123.0, 0, 2)
+    marker = next(a for a in h.client.annotations if a[2] == "slurm.k8s/provisioning")
+    assert marker[3] == '{"started_at":123.0,"from_replicas":0,"target_replicas":2}'
 
 
 def test_scale_down_marks_removed_idle_nodes_future_after_patch():
@@ -140,3 +145,5 @@ def test_scale_down_marks_removed_idle_nodes_future_after_patch():
         "slurm-worker-gpu-rtx4070-0",
         "slurm-worker-gpu-rtx4070-1",
     ]
+    assert h.last_scale_action_at["slurm-worker-gpu-rtx4070"] > 0
+    assert any(a[2] == "slurm.k8s/last-scale-action-at" for a in h.client.annotations)

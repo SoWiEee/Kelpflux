@@ -48,6 +48,11 @@ _PROVISIONING_LATENCY = Histogram(
     ["pool"],
     buckets=[5, 15, 30, 60, 120, 300, 600],
 )
+_PROVISIONING_TIMEOUT_TOTAL = Counter(
+    "slurm_operator_provisioning_timeout_total",
+    "Scale-up attempts rolled back after worker pods failed to become Ready, by pool",
+    ["pool"],
+)
 _DRAIN_TOTAL = Counter(
     "slurm_operator_drain_total",
     "Total drain-then-wait cycles initiated before a scale-down, by pool",

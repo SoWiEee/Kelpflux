@@ -46,6 +46,40 @@ tests:
         documentSelector:
           path: kind
           value: Deployment
+
+  - it: provisioning timeout and retry values reach the operator
+    set:
+      operator.provisioningTimeoutSeconds: 90
+      operator.provisioningRetrySeconds: 120
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PROVISIONING_TIMEOUT_SECONDS
+            value: "90"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PROVISIONING_RETRY_SECONDS
+            value: "120"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"cpus_per_node":4'
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"memory_mb_per_node":3500'
+        documentSelector:
+          path: kind
+          value: Deployment
       - matchRegex:
           path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
           pattern: '"drain_timeout_seconds":1800'

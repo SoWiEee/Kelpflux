@@ -453,6 +453,8 @@ operator:
   # case where every watcher missed an event.
   reconcilePeriodSeconds: 60
   scaleDownCooldownSeconds: 60
+  provisioningTimeoutSeconds: 300
+  provisioningRetrySeconds: 300
   drainTimeoutSeconds: 1800
   checkpointGuard:
     enabled: true

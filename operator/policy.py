@@ -24,13 +24,18 @@ class CheckpointAwareQueuePolicy:
         checkpoint_age_seconds: int | None,
         missing_since_seconds: float | None = None,
     ) -> ScalingDecision:
-        if state.pending_jobs > 0:
+        if state.scale_pending_jobs > 0:
             target = clamp(
                 state.current_replicas + partition_cfg.scale_up_step,
                 partition_cfg.min_replicas,
                 partition_cfg.max_replicas,
             )
-            return self._to_decision(state.current_replicas, target, "pending_jobs")
+            return self._to_decision(state.current_replicas, target, "resource_pending_jobs")
+
+        if state.pending_jobs > 0:
+            return ScalingDecision(
+                state.current_replicas, "keep", "pending_jobs_not_blocked_by_resources"
+            )
 
         safe_floor = max(partition_cfg.min_replicas, state.busy_nodes)
         candidate_target = clamp(

@@ -88,6 +88,8 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 | `slurm_operator_scale_up_total` | Counter | 觸發 scale-up 的次數，label: `pool` |
 | `slurm_operator_scale_down_total` | Counter | 觸發 scale-down 的次數，label: `pool` |
 | `slurm_operator_scale_skipped_total` | Counter | scale 被跳過的次數，label: `pool`, `reason` |
+| `slurm_operator_provisioning_latency_seconds` | Histogram | scale-up 至目標 worker 全部 Ready 的耗時，label: `pool` |
+| `slurm_operator_provisioning_timeout_total` | Counter | worker 未在期限內 Ready、回復 replicas 的 scale-up 次數，label: `pool` |
 | `slurm_operator_checkpoint_guard_blocks_total` | Counter | Checkpoint Guard 攔截 scale-down 的次數 |
 | `slurm_operator_poll_duration_seconds` | Histogram | 每次 poll loop 耗時 |
 | `slurm_operator_current_replicas` | Gauge | 各 pool 目前 replica 數，label: `pool` |

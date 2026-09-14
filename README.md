@@ -78,7 +78,7 @@ demand rises and falls.
 
 本研究就落在這個空隙，並刻意不做「宣稱 DRL 必勝」的研究，而是回答兩個更誠實的問題：
 
-1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）從 oldest-first 前 16 個 pending jobs 中選擇 `(job, node, GPU)`。目前 production daemon 將選出的 job 順序寫入 Slurm Priority；選出的 node/GPU 僅用於本輪 MPS 可行性估算，Slurm 仍決定實際 placement。透過 held-job REST controller 實現硬性 placement 是可行候選路徑，但 Slurm 23.11 的 `required_nodes` 尚未完成 round-trip 驗證，因此 2×1 Helm profile 暫不啟用。此學習式策略與 DRA 並非競爭，而是**互補**：DRA 提供 GPU/MPS 存取機制，DRL 決定排序，硬性 placement 則待 REST 致動驗證後再接入。
+1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）從 oldest-first 前 16 個 pending jobs 中選擇 `(job, node, GPU)`。production reorder daemon 將選出的 job 順序寫入 Slurm Priority，Slurm 負責一般 unheld job 的實際 placement；另有 held-job REST controller，可將所選節點寫入 `ReqNodeList` 後 release 工作。Slurm 23.11.4 的 REST v0.0.39 round-trip 已通過 canary 驗證，2×1 Helm overlay 預設啟用該 controller，但僅處理使用者明確以 held 狀態提交的 GPU job。此學習式策略與 DRA 並非競爭，而是**互補**：DRA 提供 GPU/MPS 存取機制，DRL 負責排序或 held-job placement。
 2. **這套智慧要以什麼形式、在什麼條件下才真的有用？** 早期只讓 RL **綁定節點**（placement-only、工作*順序*仍由 Slurm 決定）的實機路徑下，學習式策略僅與 Slurm 打平、且以顯著尾端代價換得——但這是**致動路徑**的限制，而非策略無法貢獻。當改讓 RL 掌握**派遣順序**、並以一條可落地的**非阻塞、失效安全的原生致動路徑（Option B：常駐程序週期性重排當前佇列、寫入 Slurm `Priority`，交由 Slurm 原生 backfill 致動）**整合後，在真實 CUDA、poisson 到達的三點負載掃描（oversub=2／4／6）下，學習式策略在**平均 JCT 與尾端 P99 皆穩健顯著勝過生產 Slurm Backfill**（平均約 −11%～−13%，深載尾端 P99 更達 −19%～−22%；配對 Wilcoxon *p*≤0.006、P99 於 10/10 seed 勝過 Backfill）。此實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並精確界定效益條件：**RL 須掌握*排序*槓桿、致動路徑須原生且連續、負載須足以形成可重排的 backlog**。支撐此結論的是一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對顯著性（Wilcoxon）與信賴區間、兼顧平均與尾端（p95／p99／CVaR）。
 
 ## Getting Started
@@ -106,7 +106,7 @@ bash scripts/verify-live.sh
 
 ### Scheduler behavior
 
-The 2x1 profile enables DRL priority reordering for unheld, explicit-MPS GPU jobs; Slurm still chooses the node and dispatch time. Hard placement through the held-job REST controller stays disabled in this profile until its Slurm 23.11 API round trip is validated. See [scheduler.md](docs/scheduler.md) for the boundary.
+The 2×1 profile enables DRL priority reordering for ordinary unheld, explicit-MPS GPU jobs; Slurm still chooses the node and dispatch time. The profile also enables the separate REST placement controller for jobs explicitly submitted with `--hold`; it writes the selected node constraint before release. CPU worker scaling is bounded by the capacity declared in the selected values overlay. See [scheduler.md](docs/scheduler.md) for the control boundaries.
 
 ### Check the deployment
 
@@ -117,6 +117,80 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 ```
 
 Grafana is then available at `http://127.0.0.1:3000`. See [monitoring.md](docs/monitoring.md) for dashboards and metrics.
+
+### 訓練與評估
+
+以下指令供研究重現使用。Python 環境需包含 PyTorch，並在 repository 根目錄執行。模擬訓練可用 CPU 或可用的 CUDA GPU；實機資料收集與評估會提交／取消 Slurm 工作、切換 Slurm 設定並重啟 controller，**只能在專用測試叢集執行，不要在共用或正式叢集執行**。
+
+#### 模擬訓練
+
+目前 2×1 模型的觀測維度為 168、動作數為 33。下列腳本會訓練 SAC、RDSAC-mean、RDSAC-CVaR 三種方法，各使用 16 個 seed：
+
+```bash
+DEVICE=cpu STEPS=100000 MAX=8 \
+SEEDS="42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57" \
+    bash eval/scripts/train_aimix_seeds_fair.sh
+# 有可用 GPU 時可改 DEVICE=cuda MAX=4
+# checkpoints 輸出至 runs/ckpts_aimix16_fair/
+```
+
+單一模型可直接呼叫模擬訓練器：
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
+    --n-nodes 2 --gpus-per-node 1 --hetero-cluster --trace aimix \
+    --n-jobs 50 --total-steps 100000 --curriculum --device cpu \
+    --fixed-alpha --init-alpha 0.05 \
+    --fairness-coef 5.0 --balance-coef 5.0 --interference 0.3 \
+    --risk-mode cvar --out-dir runs/dsac_2x1_$(date +%Y%m%d)
+```
+
+#### RLPD 實機微調
+
+需要先以 `collect_aimix_onlinelog.sh` 在專用叢集旁觀收集 16 小時的真實 transition；此步驟會執行實際 GPU 工作：
+
+```bash
+DURATION_S=57600 N_JOBS=30 bash eval/scripts/collect_aimix_onlinelog.sh
+```
+
+指定收集完成後的 log 檔，從 RDSAC-CVaR checkpoint 微調 16 個 seed：
+
+```bash
+CK=runs/ckpts_aimix16_fair \
+ONLINE_LOG=shadow_logs/transitions_<收集時間戳>.jsonl \
+SEEDS="42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57" \
+    bash eval/scripts/train_rlpd_aimix16.sh
+# 產物：runs/ckpts_aimix16_fair/rlpd_cvar_s{42..57}.pt
+```
+
+#### 150-job 實機評估
+
+先在一個終端啟動相容的 168 維 policy server（以既有 checkpoint 作為初始模型）：
+
+```bash
+mkdir -p /tmp/aimix_eval_policy
+cp runs/ckpts_aimix16_fair/rdsac_cvar_s42.pt /tmp/aimix_eval_policy/dsac.pt
+SHADOW_MODE=true PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.serve \
+    --policy-dir /tmp/aimix_eval_policy --port 8003
+```
+
+在另一個終端執行三種 oversub、10 個 seed、每次 150 jobs 的評估。`REAL_WORKLOAD=1` 使用 AiMix 的 BERT、ResNet、Qwen 與 cuBLAS 工作負載；比較 FCFS、Slurm Backfill、SAC、RDSAC-mean、RDSAC-CVaR 與 RLPD-CVaR：
+
+```bash
+ACTUATION=reorder OVERSUBS="2 4 6" N_JOBS=150 \
+SEEDS="42 43 44 45 46 47 48 49 50 51" REAL_WORKLOAD=1 \
+CK=runs/ckpts_aimix16_fair bash eval/scripts/run_step3_prio.sh
+# 結果輸出至 runs/step3prio_<時間戳>/
+```
+
+評估結束後彙整結果：
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python -m eval.scripts.aggregate_optB_deploy \
+    runs/step3prio_<時間戳>
+```
+
+訓練與評估旗標、方法細節及結果解讀見 [eval-writeup.md](docs/eval-writeup.md)；排程器實作與實機控制邊界見 [scheduler.md](docs/scheduler.md)。
 
 ## Development and Research
 

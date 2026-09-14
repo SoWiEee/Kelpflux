@@ -59,7 +59,13 @@ from metrics import (
 from models import Config, PartitionConfig, PartitionState
 from policy import CheckpointAwareQueuePolicy
 from reconciler import ReconcilerMixin
-from scale_actions import _COOLDOWN_ANNOTATION, ScaleActionsMixin
+from scale_actions import (
+    _COOLDOWN_ANNOTATION,
+    _LAST_SCALE_ACTION_ANNOTATION,
+    _PROVISIONING_ANNOTATION,
+    _PROVISIONING_RETRY_ANNOTATION,
+    ScaleActionsMixin,
+)
 from slurm import SlurmRestClient
 from watchers import WatcherMixin
 
@@ -156,10 +162,10 @@ class OperatorApp(
         # Restore cooldown timestamps from StatefulSet annotations so a pod
         # restart does not reset the cooldown clock and cause an immediate
         # scale-down that was previously guarded against.
-        self.last_scale_up_at: dict[str, float] = {}
-        # Track pending provisioning: pool → (scale_up_timestamp, target_replicas, otel_ctx).
-        # Cleared once readyReplicas reaches the target; used to emit _PROVISIONING_LATENCY.
-        self._provisioning: dict[str, tuple[float, int, Any]] = {}
+        self.last_scale_action_at: dict[str, float] = {}
+        # pool → (started_at, from_replicas, target_replicas, otel_ctx).
+        self._provisioning: dict[str, tuple[float, int, int, Any]] = {}
+        self._provisioning_retry_at: dict[str, float] = {}
         # Drain-then-scale: pool → set of node names that have been drained and are
         # waiting for running jobs to finish before replicas are patched down.
         self._draining_nodes: dict[str, set[str]] = {}
@@ -183,17 +189,63 @@ class OperatorApp(
         self._cfg_by_key: dict[str, PartitionConfig] = {p.worker_statefulset: p for p in self.partition_cfgs}
         self._slurm_state_cache: dict[str, PartitionState] = {}
         for _p in self.partition_cfgs:
-            _raw: str | None = None
             try:
-                _raw = self.client.get_annotation(
-                    "statefulset", _p.worker_statefulset, _COOLDOWN_ANNOTATION
+                _raw_action = self.client.get_annotation(
+                    "statefulset", _p.worker_statefulset, _LAST_SCALE_ACTION_ANNOTATION
+                )
+                if not _raw_action:
+                    _raw_action = self.client.get_annotation(
+                        "statefulset", _p.worker_statefulset, _COOLDOWN_ANNOTATION
+                    )
+                self.last_scale_action_at[_p.worker_statefulset] = (
+                    float(_raw_action) if _raw_action else 0.0
                 )
             except Exception:  # noqa: BLE001
-                pass
+                self.last_scale_action_at[_p.worker_statefulset] = 0.0
+
             try:
-                self.last_scale_up_at[_p.worker_statefulset] = float(_raw) if _raw else 0.0
-            except ValueError:
-                self.last_scale_up_at[_p.worker_statefulset] = 0.0
+                raw_provisioning = self.client.get_annotation(
+                    "statefulset", _p.worker_statefulset, _PROVISIONING_ANNOTATION
+                )
+                if raw_provisioning:
+                    marker = json.loads(raw_provisioning)
+                    started_at = float(marker["started_at"])
+                    from_replicas = int(marker["from_replicas"])
+                    target_replicas = int(marker["target_replicas"])
+                    if started_at > 0 and target_replicas > from_replicas:
+                        self._provisioning[_p.worker_statefulset] = (
+                            started_at, from_replicas, target_replicas, None
+                        )
+                        self.last_scale_action_at[_p.worker_statefulset] = max(
+                            self.last_scale_action_at[_p.worker_statefulset], started_at
+                        )
+                    else:
+                        self.client.set_annotation(
+                            "statefulset", _p.worker_statefulset,
+                            _PROVISIONING_ANNOTATION, "",
+                        )
+            except Exception:  # noqa: BLE001
+                try:
+                    self.client.set_annotation(
+                        "statefulset", _p.worker_statefulset, _PROVISIONING_ANNOTATION, ""
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                raw_retry = self.client.get_annotation(
+                    "statefulset", _p.worker_statefulset, _PROVISIONING_RETRY_ANNOTATION
+                )
+                retry_at = float(raw_retry) if raw_retry else 0.0
+                if retry_at > time.time():
+                    self._provisioning_retry_at[_p.worker_statefulset] = retry_at
+                elif raw_retry:
+                    self.client.set_annotation(
+                        "statefulset", _p.worker_statefulset,
+                        _PROVISIONING_RETRY_ANNOTATION, "",
+                    )
+            except (TypeError, ValueError):
+                self._provisioning_retry_at.pop(_p.worker_statefulset, None)
 
         # Phase 6 M7: fragmentation reconciler (default disabled, default
         # shadow=true even when enabled — flip FRAGMENTATION_SHADOW_MODE=false

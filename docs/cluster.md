@@ -238,14 +238,14 @@ graph TD
 | DNS 容錯 | controller Pod 使用 `ndots=2 timeout=1 attempts=1`，避免 scale-to-zero 節點的 NXDOMAIN 佔滿 REST worker |
 | PVC | `slurm-ctld-state` 1Gi RWO（`StateSaveLocation`，跨重啟保住 job queue） |
 
-#### StatefulSet `slurm-worker-cpu`（replicas 1–4）
+#### StatefulSet `slurm-worker-cpu`（2×1 profile：replicas 固定 1）
 
 | 項目 | 值 |
 |------|-----|
 | Image | `slurm-worker:23.11.4` |
 | Features | `cpu`（partition `cpu`，預設） |
 | Gres | 無 |
-| 縮放 | Operator 依 pending CPU job 數量 patch replicas |
+| 縮放 | 依 `Resources` pending job 與單節點 CPU／記憶體需求判斷；本機 2×1 profile 因 acane 容量限制為 min=max=1，其他 overlay 可依節點餘裕設定彈性範圍 |
 
 #### StatefulSet `slurm-worker-gpu-rtx4070`（replicas=1，固定，釘 acane）
 
@@ -438,10 +438,12 @@ flowchart TD
 - `SLURM_JWT_KEY_PATH` — `/slurm-jwt/jwt_hs256.key`
 - `POLL_INTERVAL_SECONDS` — 預設 15
 - `SCALE_DOWN_COOLDOWN_SECONDS` — 預設 60
+- `PROVISIONING_TIMEOUT_SECONDS` / `PROVISIONING_RETRY_SECONDS` — 預設各 300；worker 未及時 Ready 時回復原副本數並進入重試退避
 - `CHECKPOINT_GUARD_ENABLED` / `CHECKPOINT_PATH` / `MAX_CHECKPOINT_AGE_SECONDS` / `CHECKPOINT_GRACE_SECONDS` — checkpoint 保護開關
 
-**Cooldown 持久化**：scale-up 時間戳寫到 StatefulSet annotation
-`slurm.k8s/last-scale-up-at`；operator 重啟讀回，避免冷卻歸零。
+**Cooldown 持久化**：每次成功 scale-up／scale-down 的時間戳寫入 StatefulSet annotation
+`slurm.k8s/last-scale-action-at`；operator 重啟時讀回，並相容舊版
+`slurm.k8s/last-scale-up-at`，避免冷卻歸零或縮容後立即再次縮容。
 
 **Circuit breaker**：連續 poll 失敗時指數退避（最長 60s），`/tmp/operator-alive`
 持續更新維持 livenessProbe；首次成功 poll 後寫 `/tmp/operator-ready`。
@@ -456,11 +458,14 @@ flowchart TD
   `n_nodes=1`，與 1×1 DSAC checkpoint 匹配，`/decide` 才不會因 shape mismatch 靜默
   abstain。Burst 仍可彈性 scale-up 到 `maxReplicas`。
 
-operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operator/k8s.py`）：
+operator 的彈性擴縮保護（`operator/collector.py`、`operator/policy.py`、`operator/reconciler.py`）：
 
 | 機制 | 問題 | 修法 |
 |------|------|------|
-| **in-flight provisioning gate** | 冷啟動空窗 job 還 pending 時，operator 每個 loop 都 scale-up → 0→1→2 overshoot，第二顆 pod 的 StatefulSet churn 打死剛落地的 job | scale-up 前若 `key in self._provisioning`（上一次 scale-up 的 pods 尚未 Ready）就改成 `keep`，把多節點 scale-up 序列化（一次一顆、等 Ready 再評估） |
+| **resource-aware scale-up** | Priority、hold 等原因造成的 pending job 不會因新增 worker 解決；超過單節點上限的工作也會永遠 pending | 只對 Slurm `Reason=Resources` 且每節點 CPU／記憶體需求不超過 pool 規格的 pending job 擴容 |
+| **in-flight provisioning gate** | worker 尚未 Ready 時，pending job 使 operator 連續 scale-up，造成 overshoot 與 StatefulSet churn | 一次等待一個 scale-up 完成後再評估下一個副本 |
+| **provisioning timeout** | K8s 無法排出 worker 時，副本數會長期停在 Pending，且 operator 持續等待 | 超過 `provisioningTimeoutSeconds` 後將新 Slurm node 設為 `FUTURE`、回復原副本數，並依 `provisioningRetrySeconds` 暫停重試；timeout 次數暴露為 metric |
+| **action-based cooldown** | 只記 scale-up 時間會讓縮容後冷卻計時不完整 | scale-up 與 scale-down 成功時都更新持久化時間戳 |
 | **stable per-node Slurm address** | StatefulSet pod 重建後 Pod IP 改變，slurmctld 對舊位址持有連線狀態，數分鐘後標 `NOT_RESPONDING` | `NodeAddr` 指向專屬 ClusterIP Service；Service 的穩定位址轉送至目前 pod endpoint，不依賴 slurmctld 重解 Pod DNS |
 
 > 控制流程圖中 `scale_up` 分支實際會先過 in-flight gate；`scale_down` 仍依 cooldown
@@ -1018,7 +1023,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | 名稱 | Kind | 來源 | 說明 |
 |------|------|------|------|
 | `slurm-controller` | StatefulSet | chart | slurmctld + slurmrestd（同 pod） |
-| `slurm-worker-cpu` | StatefulSet | chart | CPU pool（1–4 replicas） |
+| `slurm-worker-cpu` | StatefulSet | chart | CPU pool（2×1 profile 固定 1 replica；其他 overlay 依容量設定） |
 | `slurm-worker-gpu-rtx4070` | StatefulSet | chart | RTX 4070 pool（釘 acane，replicas=1，DRA `ResourceClaim` + MPS） |
 | `slurm-worker-gpu-rtx3080` | StatefulSet | chart + values-2x1 | RTX 3080 pool（釘 node-2，replicas=1，DRA `ResourceClaim` + MPS） |
 | `slurm-worker-gpu-rtx4070-mps` / `-rtx3080-mps` | ResourceClaimTemplate（`resource.k8s.io/v1`） | chart `gpu/dra-resourceclaim.yaml` | 每個 `useDra: true` GPU pool 一份；`GpuConfig` sharing=MPS thread%=100 |

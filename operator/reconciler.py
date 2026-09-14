@@ -8,13 +8,13 @@ ScaleActionsMixin's actuators (_do_scale_up / _do_scale_down / _do_keep).
 Mixin pattern: reads ``self.client``, ``self.cfg``, ``self.policy``,
 ``self.collector``, ``self.rest``, ``self._provisioning``,
 ``self._checkpoint_missing_since``, ``self._job_pending_trace``,
-``self._job_running_trace``, ``self.last_scale_up_at``, ``self.logger``.
+``self._job_running_trace``, ``self.last_scale_action_at``, ``self.logger``.
 Split out of operator/app.py in v5 review C2.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import otel as _otel
 
@@ -24,12 +24,24 @@ from metrics import (
     _GHOST_JOBS_PRESENT,
     _PODS_READY,
     _PROVISIONING_LATENCY,
+    _PROVISIONING_TIMEOUT_TOTAL,
 )
 from models import PartitionConfig
+from scale_actions import (
+    _LAST_SCALE_ACTION_ANNOTATION,
+    _PROVISIONING_ANNOTATION,
+    _PROVISIONING_RETRY_ANNOTATION,
+)
 
 
 class ReconcilerMixin:
     """Per-pool reconcile entry point."""
+
+    def _set_annotation(self, key: str, name: str, value: str) -> None:
+        try:
+            self.client.set_annotation("statefulset", key, name, value)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _process_pool(self, partition_cfg: PartitionConfig, all_states: dict) -> None:
         key = partition_cfg.worker_statefulset
@@ -41,7 +53,7 @@ class ReconcilerMixin:
             ready = self.client.get_ready_replicas(key)
             _PODS_READY.labels(pool=key).set(ready)
             if key in self._provisioning:
-                prov_start, prov_target, prov_ctx = self._provisioning[key]
+                prov_start, prov_from, prov_target, prov_ctx = self._provisioning[key]
                 if ready >= prov_target:
                     latency = time.time() - prov_start
                     if _otel.enabled():
@@ -62,24 +74,52 @@ class ReconcilerMixin:
                         )
                     else:
                         _PROVISIONING_LATENCY.labels(pool=key).observe(latency)
-                    del self._provisioning[key]
-                    # Post-wake hardening: the freshly-recreated worker pods
-                    # came up with NEW pod IPs. slurmctld holds stale per-node
-                    # connection state and marks them NOT_RESPONDING, so the
-                    # first job dispatched onto a just-woken node NODE_FAILs.
-                    # Re-resume each provisioned node (it may still carry the
-                    # DRAIN from the prior scale-down) and reconfigure to force
-                    # slurmctld to re-resolve/re-ping. Best-effort; see
-                    # docs/note.md #16.4 / #17. Without this the cold-start
-                    # wake races and the pool flaps drain*/down*/NODE_FAIL.
+                    self._provisioning.pop(key, None)
+                    self._provisioning_retry_at.pop(key, None)
+                    self._set_annotation(key, _PROVISIONING_ANNOTATION, "")
+                    self._set_annotation(key, _PROVISIONING_RETRY_ANNOTATION, "")
+                    # NodeAddr is a stable per-worker ClusterIP. Resume only
+                    # new ordinals; a global reconfigure can reset other nodes.
                     try:
-                        for i in range(prov_target):
+                        for i in range(prov_from, prov_target):
                             self.client.resume_slurm_node(
                                 f"{partition_cfg.worker_statefulset}-{i}"
                             )
-                        self.client.reconfigure_slurm()
                     except Exception:  # noqa: BLE001
                         pass
+                elif (
+                    self.cfg.provisioning_timeout_seconds > 0
+                    and time.time() - prov_start >= self.cfg.provisioning_timeout_seconds
+                ):
+                    for i in range(prov_from, prov_target):
+                        try:
+                            self.client.future_slurm_node(
+                                f"{partition_cfg.worker_statefulset}-{i}",
+                                reason="provisioning-timeout",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    self.actuator.patch_replicas(key, prov_from)
+                    now = time.time()
+                    retry_at = now + self.cfg.provisioning_retry_seconds
+                    self.last_scale_action_at[key] = now
+                    self._provisioning_retry_at[key] = retry_at
+                    self._provisioning.pop(key, None)
+                    self._set_annotation(key, _PROVISIONING_ANNOTATION, "")
+                    self._set_annotation(key, _LAST_SCALE_ACTION_ANNOTATION, str(now))
+                    self._set_annotation(key, _PROVISIONING_RETRY_ANNOTATION, str(retry_at))
+                    _PROVISIONING_TIMEOUT_TOTAL.labels(pool=key).inc()
+                    self.logger.emit(
+                        "provisioning_timeout",
+                        level="WARN",
+                        statefulset=key,
+                        from_replicas=prov_from,
+                        target_replicas=prov_target,
+                        ready_replicas=ready,
+                        timeout_seconds=self.cfg.provisioning_timeout_seconds,
+                        retry_after_seconds=self.cfg.provisioning_retry_seconds,
+                        remediation="check pod scheduling events and node capacity",
+                    )
 
             # E7 hardening — ghost-job detector. If slurmrestd reports
             # running jobs but the StatefulSet has scaled to zero AND no
@@ -128,7 +168,7 @@ class ReconcilerMixin:
             decision = self.policy.evaluate(partition_cfg, state, checkpoint_age, _missing_since)
 
             now = time.time()
-            cooldown_elapsed = now - self.last_scale_up_at[key]
+            cooldown_elapsed = now - self.last_scale_action_at[key]
             cooldown_remaining = max(partition_cfg.scale_down_cooldown - int(cooldown_elapsed), 0)
 
             # OTel: track job lifecycle spans (queue_wait → job_running).
@@ -236,7 +276,19 @@ class ReconcilerMixin:
             # just landed and NODE_FAILs it. Serializing scale-ups (one node,
             # wait for Ready, then re-evaluate) removes the cold-start race.
             # See docs/note.md #17.
-            if decision.action == "scale_up" and key in self._provisioning:
+            retry_at = self._provisioning_retry_at.get(key, 0.0)
+            if decision.action == "scale_up" and retry_at > now:
+                self._do_keep(
+                    partition_cfg, state,
+                    replace(
+                        decision,
+                        target_replicas=state.current_replicas,
+                        action="keep",
+                        reason="provisioning_retry_backoff",
+                    ),
+                    key, checkpoint_age,
+                )
+            elif decision.action == "scale_up" and key in self._provisioning:
                 self.logger.emit(
                     "scale_deferred",
                     policy=self.cfg.policy_name,
@@ -245,8 +297,22 @@ class ReconcilerMixin:
                     reason="provisioning_in_flight",
                     pending_jobs=state.pending_jobs,
                 )
-                self._do_keep(partition_cfg, state, decision, key, checkpoint_age)
+                self._do_keep(
+                    partition_cfg,
+                    state,
+                    replace(
+                        decision,
+                        target_replicas=state.current_replicas,
+                        action="keep",
+                        reason="provisioning_in_flight",
+                    ),
+                    key,
+                    checkpoint_age,
+                )
             elif decision.action == "scale_up":
+                if retry_at:
+                    self._provisioning_retry_at.pop(key, None)
+                    self._set_annotation(key, _PROVISIONING_RETRY_ANNOTATION, "")
                 self._do_scale_up(partition_cfg, state, decision, key, now)
             elif decision.action == "scale_down":
                 self._do_scale_down(partition_cfg, state, decision, key, cooldown_elapsed, cooldown_remaining)

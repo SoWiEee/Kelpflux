@@ -9,12 +9,13 @@ on the policy's decision. Side effects:
   - keep:       just log + emit "skipped" metric with reason
 
 Mixin pattern: reads ``self.client``, ``self.actuator``, ``self.cfg``,
-``self.last_scale_up_at``, ``self._provisioning``, ``self._draining_*``,
+``self.last_scale_action_at``, ``self._provisioning``, ``self._draining_*``,
 ``self.logger`` from OperatorApp. Split out of operator/app.py in v5
 review C2.
 """
 from __future__ import annotations
 
+import json
 import time
 
 from metrics import (
@@ -30,6 +31,9 @@ from models import PartitionConfig
 import otel as _otel
 
 _COOLDOWN_ANNOTATION = "slurm.k8s/last-scale-up-at"
+_LAST_SCALE_ACTION_ANNOTATION = "slurm.k8s/last-scale-action-at"
+_PROVISIONING_ANNOTATION = "slurm.k8s/provisioning"
+_PROVISIONING_RETRY_ANNOTATION = "slurm.k8s/provisioning-retry-at"
 
 
 class ScaleActionsMixin:
@@ -48,8 +52,6 @@ class ScaleActionsMixin:
                 self.client.resume_slurm_node(node_name)
             except Exception:  # noqa: BLE001
                 pass
-        self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
-        self.last_scale_up_at[key] = now
         # Emit scale_up_decision span and store context for the subsequent
         # k8s_provisioning span (which is emitted when pods become ready).
         _prov_ctx = None
@@ -67,11 +69,35 @@ class ScaleActionsMixin:
             ) as _span:
                 from opentelemetry import context as _octx
                 _prov_ctx = _octx.get_current()
-        self._provisioning[key] = (now, decision.target_replicas, _prov_ctx)
+        self.client.set_annotation(
+            "statefulset", partition_cfg.worker_statefulset,
+            _PROVISIONING_ANNOTATION,
+            json.dumps({
+                "started_at": now,
+                "from_replicas": state.current_replicas,
+                "target_replicas": decision.target_replicas,
+            }, separators=(",", ":")),
+        )
+        self._provisioning[key] = (
+            now, state.current_replicas, decision.target_replicas, _prov_ctx
+        )
+        self.actuator.patch_replicas(
+            partition_cfg.worker_statefulset, decision.target_replicas
+        )
+        self._provisioning_retry_at.pop(key, None)
+        self.last_scale_action_at[key] = now
         try:
             self.client.set_annotation(
                 "statefulset", partition_cfg.worker_statefulset,
                 _COOLDOWN_ANNOTATION, str(now),
+            )
+            self.client.set_annotation(
+                "statefulset", partition_cfg.worker_statefulset,
+                _LAST_SCALE_ACTION_ANNOTATION, str(now),
+            )
+            self.client.set_annotation(
+                "statefulset", partition_cfg.worker_statefulset,
+                _PROVISIONING_RETRY_ANNOTATION, "",
             )
         except Exception:  # noqa: BLE001
             pass  # best-effort; in-memory value is still correct for this cycle
@@ -202,6 +228,14 @@ class ScaleActionsMixin:
                     pass
             self._draining_nodes.pop(key, None)
             self._draining_started.pop(key, None)
+            self.last_scale_action_at[key] = now_ts
+            try:
+                self.client.set_annotation(
+                    "statefulset", partition_cfg.worker_statefulset,
+                    _LAST_SCALE_ACTION_ANNOTATION, str(now_ts),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             _SCALE_DOWN_TOTAL.labels(pool=key).inc()
             self.logger.emit(
                 "scale_action",

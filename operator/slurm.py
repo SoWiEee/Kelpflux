@@ -160,4 +160,5 @@ class SlurmRestClient:
             "NodeList": job.get("nodes", "(null)") or "(null)",
             "Features": features,
             "TresPerNode": tres,
+            "Reason": str(job.get("state_reason") or job.get("reason") or ""),
         }

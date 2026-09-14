@@ -35,8 +35,8 @@ physical CPU / GPU / MPS slots
 
 - Slurm 仍是最終資源分配與 job lifecycle owner。
 - `job_submit.lua` 在提交時調整 priority / metadata / placement contract，不阻塞 Slurm 的基本行為。
-- Submit-time `/decide` 可回傳 placement intent；2×1 Helm target 的 production reorder daemon 只調整 Priority，hard placement controller 目前停用。
-- 若 held-job controller 的 Slurm 23.11 REST round-trip 通過驗證，則可透過 hold-release 與 `select/cons_tres` 落實 `ReqNodeList`；目前不得視為已驗證的 production path。
+- Submit-time `/decide` 與 production reorder daemon 會調整 Priority；held-job controller 是另一條明確的 placement 致動路徑。
+- Slurm 23.11.4 REST v0.0.39 的 `required_nodes` round-trip 已通過 held-job canary；2×1 Helm overlay 預設啟用 controller，僅處理明確以 `--hold` 提交的工作。
 - 任何 DSAC 失敗都 fallback 到 score / Slurm 原生排程。
 - GPU live migration 不在上線規格內；若要處理 running job，只能走 application-level checkpoint + requeue。
 
@@ -311,7 +311,7 @@ REST v0.0.39 若省略 `environment` 會回 HTTP 500；若把 `required_nodes` �
 
 `values-2x1.yaml` 啟用 `rl-reorder-daemon`；通用 chart 與單 GPU profile 不啟用。它透過 slurmrestd v0.0.39 每 30 秒讀取 queue/node snapshot，對最多 150 個 pending、unheld、明確請求 MPS 的 GPU jobs 反覆呼叫 `/act`，每次讓策略從 oldest-first top-16 選一個 `(job, node, GPU)` 動作，然後只把選出的順序寫成 Slurm Priority。固定 node order 為 RTX 4070、RTX 3080，以符合 checkpoint 的 2×1 拓樸；MPS quota 仍由 Slurm GRES 核發，node placement 與派遣時機仍由 Slurm backfill 決定。
 
-daemon 只管理最多 150 個 job 對應的 3,510,000–5,000,000 保留 priority band；啟動、正常關閉與失敗時會搜尋整個 Slurm queue，對仍在此 band 的 pending jobs 以 `INFINITE` 重算，避免 job 在執行期間改變 partition/GRES 後漏清。回讀若仍是保留 band、0 或 `INFINITE`，清理會回報失敗。policy/topology 不符、queue/node snapshot 改變或超過 25 秒期限時不套用本輪結果。這會有意覆蓋被 daemon 排序的 job 原本 multifactor/QOS 相對優先序；CPU、held、非 MPS、multi-GPU 與其他 partition jobs 不會被排程，但若 job 原先曾由 daemon 寫入保留 band，清理仍會重算其 priority。此為論文 §5.8 所測的**排序路徑**，不代表 DRL hard placement 已部署。停止 daemon 時使用 360 秒 termination grace，涵蓋最多 150 筆序列 REST 更新的 2 秒 timeout 上限。
+daemon 只管理最多 150 個 job 對應的 3,510,000–5,000,000 保留 priority band；啟動、正常關閉與失敗時會搜尋整個 Slurm queue，對仍在此 band 的 pending jobs 以 `INFINITE` 重算，避免 job 在執行期間改變 partition/GRES 後漏清。回讀若仍是保留 band、0 或 `INFINITE`，清理會回報失敗。policy/topology 不符、queue/node snapshot 改變或超過 25 秒期限時不套用本輪結果。這會有意覆蓋被 daemon 排序的 job 原本 multifactor/QOS 相對優先序；CPU、held、非 MPS、multi-GPU 與其他 partition jobs 不會被排序，但若 job 原先曾由 daemon 寫入保留 band，清理仍會重算其 priority。此為論文 §5.8 所測的**一般工作排序路徑**；held-job hard placement 是獨立路徑，只作用於明確 held 的工作。停止 daemon 時使用 360 秒 termination grace，涵蓋最多 150 筆序列 REST 更新的 2 秒 timeout 上限。
 
 > **Live rollout status (2026-09-14):** image `htab2x1-r2` carries the corrected REST placement payload. Confirm the live `/healthz` and per-node MPS smoke before considering a rollout complete.
 
@@ -525,7 +525,7 @@ Predictor response：
 | `POST /shadow` | 切換 shadow mode（只記錄不套用） |
 | `GET /metrics` | Prometheus metrics |
 
-2×1 Helm target 是週期性 **priority reorder**；Slurm 仍負責 placement。Submit-time `/decide` 與 held-job controller 仍保留，但 held-job REST placement 在 v0.0.39 驗證完成前不啟用為預設。
+2×1 Helm target 預設部署週期性 **priority reorder**，一般 unheld 工作仍由 Slurm placement；overlay 也部署 held-job REST controller，對明確 held 的工作寫入 `ReqNodeList` 並解除 hold。通用 chart 預設不部署此 controller。
 
 ```text
 job_submit.lua -> POST /decide
@@ -535,7 +535,7 @@ job_submit.lua -> POST /decide
 
 在 submit-time `/decide` 路徑中，DSAC 不直接執行 `srun --nodelist`，也不在 `job_submit.lua` 內覆蓋 Slurm placement；`node_j` 與 `gpu_k` 會回傳並記錄為 placement intent，實際 placement 仍交給 Slurm `select/cons_tres`。
 
-held-job placement controller（`services/rl_scheduler/placement_controller.py`）只處理 `sbatch --hold` 工作；2×1 production overlay 將它關閉，因為 REST v0.0.39 的 `required_nodes` 寫入尚待 live 驗證。若之後啟用，checkpoint topology 必須與 node/GPU 順序一致；2 node × 1 GPU 的 checkpoint 為 168/33。
+held-job placement controller（`services/rl_scheduler/placement_controller.py`）只處理 `sbatch --hold` 工作；2×1 production overlay 預設啟用，REST v0.0.39 的 `required_nodes` round-trip 已通過 held-job canary。checkpoint topology 必須與 node/GPU 順序一致；2 node × 1 GPU 的 checkpoint 為 168/33。
 
 ### 7.1 Snapshot Schema
 
@@ -604,7 +604,7 @@ Service response：
 | invalid / masked action | 不 boost |
 | network / parse / Lua error | Lua hook no-op，submission 繼續 |
 
-The 2×1 Helm target uses the DSAC checkpoint for priority reordering. The held-job controller can be enabled separately, but its `shadow` flag is independent of Lua `shadowMode`; do not enable real REST updates until a live v0.0.39 canary confirms `ReqNodeList` and hold-release round-trip. The current live cluster has not yet received the target image, as recorded in §3.4.
+The 2×1 Helm target uses the DSAC checkpoint for priority reordering and enables the held-job controller; the generic chart leaves it disabled. Its `shadow` flag is independent of Lua `shadowMode`. Before deploying a changed controller image, verify the Slurm v0.0.39 `ReqNodeList` and hold-release round-trip with the held-job canary described in §3.4.
 
 ## 8. Boundary Policy
 

@@ -24,6 +24,8 @@ class PartitionConfig:
     drain_timeout_seconds: int = 1800
     match_features: tuple[str, ...] = field(default_factory=tuple)
     match_gres: tuple[str, ...] = field(default_factory=tuple)
+    cpus_per_node: int = 0
+    memory_mb_per_node: int = 0
     fallback: bool = False
 
 
@@ -48,6 +50,8 @@ class Config:
     default_scale_up_step: int = int(os.getenv("SCALE_UP_STEP", "1"))
     default_scale_down_step: int = int(os.getenv("SCALE_DOWN_STEP", "1"))
     default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
+    provisioning_timeout_seconds: int = int(os.getenv("PROVISIONING_TIMEOUT_SECONDS", "300"))
+    provisioning_retry_seconds: int = int(os.getenv("PROVISIONING_RETRY_SECONDS", "300"))
     default_checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
     default_max_checkpoint_age_seconds: int = int(os.getenv("MAX_CHECKPOINT_AGE_SECONDS", "600"))
     default_checkpoint_grace_seconds: int = int(os.getenv("CHECKPOINT_GRACE_SECONDS", "0"))
@@ -70,6 +74,7 @@ class PartitionState:
     pending_jobs: int
     running_jobs: int
     busy_nodes: int
+    scale_pending_jobs: int = 0
 
 
 @dataclass(frozen=True)

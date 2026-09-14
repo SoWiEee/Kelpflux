@@ -31,6 +31,7 @@ def _state(**overrides):
         pending_jobs=0,
         running_jobs=0,
         busy_nodes=0,
+        scale_pending_jobs=0,
     )
     values.update(overrides)
     return PartitionState(**values)
@@ -70,3 +71,30 @@ def test_idle_pool_can_scale_down_to_min_replicas():
     assert decision.action == "scale_down"
     assert decision.target_replicas == 0
     assert decision.reason == "no_pending_jobs"
+
+
+def test_only_resource_blocked_pending_jobs_scale_up():
+    policy = CheckpointAwareQueuePolicy(guard_enabled=False)
+    cfg = _cfg()
+
+    decision = policy.evaluate(
+        cfg,
+        _state(current_replicas=0, pending_jobs=1, scale_pending_jobs=1),
+        checkpoint_age_seconds=None,
+    )
+
+    assert decision.action == "scale_up"
+    assert decision.reason == "resource_pending_jobs"
+    assert decision.target_replicas == 1
+
+
+def test_pending_jobs_for_other_reasons_do_not_scale_up_or_down():
+    decision = CheckpointAwareQueuePolicy(guard_enabled=False).evaluate(
+        _cfg(),
+        _state(current_replicas=2, pending_jobs=1, scale_pending_jobs=0),
+        checkpoint_age_seconds=None,
+    )
+
+    assert decision.action == "keep"
+    assert decision.target_replicas == 2
+    assert decision.reason == "pending_jobs_not_blocked_by_resources"

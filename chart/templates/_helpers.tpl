@@ -399,6 +399,8 @@ Schema (matches operator/main.py PoolConfig):
       "scale_down_step" 1
       "scale_down_cooldown" (int (default 60 .scaleCooldownSeconds))
       "drain_timeout_seconds" (int (default 1800 $.Values.operator.drainTimeoutSeconds))
+      "cpus_per_node" (int (default 0 .cpus))
+      "memory_mb_per_node" (int (default 0 .realMemory))
       "match_features" (default (list) .features)
       "match_gres" (default (list) .matchGres)
       "fallback" (default false .fallback) -}}

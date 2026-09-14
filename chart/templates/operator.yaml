@@ -108,6 +108,10 @@ spec:
               value: {{ .Values.operator.reconcilePeriodSeconds | quote }}
             - name: SCALE_DOWN_COOLDOWN_SECONDS
               value: {{ .Values.operator.scaleDownCooldownSeconds | quote }}
+            - name: PROVISIONING_TIMEOUT_SECONDS
+              value: {{ .Values.operator.provisioningTimeoutSeconds | quote }}
+            - name: PROVISIONING_RETRY_SECONDS
+              value: {{ .Values.operator.provisioningRetrySeconds | quote }}
             # R1: cluster-wide default. Per-pool override via PARTITIONS_JSON.
             - name: DRAIN_TIMEOUT_SECONDS
               value: {{ .Values.operator.drainTimeoutSeconds | quote }}
