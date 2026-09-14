@@ -128,7 +128,11 @@ def test_apply_hard_placement_posts_required_nodes_and_release(monkeypatch):
             "POST",
             "http://rest/slurm/v0.0.39/job/99",
             b"k",
-            {"required_nodes": "gpu-0", "priority": pc.RELEASE_PRIORITY},
+            {
+                "environment": [],
+                "required_nodes": ["gpu-0"],
+                "priority": {"set": True, "infinite": True},
+            },
         )
     ]
 
@@ -145,7 +149,26 @@ def test_apply_hard_placement_shadow_omits_priority_when_no_release(monkeypatch)
         job_id="5", node_name="gpu-0", release=False,
     )
 
-    assert calls == [{"required_nodes": "gpu-0"}]
+    assert calls == [{"environment": [], "required_nodes": ["gpu-0"]}]
+
+
+def test_apply_hard_placement_encodes_finite_release_priority(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        pc, "http_json",
+        lambda method, url, *, jwt_key=None, body=None, timeout=10.0: calls.append(body) or {},
+    )
+
+    pc.apply_hard_placement(
+        rest_base="http://rest/slurm/v0.0.39", jwt_key=None,
+        job_id="5", node_name="gpu-0", release=True, release_priority=42,
+    )
+
+    assert calls == [{
+        "environment": [],
+        "required_nodes": ["gpu-0"],
+        "priority": {"set": True, "number": 42},
+    }]
 
 
 def _stub_http(monkeypatch, *, jobs, nodes, act):
@@ -190,7 +213,11 @@ def test_choose_and_apply_actuates_when_not_shadow(monkeypatch):
     assert decision.reason == "applied"
     assert updates == [(
         "http://rest/slurm/v0.0.39/job/7",
-        {"required_nodes": "gpu-0", "priority": pc.RELEASE_PRIORITY},
+        {
+            "environment": [],
+            "required_nodes": ["gpu-0"],
+            "priority": {"set": True, "infinite": True},
+        },
     )]
 
 

@@ -1,0 +1,20 @@
+suite: stable Slurm worker addresses
+templates:
+  - services.yaml
+tests:
+  - it: gives each Slurm node a stable ClusterIP service for slurmd
+    documentSelector:
+      path: metadata.name
+      value: slurm-worker-gpu-rtx4070-0-addr
+    asserts:
+      - equal:
+          path: spec.selector.app
+          value: slurm-worker-gpu-rtx4070
+      - equal:
+          path: spec.selector["statefulset.kubernetes.io/pod-name"]
+          value: slurm-worker-gpu-rtx4070-0
+      - equal:
+          path: spec.ports[0].port
+          value: 6818
+      - notExists:
+          path: spec.clusterIP

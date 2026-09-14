@@ -42,7 +42,7 @@
 
 - **Node 1 — `acane`**：k3s control-plane，**RTX 4070（12 GB，Ada Lovelace，compute 8.9）**，16 logical CPU、~62.6 GiB RAM。primary / 快節點。
 - **Node 2 — `nutnadmin-e500-g9-ws760t`**：GPU worker（k3s agent），**RTX 3080（10 GB，Ampere，compute 8.6）**，20 logical CPU、~7.4 GiB RAM。慢節點（sim 中以 ~0.25× 4070 速度建模）。近期由 Ubuntu 22.04 升級到 24.04（升級記錄見 `docs/intergration.md §12`）。
-- **GPU 異質性**：4070（快）vs 3080（慢）。RL scheduler 的 obs 已內含 per-card 型別 one-hot（`GPU_TYPES = ("rtx4070", "rtx3080")`）；2×1 拓樸下 `obs_dim=166`、`n_actions=33`。
+- **GPU 異質性**：RTX 4070 + RTX 3080。RL scheduler 的 obs 含 per-card 型別 one-hot（`GPU_TYPES = ("rtx4070", "rtx3080")`）；2×1 拓樸下 `obs_dim=168`、`n_actions=33`。
 
 各層職責：
 
@@ -71,7 +71,7 @@
 | NVIDIA driver | 580.167.08 | 580.173.02 |
 | CUDA runtime / image | 13.0 host label / 12.6.3 worker image | 13.0 host label / 12.6.3 worker image |
 | Container runtime | containerd 2.2.7-k3s1 | containerd 2.2.7-k3s1 |
-| InternalIP | 192.168.0.111 | 192.168.0.103 |
+| InternalIP | 192.168.0.111 | 192.168.0.104 |
 | sim 相對速度 | 1.0×（基準） | ~0.25× |
 
 > 兩台的 GPU 存取皆已改走 DRA：`gpu-kubelet-plugin` 各自 advertise 一份 `ResourceSlice`（`gpu.nvidia.com`），
@@ -182,8 +182,8 @@ graph TD
 | 0. 系統 / GPU driver | `bash scripts/setup-linux-gpu.sh` | 安裝 nvidia-driver + container-toolkit + 設 k3s default runtime |
 | 1. NFS server | `sudo bash scripts/setup-nfs-server.sh` | host 上 export `/srv/nfs/k8s` |
 | 2. Secrets | `bash scripts/deploy-1.sh` | munge / ssh / jwt / mysql Secret |
-| 3. 平台 + GPU Operator + DRA driver + DSAC | `bash scripts/deploy-2.sh` | 一次收斂 Helm chart、GPU Operator（device-plugin 停用）、NVIDIA DRA driver 與 live DSAC scheduler；`SKIP_DRA=1` 可退回 device-plugin 路徑 |
-| 4. Slurm 平台 | `helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm` | 一鍵部署 controller / workers / login / operator / exporter / monitoring / storage |
+| 3. 平台 + GPU Operator + DRA + DRL reorder | `bash scripts/deploy-2.sh` | 預設疊加 `values-k3s.yaml` + `values-2x1.yaml`，並匯入 RL image 至兩個 GPU 節點；`SKIP_DRA=1` 可退回 device-plugin 路徑 |
+| 4. Slurm 平台 | `helm upgrade --install slurm-platform ./chart -f chart/values-k3s.yaml -f chart/values-2x1.yaml -n slurm` | 部署 4070 + 3080 的 2×1 profile；新環境通常使用 `deploy-2.sh` |
 | 5. Accounting（暫時保留） | `kubectl apply -f manifests/core/slurm-accounting.yaml` | slurmdbd + mysql + 對應 Secret，尚未併入 chart |
 | 6. Lmod | `bash scripts/verify-live.sh` | Lmod 已由 chart 整合，live 驗證會檢查 module load/purge |
 
@@ -325,9 +325,10 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 |---------|------|------|---------|------|
 | `slurm-controller` | Headless (`clusterIP: None`, `publishNotReadyAddresses: true`) | 6817 | slurm-controller | NodeName / SlurmctldHost 解析；publish-not-ready 讓 worker 在 controller 還沒過 readiness 之前就能 DNS 解析 |
 | `slurm-restapi` | ClusterIP | 6820 | slurm-controller | slurmrestd HTTP 入口（operator + exporter 用） |
-| `slurm-worker-cpu` | Headless | 6818 | worker pods | per-pod DNS（StatefulSet ordinal） |
-| `slurm-worker-gpu-rtx4070` | Headless | 6818 | worker pods（acane） | 同上 |
-| `slurm-worker-gpu-rtx3080` | Headless | 6818 | worker pods（node-2） | 同上 |
+| `slurm-worker-cpu` | Headless | 6818 | worker pods | StatefulSet identity / pod DNS |
+| `slurm-worker-gpu-rtx4070` | Headless | 6818 | worker pods（acane） | StatefulSet identity / pod DNS |
+| `slurm-worker-gpu-rtx3080` | Headless | 6818 | worker pods（node-2） | StatefulSet identity / pod DNS |
+| `<statefulset>-<ordinal>-addr` | ClusterIP | 6818 | one worker pod | stable `NodeAddr`; the Service IP stays fixed while its pod endpoint changes |
 | `slurm-login` | ClusterIP | 22 | slurm-login | login SSH（內部用） |
 | `slurm-exporter` | ClusterIP | 9341 | slurm-exporter | Prometheus scrape target |
 | `slurm-elastic-operator` | ClusterIP | 8000 | operator | operator `/metrics`（Prometheus scrape） |
@@ -460,7 +461,7 @@ operator 端另補兩個 scale-up hardening（`operator/reconciler.py` / `operat
 | 機制 | 問題 | 修法 |
 |------|------|------|
 | **in-flight provisioning gate** | 冷啟動空窗 job 還 pending 時，operator 每個 loop 都 scale-up → 0→1→2 overshoot，第二顆 pod 的 StatefulSet churn 打死剛落地的 job | scale-up 前若 `key in self._provisioning`（上一次 scale-up 的 pods 尚未 Ready）就改成 `keep`，把多節點 scale-up 序列化（一次一顆、等 Ready 再評估） |
-| **reconfigure-on-provisioning-complete** | 新 pod 換了 IP，slurmctld 持有 stale per-node 連線狀態並標 `NOT_RESPONDING`，第一個派上去的 job `NODE_FAIL` | pods 變 Ready（provisioning 完成）時，對該批節點 `resume` 並 `scontrol reconfigure` 強制 slurmctld 重新解析/重 ping（reconfigure RPC 常 `Socket timed out` 但有生效，吞掉錯誤） |
+| **stable per-node Slurm address** | StatefulSet pod 重建後 Pod IP 改變，slurmctld 對舊位址持有連線狀態，數分鐘後標 `NOT_RESPONDING` | `NodeAddr` 指向專屬 ClusterIP Service；Service 的穩定位址轉送至目前 pod endpoint，不依賴 slurmctld 重解 Pod DNS |
 
 > 控制流程圖中 `scale_up` 分支實際會先過 in-flight gate；`scale_down` 仍依 cooldown
 > drain，但因 `minReplicas=1`，GPU pool 不會再縮到 0。
@@ -1002,7 +1003,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
   --out-dir runs/dsac_2x2_$(date +%Y%m%d)
 ```
 
-訓練完成後，將 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指到新的 checkpoint，重新 build/import `slurm-rl-scheduler:htab2x1`，再套用 Helm。live snapshot collector 或手動 `/snapshot` payload 也必須送：
+訓練完成後，將 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指到新的 checkpoint，重新 build/import `slurm-rl-scheduler:htab2x1-r1`，再套用 Helm。live snapshot collector 或手動 `/snapshot` payload 也必須送：
 
 ```json
 {"n_nodes":2,"gpus_per_node":2,"mps_per_gpu":100}

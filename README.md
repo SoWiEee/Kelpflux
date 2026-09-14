@@ -78,7 +78,7 @@ demand rises and falls.
 
 本研究就落在這個空隙，並刻意不做「宣稱 DRL 必勝」的研究，而是回答兩個更誠實的問題：
 
-1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）作為 placement 建議者，透過 Slurm `job_submit.lua` 以**非阻塞、失效即回退**的方式整合進生產路徑——任何服務異常都自動退回既有啟發式，slurmctld 永不被阻塞。此學習式策略與 DRA 並非競爭，而是**互補**：它可在 DRA 的分片機制之上驅動裝置選擇與准入排序。
+1. **能不能用學習式、風險敏感的策略補上那層缺失的智慧？** 我們以分散式深度強化學習（RDSAC：discrete SAC + IQN，並以 CVaR 風險量度直接優化回報分布的尾端）從 oldest-first 前 16 個 pending jobs 中選擇 `(job, node, GPU)`。目前 production daemon 將選出的 job 順序寫入 Slurm Priority；選出的 node/GPU 僅用於本輪 MPS 可行性估算，Slurm 仍決定實際 placement。透過 held-job REST controller 實現硬性 placement 是可行候選路徑，但 Slurm 23.11 的 `required_nodes` 尚未完成 round-trip 驗證，因此 2×1 Helm profile 暫不啟用。此學習式策略與 DRA 並非競爭，而是**互補**：DRA 提供 GPU/MPS 存取機制，DRL 決定排序，硬性 placement 則待 REST 致動驗證後再接入。
 2. **這套智慧要以什麼形式、在什麼條件下才真的有用？** 早期只讓 RL **綁定節點**（placement-only、工作*順序*仍由 Slurm 決定）的實機路徑下，學習式策略僅與 Slurm 打平、且以顯著尾端代價換得——但這是**致動路徑**的限制，而非策略無法貢獻。當改讓 RL 掌握**派遣順序**、並以一條可落地的**非阻塞、失效安全的原生致動路徑（Option B：常駐程序週期性重排當前佇列、寫入 Slurm `Priority`，交由 Slurm 原生 backfill 致動）**整合後，在真實 CUDA、poisson 到達的三點負載掃描（oversub=2／4／6）下，學習式策略在**平均 JCT 與尾端 P99 皆穩健顯著勝過生產 Slurm Backfill**（平均約 −11%～−13%，深載尾端 P99 更達 −19%～−22%；配對 Wilcoxon *p*≤0.006、P99 於 10/10 seed 勝過 Backfill）。此實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並精確界定效益條件：**RL 須掌握*排序*槓桿、致動路徑須原生且連續、負載須足以形成可重排的 backlog**。支撐此結論的是一套**模擬到實機（sim-to-real）評估方法學**——抗跑序漂移的交錯輪轉、多 seed 配對顯著性（Wilcoxon）與信賴區間、兼顧平均與尾端（p95／p99／CVaR）。
 
 ## Getting Started
@@ -102,11 +102,11 @@ bash scripts/verify-live.sh
 
 `deploy-1.sh` prepares the host resources and application images. `deploy-2.sh` installs or upgrades the platform Helm release, NVIDIA GPU components, and scheduler services. `verify-live.sh` checks the resulting cluster, including GPU scheduling and monitoring.
 
-The deployment uses `chart/values-k3s.yaml`. Review its storage address and access settings before applying it to a different environment. For detailed prerequisites, optional NFS setup, manual recovery, or full teardown, use the [user guide](docs/tutorial.md) and [cluster notes](docs/cluster.md).
+`deploy-2.sh` layers `chart/values-2x1.yaml` over `chart/values-k3s.yaml` for the RTX 4070 + RTX 3080 cluster. Review the k3s storage settings before applying it elsewhere; set `TOPOLOGY_VALUES_FILE` to another overlay to target a different topology.
 
 ### Scheduler behavior
 
-`deploy-2.sh` enables the RL scheduler. In the chart, `rlScheduler.placementController.enabled` defaults to `true` and `shadow` defaults to `false` when the RL scheduler is enabled. Ordinary jobs enter Slurm's queue; the submit hook may adjust their priority, while Slurm chooses their resources. The placement controller only processes held jobs submitted with `sbatch --hold`. See [scheduler.md](docs/scheduler.md) before changing these settings.
+The 2x1 profile enables DRL priority reordering for unheld, explicit-MPS GPU jobs; Slurm still chooses the node and dispatch time. Hard placement through the held-job REST controller stays disabled in this profile until its Slurm 23.11 API round trip is validated. See [scheduler.md](docs/scheduler.md) for the boundary.
 
 ### Check the deployment
 

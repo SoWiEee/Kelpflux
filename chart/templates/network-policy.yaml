@@ -88,6 +88,7 @@ spec:
                   - slurm-exporter
                   - rl-snapshot-agent
                   - rl-placement-controller   # writes required_nodes via slurmrestd :6820
+                  - rl-reorder-daemon         # reads/writes pending jobs via slurmrestd :6820
       ports:
         - protocol: TCP
           port: 6817   # slurmctld

@@ -11,8 +11,11 @@ MON_NAMESPACE="${MON_NAMESPACE:-monitoring}"
 GPU_OPERATOR_NAMESPACE="${GPU_OPERATOR_NAMESPACE:-gpu-operator}"
 KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 VALUES_FILE="${VALUES_FILE:-chart/values-k3s.yaml}"
+TOPOLOGY_VALUES_FILE="${TOPOLOGY_VALUES_FILE:-chart/values-2x1.yaml}"
 HELM_RELEASE="${HELM_RELEASE:-slurm-platform}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
+EXPECTED_OBS_DIM="${EXPECTED_OBS_DIM:-168}"
+EXPECTED_ACTIONS="${EXPECTED_ACTIONS:-33}"
 PF_WAIT="${PF_WAIT:-3}"
 SKIP_HELM_RENDER="${SKIP_HELM_RENDER:-0}"
 SKIP_STORAGE="${SKIP_STORAGE:-0}"
@@ -112,6 +115,7 @@ check_preflight() {
   require_cmd kubectl
   require_cmd helm
   require_cmd curl
+  require_cmd timeout
   [[ -r "$KUBECONFIG" ]] || fatal "KUBECONFIG is not readable: $KUBECONFIG"
   record_cmd "k3s node reachable" kubectl get nodes -o wide
   if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -q $'\tTrue'; then
@@ -124,18 +128,30 @@ check_preflight() {
 check_helm_render() {
   [[ "$SKIP_HELM_RENDER" == "1" ]] && { warn "SKIP_HELM_RENDER=1; skipping chart render checks"; return; }
   log "helm render"
-  record_cmd "helm lint values-k3s" helm lint "$ROOT_DIR/chart" -f "$ROOT_DIR/$VALUES_FILE"
-  record_cmd "helm template values-k3s" helm template "$HELM_RELEASE" "$ROOT_DIR/chart" -f "$ROOT_DIR/$VALUES_FILE" -n "$NAMESPACE"
+  local -a values_args=( -f "$ROOT_DIR/$VALUES_FILE" )
+  if [[ -n "$TOPOLOGY_VALUES_FILE" ]]; then
+    values_args+=( -f "$ROOT_DIR/$TOPOLOGY_VALUES_FILE" )
+  fi
+  record_cmd "helm lint target values" helm lint "$ROOT_DIR/chart" "${values_args[@]}"
+  record_cmd "helm template target values" helm template "$HELM_RELEASE" "$ROOT_DIR/chart" \
+    "${values_args[@]}" -n "$NAMESPACE" --set rlScheduler.lua.enabled=true
+  if [[ -n "$TOPOLOGY_VALUES_FILE" ]]; then
+    record_cmd "2x1 reorder daemon template" helm template "$HELM_RELEASE" "$ROOT_DIR/chart" \
+      "${values_args[@]}" -n "$NAMESPACE" \
+      --show-only templates/rl-scheduler/reorder-daemon.yaml
+  fi
 }
 
 check_rollouts() {
   log "core rollouts"
   wait_rollout statefulset slurm-controller
-  wait_rollout statefulset slurm-worker-cpu
+  record_cmd "CPU worker pod is Ready" \
+    kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-cpu-0 --timeout="$ROLLOUT_TIMEOUT"
   wait_rollout deployment slurm-login
   wait_rollout deployment slurm-elastic-operator
   wait_rollout deployment slurm-exporter
   wait_rollout deployment rl-scheduler
+  wait_rollout deployment rl-reorder-daemon
 
   log "monitoring rollouts"
   wait_rollout deployment prometheus "$MON_NAMESPACE"
@@ -202,13 +218,60 @@ check_gpu() {
 
   login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null || true" >/dev/null 2>&1 || true
 
-  local gpu_jobid
-  if gpu_jobid=$(login_exec "sbatch --parsable --job-name='gpu-live-smoke' -p ${GPU_PARTITION} --constraint=${GPU_CONSTRAINT} --gres=${GPU_GRES} --wrap='nvidia-smi --query-gpu=name --format=csv,noheader >/shared/gpu-live-smoke-${RANDOM}.out'" 2>/tmp/verify-live-gpu-sbatch.err | tr -d '\r' | tail -n1); then
+  local gpu_node="${GPU_POOL_STS}-0"
+  if login_exec "sinfo --future -N --noheader -o '%N|%G|%T' | awk -F'|' -v node='${gpu_node}' '\$1 == node && \$2 ~ /gpu/ && tolower(\$3) ~ /^(idle|allocated|mixed|completing)$/ {found=1} END {exit !found}'"; then
+    pass "Slurm reports active GPU GRES on ${gpu_node}"
+  else
+    fail "Slurm GPU node ${gpu_node} is not schedulable"
+    return 0
+  fi
+
+  local gpu_jobid gpu_output deadline gpu_job_succeeded=0
+  if gpu_jobid=$(login_exec "sbatch --parsable --job-name='gpu-live-smoke' --output=/shared/gpu-live-smoke-%j.out -p ${GPU_PARTITION} --constraint=${GPU_CONSTRAINT} --gres=${GPU_GRES} --wrap='nvidia-smi --query-gpu=name --format=csv,noheader'" 2>/tmp/verify-live-gpu-sbatch.err | tr -d '\r' | tail -n1); then
     pass "submitted GPU smoke job ${gpu_jobid}"
   else
     fail "failed to submit GPU smoke job"
     sed 's/^/    /' /tmp/verify-live-gpu-sbatch.err >&2 || true
   fi
+
+  if [[ -n "${gpu_jobid:-}" ]]; then
+    gpu_output="/shared/gpu-live-smoke-${gpu_jobid}.out"
+    deadline=$(( $(date +%s) + GPU_WAKE_TIMEOUT ))
+    while (( $(date +%s) < deadline )); do
+      if login_exec "grep -Eq 'NVIDIA|Tesla|RTX' '$gpu_output'" >/dev/null 2>&1; then
+        pass "Slurm ran GPU smoke job ${gpu_jobid} and reported the GPU model"
+        gpu_job_succeeded=1
+        break
+      fi
+      sleep 3
+    done
+    if (( gpu_job_succeeded == 0 )); then
+      fail "GPU smoke job ${gpu_jobid} did not run successfully within ${GPU_WAKE_TIMEOUT}s"
+      login_exec "scancel ${gpu_jobid}" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local gpu_nodes gpu_node gpu_name login
+  login=$(login_pod)
+  gpu_nodes=$(login_exec "sinfo --future -N --noheader -o '%N|%G' | awk -F'|' '\$2 ~ /gpu/ {print \$1}' | sort -u")
+  for gpu_node in $gpu_nodes; do
+    if login_exec "sinfo --future -N --noheader -o '%N|%G|%T' | awk -F'|' -v node='${gpu_node}' '\$1 == node && \$2 ~ /gpu/ && tolower(\$3) ~ /^(idle|allocated|mixed|completing)$/ {found=1} END {exit !found}'"; then
+      pass "Slurm keeps ${gpu_node} schedulable"
+    else
+      fail "Slurm GPU node ${gpu_node} is not schedulable"
+      continue
+    fi
+
+    if gpu_name=$(timeout 150 kubectl -n "$NAMESPACE" exec "pod/$login" -- bash -lc \
+        "srun -p gpu --nodelist='${gpu_node}' --gres=mps:25 --time=1 nvidia-smi --query-gpu=name --format=csv,noheader" 2>/tmp/verify-live-${gpu_node}.err); then
+      grep -Eq 'NVIDIA|Tesla|RTX' <<<"$gpu_name" \
+        && pass "MPS smoke job on ${gpu_node}: ${gpu_name}" \
+        || fail "MPS smoke job on ${gpu_node} returned no GPU model"
+    else
+      fail "MPS smoke job on ${gpu_node} failed"
+      sed 's/^/    /' "/tmp/verify-live-${gpu_node}.err" >&2 || true
+    fi
+  done
 
   local gpu_pod
   if gpu_pod=$(wait_for_gpu_pod); then
@@ -218,11 +281,6 @@ check_gpu() {
     fail "GPU worker pod not found for app=${GPU_POOL_STS} after ${GPU_WAKE_TIMEOUT}s"
   fi
 
-  if login_exec "sinfo --Node --Format=Gres --noheader | grep -q gpu" >/tmp/verify-live-sinfo-gpu.txt 2>&1; then
-    pass "Slurm sinfo shows GPU GRES"
-  else
-    fail "Slurm sinfo does not show GPU GRES"
-  fi
 }
 
 check_monitoring() {
@@ -249,8 +307,31 @@ check_monitoring() {
 check_dsac_smoke() {
   [[ "$SKIP_DSAC_SMOKE" == "1" ]] && { warn "SKIP_DSAC_SMOKE=1; skipping DSAC smoke"; return; }
   log "DSAC live smoke"
-  record_cmd "rl-scheduler healthz from controller" \
-    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS http://rl-scheduler:8002/healthz
+  local health_json
+  if health_json=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- \
+      curl -fsS http://rl-scheduler:8002/healthz); then
+    pass "rl-scheduler healthz responds"
+    if grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' <<< "$health_json" \
+        && grep -Eq "\"obs_dim\"[[:space:]]*:[[:space:]]*$EXPECTED_OBS_DIM([^0-9]|$)" <<< "$health_json" \
+        && grep -Eq "\"n_actions\"[[:space:]]*:[[:space:]]*$EXPECTED_ACTIONS([^0-9]|$)" <<< "$health_json"; then
+      pass "rl-scheduler checkpoint dimensions are ${EXPECTED_OBS_DIM}/${EXPECTED_ACTIONS}"
+    else
+      fail "rl-scheduler model readiness/dimensions mismatch: $health_json"
+    fi
+  else
+    fail "rl-scheduler healthz did not respond"
+  fi
+
+  local reorder_logs
+  if reorder_logs=$(kubectl -n "$NAMESPACE" logs deploy/rl-reorder-daemon --since=30s --tail=50 2>&1); then
+    if grep -Eiq 'cycle skipped|could not (roll back|reset|restore)' <<< "$reorder_logs"; then
+      fail "reorder daemon reports a recent cycle or cleanup error"
+    else
+      pass "reorder daemon has no recent cycle or cleanup errors"
+    fi
+  else
+    fail "could not read reorder daemon logs"
+  fi
 
   record_cmd "rl-snapshot-agent recent logs" \
     kubectl -n "$NAMESPACE" logs deploy/rl-snapshot-agent --tail=20

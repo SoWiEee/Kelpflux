@@ -1,6 +1,6 @@
 # Cluster Operations
 
-The maintained deployment path targets the Linux + k3s + NVIDIA GPU environment documented in [cluster.md](../cluster.md). The Helm chart is under `chart/`; `chart/values-k3s.yaml` is the deployment overlay used by the repository scripts.
+The maintained deployment path targets the Linux + k3s + NVIDIA GPU environment documented in [cluster.md](../cluster.md). `deploy-2.sh` layers `chart/values-2x1.yaml` over `chart/values-k3s.yaml` by default.
 
 For a fresh host, follow [tutorial.md](../tutorial.md) and run the deployment scripts in order:
 
@@ -11,6 +11,6 @@ bash scripts/deploy-2.sh
 bash scripts/verify-live.sh
 ```
 
-`deploy-2.sh` enables the RL scheduler. With `rlScheduler.enabled=true`, the Helm default enables `rlScheduler.placementController`; its `shadow` default is `false`, so it applies placements rather than only logging. It acts only on held pending jobs (submitted with `sbatch --hold`). Keep operational claims aligned with `chart/values.yaml` and the selected overlay.
+The 2x1 overlay enables `rlScheduler.reorderDaemon` for unheld, explicit-MPS jobs and disables held-job REST placement until Slurm 23.11 `required_nodes` is verified end to end. The daemon changes priority only; Slurm selects the node and dispatch time.
 
 Before changing chart behavior, inspect rendered output with `helm template` and update the relevant Helm tests. Live deploy, teardown, and host/GPU toggle commands require explicit user authorization.

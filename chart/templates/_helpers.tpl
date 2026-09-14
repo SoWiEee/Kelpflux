@@ -302,7 +302,7 @@ mounting is wired up later.
 {{- end }}
 {{- range $i, $_ := until (int $pool.maxNodes) }}
 {{- $nodeName := printf "%s-%d" $pool.statefulset $i }}
-{{- $nodeAddr := printf "%s.%s.%s.svc.cluster.local" $nodeName $pool.statefulset $ns }}
+{{- $nodeAddr := printf "%s-addr.%s.svc.cluster.local" $nodeName $ns }}
 {{/* Every predeclared ordinal starts FUTURE and is resumed by its worker. This
      keeps scale-to-zero ordinals from triggering DNS validation in slurmctld. */}}
 NodeName={{ $nodeName }} NodeAddr={{ $nodeAddr }} NodeHostname={{ $nodeName }} CPUs={{ $pool.cpus }} RealMemory={{ $pool.realMemory }} Sockets={{ $pool.sockets }} CoresPerSocket={{ $pool.coresPerSocket }} ThreadsPerCore={{ $pool.threadsPerCore }} State=FUTURE{{ $featureStr }}{{ $gresStr }}

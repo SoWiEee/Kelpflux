@@ -2,7 +2,7 @@ suite: rl placement controller (hard placement via slurmrestd)
 templates:
   - rl-scheduler/placement-controller.yaml
 tests:
-  - it: omitted when rlScheduler.enabled=false (default)
+  - it: omitted when hard placement is disabled (default)
     asserts:
       - hasDocuments:
           count: 0
@@ -10,7 +10,6 @@ tests:
   - it: omitted when rlScheduler enabled but placementController disabled
     set:
       rlScheduler.enabled: true
-      rlScheduler.placementController.enabled: false
     asserts:
       - hasDocuments:
           count: 0
@@ -18,6 +17,7 @@ tests:
   - it: enabling renders Deployment + egress NetworkPolicy
     set:
       rlScheduler.enabled: true
+      rlScheduler.placementController.enabled: true
     asserts:
       - hasDocuments:
           count: 2
@@ -31,6 +31,7 @@ tests:
   - it: default command actuates (--no-shadow) and runs the controller module
     set:
       rlScheduler.enabled: true
+      rlScheduler.placementController.enabled: true
     documentSelector:
       path: kind
       value: Deployment
@@ -48,6 +49,7 @@ tests:
   - it: shadow=true renders --shadow instead
     set:
       rlScheduler.enabled: true
+      rlScheduler.placementController.enabled: true
       rlScheduler.placementController.shadow: true
     documentSelector:
       path: kind
@@ -63,6 +65,7 @@ tests:
   - it: networkPolicy egress targets slurmrestd and rl-scheduler
     set:
       rlScheduler.enabled: true
+      rlScheduler.placementController.enabled: true
     documentSelector:
       path: kind
       value: NetworkPolicy

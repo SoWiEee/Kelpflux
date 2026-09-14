@@ -1,0 +1,12 @@
+suite: Slurm controller REST ingress policy
+templates:
+  - network-policy.yaml
+tests:
+  - it: allows the reorder daemon to reach slurmrestd
+    documentSelector:
+      path: metadata.name
+      value: allow-controller-ingress
+    asserts:
+      - contains:
+          path: spec.ingress[0].from[0].podSelector.matchExpressions[0].values
+          content: rl-reorder-daemon

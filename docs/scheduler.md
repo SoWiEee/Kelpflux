@@ -1,14 +1,14 @@
 # Scheduler Production Spec
 
-本文件描述目前 Kelpflux 上線中的排程與 placement 規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、DSAC live scheduler、Kubernetes / NVIDIA GPU stack、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
+本文件描述 Kelpflux 的排程實作與 Helm 目標設定，並在 §3.4 明確記錄目前 live rollout 狀態。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、DSAC scheduler、Kubernetes / NVIDIA GPU stack、fallback policy 與可觀測性；Helm profile 中的功能不代表已部署到 live cluster。
 
 Kelpflux 的主要貢獻不是取代 Slurm，而是在 Slurm 前後加入一層可訓練、可觀測、可回退的 ML placement control plane：
 
 - 將使用者的 CPU / GPU / VRAM / MPS 需求正規化成 Slurm 能執行的 placement contract。
 - 以 submit-time score 作為穩定 fallback，避免 RL service 不可用時影響提交。
-- 以 DSAC 在 live traffic 上介入 pending job 的排序，並在 hard placement path 中把模型輸出的 `node_j` / `gpu_k` 轉成 Slurm 原生 placement constraint。
+- 以 DSAC 對 oldest-first 前 16 個 pending jobs 輸出 `(job,node,GPU)` action；2×1 Helm profile 用常駐 daemon 將 job 順序寫入 Slurm Priority，實際 node/GPU 仍由 Slurm 選擇。
 - 以 Slurm GRES、`select/cons_tres`、Kubernetes worker pool、NVIDIA runtime 與 MPS control daemon 共同完成硬體資源配置。
-- 以 Prometheus / Grafana / OpenTelemetry 暴露決策、queue、GPU、MPS、placement intent 與 hard placement action，讓非開發者也能看懂系統如何把 job 放到資源上。
+- 以 Prometheus / Grafana / OpenTelemetry 暴露決策、queue、GPU、MPS 與 placement intent；hard placement action 只在 REST 致動驗證後才納入 live path。
 
 ## 1. 上線架構
 
@@ -35,8 +35,8 @@ physical CPU / GPU / MPS slots
 
 - Slurm 仍是最終資源分配與 job lifecycle owner。
 - `job_submit.lua` 在提交時調整 priority / metadata / placement contract，不阻塞 Slurm 的基本行為。
-- DSAC live scheduler 以 priority boost 介入排序；hard placement controller 會把 `node_j` / `gpu_k` action 轉成 Slurm `ReqNodeList` + release。
-- Submit-time path 不在 `job_submit.lua` 內覆蓋 node allocation；正式 hard placement path 透過 Slurm 原生 hold-release 與 `select/cons_tres` 執行。
+- Submit-time `/decide` 可回傳 placement intent；2×1 Helm target 的 production reorder daemon 只調整 Priority，hard placement controller 目前停用。
+- 若 held-job controller 的 Slurm 23.11 REST round-trip 通過驗證，則可透過 hold-release 與 `select/cons_tres` 落實 `ReqNodeList`；目前不得視為已驗證的 production path。
 - 任何 DSAC 失敗都 fallback 到 score / Slurm 原生排程。
 - GPU live migration 不在上線規格內；若要處理 running job，只能走 application-level checkpoint + requeue。
 
@@ -159,7 +159,7 @@ DSAC action space 已經是 placement-aware：模型輸出的 flat action 會被
 | `priority_boost` | 加到 `job_desc.priority`，讓 Slurm 更早考慮該 job | 不使用；controller 透過 hold-release 控制何時進入 Slurm placement |
 | `abstain` / no-op | guardrail 觸發時不 boost，回到 score + Slurm | 不更新 job，保持 held/pending，等待下一輪或人工處理 |
 
-Submit-time path 仍是低風險預設；hard placement controller 是正式可用的 Slurm-safe placement path，適合需要 DSAC 實際指定 worker / GPU / MPS contract 的實驗與受控上線。它不在 `job_submit.lua` 裡阻塞，而是只處理 held pending jobs，先讓使用者提交 `sbatch --hold ... --gres=mps:N`，再由 controller 寫入 Slurm 原生約束並 release。
+Submit-time priority path 保持為通用 fallback。Slurm 23.11.4 的 REST v0.0.39 已實機驗證支援 held-job placement：update request 需帶 `environment: []`、`required_nodes: ["<node>"]`，以及 `{ "set": true, "infinite": true }` priority 結構；Slurm 會將節點寫入 `ReqNodeList` 並解除 hold。`values-2x1.yaml` 預設啟用此 controller；它只處理 held pending GPU jobs，使用者需先提交 `sbatch --hold ... --gres=mps:N`。若 DSAC abstain 或服務失敗，job 仍保留 held 狀態，不會以錯誤節點執行。
 
 #### 演算法：SAC 與 RDSAC 的公式與運作
 
@@ -167,7 +167,7 @@ Submit-time path 仍是低風險預設；hard placement controller 是正式可�
 
 **共用設定（兩者相同）**
 
-placement 是離散動作，故 actor 是**顯式 masked categorical** `π(a|s;φ)`（非法動作 logits 設 −1e9）。狀態 `s` 為 160 維 obs，動作 `a` 從 `valid(s)` 中取。最大熵目標：最大化
+placement 是離散動作，故 actor 是**顯式 masked categorical** `π(a|s;φ)`（非法動作 logits 設 −1e9）。1×1 狀態 `s` 為 161 維 obs（live 2×1 為 168 維），動作 `a` 從 `valid(s)` 中取。最大熵目標：最大化
 
 ```
 J = Σ_t E[ r_t + α·H(π(·|s_t)) ]，  H = −Σ_a π(a|s)·log π(a|s)
@@ -255,9 +255,9 @@ value = Σ_a π(a|s)·( ρ[Z_R(s,a)] + α·E[Z_H(s,a)] )                       #
 sequenceDiagram
     participant U as User
     participant L as job_submit.lua
-    participant R as DSAC /decide + /act
-    participant P as placement_controller
     participant S as Slurm queue
+    participant D as rl-reorder-daemon
+    participant R as DSAC /act
     participant O as Kelpflux operator
     participant K as K8s worker pool
     participant G as NVIDIA / MPS
@@ -266,30 +266,34 @@ sequenceDiagram
     U->>L: sbatch / srun with CPU/GPU/MPS intent
     L->>L: Fill missing partition, memory, QoS
     L->>L: Compute score fallback
-    L->>R: POST /decide with job + latest snapshot
-    R-->>L: priority_boost + job_i/node_j/gpu_k + safety state
-    L->>S: Submit final priority + placement contract
-    P->>R: POST /act for held placement queue
-    R-->>P: selected job_i/node_j/gpu_k
-    P->>S: scontrol update ReqNodeList + release
+    L->>S: Submit job with Slurm priority
+    D->>S: Read pending jobs + GPU state via REST
+    D->>R: POST /act over oldest-first top-16
+    R-->>D: selected job_i/node_j/gpu_k
+    Note over D,S: Production path writes job Priority only; node/GPU are used for feasibility simulation, not ReqNodeList
+    D->>S: Update ordered job priorities via REST
     S->>S: Multifactor priority + backfill
     S->>O: Pending job reveals required pool
     O->>K: Scale CPU/GPU worker StatefulSet
-    K->>G: RuntimeClass + device plugin + MPS control daemon
+    K->>G: DRA ResourceClaim with MPS sharing
     S->>G: Allocate GRES gpu/mps and start job
     R->>M: decision/value/entropy/placement action
     G->>M: GPU utilization and MPS free slots
 ```
 
+Held-job hard placement is a separate path enabled by the 2×1 overlay; ordinary unheld jobs continue through the priority + Slurm scheduling path.
+
 ### 3.4 Hard Placement Controller
 
-`services/rl_scheduler/placement_controller.py` 是 Slurm-safe hard placement 執行路徑，且**現在預設常駐啟用**（`rlScheduler.placementController.enabled=true`，由 `deploy-2.sh` 一併部署為 `rl-placement-controller` Deployment）。它透過 **slurmrestd（JWT，與 `snapshot_agent` 同一條認證路徑）** 輪詢 held queue 與 GPU worker state，呼叫 DSAC `/act`，把 action 解碼出的 `node_j` 映射到可用 worker，接著對選中的 held job 送一個 job-update：
+`services/rl_scheduler/placement_controller.py` 是 held-job hard placement 路徑。它透過 **slurmrestd（JWT，與 `snapshot_agent` 同一條認證路徑）** 輪詢 held queue 與 GPU worker state，呼叫 DSAC `/act`，把 action 解碼出的 `node_j` 映射到可用 worker，接著對選中的 held job 送一個 job-update：
 
 ```
-POST /slurm/<v>/job/<job_id>   { "required_nodes": "<selected_node>", "priority": <INFINITE> }
+POST /slurm/v0.0.39/job/<job_id>
+{ "environment": [], "required_nodes": ["<selected_node>"],
+  "priority": { "set": true, "infinite": true } }
 ```
 
-`required_nodes` 即 `ReqNodeList`；`priority=INFINITE`（0xFFFFFFFF）等同 `scontrol release`——讓 multifactor plugin 重算優先序、解除 user hold。改走 REST 是為了避免在 service 容器裡塞 `squeue`/`scontrol` CLI、munge socket 或 `kubectl exec` RBAC。`shadow=false`（預設）才真的送 job-update；`shadow=true` 只記 log。
+`required_nodes` 即 `ReqNodeList`；`priority=INFINITE`（0xFFFFFFFF）用於解除 hold。改走 REST 是為了避免在 service 容器裡塞 `squeue`/`scontrol` CLI、munge socket 或 `kubectl exec` RBAC。`shadow=false` 才真的送 job-update；`shadow=true` 只記 log。
 
 執行規則：
 
@@ -299,9 +303,17 @@ POST /slurm/<v>/job/<job_id>   { "required_nodes": "<selected_node>", "priority"
 - 會讀 `/healthz` 的 `n_actions`，若 node list 大於 checkpoint topology 支援的 placement 數，會自動修剪並在 log 中提示需要重新訓練 / 部署更大 topology checkpoint。
 - DSAC no-op 時不更新 job，維持 held/pending。
 
-Live 手動驗證已確認 controller 能把 DSAC action 寫入 Slurm：job `131` 被更新為 `ReqNodeList=slurm-worker-gpu-rtx4070-1`，Slurm 隨後配置 `NodeList=slurm-worker-gpu-rtx4070-1`、`BatchHost=slurm-worker-gpu-rtx4070-1`、`TRES=gres/mps=10`。後續已修正 elastic operator worker lifecycle guard：只要 pool 內 `running_jobs > 0`，policy 會回 `running_jobs_block_scale_down`，scale action 層也會阻止 drain / replica patch，因此 hard placement job 不會再因 `pending_jobs=0` 被 operator scale-down eviction。
+REST v0.0.39 若省略 `environment` 會回 HTTP 500；若把 `required_nodes` 或 `priority` 當純字串/整數傳送，也不符合 OpenAPI 型別。程式已按 schema 傳送並以 held canary 驗證 `ReqNodeList` round-trip；實際節點工作驗證仍由 live integration smoke 覆蓋。
 
-`services/rl_scheduler/live_daemon.py` 保留為研究 / legacy 原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，適合離線比較與 RLPD transition 蒐集。正式 hard placement path 是 `services/rl_scheduler/placement_controller.py`，因為它使用 Slurm 原生 hold-release 與 `ReqNodeList`，可被 Slurm priority、backfill、GRES/MPS accounting 和 operator lifecycle guard 正常約束。
+`services/rl_scheduler/live_daemon.py` 保留為研究 / legacy 原型；它以 `srun --jobid ... --nodelist ...` 嘗試直接執行，不是 production placement path。`placement_controller.py` 使用 Slurm hold-release 與 `ReqNodeList`，並已在 Slurm 23.11.4 v0.0.39 通過 live canary；2×1 overlay 預設部署此 controller。
+
+#### Production priority reorder daemon
+
+`values-2x1.yaml` 啟用 `rl-reorder-daemon`；通用 chart 與單 GPU profile 不啟用。它透過 slurmrestd v0.0.39 每 30 秒讀取 queue/node snapshot，對最多 150 個 pending、unheld、明確請求 MPS 的 GPU jobs 反覆呼叫 `/act`，每次讓策略從 oldest-first top-16 選一個 `(job, node, GPU)` 動作，然後只把選出的順序寫成 Slurm Priority。固定 node order 為 RTX 4070、RTX 3080，以符合 checkpoint 的 2×1 拓樸；MPS quota 仍由 Slurm GRES 核發，node placement 與派遣時機仍由 Slurm backfill 決定。
+
+daemon 只管理最多 150 個 job 對應的 3,510,000–5,000,000 保留 priority band；啟動、正常關閉與失敗時會搜尋整個 Slurm queue，對仍在此 band 的 pending jobs 以 `INFINITE` 重算，避免 job 在執行期間改變 partition/GRES 後漏清。回讀若仍是保留 band、0 或 `INFINITE`，清理會回報失敗。policy/topology 不符、queue/node snapshot 改變或超過 25 秒期限時不套用本輪結果。這會有意覆蓋被 daemon 排序的 job 原本 multifactor/QOS 相對優先序；CPU、held、非 MPS、multi-GPU 與其他 partition jobs 不會被排程，但若 job 原先曾由 daemon 寫入保留 band，清理仍會重算其 priority。此為論文 §5.8 所測的**排序路徑**，不代表 DRL hard placement 已部署。停止 daemon 時使用 360 秒 termination grace，涵蓋最多 150 筆序列 REST 更新的 2 秒 timeout 上限。
+
+> **Live rollout status (2026-09-14):** image `htab2x1-r2` carries the corrected REST placement payload. Confirm the live `/healthz` and per-node MPS smoke before considering a rollout complete.
 
 ### 3.5 訓練管線：sim 訓練 → RLPD 微調至真實環境
 
@@ -513,7 +525,7 @@ Predictor response：
 | `POST /shadow` | 切換 shadow mode（只記錄不套用） |
 | `GET /metrics` | Prometheus metrics |
 
-目前 live 介入方式分成兩層：submit-time **priority boost** 是預設低風險路徑；hold-release **hard placement controller** 是正式可用的受控 placement 路徑。
+2×1 Helm target 是週期性 **priority reorder**；Slurm 仍負責 placement。Submit-time `/decide` 與 held-job controller 仍保留，但 held-job REST placement 在 v0.0.39 驗證完成前不啟用為預設。
 
 ```text
 job_submit.lua -> POST /decide
@@ -523,7 +535,7 @@ job_submit.lua -> POST /decide
 
 在 submit-time `/decide` 路徑中，DSAC 不直接執行 `srun --nodelist`，也不在 `job_submit.lua` 內覆蓋 Slurm placement；`node_j` 與 `gpu_k` 會回傳並記錄為 placement intent，實際 placement 仍交給 Slurm `select/cons_tres`。
 
-DSAC 的 placement action 要真正生效，靠的是 **`rl-placement-controller`**（`services/rl_scheduler/placement_controller.py`，§3.4），它**現在預設常駐啟用**：對 held pending jobs 呼叫 `/act`，把 `node_j` 映射到 GPU worker，透過 slurmrestd job-update 寫 `required_nodes` 並以 `priority=INFINITE` release。注意 checkpoint topology 必須與 live node/GPU topology 一致——不一致時 `/act` 會 abstain，controller 隨即 no-op，Slurm 照常 `select/cons_tres` 放置（fail-safe）。目前研究產出的 checkpoint 為 2×1 拓樸的 168-dim（`runs/ckpts_aimix16_fair/`）；上線時 image 烘入的 checkpoint 維度與 live node/GPU 拓樸須一致（2 node × 1 GPU → n_placements=2），否則 `/act` abstain、controller 不動 job。換拓樸即需重訓（見 §3.5、`docs/intergration.md §7`）。
+held-job placement controller（`services/rl_scheduler/placement_controller.py`）只處理 `sbatch --hold` 工作；2×1 production overlay 將它關閉，因為 REST v0.0.39 的 `required_nodes` 寫入尚待 live 驗證。若之後啟用，checkpoint topology 必須與 node/GPU 順序一致；2 node × 1 GPU 的 checkpoint 為 168/33。
 
 ### 7.1 Snapshot Schema
 
@@ -592,7 +604,7 @@ Service response：
 | invalid / masked action | 不 boost |
 | network / parse / Lua error | Lua hook no-op，submission 繼續 |
 
-目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。hard placement controller（預設常駐）另以 `/act` 執行 held job placement，**不受 Lua `shadowMode` 控制**；它自己用 `rlScheduler.placementController.shadow`（→ `--shadow / --no-shadow`，預設 `false`）決定是否真的送 slurmrestd job-update。兩條路徑互補：`/decide` 影響 priority 排序，controller 決定 held job 落在哪個 node。
+The 2×1 Helm target uses the DSAC checkpoint for priority reordering. The held-job controller can be enabled separately, but its `shadow` flag is independent of Lua `shadowMode`; do not enable real REST updates until a live v0.0.39 canary confirms `ReqNodeList` and hold-release round-trip. The current live cluster has not yet received the target image, as recorded in §3.4.
 
 ## 8. Boundary Policy
 

@@ -11,7 +11,12 @@
 #   SKIP_IMPORT=1         Skip k3s ctr image import.
 #   SKIP_PLATFORM=1       Skip slurm-platform Helm deployment.
 #   SKIP_GPU_OPERATOR=1   Skip NVIDIA GPU Operator deployment.
+#   SKIP_DRA=1            Skip NVIDIA DRA driver deployment.
 #   SKIP_WAIT=1           Skip rollout/status waits after deployment.
+#   RL_IMAGE=...          Scheduler image tag; also used by the Helm release.
+#   VALUES_FILE=...       Base k3s values (defaults to chart/values-k3s.yaml).
+#   TOPOLOGY_VALUES_FILE=...  GPU topology overlay (defaults to 2x1).
+#   REMOTE_IMPORT_HOST=... SSH target for the second GPU node image store.
 #   NAMESPACE=slurm       Target namespace for platform resources.
 #   KUBECONFIG=...        Defaults to ~/.kube/config.
 
@@ -30,8 +35,11 @@ SKIP_WAIT="${SKIP_WAIT:-0}"
 
 HELM_RELEASE="${HELM_RELEASE:-slurm-platform}"
 VALUES_FILE="${VALUES_FILE:-chart/values-k3s.yaml}"
+TOPOLOGY_VALUES_FILE="${TOPOLOGY_VALUES_FILE:-chart/values-2x1.yaml}"
 HELM_TIMEOUT="${HELM_TIMEOUT:-10m}"
-RL_IMAGE="${RL_IMAGE:-slurm-rl-scheduler:htab2x1}"
+RL_IMAGE="${RL_IMAGE:-slurm-rl-scheduler:htab2x1-r2}"
+REMOTE_IMPORT_HOST="${REMOTE_IMPORT_HOST:-nutn-admin@192.168.0.104}"
+SKIP_REMOTE_IMPORT="${SKIP_REMOTE_IMPORT:-0}"
 
 GPU_OPERATOR_NAMESPACE="${GPU_OPERATOR_NAMESPACE:-gpu-operator}"
 GPU_OPERATOR_RELEASE="${GPU_OPERATOR_RELEASE:-gpu-operator}"
@@ -83,7 +91,7 @@ build_rl_image() {
   fi
 
   log "building DSAC scheduler image: $RL_IMAGE"
-  run docker build -t "$RL_IMAGE" -f "$ROOT_DIR/services/rl_scheduler/Dockerfile" "$ROOT_DIR"
+  run docker build --network=host -t "$RL_IMAGE" -f "$ROOT_DIR/services/rl_scheduler/Dockerfile" "$ROOT_DIR"
 }
 
 import_rl_image() {
@@ -93,7 +101,21 @@ import_rl_image() {
   fi
 
   log "importing $RL_IMAGE into k3s containerd"
-  docker save "$RL_IMAGE" | sudo_cmd k3s ctr images import -
+  docker save "$RL_IMAGE" | sudo_cmd k3s ctr -n k8s.io images import -
+  if [[ "$SKIP_REMOTE_IMPORT" != "1" ]]; then
+    require_cmd ssh
+    require_cmd scp
+    log "importing $RL_IMAGE on $REMOTE_IMPORT_HOST"
+    (
+      archive="$(mktemp "${TMPDIR:-/tmp}/kelpflux-rl-image.XXXXXX")"
+      remote_archive="/tmp/${archive##*/}"
+      trap 'rm -f -- "$archive"' EXIT
+      docker save --output "$archive" "$RL_IMAGE"
+      run scp "$archive" "$REMOTE_IMPORT_HOST:$remote_archive"
+      run ssh -tt "$REMOTE_IMPORT_HOST" \
+        "sudo k3s ctr -n k8s.io images import '$remote_archive'; result=\$?; rm -f '$remote_archive'; exit \$result"
+    )
+  fi
 }
 
 adopt_lmod_configmaps() {
@@ -118,12 +140,29 @@ deploy_platform() {
 
   adopt_lmod_configmaps
 
-  log "converging slurm-platform with live DSAC scheduler enabled"
-  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart"     -f "$ROOT_DIR/$VALUES_FILE"     -n "$NAMESPACE"     --create-namespace     --timeout "$HELM_TIMEOUT"     --wait     --set slurm.jobSubmit.enabled=true     --set gpu.autoLabel=false     --set rlScheduler.enabled=true     --set rlScheduler.lua.enabled=true     --set rlScheduler.shadowMode=false
+  local values_args=( -f "$ROOT_DIR/$VALUES_FILE" )
+  if [[ -n "$TOPOLOGY_VALUES_FILE" ]]; then
+    values_args+=( -f "$ROOT_DIR/$TOPOLOGY_VALUES_FILE" )
+  fi
+  [[ "${RL_IMAGE##*/}" == *:* ]] || fail "RL_IMAGE must include an image tag: $RL_IMAGE"
+  local rl_image_repository="${RL_IMAGE%:*}"
+  local rl_image_tag="${RL_IMAGE##*:}"
+  log "converging slurm-platform from chart defaults and the selected values files"
+  run helm upgrade --install "$HELM_RELEASE" "$ROOT_DIR/chart" \
+    "${values_args[@]}" -n "$NAMESPACE" --create-namespace \
+    --timeout "$HELM_TIMEOUT" --wait --reset-values \
+    --set slurm.jobSubmit.enabled=true --set gpu.autoLabel=false \
+    --set rlScheduler.lua.enabled=true \
+    --set rlScheduler.shadowMode=false \
+    --set-string "rlScheduler.image.repository=$rl_image_repository" \
+    --set-string "rlScheduler.image.tag=$rl_image_tag"
 
   if [[ "$SKIP_BUILD" != "1" || "$SKIP_IMPORT" != "1" ]]; then
-    log "restarting RL deployments to pick up mutable image tag $RL_IMAGE"
-    run kubectl -n "$NAMESPACE" rollout restart deployment/rl-scheduler deployment/rl-snapshot-agent deployment/rl-placement-controller
+    for deployment in rl-scheduler rl-snapshot-agent rl-placement-controller rl-reorder-daemon; do
+      if kubectl -n "$NAMESPACE" get deployment "$deployment" >/dev/null 2>&1; then
+        run kubectl -n "$NAMESPACE" rollout restart "deployment/$deployment"
+      fi
+    done
   fi
 }
 
@@ -181,7 +220,12 @@ wait_for_final_state() {
     log "waiting for slurm-platform workloads"
     run kubectl -n "$NAMESPACE" rollout status deployment/rl-scheduler --timeout=180s
     run kubectl -n "$NAMESPACE" rollout status deployment/rl-snapshot-agent --timeout=180s
-    run kubectl -n "$NAMESPACE" rollout status deployment/rl-placement-controller --timeout=180s
+    if kubectl -n "$NAMESPACE" get deployment rl-placement-controller >/dev/null 2>&1; then
+      run kubectl -n "$NAMESPACE" rollout status deployment/rl-placement-controller --timeout=180s
+    fi
+    if kubectl -n "$NAMESPACE" get deployment rl-reorder-daemon >/dev/null 2>&1; then
+      run kubectl -n "$NAMESPACE" rollout status deployment/rl-reorder-daemon --timeout=180s
+    fi
     run kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout=180s
   fi
 
@@ -192,12 +236,13 @@ wait_for_final_state() {
 }
 
 summary() {
-  log "deployment complete: slurm-platform + GPU Operator + live DSAC scheduler"
+  log "requested deploy-2 steps completed"
   printf '\nUseful checks:\n'
   printf '  kubectl -n %q get pods\n' "$NAMESPACE"
   printf '  kubectl -n %q get pods\n' "$GPU_OPERATOR_NAMESPACE"
   printf '  kubectl -n %q exec slurm-controller-0 -- curl -fsS http://rl-scheduler:8002/healthz\n' "$NAMESPACE"
   printf '  kubectl -n %q logs deploy/rl-snapshot-agent --tail=50\n' "$NAMESPACE"
+  printf '  kubectl -n %q logs deploy/rl-reorder-daemon --tail=50\n' "$NAMESPACE"
 }
 
 main() {

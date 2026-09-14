@@ -112,6 +112,39 @@ def test_build_obs_and_mask_marks_only_feasible_actions(serve):
     assert bool(mask[16]) is True  # no-op is always valid
 
 
+def test_build_obs_and_mask_respects_slurm_node_eligibility(serve):
+    req = serve.ActRequest(
+        now=10.0,
+        pending_jobs=[serve.JobView(
+            job_id="3080-only", mps_req=25, gpu_count=1, runtime=60,
+            submit_ts=1, eligible_node_indices=[1],
+        )],
+        nodes=[
+            serve.NodeView(gpus=[serve.GpuView(free_mps=100, gpu_type="rtx4070")]),
+            serve.NodeView(gpus=[serve.GpuView(free_mps=100, gpu_type="rtx3080")]),
+        ],
+        n_nodes=2,
+        gpus_per_node=1,
+        mps_per_gpu=100,
+    )
+
+    _, mask, _ = serve.build_obs_and_mask(req)
+
+    assert not bool(mask[0])
+    assert bool(mask[1])
+    assert bool(mask[32])  # no-op
+
+
+def test_act_rejects_checkpoint_topology_mismatch(serve, client):
+    serve._holder = _FakeHolder(action=0)
+    payload = _snapshot_payload()
+    payload.update({"n_nodes": 2, "nodes": payload["nodes"] * 2})
+
+    res = client.post("/act", json=payload)
+
+    assert res.status_code == 409
+
+
 def test_snapshot_endpoint_updates_prometheus_metrics(client):
     res = client.post("/snapshot", json=_snapshot_payload(free_mps=75))
     assert res.status_code == 200

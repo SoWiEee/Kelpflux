@@ -10,8 +10,8 @@
 #     -n slurm
 #
 # This is the topology that matches DSAC training with
-# `--n-nodes 2 --gpus-per-node 1` → obs_dim=166, n_actions=33 (NOT the 2×2
-# profile / 178/65). It gives each GPU its OWN Slurm partition + host class so
+# `--n-nodes 2 --gpus-per-node 1` → obs_dim=168, n_actions=33 (NOT the 2×2
+# profile / 182/65). It gives each GPU its OWN Slurm partition + host class so
 # the RL placement decision (which node) is real and type-correct, and so a
 # job's VRAM/type assumptions can't be served by the wrong card.
 #
@@ -206,5 +206,13 @@ slurm:
 
 rlScheduler:
   image:
-    tag: htab2x1
+    tag: htab2x1-r2
   snapshotTtlSeconds: 30
+  placementController:
+    enabled: true   # Slurm 23.11.4 v0.0.39 required_nodes round-trip verified
+  reorderDaemon:
+    enabled: true
+    nodeNames:
+      - slurm-worker-gpu-rtx4070-0
+      - slurm-worker-gpu-rtx3080-0
+    gpuPartitions: [gpu, gpu-rtx4070, gpu-rtx3080]

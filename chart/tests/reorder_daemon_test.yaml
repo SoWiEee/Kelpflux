@@ -1,0 +1,60 @@
+suite: RL priority reorder daemon
+templates:
+  - rl-scheduler/reorder-daemon.yaml
+tests:
+  - it: omitted when topology-specific reordering is disabled (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders one daemon and its scoped egress policy
+    set:
+      rlScheduler.enabled: true
+      rlScheduler.reorderDaemon.enabled: true
+      rlScheduler.reorderDaemon.nodeNames: [slurm-worker-gpu-rtx4070-0, slurm-worker-gpu-rtx3080-0]
+      rlScheduler.reorderDaemon.gpuPartitions: [gpu, gpu-rtx4070, gpu-rtx3080]
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: spec.replicas
+          value: 1
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 360
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: slurm-rl-scheduler:htab2x1
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: services.rl_scheduler.reorder_daemon
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: slurm-worker-gpu-rtx4070-0
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: slurm-worker-gpu-rtx3080-0
+        documentSelector:
+          path: metadata.name
+          value: rl-reorder-daemon

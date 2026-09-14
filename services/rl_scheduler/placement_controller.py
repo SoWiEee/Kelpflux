@@ -25,6 +25,7 @@ slurmrestd version expects a different sentinel.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -66,6 +67,13 @@ class SlurmJob:
     gpu_type: str
     runtime: float
     submit_ts: float
+    priority: int = 0
+    partition: str = ""
+    required_nodes: str = ""
+    ram_req: float = 0.0
+    slo_s: float = 0.0
+    job_class: str = "batch"
+    required_gpu_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,9 +118,28 @@ def parse_jobs(
         tres = ",".join(str(item.get(k, "") or "") for k in ("tres_req_str", "tres_per_node", "gres"))
         mps_req = _parse_tres_int(tres, ("mps",), default=0) or default_mps
         gpu_count = _parse_tres_int(tres, ("gpu",), default=0) or int(_number(item.get("gpus_total"), 1)) or 1
+        partition = str(item.get("partition") or "")
+        gpu_type = _gpu_type_from_text(f"{tres},{partition}")
+        required_gpu_type = next(
+            (name for name in ("rtx4070", "rtx3080")
+             if name in str(item.get("partition") or "").lower()),
+            next((name for name in ("rtx4070", "rtx3080") if name in tres.lower()), ""),
+        )
+        metadata = {}
+        try:
+            parsed_metadata = json.loads(item.get("comment") or "{}")
+            if isinstance(parsed_metadata, dict):
+                metadata = parsed_metadata
+        except (json.JSONDecodeError, TypeError):
+            pass
         runtime = _number(item.get("time_limit"), 0.0) * 60.0
+        runtime = _number(metadata.get("reported"), runtime)
         if runtime <= 0:
             runtime = default_runtime
+        gpu_type = str(metadata.get("gtype") or gpu_type)
+        required_nodes = item.get("required_nodes") or item.get("req_nodes") or ""
+        if isinstance(required_nodes, (list, tuple)):
+            required_nodes = ",".join(str(node) for node in required_nodes)
         jobs.append(
             SlurmJob(
                 job_id=str(item.get("job_id", "")),
@@ -121,9 +148,16 @@ def parse_jobs(
                 reason=str(item.get("state_reason") or item.get("reason") or ""),
                 mps_req=int(mps_req),
                 gpu_count=int(gpu_count),
-                gpu_type=_gpu_type_from_text(tres),
+                gpu_type=gpu_type,
                 runtime=float(runtime),
                 submit_ts=_number(item.get("submit_time"), now),
+                priority=int(_number(item.get("priority"), 0)),
+                partition=partition,
+                required_nodes=str(required_nodes),
+                ram_req=_number(metadata.get("ram"), 0.0),
+                slo_s=_number(metadata.get("slo"), 0.0),
+                job_class=str(metadata.get("cls") or "batch"),
+                required_gpu_type=required_gpu_type,
             )
         )
     return jobs
@@ -169,20 +203,33 @@ def build_act_payload(
     now: float | None = None,
 ) -> dict[str, Any]:
     ts = time.time() if now is None else now
+    pending_jobs = []
+    for job in sorted(jobs, key=lambda item: item.submit_ts)[:TOP_K]:
+        gpu_type = job.required_gpu_type
+        allowed = [
+            index for index, node in enumerate(nodes)
+            if node.available and (not gpu_type or node.gpu_type == gpu_type)
+            and (not job.required_nodes or node.name in job.required_nodes.split(","))
+        ]
+        pending_jobs.append({
+            "job_id": job.job_id,
+            "mps_req": job.mps_req,
+            "gpu_count": job.gpu_count,
+            "gpu_type": job.gpu_type,
+            "runtime": job.runtime,
+            "submit_ts": job.submit_ts,
+            "ram_req": job.ram_req,
+            "slo_s": job.slo_s,
+            "job_class": job.job_class,
+            "eligible_node_indices": allowed,
+            "can_fit": any(
+                i in allowed and nodes[i].free_mps >= job.mps_req
+                for i in range(len(nodes))
+            ),
+        })
     return {
         "now": ts,
-        "pending_jobs": [
-            {
-                "job_id": j.job_id,
-                "mps_req": j.mps_req,
-                "gpu_count": j.gpu_count,
-                "gpu_type": j.gpu_type,
-                "runtime": j.runtime,
-                "submit_ts": j.submit_ts,
-                "can_fit": any(n.free_mps >= j.mps_req for n in nodes),
-            }
-            for j in sorted(jobs, key=lambda item: item.submit_ts)[:TOP_K]
-        ],
+        "pending_jobs": pending_jobs,
         "nodes": [
             {"gpus": [{"free_mps": n.free_mps, "running_jobs": n.running_jobs, "gpu_type": n.gpu_type}]}
             for n in nodes
@@ -236,9 +283,16 @@ def apply_hard_placement(
     timeout: float = 10.0,
 ) -> dict[str, Any]:
     """POST a job update: pin ``required_nodes`` and (optionally) release the hold."""
-    body: dict[str, Any] = {"required_nodes": node_name}
+    # Slurm 23.11's v0.0.39 job_desc_msg requires environment even for updates;
+    # required_nodes is an array, and priority uses the uint32_no_val object.
+    body: dict[str, Any] = {"environment": [], "required_nodes": [node_name]}
     if release:
-        body["priority"] = int(release_priority)
+        priority: dict[str, Any] = {"set": True}
+        if release_priority == RELEASE_PRIORITY:
+            priority["infinite"] = True
+        else:
+            priority["number"] = int(release_priority)
+        body["priority"] = priority
     return http_json("POST", f"{rest_base}/job/{job_id}", jwt_key=jwt_key, body=body, timeout=timeout)
 
 

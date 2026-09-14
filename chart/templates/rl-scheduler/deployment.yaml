@@ -5,8 +5,7 @@ M11 Phase D — RL scheduler serve endpoint (FastAPI /decide + /snapshot).
   Service      → ClusterIP, port 8002
   NetPol       → controller (lua) → rl-scheduler ingress
 
-Disabled by default. Enable via rlScheduler.enabled=true; pair with
-slurm.luaPlugin.rlEnabled to wire the lua side.
+Enabled by default. Set rlScheduler.enabled=false to omit the service.
 */}}
 {{- if .Values.rlScheduler.enabled }}
 {{- $rl := .Values.rlScheduler -}}
@@ -107,7 +106,7 @@ spec:
         # Only the three legitimate callers of :8002:
         #   /decide   ← job_submit.lua inside slurmctld (slurm-controller)
         #   /snapshot ← rl-snapshot-agent
-        #   /act      ← rl-placement-controller
+        #   /act      ← placement and reorder controllers
         # Workers/login run user sbatch payloads and must NOT reach 8002.
         - podSelector:
             matchExpressions:
@@ -117,6 +116,7 @@ spec:
                   - slurm-controller
                   - rl-snapshot-agent
                   - rl-placement-controller
+                  - rl-reorder-daemon
       ports:
         - protocol: TCP
           port: 8002

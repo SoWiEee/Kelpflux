@@ -68,6 +68,7 @@ class JobView(BaseModel):
     ram_req:   float = 0.0       # host-RAM footprint (GB) — OOM lever
     slo_s:     float = 0.0       # latency deadline (s); >0 = inference SLO
     job_class: str   = "batch"   # inference / training / llm / batch
+    eligible_node_indices: Optional[List[int]] = None
 
 
 class GpuView(BaseModel):
@@ -261,6 +262,9 @@ def build_obs_and_mask(
         if not j.can_fit:
             continue
         for nj in range(n_nodes):
+            if (j.eligible_node_indices is not None
+                    and nj not in j.eligible_node_indices):
+                continue
             if nj >= len(req.nodes):
                 continue
             for gk in range(n_gpus):
@@ -561,6 +565,12 @@ def act(req: ActRequest):
         raise HTTPException(status_code=503, detail="model not loaded")
 
     obs, mask, top_ids = build_obs_and_mask(req)
+    if obs.shape[0] != _holder.agent.obs_dim or mask.shape[0] != _holder.agent.n_actions:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"topology mismatch: obs/actions {obs.shape[0]}/{mask.shape[0]} "
+                    f"!= {_holder.agent.obs_dim}/{_holder.agent.n_actions}"),
+        )
     action, value, entropy = _holder.select(obs, mask)
 
     n_placements = req.n_nodes * req.gpus_per_node

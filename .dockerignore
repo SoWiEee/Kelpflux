@@ -1,0 +1,12 @@
+.git
+.venv-m11
+.pytest_cache
+.ruff_cache
+shadow_logs
+__pycache__
+**/__pycache__
+
+runs/*
+!runs/ckpts_aimix16_fair/
+runs/ckpts_aimix16_fair/*
+!runs/ckpts_aimix16_fair/rdsac_cvar_s42.pt

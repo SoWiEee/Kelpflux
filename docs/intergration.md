@@ -1,5 +1,7 @@
 # Integration Guide: Add a Second GPU Node (RTX 3080)
 
+> **歷史操作紀錄。** 本文保留 2026 年中加入第二節點與升級前的過程；其中的 166/33、160/17、178/65 等模型維度及部分部署指令已過期。現行 2×1 叢集與 Helm 設定以 [`docs/cluster.md`](cluster.md) 為準（168/33），DRL 排序及 placement 狀態以 [`docs/scheduler.md`](scheduler.md) 為準。不要將本文的舊 checkpoint 或舊 live 狀態描述當成目前狀態。
+
 本文件記錄在目前單機 Linux + k3s + GPU 環境中，再加入第二台電腦時需要調整的地方。具體情境：
 
 - **第一台（現況）**：Linux + k3s server，1× RTX 4070（12 GB VRAM），NVIDIA MPS enabled。
@@ -245,7 +247,6 @@ helm template slurm-platform ./chart \
   -f chart/values-k3s.yaml \
   -f chart/values-2x1.yaml \
   --set slurm.jobSubmit.enabled=true \
-  --set rlScheduler.enabled=true \
   >/tmp/kelpflux-2x1-render.yaml
 grep -E 'NodeName=.*gpu|Name=mps|gpu-host-class|PartitionName=gpu' /tmp/kelpflux-2x1-render.yaml
 ```
@@ -260,7 +261,6 @@ helm upgrade --install slurm-platform ./chart \
   -n slurm \
   --set gpu.autoLabel=false \
   --set slurm.jobSubmit.enabled=true \
-  --set rlScheduler.enabled=true \
   --set rlScheduler.lua.enabled=true \
   --set rlScheduler.shadowMode=false
 ```
@@ -301,7 +301,7 @@ ssh <user>@192.168.0.103 'sudo rm -f /tmp/slurm-images.tar'
 |---|---|---|
 | GPU worker `ErrImagePull`（node-2） | 本地映像沒匯入 node-2 | 做 §6.3，然後 `kubectl -n slurm delete pod slurm-worker-gpu-rtx3080-0`（StatefulSet 重建、IfNotPresent 直接用） |
 | Slurm node `INVALID_REG`（`Low socket*core*thread count`） | reconfigure 期間殘留的舊註冊；偵測 CPU 其實 ≥ 設定 | `state=resume` 無效（INVALID_REG 只能靠重新註冊清）→ `kubectl -n slurm delete pod <worker>` 讓 slurmd 重註冊 → 再 `scontrol update nodename=<node> state=resume` 清 DRAIN |
-| Slurm node `DOWN / Not responding` | 跨 node 的 slurmctld→slurmd ping 被 acane ufw `deny routed` 擋（見 §3.1） | 開 routed + pod/svc CIDR 後 `scontrol update nodename=<node> state=resume` →（必要時）`scontrol reconfigure` 清 `*` |
+| Slurm node `DOWN / Not responding`（worker Pod 仍 Ready） | slurmctld 對 StatefulSet pod DNS 快取了舊 Pod IP；pod 重建後位址未更新 | 確認 `NodeAddr` 使用 `<statefulset>-<ordinal>-addr` ClusterIP Service，`kubectl -n slurm get svc <service>`；再 `scontrol update NodeName=<node> State=RESUME`。不要用全域 `scontrol reconfigure` 作常態修復 |
 | srun `can't find address for host <node-2>`（只跨 node job） | slurm 設定檔是 **subPath 掛載 → pod 建立時凍結、不隨 configmap 更新**；比 topology 變更更早建立的 pod 拿到舊設定、缺新 node 的 NodeAddr | 重啟那些舊 pod 讓它重掛當前 configmap：`kubectl -n slurm delete pod <pod>`。controller/worker 部署時通常已重建，**`slurm-login` 常被遺漏** |
 
 > 驗證跨 node 連通（pod 沒有 ping/nc 時用 bash `/dev/tcp`）：

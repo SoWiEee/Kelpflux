@@ -1,0 +1,21 @@
+suite: RL scheduler service
+templates:
+  - rl-scheduler/deployment.yaml
+tests:
+  - it: renders the service by default
+    asserts:
+      - hasDocuments:
+          count: 3
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: slurm-rl-scheduler:htab2x1
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: can be explicitly disabled
+    set:
+      rlScheduler.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

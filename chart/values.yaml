@@ -496,11 +496,12 @@ operator:
     partitions: []
 
 # -- RL scheduler serve (M11 Phase D) ----------------------------------------
-# Optional FastAPI service that holds a trained MaskablePPO policy and
-# answers /decide from the lua submit filter (rl_hook.lua → curl /decide).
-# Shadow mode by default — logs decision but does not mutate priority.
+# FastAPI service that holds the trained policy and serves /decide and /act.
+# The service is enabled by default; fail-safe paths preserve Slurm scheduling
+# when the model or service is unavailable. Topology-specific controllers are
+# enabled separately by the selected values overlay.
 rlScheduler:
-  enabled: false
+  enabled: true
   image:
     repository: slurm-rl-scheduler
     tag: htab2x1
@@ -538,7 +539,7 @@ rlScheduler:
   # and pins the chosen node. Fails safe: when /act abstains (e.g. checkpoint
   # topology ≠ live), it no-ops and Slurm places normally.
   placementController:
-    enabled: true
+    enabled: false          # generic profile; topology-specific 2x1 overlay enables verified REST placement
     shadow: false          # false = actually POST job updates; true = log only
     intervalSeconds: 5
     slurmRestUrl: ""       # defaults to slurm-restapi.<namespace>.svc:6820
@@ -552,6 +553,25 @@ rlScheduler:
     requireHeld: true      # only touch jobs submitted held (sbatch -H)
     autoTrimModelTopology: true  # cap node list to checkpoint n_actions
     releasePriority: "4294967295"  # Slurm INFINITE → recompute priority, lift hold. Quoted: Helm loads large ints as float64 → renders "4.294967295e+09" → argparse type=int rejects it (placement-controller CrashLoop). String keeps it literal.
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 250m, memory: 256Mi }
+    networkPolicy:
+      enabled: true
+  reorderDaemon:
+    enabled: false
+    shadow: false
+    intervalSeconds: 30
+    maxPendingJobs: 150
+    deadlineSeconds: 25
+    mpsPerGpu: 100
+    defaultRuntimeSeconds: 600
+    nodeNames: []
+    gpuPartitions: []
+    jobNamePrefix: ""
+    slurmRestUrl: ""
+    slurmRestApiVersion: v0.0.39
+    rlSchedulerUrl: "http://rl-scheduler:8002"
     resources:
       requests: { cpu: 50m, memory: 128Mi }
       limits:   { cpu: 250m, memory: 256Mi }
@@ -671,7 +691,7 @@ monitoring:
     image: "quay.io/prometheus/node-exporter:v1.8.2"
     nodes:
       acane: 192.168.0.111
-      nutnadmin-e500-g9-ws760t: 192.168.0.103
+      nutnadmin-e500-g9-ws760t: 192.168.0.104
   # Phase 7-A: OpenTelemetry distributed tracing (Tempo + OTel Collector).
   # Set enabled: true to deploy Tempo + otel-collector and wire Grafana datasource.
   otel:

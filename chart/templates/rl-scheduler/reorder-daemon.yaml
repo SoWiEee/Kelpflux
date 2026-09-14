@@ -1,0 +1,118 @@
+{{- if and .Values.rlScheduler.enabled .Values.rlScheduler.reorderDaemon.enabled }}
+{{- $rl := .Values.rlScheduler -}}
+{{- $rd := .Values.rlScheduler.reorderDaemon -}}
+{{- $ns := .Values.cluster.namespace -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-reorder-daemon
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: rl-reorder-daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: rl-reorder-daemon
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: rl-reorder-daemon
+    spec:
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: reorder-daemon
+          image: "{{ $rl.image.repository }}:{{ $rl.image.tag }}"
+          imagePullPolicy: {{ $rl.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - services.rl_scheduler.reorder_daemon
+            - --rest-url
+            - {{ default (printf "http://slurm-restapi.%s.svc.cluster.local:6820" $ns) $rd.slurmRestUrl | quote }}
+            - --api-version
+            - {{ $rd.slurmRestApiVersion | quote }}
+            - --scheduler-url
+            - {{ default "http://rl-scheduler:8002" $rd.rlSchedulerUrl | quote }}
+            - --jwt-key-path
+            - /slurm-jwt/jwt_hs256.key
+            - --mps-per-gpu
+            - {{ $rd.mpsPerGpu | quote }}
+            - --interval
+            - {{ $rd.intervalSeconds | quote }}
+            - --max-jobs
+            - {{ $rd.maxPendingJobs | quote }}
+            - --deadline-seconds
+            - {{ $rd.deadlineSeconds | quote }}
+            {{- range $rd.nodeNames }}
+            - --node-name
+            - {{ . | quote }}
+            {{- end }}
+            {{- range $rd.gpuPartitions }}
+            - --gpu-partition
+            - {{ . | quote }}
+            {{- end }}
+            {{- if $rd.jobNamePrefix }}
+            - --job-name-prefix
+            - {{ $rd.jobNamePrefix | quote }}
+            {{- end }}
+            {{- if $rd.shadow }}
+            - --shadow
+            {{- end }}
+          resources:
+            {{- toYaml $rd.resources | nindent 12 }}
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: {{ .Values.secrets.jwt }}
+            defaultMode: 0400
+{{- if and .Values.networkPolicy.enabled $rd.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rl-reorder-daemon-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-reorder-daemon
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6820
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rl-scheduler
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}

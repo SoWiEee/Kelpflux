@@ -5,10 +5,9 @@ Services for the Slurm cluster.
                        only after the controller and slurmrestd are Ready.
   - slurm-restapi    : ClusterIP for slurmrestd on :6820, used by the operator
                        to query job/node state.
-  - per-pool worker  : headless Service per pool, named after the pool's
-                       statefulset so the StatefulSet's pod DNS records resolve
-                       to <pod>.<svc>.<ns>.svc.cluster.local — this is what
-                       slurm.conf's NodeAddr lines reference.
+  - per-pool worker  : headless Service for StatefulSet identity.
+  - per-node worker  : stable ClusterIP Service per Slurm node. Slurm caches
+                       NodeAddr resolution, so it must not point at Pod IP DNS.
 */}}
 ---
 apiVersion: v1
@@ -62,4 +61,24 @@ spec:
     - name: slurmd
       port: 6818
       targetPort: 6818
+{{- range $i, $_ := until (int $pool.maxNodes) }}
+{{- $nodeName := printf "%s-%d" $pool.statefulset $i }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $nodeName }}-addr
+  namespace: {{ $.Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" $ | nindent 4 }}
+    pool-id: {{ $pool.id }}
+spec:
+  selector:
+    app: {{ $pool.appLabel }}
+    statefulset.kubernetes.io/pod-name: {{ $nodeName }}
+  ports:
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+{{- end }}
 {{- end }}

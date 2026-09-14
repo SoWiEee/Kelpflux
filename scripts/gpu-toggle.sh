@@ -79,12 +79,34 @@ case "$MODE" in
       [ "$(kubectl get pod -n "$NS" "$POD" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)" = "true" ] && { echo "  worker ready"; break; }
       sleep 6
     done
-    kubectl exec -n "$NS" "$CTL" -- bash -lc "scontrol update nodename=$POD state=resume 2>/dev/null; scontrol reconfigure 2>/dev/null" 2>/dev/null || true
+    # Reconfigure reloads State=FUTURE and can reset unrelated workers.
+    # Wait for slurmd registration; Kubernetes readiness only checks processes.
+    node_state=
+    node_ready=0
+    for _ in $(seq 1 30); do
+      node_state=$(kubectl exec -n "$NS" "$CTL" -- \
+        sinfo --future -N -n "$POD" --noheader -o %T 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')
+      case "$node_state" in
+        idle|allocated|mixed|completing)
+          node_ready=1
+          break
+          ;;
+      esac
+      kubectl exec -n "$NS" "$CTL" -- scontrol update nodename="$POD" state=resume >/dev/null 2>&1 || true
+      sleep 2
+    done
+    if [ "$node_ready" -ne 1 ]; then
+      echo "Slurm node $POD did not become schedulable (state=${node_state:-unknown})" >&2
+      exit 1
+    fi
     echo "✅ restored. (MPS keepalive re-warms the server; verify with 4 concurrent --gres=mps:25 jobs before heavy use.)"
     show_status
     ;;
-  status|*)
+  status)
     show_status
-    echo "Usage: $0 {release|restore|status}"
+    ;;
+  *)
+    echo "Usage: $0 {release|restore|status}" >&2
+    exit 2
     ;;
 esac

@@ -151,7 +151,7 @@ class DSACAgent:
     """Risk-sensitive distributional SAC for masked scheduling (Ma et al. discrete).
 
     Usage::
-        agent = DSACAgent(obs_dim=160, n_actions=17, risk_mode="cvar", risk_beta=0.25)
+        agent = DSACAgent(obs_dim=161, n_actions=17, risk_mode="cvar", risk_beta=0.25)
         a = agent.select_action(obs, mask)
         info = agent.update(batch)   # dict incl. td_errors for PER
     """

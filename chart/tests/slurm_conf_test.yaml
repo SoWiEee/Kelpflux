@@ -48,7 +48,7 @@ tests:
           pattern: "NodeName=slurm-worker-cpu-1 .*State=FUTURE"
       - matchRegex:
           path: data["slurm.nodes.conf"]
-          pattern: "NodeName=slurm-worker-gpu-rtx4070-0 .*Gres=gpu:rtx4070:1,mps:100"
+          pattern: "NodeName=slurm-worker-gpu-rtx4070-0 NodeAddr=slurm-worker-gpu-rtx4070-0-addr.slurm.svc.cluster.local .*Gres=gpu:rtx4070:1,mps:100"
 
   - it: skips PartitionName when no nodes assigned
     template: configmap-nodes.yaml

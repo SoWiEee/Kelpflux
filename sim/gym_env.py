@@ -2,10 +2,10 @@
 
 MDP spec (placement-aware):
 - State : top-K=16 pending jobs × 9 feats
-          + 2 nodes × 2 GPUs × 6 feats   (GPU slot state)
+          + 2 nodes × 2 GPUs × 7 feats   (GPU slot state)
           + 4 topology feats
           + 6 global feats
-          = 178 dims
+          = 182 dims
 - Action: Discrete(N_JOBS × N_NODES × N_GPUS + 1)
           = 16 × 2 × 2 + 1 = 65
           action a = job_i * (N_NODES*N_GPUS) + node_j * N_GPUS + gpu_k
@@ -35,7 +35,7 @@ from .loader import Job, MPS_PER_GPU, RAM_REQ_GB
 
 # ── Layout constants ───────────────────────────────────────────────────────
 TOP_K     = 16
-# Cluster is rtx4070 today; rtx3080 is the only planned addition (2nd node).
+# Cluster GPU alphabet for per-job identity features.
 # This 2-entry tuple is the per-job GPU one-hot alphabet → feeds JOB_FEAT_DIM.
 GPU_TYPES = ("rtx4070", "rtx3080")
 
@@ -58,23 +58,11 @@ SPEED_MATRIX = {
 # llm jobs there OOM — the dominant, real asymmetry on this cluster.
 RAM_REF_GB = 4.0   # obs normalizer for per-job ram_req
 
-# ── Cluster size — current deployment vs. target ───────────────────────────
-# LIVE (current): 1 host × 1 GPU (RTX 4070, MPS enabled)
-#   obs_dim  = 16*9 + 1*1*6 + 4 + 6 = 160
-#   n_actions = 16*1*1 + 1 = 17
-#
-# SIM training default (2×2): mirrors target 2-host cluster
-#   obs_dim  = 16*9 + 2*2*6 + 4 + 6 = 178
-#   n_actions = 16*2*2 + 1 = 65
-#
-# HOW TO ADD A SECOND GPU:
-#   1. Set N_NODES=2, N_GPUS=2 below (or pass n_nodes=2, gpus_per_node=2 to env)
-#   2. Retrain DSAC from scratch (obs_dim 160→178, n_actions 17→65 — checkpoint
-#      is NOT compatible; different network input/output shape)
-#   3. Update rlpd_finetune.py CLI defaults to match
-#   4. In Slurm: verify two worker nodes are registered and GRES is correct
-N_NODES = 1   # current: single host  ← change to 2 when second GPU is online
-N_GPUS  = 1   # current: single GPU   ← change to 2 when second GPU is online
+# Checkpoint dimensions depend on topology: 1×1 = 161/17, live 2×1 = 168/33,
+# and 2×2 = 182/65. Keep the module default small; production training passes
+# its topology explicitly. A checkpoint cannot be reused across these shapes.
+N_NODES = 1   # module default; production 2×1 runs pass --n-nodes 2
+N_GPUS  = 1   # one physical GPU per node in the live cluster
 
 # Derived defaults (reflect N_NODES / N_GPUS above)
 N_PLACEMENTS = N_NODES * N_GPUS
