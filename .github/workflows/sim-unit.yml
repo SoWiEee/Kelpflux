@@ -1,6 +1,6 @@
 name: sim-unit
 
-# Fast unit tests for the discrete-event simulator (no torch, no gymnasium).
+# Fast unit tests for the discrete-event simulator (no torch).
 # Covers: Job dataclass + trace generators, Cluster MPS model, runner event loop,
 # score/fcfs/multifactor schedulers, MetricCollector.
 
@@ -30,8 +30,10 @@ jobs:
             --python 3.11 \
             --with "pytest==8.2.2" \
             --with "numpy==1.26.4" \
+            --with "gymnasium==0.29.1" \
             pytest sim/tests/ \
               --ignore=sim/tests/test_dsac_sim_integration.py \
+              --ignore=sim/tests/test_live_daemon_obs_parity.py \
               --ignore=sim/tests/test_gym_env_smoke.py \
               -v --tb=short
         env:

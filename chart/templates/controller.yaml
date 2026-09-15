@@ -106,7 +106,14 @@ spec:
               # on absent scale-to-zero or cordoned worker pods. A worker's
               # startup RESUME command activates the node when it returns.
               while read -r node addr; do
-                if ! getent hosts "$addr" >/dev/null 2>&1 && scontrol show node "$node" >/dev/null 2>&1; then
+                if getent hosts "$addr" >/dev/null 2>&1 && (echo >/dev/tcp/"$addr"/6818) 2>/dev/null; then
+                  # Worker pods use OnDelete, so an existing slurmd may outlive
+                  # a controller restart. Recreate a missing node record only
+                  # when its per-node service is accepting slurmd traffic.
+                  if ! scontrol show node "$node" >/dev/null 2>&1; then
+                    scontrol update NodeName="$node" State=RESUME >/dev/null 2>&1 || true
+                  fi
+                elif ! getent hosts "$addr" >/dev/null 2>&1 && scontrol show node "$node" >/dev/null 2>&1; then
                   scontrol update NodeName="$node" State=DOWN Reason=unresolved-dns >/dev/null 2>&1 || true
                   scontrol update NodeName="$node" State=FUTURE Reason=unresolved-dns >/dev/null 2>&1 || true
                 fi
