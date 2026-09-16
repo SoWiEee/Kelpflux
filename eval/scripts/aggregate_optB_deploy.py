@@ -43,13 +43,22 @@ def load_dir(d):
         out.setdefault(arm, {})[int(o["seed"])] = dict(
             mean=float(jct.mean()), p50=float(np.percentile(jct, 50)),
             p95=float(np.percentile(jct, 95)), p99=float(np.percentile(jct, 99)),
-            n=len(jct))
+            n=len(jct), metrics=o.get("metrics", {}))
     return out
 
 
 def ms(vals):
     a = np.asarray(vals, float)
     return f"{a.mean():.1f} ± {a.std():.1f}"
+
+
+def metric_ms(ad, key):
+    vals = []
+    for item in ad.values():
+        value = item.get("metrics", {}).get(key)
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            vals.append(float(value))
+    return ms(vals) if vals else "—"
 
 
 def delta_ci(arm_d, base):
@@ -97,6 +106,27 @@ def table(d):
             pstr = f"{p:.3f}" if p == p else "n/a"
             print(f"| {LABEL[arm]} | {mean} | {p50} | {p95} | {p99} | "
                   f"{sgn}{m:.1f} [{slo}, {shi}] | {pstr} | {wins}/{n} |")
+    print("\nReviewer metrics (mean ± std across seeds; telemetry must cover both GPU workers)")
+    print("| 排程策略 | GPU 利用率 (%) | VRAM 壓力平均 (%) | VRAM 壓力峰值 (%) | "
+          "Slowdown 平均 | Slowdown P95 | Slowdown 最大 | Jain slowdown | "
+          "等待 P95 (s) | 完成率 | Telemetry 完整 |")
+    print("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+    for arm in ORDER:
+        if arm not in data:
+            continue
+        ad = data[arm]
+        rates = [item.get("metrics", {}).get("completion_rate") for item in ad.values()]
+        rates = [float(v) for v in rates if isinstance(v, (int, float)) and np.isfinite(v)]
+        complete = [bool(item.get("metrics", {}).get("gpu_telemetry_complete"))
+                    for item in ad.values() if "gpu_telemetry_complete" in item.get("metrics", {})]
+        rate = f"{np.mean(rates) * 100:.1f}%" if rates else "—"
+        coverage = f"{sum(complete)}/{len(complete)}" if complete else "—"
+        print(f"| {LABEL[arm]} | {metric_ms(ad, 'gpu_util_mean_pct')} | "
+              f"{metric_ms(ad, 'gpu_memory_pressure_mean_pct')} | "
+              f"{metric_ms(ad, 'gpu_memory_pressure_peak_pct')} | "
+              f"{metric_ms(ad, 'slowdown_mean')} | {metric_ms(ad, 'slowdown_p95')} | "
+              f"{metric_ms(ad, 'slowdown_max')} | {metric_ms(ad, 'jain_slowdown')} | "
+              f"{metric_ms(ad, 'wait_p95')} | {rate} | {coverage} |")
 
 
 def main():

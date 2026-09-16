@@ -10,7 +10,7 @@
 
 ## 摘要
 
-異質 GPU 與 NVIDIA MPS 共享使排程器必須同時考量硬體差異、工作配額與佇列狀態；傳統 Slurm 固定規則難以動態兼顧工作完成時間（JCT）與尾端延遲 [1][2][3][4]。現有深度強化學習（DRL）排程研究多停留於模擬，較少在真實 Slurm 流程中處理 MPS-aware 工作派遣與 GPU placement。
+異質 GPU 與 NVIDIA MPS 共享使排程器必須同時考量硬體差異、工作配額與佇列狀態；傳統 Slurm 靜態優先序難以動態兼顧工作完成時間（JCT）與尾端延遲 [1][2][3][4]。現有深度強化學習（DRL）排程研究多停留於模擬，較少在真實 Slurm 流程中處理 MPS-aware 工作派遣與 GPU placement。
 
 本研究提出以 Slurm-on-Kubernetes 為排程核心的異質 GPU 智慧排程框架；Kubernetes 僅負責部署 [5]。框架以聯合動作介面建模 MPS-aware 工作派遣與 placement。本研究於 RTX 4070 與 RTX 3080 環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、SAC、RDSAC 與 RLPD [6][7][8][9]。在由 DRL 控制順序、並以可落地的 **動態優先權重排（非阻塞週期性重排、失效安全）**下，評估**真實 CUDA、poisson 到達**的結果：深負載（oversub=6）下學習式策略的平均 JCT 顯著勝過 Backfill 約 10~12%、尾端 P99 更大幅同勝約 19~22%；且於淺／中／深三個負載點（oversub=2／4／6）平均 JCT 皆穩健勝過 Backfill（≈−11%～−13%，皆顯著）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示效益取決於 RL 是否掌握*順序*槓桿、施行路徑是否原生連續，以及負載形成可重排的 job queue。
 
@@ -18,7 +18,7 @@
 
 ## Abstract
 
-The rapid growth of large language models and generative AI has made GPUs the primary compute resource for AI workloads [1][2]. However, many laboratory and small-scale clusters consist of heterogeneous GPU generations, and NVIDIA Multi-Process Service (MPS) allows multiple jobs to share a single GPU [3], making it difficult for traditional Slurm scheduling [4] to jointly optimize GPU utilization, job completion time (JCT), and tail latency. Existing heuristic policies such as FCFS and Backfill rely on fixed rules and cannot adapt to workload characteristics, while existing DRL schedulers rarely perform job selection and heterogeneous GPU placement under explicit MPS-quota constraints inside a real Slurm environment.
+The rapid growth of large language models and generative AI has made GPUs the primary compute resource for AI workloads [1][2]. However, many laboratory and small-scale clusters consist of heterogeneous GPU generations, and NVIDIA Multi-Process Service (MPS) allows multiple jobs to share a single GPU [3], making it difficult for traditional Slurm scheduling [4] to jointly optimize GPU utilization, job completion time (JCT), and tail latency. Existing Slurm policies rely on static priorities and cannot adapt to workload characteristics, while existing DRL schedulers rarely perform job selection and heterogeneous GPU placement under explicit MPS-quota constraints inside a real Slurm environment.
 
 This paper proposes an intelligent scheduling framework for heterogeneous GPUs with NVIDIA MPS, using **Slurm as the scheduling core**. Kubernetes (k3s) only provides deployment and lifecycle management [5]. The policy interface models joint queue selection and placement. A placement-only real-machine path calls `/act` before submission and binds the selected node through `sbatch -w`, leaving job *ordering* to Slurm; on an RTX 4070/3080 testbed with trace-derived mixed AI workloads [1][2], learned policies under this path only match or marginally beat FCFS/Backfill in mean JCT and at a large tail cost, without a robust advantage. A held-job controller's post-submission `required_nodes` REST actuation was disabled by the tested Slurm REST API (v0.0.37); we therefore validated a **native ordering path** instead, deployed as a **non-blocking periodic re-prioritization daemon** (fail-safe): every few seconds it re-ranks the live pending queue by the served policy and writes those ranks as administrator `Priority` on unheld jobs (`scontrol update`), letting Slurm's own in-process backfill dispatch at native speed and place freely. Under **real-CUDA aimix and poisson arrival** (10 seeds, 150 jobs), at deep load (oversub=6) every learned policy significantly beats production Backfill by **~10–12% in mean JCT and ~19–22% in tail P99** (paired Wilcoxon *p*≤0.006; P99 below Backfill in 10/10 seeds) — at this load Backfill's own aggressive mean-optimizing reorder starves some jobs into the worst tail of all arms, exactly what RL ordering avoids. Across a three-point load sweep (oversub=2/4/6) the learned policies beat Backfill in mean JCT at **all three loads** (≈−11% to −13%, all significant); the *mechanism* is load-dependent (a mild-SJF ordering benefit at deep/medium load versus avoidance of Backfill's tail-starvation at shallow load, both confirmed on the realized dispatch order). This is a real-machine confirmation of the simulator ceiling analysis's prediction that ordering benefit grows with load, and shows it hinges on the RL agent controlling *ordering* and a native, continuously-updated priority path. A same-batch control further shows the periodic-update daemon beats a one-shot static-priority variant of the same policy (see Appendix A). Multiple-comparison correction, TOST, a ceiling analysis, and a placement ablation characterize the efficacy boundary and remaining uncertainty [6][7][8][9].
 
@@ -40,11 +40,11 @@ NVIDIA MPS 提供另一個重要槓桿：多個 CUDA 工作可共享同一張 GP
 
 ### 1.2 現有方法限制
 
-Slurm 提供 FCFS、Backfill、multifactor priority 與 GRES/TRES GPU 資源管理 [4]，但其傳統策略多以固定規則為主，難以感知異質 GPU、MPS 分片、工作類型與長期回報之間的相互影響。現有方法主要存在四項限制：
+Slurm 提供 FCFS、Backfill、multifactor priority 與 GRES/TRES GPU 資源管理 [4]，但其傳統策略主要依賴靜態優先序，難以感知異質 GPU、MPS 分片、工作類型與長期回報之間的相互影響。現有方法主要存在四項限制：
 
 1. **不充分考慮 GPU 差異**：許多排程方法把 GPU 視為同質資源，較少將不同世代 GPU 的算力、記憶體與執行時間差異納入 placement 決策。
 2. **不充分考慮 MPS fraction**：部分研究討論 GPU sharing 或 GPU partition，但未將 **MPS fraction** 需求作為排程器的顯式感知變數。
-3. **依賴固定規則**：FCFS 與 Backfill 能提供穩定基準，但難以隨工作負載動態調整策略。
+3. **依賴靜態優先序**：FCFS 與 Backfill 能提供穩定基準，但難以隨工作負載動態調整策略。
 4. **缺乏真實 Slurm 流程驗證**：不少學習式排程研究停留在模擬環境，未整合到真實 Slurm job submission path，也未處理服務失效與實機部署。
 
 ### 1.3 為什麼使用 DRL
@@ -53,7 +53,7 @@ GPU scheduling 不是單次分類問題，而是序列決策問題。一次 plac
 
 1. **Sequential decision**：每次工作放置會影響後續所有排程決策。
 2. **Long-term optimization**：排程目標不只包含當下工作的執行時間，也包含 queue delay、makespan、tail latency 與整體 GPU utilization。
-3. **Dynamic environment**：工作到達率、工作類型、GPU 使用率與 MPS 剩餘容量會隨時間改變，固定 heuristic 難以完整涵蓋所有情境。
+3. **Dynamic environment**：工作到達率、工作類型、GPU 使用率與 MPS 剩餘容量會隨時間改變，固定策略難以完整涵蓋所有情境。
 
 因此，本研究採用 DRL 作為排程策略學習方法，讓代理人從模擬與實機回饋中學習 GPU placement 與 MPS-aware 排程的長期效果。
 
@@ -63,9 +63,9 @@ GPU scheduling 不是單次分類問題，而是序列決策問題。一次 plac
 
 1. **MPS 配額約束下的工作派遣與異質 GPU placement**：不同於 UXP-RL [11] 主要決定 CPU-vs-GPU 資源類型、KIS-S [12] 調整 Kubernetes 推論副本數、DRR [13] 處理 GPU 碎片化，本研究的策略介面與模擬環境將「派哪個工作」與「放到哪張異質 GPU」建模為聯合離散動作。每個工作攜帶既定的 MPS fraction 需求（25%/50%/75%/100%）作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。此設計首次在真實 Slurm 佇列上刻畫「job 選擇與異質 GPU placement 聯合決策」相對於僅決定資源類型 [11] 或僅調整副本數 [12] 的可行性與行為差異。
 
-2. **失效安全的 Slurm 策略層整合**：不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入真實 Slurm job submission path，並提供 fail-safe 回退機制，當 RL 服務逾時、回傳無效 action 或健康檢查失敗時自動回退至啟發式策略，使排程核心 (slurmctld) 永不被阻塞。此設計讓 DRL scheduler 得以在真實排程路徑中部署，而不需修改 Slurm 核心。本研究因此證明學習式排程可在不更動 slurmctld 的前提下安全嵌入生產排程路徑，這是先前純模擬研究 [11][12] 未曾示範的部署可行性。
+2. **失效安全的 Slurm 策略層整合**：不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入真實 Slurm job submission path，並提供 fail-safe 回退機制，當 RL 服務逾時、回傳無效 action 或健康檢查失敗時自動回退至 Slurm 原生策略，使排程核心 (slurmctld) 永不被阻塞。此設計讓 DRL scheduler 得以在真實排程路徑中部署，而不需修改 Slurm 核心。本研究因此證明學習式排程可在不更動 slurmctld 的前提下安全嵌入生產排程路徑，這是先前純模擬研究 [11][12] 未曾示範的部署可行性。
 
-3. **實機比較與效益邊界分析**：本研究於 RTX 4070/3080 異質環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、啟發式、SAC、RDSAC 與 RLPD，並採多 seed、Holm-Bonferroni 校正與 TOST 等價檢定。學習式策略在平均 JCT 上優於傳統 Slurm 排程，但兩者皆不足以支持穩健超越 size-aware 啟發式。並且由於實驗環境限於小叢集，經消融實驗分析後因變異過大而無法辨識哪個決策具有穩定優勢。
+3. **實機比較與效益邊界分析**：本研究於 RTX 4070/3080 異質環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、SAC、RDSAC 與 RLPD，並採多 seed、Holm-Bonferroni 校正與 TOST 等價檢定。結果分析不同佇列深度與施行路徑下的平均 JCT、尾端 P99 及效益邊界；由於實驗環境限於小叢集，跨較大規模的效益仍待驗證。
 
 ## 2. 相關研究
 
@@ -77,7 +77,7 @@ GPU scheduling 不是單次分類問題，而是序列決策問題。一次 plac
 
 ### 2.2 強化學習排程
 
-Lin 等人 [11] 提出 UXP-RL：一個以 DQN 為核心、涵蓋前處理／訓練／推論三類任務、可部署為集中式或分散式排程器、並跨雲／邊／霧三層架構運作的 CPU-GPU 任務排程演算法。其於**模擬環境**中，集中式排程器將平均週轉時間相較 SJF／FCFS 與 TYPE 啟發式分別降低 57.81%、57.28% 與 27.66%；分散式排程器則因能將長訓練工作卸載至雲端而把推論任務週轉時間再降低 89.07%。同年 Zhang 等人的 KIS-S [12] 以 PPO 訓練一個 GPU-aware 的 Kubernetes 推論自動擴縮策略，完全於自建模擬器 (KISim) 中訓練後零樣本部署，於多種流量情境下平均獎勵提升 75.2%；其問題設定是調整副本數的自動擴縮，而非本研究的工作放置排程。Wu 等人的 DRR [13] 則針對 GPU 共享叢集的碎片化問題，以模仿學習從既有啟發式暖啟動一個深度強化學習去碎片化排程器，並同時於實體 Kubernetes 測試床與大規模模擬叢集上驗證，平均碎片率降低 50%，是少數同時涉及真實 Kubernetes 部署的學習式排程器。
+Lin 等人 [11] 提出 UXP-RL：一個以 DQN 為核心、涵蓋前處理／訓練／推論三類任務、可部署為集中式或分散式排程器、並跨雲／邊／霧三層架構運作的 CPU-GPU 任務排程演算法。其於**模擬環境**中，集中式排程器將平均週轉時間相較 SJF／FCFS 與 TYPE 基準分別降低 57.81%、57.28% 與 27.66%；分散式排程器則因能將長訓練工作卸載至雲端而把推論任務週轉時間再降低 89.07%。同年 Zhang 等人的 KIS-S [12] 以 PPO 訓練一個 GPU-aware 的 Kubernetes 推論自動擴縮策略，完全於自建模擬器 (KISim) 中訓練後零樣本部署，於多種流量情境下平均獎勵提升 75.2%；其問題設定是調整副本數的自動擴縮，而非本研究的工作放置排程。Wu 等人的 DRR [13] 則針對 GPU 共享叢集的碎片化問題，以模仿學習暖啟動一個深度強化學習去碎片化排程器，並同時於實體 Kubernetes 測試床與大規模模擬叢集上驗證，平均碎片率降低 50%，是少數同時涉及真實 Kubernetes 部署的學習式排程器。
 
 在演算法基礎方面，Discrete SAC 將最大熵框架延伸到離散動作空間，以 categorical 策略取代高斯策略、以期望估計熵項 [6]；分布式評論家（如 IQN [7]、DSAC [8]）以回報分布與風險敏感目標處理尾端延遲；以 BatchNorm 移除 target network 以提升樣本效率的 CrossQ [21] 則代表近期簡化訓練流程的方向；RLPD [9] 進一步以對稱取樣真實資料的方式進行 offline-to-online 微調，降低從零探索的成本。然而，現有 RL scheduler 多假設單一 GPU、同質 GPU 或大型模擬叢集，或將 Kubernetes 當作排程主體（如 Kubeflow [22]、Volcano [23]、Kueue [24]、NVIDIA KAI [25]）；較少探討在真實 Slurm 流程中，如何讓 RL 同時決定異質 GPU placement 與 MPS-aware 排程，並在服務失效時維持排程安全。
 
@@ -93,7 +93,7 @@ Tsenos 與 Kalogeraki [26] 針對缺乏原生虛擬化支援的邊緣 GPU（如�
 
 | 類型 | 是否考慮異質 GPU | 是否考慮 MPS fraction | 是否整合真實 Slurm | 主要限制 |
 |---|:--:|:--:|:--:|---|
-| FCFS / Backfill [4] | 部分 | 部分 | 是 | 固定規則，難以學習長期效果 |
+| FCFS / Backfill [4] | 部分 | 部分 | 是 | Slurm 原生策略，難以學習長期效果 |
 | GPU sharing / partition [3][16][17][18] | 部分 | 部分 | 否 | 多聚焦 partition 機制，較少處理排程流程 |
 | RL scheduler（模擬）[11][12] | 部分 | 少 | 否 | sim-to-real 效益不明 |
 | RL scheduler（真實 K8s）[13] | 部分 | 少 | 否 | 針對碎片化，非 Slurm 工作流 |
@@ -107,14 +107,14 @@ Tsenos 與 Kalogeraki [26] 針對缺乏原生虛擬化支援的邊緣 GPU（如�
 基於上述背景，本研究聚焦於以下三項問題：
 
 1. 在每個工作的 MPS 配額與 GPU 型號差異（異質 GPU）同時存在時，聯合考慮工作選擇與 GPU 放置能否改善工作完成時間？
-2. 學習式策略接入真實 Slurm 排程機制後，，能否在保有失效回退機制的條件下，與 FCFS 及 Backfill 進行公平比較？
+2. 學習式策略接入真實 Slurm 排程機制後，能否在保有失效回退機制的條件下，與 FCFS 及 Backfill 進行公平比較？
 3. 在多種工作負載情境下，當學習式策略是否能進一步改善平均 JCT與尾端 JCT？
 
 本研究的核心貢獻在於將「異質 GPU + MPS + 真實 Slurm 流程」三者結合，主要貢獻有三：
 
-- **MPS 配額約束下的工作派遣與異質 GPU placement**。不同於 UXP-RL [4] 主要決定 CPU-vs-GPU 資源類型、KIS-S [5] 調整 Kubernetes 推論副本數、DRR[6] 處理 GPU 碎片化，本研究的策略介面與模擬環境將「派哪個工作」與「放到哪張異質 GPU」建模為聯合離散動作。每個工作攜帶既定的 MPS 配額需求作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。此設計在模擬環境刻畫「job 選擇與異質 GPU placement 聯合決策」，實機則聚焦提交時 placement 相對於僅決定資源類型 [4] 或僅調整副本數 [5] 的可行性與行為差異。
-- **失效安全的Slurm 策略層整合**。不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入 Slurm job submission path，並提供 fail-safe 回退機制，當學習式排程服務逾時就自動回退至 Slurm 原生策略，在評估量測中未觀察到逾時，且策略服務失效時具備回退機制。此設計讓客製化 DRL 排程器得以在真實排程路徑中部署，而不需修改 Slurm 核心，這是先前純模擬研究 [4, 5] 未曾示範的部署可行性。
-- **實機比較與效益分析**。本研究於 RTX 4070與 RTX 3080 異質環境，以 trace-derived 混合 AI 工作負載比較 FCF、Backfill、SAC、RDSAC 與 RLPD，並使用統計檢定。結果顯示，學習式策略的工作完成時間優於 FCFS 與 Backfill，但是在尾端部分仍比 FCFS 略差。
+- **MPS 配額約束下的工作派遣與異質 GPU placement**。不同於 UXP-RL [4] 主要決定 CPU-vs-GPU 資源類型、KIS-S [5] 調整 Kubernetes 推論副本數、DRR [6] 處理 GPU 碎片化，本研究的策略介面與模擬環境將「派哪個工作」與「放到哪張異質 GPU」建模為聯合離散動作。每個工作攜帶既定的 MPS 配額需求作為 state 特徵與 action mask 的可行性約束，使決策在尊重 MPS 配額的前提下進行。此設計在模擬環境刻畫「job 選擇與異質 GPU placement 聯合決策」，實機則聚焦提交時 placement 相對於僅決定資源類型 [4] 或僅調整副本數 [5] 的可行性與行為差異。
+- **失效安全的 Slurm 策略層整合**。不同於 UXP-RL、KIS-S 等純模擬研究，本研究把學習式決策服務嵌入 Slurm job submission path，並提供 fail-safe 回退機制，當學習式排程服務逾時就自動回退至 Slurm 原生策略，在評估量測中未觀察到逾時，且策略服務失效時具備回退機制。此設計讓客製化 DRL 排程器得以在真實排程路徑中部署，而不需修改 Slurm 核心，這是先前純模擬研究 [4, 5] 未曾示範的部署可行性。
+- **實機比較與效益分析**。本研究於 RTX 4070 與 RTX 3080 異質環境，以 trace-derived 混合 AI 工作負載比較 FCFS、Backfill、SAC、RDSAC 與 RLPD，並使用 seed-level 統計檢定。結果顯示，學習式策略在中度與重度 queue 深度的平均 JCT 上優於 FCFS 與 Backfill，但 P99 尾端仍以 FCFS 較佳。
 
 **State.** 狀態包含四類資訊：
 
@@ -163,14 +163,14 @@ $$
 
 ### 3.2 系統架構
 
-本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台（圖 1）。學習式策略以服務形式接入 Slurm 的工作提交流程：策略讀取工作、GPU、MPS 剩餘容量與佇列狀態，輸出建議的工作與 GPU placement，並由系統於提交時據以綁定節點（工作的 MPS fraction 依其請求分配、非策略輸出）。若策略服務逾時或回傳不可行決策，系統自動回退至啟發式路徑，確保排程核心不被阻塞。工作執行期間，監控服務收集資源使用、queue delay、JCT 與 reward，寫入 replay buffer 供後續訓練或 RLPD (Reinforcement Learning with Prior Data) [9] 微調使用。
+本研究建立一套以 Slurm 為排程核心的異質 GPU + MPS 智慧排程平台（圖 1）。學習式策略以服務形式接入 Slurm 的工作提交流程：策略讀取工作、GPU、MPS 剩餘容量與佇列狀態，輸出建議的工作與 GPU placement，並由系統於提交時據以綁定節點（工作的 MPS fraction 依其請求分配、非策略輸出）。若策略服務逾時或回傳不可行決策，系統自動回退至 Slurm 原生路徑，確保排程核心不被阻塞。工作執行期間，監控服務收集資源使用、queue delay、JCT 與 reward，寫入 replay buffer 供後續訓練或 RLPD (Reinforcement Learning with Prior Data) [9] 微調使用。
 
 需說明的是，本文的主要實機評估聚焦於 **GPU placement** 的效果：系統於提交時取得策略建議的節點並綁定，藉此在真實叢集上比較不同 placement 決策；由策略即時從佇列挑選下一個工作（順序）並以 held-job 控制器透過 `required_nodes` REST 呼叫派工，在受測 slurmrestd（v0.0.37）中被停用而未生效，故該 REST 施行路徑不納入本文效能宣稱。§5.8 進一步驗證並採用一條替代的**原生排序施行路徑**：前展服務中的策略取得完整派遣順序，再以固定 Slurm `Priority` 交由 Slurm 自身 in-process 排程器派工，使 RL 掌握順序與節點、Slurm 掌握時機；此路徑經實測有效並用於 §5.8 之重載評估。
 
 ```mermaid
 flowchart TD
     A[Job Submission] --> B[Slurm Controller]
-    B --> C[job_submit.lua<br/>Score / optional priority intent]
+    B --> C[job_submit.lua<br/>Optional priority intent]
     B --> D[Held Pending Queue]
     D --> E[Placement Controller<br/>via slurmrestd]
     E --> F{RL Scheduler /act}
@@ -182,11 +182,11 @@ flowchart TD
     G --> H[Monitoring<br/>JCT, Util, Queue Delay]
     H --> I[Replay Buffer]
     I --> F
-    F -.->|Timeout / Invalid / No-op| J[Leave Held or Use<br/>Slurm / Heuristic Path]
+    F -.->|Timeout / Invalid / No-op| J[Leave Held or Use<br/>Slurm Native Path]
     J --> B
 ```
 
-**圖 1. 系統架構與排程流程。** 學習式策略接入 Slurm 提交流程，於提交時提供節點綁定建議；透過 `required_nodes` REST 的即時派工在受測環境未生效（圖中虛線），改採 §5.8 驗證的原生路徑：前展策略取得派遣順序後，以固定 Priority 交由 Slurm 自身 in-process 排程器派工。逾時、不可行決策或 no-op 時回退至 Slurm／啟發式路徑。監控服務週期蒐集資源使用、queue delay 與 job events，寫入 Replay Buffer。
+**圖 1. 系統架構與排程流程。** 學習式策略接入 Slurm 提交流程，於提交時提供節點綁定建議；透過 `required_nodes` REST 的即時派工在受測環境未生效（圖中虛線），改採 §5.8 驗證的原生路徑：前展策略取得派遣順序後，以固定 Priority 交由 Slurm 自身 in-process 排程器派工。逾時、不可行決策或 no-op 時回退至 Slurm 原生路徑。監控服務週期蒐集資源使用、queue delay 與 job events，寫入 Replay Buffer。
 
 本平台使用 Kubernetes (k3s) 部署 Slurm controller、worker、RL scheduler、monitoring service 與相關容器 [5]。底層 GPU 基礎建設是透過 Kubernetes Dynamic Resource Allocation (DRA) 宣告與取得裝置 [32]，工作層級的 MPS 配額仍由 Slurm `gres/mps` 與對應的 MPS 執行環境落實。**Kubernetes 在本文中不負責工作排程決策**，只提供容器化部署、服務健康檢查、網路與生命週期管理。此設計保留 Slurm 在 HPC batch scheduling 中成熟的佇列語意 [4]。此方向與將 Slurm 整合進 Kubernetes 的 Slinky [10] 互補：Slinky 提供 Slurm-on-Kubernetes 部署基礎，本研究則在 Slurm 排程路徑上加入具失效回退機制的學習式策略層。
 
@@ -207,7 +207,7 @@ flowchart TD
 3. **RDSAC-cvar**：在 RDSAC 上加入 CVaR 風險敏感目標，使策略更重視尾端 JCT 與 SLO violation [8]。
 4. **RLPD**：以真實資料對模擬訓練出的模型進行微調，縮小 sim-to-real gap [9]。本研究忠實採用原論文核心配方——每個 batch 對稱取樣 50% sim 先驗 + 50% 真實資料、critic 加 LayerNorm 的 critic ensemble、高 UTD——但訓練機制為離線（更新迴圈只做梯度更新、不在真環境即時互動），故為「sim + 真實混合 buffer 的離線微調」，非原論文的真線上更新。具體作法為：**暖啟動自對應 campaign 的 RDSAC-cvar base**（§5.2 重載複核用早期 RDSAC-cvar base、§5.8 用該節之 fairness-reward RDSAC-cvar base），offline 先驗為同一異質 regime 的 sim rollouts、online 半批為 §5.1 所述之真實 Slurm 線上日誌（168 維、2 786 筆 transition、以 sacct 真實 JCT 計 reward）。關鍵在於 **RLPD 微調階段的 reward 刻意採 `jct_aligned`（$-\mathrm{JCT}/1000$）而非 base 的 mo＋公平 reward**：RLPD 的 critic 從頭學起，需要 offline↔online 兩半批的 reward *定義一致*，而線上日誌記錄的即是 $-\mathrm{JCT}/1000$，故 offline 半批亦以同尺度的 `jct_aligned` 計，而非與 base 的訓練目標一致（此為與其他三臂在 reward 上的**刻意差異**）。微調配置：offline-steps=50 000、gradient updates=200、UTD=20、固定 $\alpha=0.05$。
 
-RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action（即所選放置的 GPU 剩餘 MPS 不足以容納該工作請求的動作）。訓練流程包含 prioritized replay、n-step return、potential-based reward shaping [31] 與 heuristic warm start。需澄清命名：本研究的 RDSAC 為自組的「distributional + discrete SAC」，以離散動作空間搭配 IQN 分位數 critic 建構 [7][8]，與 Duan 等人 [33] 針對連續控制、將回報建模為單一高斯分布的 Distributional Soft Actor-Critic 不同，兩者不應混淆。
+RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並使用 masked categorical actor 避免選到不可執行 action（即所選放置的 GPU 剩餘 MPS 不足以容納該工作請求的動作）。訓練流程包含 prioritized replay、n-step return 與 potential-based reward shaping [31]。需澄清命名：本研究的 RDSAC 為自組的「distributional + discrete SAC」，以離散動作空間搭配 IQN 分位數 critic 建構 [7][8]，與 Duan 等人 [33] 針對連續控制、將回報建模為單一高斯分布的 Distributional Soft Actor-Critic 不同，兩者不應混淆。
 
 ## 5. 實驗與評估
 
@@ -233,7 +233,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 訓練資料集使用 Alibaba GPU Trace 與 Microsoft Philly Trace：前者用於參考生產 MLaaS 工作的到達率、工作長度與資源需求分布 [2]，後者用於參考多租戶 GPU training workload 的佇列與 JCT 特性 [1]。同時在本研究叢集上執行 cuBLAS、BERT inference、ResNet training、Qwen fine-tuning 與矩陣運算等真實 AI 工作。
 
-為確保比較公平，各方法在同一評估中取得一致的工作資訊：FCFS／Backfill 使用提交時的 Slurm time-limit；模擬中 score 的 SJF 項與學習式策略的 runtime 特徵皆來自同一組執行時間估計（模擬為 oracle），無單一方法獨享的未來資訊；實機部署因 runtime predictor 未上線，score 停用 SJF 項（ε=0），僅使用 MPS-fit 與 VRAM-fit。
+為確保比較公平，各方法在同一評估中取得一致的工作資訊：FCFS／Backfill 使用提交時的 Slurm time-limit，學習式策略使用相同的工作特徵與 MPS 請求；模擬與實機均不讓單一方法取得其他方法沒有的未來資訊。
 
 直接在實際環境從頭訓練需要數十萬到數百萬個 transition，而真實叢集中一個決策對應一個跑數分鐘至數小時的任務，收集足夠樣本需時數月。因此本研究採 sim-to-real 兩段式：(1) 在模擬環境大量訓練，產出基本模型；(2) 上線部署，記錄真實叢集 (observation, action, reward) 資料；(3) 以 RLPD 用真實資料把基本模型微調成真實環境策略。DRL 訓練參數如表 3 所示；所有學習臂共用網路與最佳化設定，僅 critic 家族與風險目標不同。
 
@@ -246,7 +246,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 | 隱藏層（MLP trunk） | (256, 256) + LayerNorm |
 | batch size／UTD ratio | 256／4 |
 | n-step return | 10 |
-| replay | Prioritized (SumTree) + score warm start |
+| replay | Prioritized (SumTree) |
 | IQN 分位數 N_QUANT／cosine 維度 | 32／64（RDSAC 臂） |
 | 風險目標／tail mass β | CVaR／0.25（RDSAC-cvar 臂） |
 | 溫度 α | 固定 0.05 |
@@ -261,9 +261,11 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 ### 5.2 實機評估結果
 
-在 BERT 推論、ResNet 訓練、Qwen 微調與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%），每個 seed 提交 150 個工作，使用 10 seeds 進行評估，到達採 poisson，：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、job queue 隨時間持續堆積，runtime 經壓縮使 p95≈`target_max`=20 s。排序只有在存在可重排的 backlog 時才有意義，故本節取三個負載點 poisson **oversub=2、4、6**（淺／中／深佇列）並置成三點負載掃描，以檢驗 RL 在不同 job queue 的效益，結果分別如 6, 7, 8 所示。
+在 BERT 推論、ResNet 訓練、Qwen 微調與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%），每個 seed 提交 150 個工作，使用 10 seeds 進行評估。到達採 poisson：inter-arrival 為指數分佈、平均間隔 = mean(runtime)/oversub，故到達比服務快 `oversub` 倍、job queue 隨時間持續堆積，runtime 經壓縮使 p95≈`target_max`=20 s。排序只有在存在可重排的 backlog 時才有意義，故本節取三個負載點 poisson **oversub=2、4、6**（淺／中／深佇列）並置成三點負載掃描，以檢驗 RL 在不同 job queue 的效益，結果分別如表 4、表 5、表 6 所示。
 
 > JCT／Makespan／P95／P99 為各 seed 內平均之未加權平均 ± 標準差，以 Slurm 內建 Backfill 作為 seed-level 配對基準；三點負載掃描之 ΔmeanJCT% 彙總見表 7。
+
+除 JCT 與尾端延遲外，評估腳本同步記錄兩張 GPU 的平均利用率、VRAM 使用壓力、每工作 slowdown、slowdown P95／最大值、Jain slowdown fairness、等待時間 P95，以及完成率。GPU telemetry 以 worker pod 內的 `nvidia-smi` 每秒取樣；若兩個 GPU worker 未同時被觀測，結果會標記為 telemetry 不完整，不將單卡數據解讀為整個叢集的平均。
 
 表 4. 重載混合工作負載評估結果（oversub=6，**動態優先權重排**）
 
@@ -326,7 +328,7 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 除排程品質外，本研究亦量測學習式決策路徑的系統行為，以檢驗其失效安全整合是否非侵入。在 2×1 平台上以 8 個工作負載 seed（每 seed 125 個工作）重放排程序列，於控制平面（CPU）逐次計時策略決策，並依線上服務的判定門檻（低信心 value／entropy）將每次決策分類為 RL 主導、低信心回退，或暫不派遣（no-op），結果如表 8。
 
-決策延遲為次毫秒級（p99 0.27 ms、最大 7.3 ms），較 Lua hook 的 fail-safe 逾時門檻（150 ms）低約三個數量級；在 76,099 次決策中無任一次逾時，顯示 RL 路徑對 slurmctld 幾乎零額外負擔，逾時型回退不會因決策過慢而觸發。在實際放置決策中約 12% 因低信心回退至啟發式基準、其餘由 RL 主導；其中大量的 no-op 反映離散事件下多數時間步並無可派工作，屬正常等待行為。
+決策延遲為次毫秒級（p99 0.27 ms、最大 7.3 ms），較 Lua hook 的 fail-safe 逾時門檻（150 ms）低約三個數量級；在 76,099 次決策中無任一次逾時，顯示 RL 路徑對 slurmctld 幾乎零額外負擔，逾時型回退不會因決策過慢而觸發。在實際放置決策中約 12% 因低信心回退至 Slurm 原生基準、其餘由 RL 主導；其中大量的 no-op 反映離散事件下多數時間步並無可派工作，屬正常等待行為。
 
 表 8. 系統行為量測（RDSAC-cvar 策略，2×1，8 seeds × 125 工作，控制平面 CPU）
 
@@ -364,7 +366,7 @@ $$
 此節用於量測 RL 方法的提升效益天花板，因此在模擬器中進行了獨立於任何學習式方法的天花板分析：固定 GPU/MPS placement，讓排程器唯一能控制的槓桿只有**分派順序**，並以 random-restart + swap local search 搜尋每個 instance 在所有 ordering 中可達的最佳平均 JCT，定義
 
 $$
-\text{headroom}\% \;=\; \frac{\mathrm{JCT}_{\text{score}} - \mathrm{JCT}_{\text{best-ordering}}}{\mathrm{JCT}_{\text{best-ordering}}},
+\text{headroom}\% \;=\; \frac{\mathrm{JCT}_{\text{Backfill}} - \mathrm{JCT}_{\text{best-ordering}}}{\mathrm{JCT}_{\text{best-ordering}}},
 $$
 
 結果如表 9 所示，代表 headroom 會隨著工作負載的數目有單調遞增的趨勢，即工作越多、學習式的效益越明顯。
@@ -415,7 +417,7 @@ $$
 
 ### 5.9 效益邊界小結
 
-綜合 §5.2–5.8，效益邊界可依「RL 掌握何種槓桿、以何方式施行」而清楚劃分。在 placement 為主的實機路徑（§5.2，RL 只選節點、順序由 Slurm 決定）下，部分學習式策略（SAC、RDSAC-cvar）的平均 JCT 僅略優於或打平 FCFS／Backfill，且未形成相對 size-aware 啟發式的穩健優勢；更關鍵的是這些平均值是以顯著的尾端代價換得——該路徑下學習式 P99（約 500–600 s，重載達 640–668 s）約為 FCFS／Backfill（255–270 s）的兩倍。
+綜合 §5.2–5.8，效益邊界可依「RL 掌握何種槓桿、以何方式施行」而清楚劃分。在 placement 為主的實機路徑（§5.2，RL 只選節點、順序由 Slurm 決定）下，部分學習式策略（SAC、RDSAC-cvar）的平均 JCT 僅略優於或打平 FCFS／Backfill，且未形成相對 Slurm 原生策略的穩健優勢；更關鍵的是這些平均值是以顯著的尾端代價換得——該路徑下學習式 P99（約 500–600 s，重載達 640–668 s）約為 FCFS／Backfill（255–270 s）的兩倍。
 
 然而 §5.8 顯示，當 RL 經一條**原生排序施行路徑**取得對*順序*的控制權、並以可落地的 **動態優先權重排（非阻塞週期性重排）**後，在**真實 CUDA、realistic poisson 到達、深負載（oversub=6）**下，所有學習式策略不僅平均 JCT **顯著勝過生產 Backfill 約 10–12%**（Wilcoxon 皆 *p*≤0.006），**尾端 P99 亦大幅同勝約 19–22%**（10 seed 中 10/10 的 P99 低於 Backfill）。此結果一方面**實機確認**了 §5.6 天花板分析對「ordering headroom 隨負載上升」的預測（且**可被現有 DRL 策略捕捉**，修正了先前「出現 headroom 但 DRL 未能捕捉」的暫時性判斷），另一方面也指出 §5.2 的負向結果與 2.4 倍尾端相當程度是**施行路徑**（進程外綁定、節點綁定序列化、順序不由 RL 掌握）之限制，而非策略本身無法貢獻。
 
@@ -427,9 +429,9 @@ $$
 
 ### 6.1 結論
 
-本研究實作了可在異質 GPU 與 NVIDIA MPS 配額約束下輸出工作選擇與 GPU placement 的 DRL 策略，並透過 Slurm job submission path 整合到真實排程流程。相較傳統只選 GPU 或只做固定規則的方法，本研究在排程框架中整合了 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號，並以失效安全設計確保排程核心穩定。
+本研究實作了可在異質 GPU 與 NVIDIA MPS 配額約束下輸出工作選擇與 GPU placement 的 DRL 策略，並透過 Slurm job submission path 整合到真實排程流程。相較傳統只選 GPU 或只依賴靜態優先序的方法，本研究在排程框架中整合了 GPU 型號差異、MPS 配額、工作特徵、佇列狀態與回饋訊號，並以失效安全設計確保排程核心穩定。
 
-實驗結果顯示，學習式策略的效益取決於其掌握的排程槓桿、施行路徑與負載強度。在僅控制 placement（節點綁定、順序由 Slurm 決定）的實機路徑下，部分學習式策略（SAC、RDSAC-cvar）在平均 JCT 上僅略優於或打平 FCFS／Backfill，且以顯著尾端代價換得（P99 約為 Slurm-native 的兩倍），未形成相對 size-aware 啟發式的穩健優勢。然而，當策略經一條經驗證的**原生排序施行路徑**、並以可落地的 **動態優先權重排（非阻塞週期性重排、失效安全）**取得對*順序*的控制權後，在**真實 CUDA、poisson 到達、深負載（oversub=6）**下，所有學習式策略的平均 JCT **顯著勝過生產 Backfill 約 10–12%**、尾端 P99 更**大幅同勝約 19–22%**（Wilcoxon 皆 *p*≤0.006，P99 於 10/10 seed 低於 Backfill）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示先前的負向結果相當程度上係施行路徑（進程外綁定、節點綁定序列化）之限制而非策略本身無法貢獻。
+實驗結果顯示，學習式策略的效益取決於其掌握的排程槓桿、施行路徑與負載強度。在僅控制 placement（節點綁定、順序由 Slurm 決定）的實機路徑下，部分學習式策略（SAC、RDSAC-cvar）在平均 JCT 上僅略優於或打平 FCFS／Backfill，且以顯著尾端代價換得（P99 約為 Slurm-native 的兩倍），未形成相對 Slurm 原生策略的穩健優勢。然而，當策略經一條經驗證的**原生排序施行路徑**、並以可落地的 **動態優先權重排（非阻塞週期性重排、失效安全）**取得對*順序*的控制權後，在**真實 CUDA、poisson 到達、深負載（oversub=6）**下，所有學習式策略的平均 JCT **顯著勝過生產 Backfill 約 10–12%**、尾端 P99 更**大幅同勝約 19–22%**（Wilcoxon 皆 *p*≤0.006，P99 於 10/10 seed 低於 Backfill）。此結果實機確認了模擬天花板分析對「ordering headroom 隨負載上升」的預測，並顯示先前的負向結果相當程度上係施行路徑（進程外綁定、節點綁定序列化）之限制而非策略本身無法貢獻。
 
 此結果亦修正了本文早期以 wait-dominated 代理所得的暫時性判斷「尾端結構性受限、fairness reward 動不了 P99」：在深佇列、真實 CUDA 下，尾端主要來自 Backfill 為衝平均而生的重排飢餓，正是 RL 排序可避免者，故學習式 P99 反而穩定較低。在可落地的動態優先權重排部署形態下，本文之 poisson 三點負載掃描（oversub=2／4／6）顯示相對 Backfill 的平均 JCT 優勢於**三個負載點皆存在**（≈−11%～−13%，同-campaign seed-paired 皆顯著），惟勝出*機制*隨負載而異（深／中載為 backlog 下的排序空間、淺載為對 Backfill 尾端飢餓的規避）；此外一個同批次對照顯示可落地的動態優先權重排相對一次性靜態優先權另有優勢（二者排序相同但持續更新優先權能得到較低的 JCT 與尾端，詳見附錄 A）；跨較大型叢集與其他工作負載組成之外推仍待後續驗證，placement 消融亦因變異過大而無法形成確定歸因。
 

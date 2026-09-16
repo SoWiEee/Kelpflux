@@ -148,12 +148,12 @@ spec:
               name: rest
           readinessProbe:
             exec:
-              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null && pgrep -x slurmrestd >/dev/null"]
+              command: ["/bin/sh", "-c", "(pgrep -x slurmctld >/dev/null || pgrep -x slurmctld-wlm >/dev/null) && pgrep -x munged >/dev/null && pgrep -x slurmrestd >/dev/null"]
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             exec:
-              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x slurmrestd >/dev/null"]
+              command: ["/bin/sh", "-c", "(pgrep -x slurmctld >/dev/null || pgrep -x slurmctld-wlm >/dev/null) && pgrep -x slurmrestd >/dev/null"]
             initialDelaySeconds: 60
             periodSeconds: 20
           volumeMounts:

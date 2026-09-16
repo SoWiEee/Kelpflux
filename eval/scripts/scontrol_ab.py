@@ -35,13 +35,14 @@ Usage (driven by run_step3_prio.sh across an oversub load sweep):
       --real-workload --arrival-mode poisson --oversub 6 --out-json out.json
 """
 from __future__ import annotations
-import argparse, json, os, subprocess, time, sys, urllib.request
+import argparse, csv, json, os, subprocess, sys, threading, time, urllib.request
 import numpy as np
 from sim.loader import generate_by_family
 from services.rl_scheduler.placement_controller import (
     SlurmJob, SlurmNode, build_act_payload, post_act)
 from eval.scripts.live_ab_heavytail import (
     LiveJob, AiMixWorkloadSpec, LlmWorkloadSpec, gen_workload)
+from eval.scripts.tail_metrics import summarize_gpu_samples, summarize_live_records
 
 NS = "slurm"; CTL = "slurm-controller-0"
 LOGIN = "slurm-login-7f8cfbc48-c875f"
@@ -49,6 +50,9 @@ NODES = ["slurm-worker-gpu-rtx4070-0", "slurm-worker-gpu-rtx3080-0"]
 MPS_PER_GPU = 100
 SERVE = "http://localhost:8003"
 REAL_WORKLOAD = None  # set by main() from --real-workload; None → sleep+MPS
+GPU_QUERY = ("nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,"
+             "memory.total,power.draw --format=csv,noheader,nounits")
+ACTIVE_STATES = frozenset({"PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "SUSPENDED"})
 
 
 def _to_livejob(j: dict) -> LiveJob:
@@ -85,9 +89,85 @@ def submit_stream(jobs, submit_one):
 
 
 def _exec(pod, script, timeout=60):
+    if pod.startswith("slurm-login-"):
+        resolved = subprocess.run(
+            ["kubectl", "get", "pods", "-n", NS, "-l", "app=slurm-login",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        if resolved:
+            pod = resolved
     r = subprocess.run(["kubectl", "exec", "-n", NS, pod, "--", "bash", "-lc", script],
                        capture_output=True, text=True, timeout=timeout)
     return r.stdout.strip()
+
+
+def _active_job_ids():
+    """Return only jobs Slurm still considers active; MinJobAge keeps old rows in squeue."""
+    out = _exec(CTL, "squeue -h -o '%i|%T' 2>/dev/null")
+    active = set()
+    for line in out.splitlines():
+        parts = line.split("|", 1)
+        if len(parts) == 2 and parts[1] in ACTIVE_STATES:
+            active.add(parts[0])
+    return active
+
+
+def _float_or_none(value):
+    try:
+        return float(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _gpu_sample(node):
+    """Read one node's GPUs through its worker pod; failures are non-fatal."""
+    out = _exec(node, GPU_QUERY, timeout=15)
+    samples = []
+    for index, row in enumerate(csv.reader(out.splitlines(), skipinitialspace=True)):
+        if len(row) < 5:
+            continue
+        gpu_util, memory_util = _float_or_none(row[0]), _float_or_none(row[1])
+        memory_used, memory_total = _float_or_none(row[2]), _float_or_none(row[3])
+        pressure = (memory_used / memory_total * 100.0
+                    if memory_used is not None and memory_total and memory_total > 0 else None)
+        samples.append({
+            "node": node,
+            "gpu_index": index,
+            "gpu_util_pct": gpu_util,
+            "memory_util_pct": memory_util,
+            "memory_used_mib": memory_used,
+            "memory_total_mib": memory_total,
+            "memory_pressure_pct": pressure,
+            "power_w": _float_or_none(row[4]),
+            "sample_ts": time.time(),
+        })
+    return samples
+
+
+def start_gpu_telemetry(interval=1.0):
+    """Start best-effort per-node nvidia-smi sampling for one evaluation run."""
+    samples = []
+    stop = threading.Event()
+    warned = set()
+
+    def sample_once():
+        for node in NODES:
+            try:
+                samples.extend(_gpu_sample(node))
+            except Exception as exc:  # telemetry must never block scheduling
+                if node not in warned:
+                    print(f"[telemetry] {node} unavailable: {exc}", flush=True)
+                    warned.add(node)
+
+    def loop():
+        sample_once()
+        while not stop.wait(interval):
+            sample_once()
+
+    thread = threading.Thread(target=loop, name="gpu-telemetry", daemon=True)
+    thread.start()
+    return stop, thread, samples
 
 
 def reload_serve(ckpt_path, serve=SERVE, timeout=30):
@@ -340,7 +420,7 @@ def run_reorder_arm(jobs):
         with lock:
             if not (submitted["done"] and len(meta) >= len(jobs)):
                 return False
-        live = {l.strip() for l in _exec(CTL, "squeue -h -o '%i' 2>/dev/null").splitlines()}
+        live = _active_job_ids()
         with lock:
             return not (live & set(meta))
 
@@ -377,8 +457,7 @@ def run_backfill_arm(jobs):
 def wait_done(ids, timeout=1800):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        out = _exec(CTL, "squeue -h -o '%i' 2>/dev/null")
-        live = set(out.split()) & set(ids)
+        live = _active_job_ids() & set(ids)
         if not live:
             return
         time.sleep(10)
@@ -392,45 +471,70 @@ def _dt(s):
         return None
 
 
-def collect_jct(ids):
+def collect_job_records(ids, jobs):
+    """Return completed per-job timing records from Slurm accounting."""
+    if not ids:
+        return []
+    name2job = {f"sc{j['jid'].split('-')[-1]}": j for j in jobs}
     idcsv = ",".join(ids)
-    out = _exec(CTL, f"sacct -X -P -n -j {idcsv} -o JobID,Submit,Start,End,State 2>/dev/null")
-    jcts, waits = [], []
+    out = _exec(CTL, f"sacct -X -P -n -j {idcsv} "
+                       "-o JobID,JobName,Submit,Start,End,State,NodeList 2>/dev/null")
+    records = []
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) < 5 or "COMPLETED" not in p[4]:
+        if len(p) < 7 or not p[5].startswith("COMPLETED"):
             continue
-        sub, sta, end = _dt(p[1]), _dt(p[2]), _dt(p[3])
-        if sub and end: jcts.append(end - sub)
-        if sub and sta: waits.append(sta - sub)
-    return np.array(jcts), np.array(waits)
+        job = name2job.get(p[1])
+        sub, sta, end = _dt(p[2]), _dt(p[3]), _dt(p[4])
+        if job is None or sub is None or end is None:
+            continue
+        records.append({
+            "jid": job["jid"], "cls": job.get("cls", "batch"),
+            "mps": int(job.get("mps", 0)), "runtime": float(job.get("rt", 0.0)),
+            "arrival": float(job.get("arrival", 0.0)), "node": p[6],
+            "submit_ts": sub, "start_ts": sta, "end_ts": end,
+            "jct": end - sub, "wait": (sta - sub if sta is not None else None),
+        })
+    return records
 
 
-def collect_order_log(ids, jobs, path):
+def collect_jct(ids, jobs=None):
+    """Backward-compatible JCT/wait arrays used by the existing console output."""
+    if jobs is None:
+        idcsv = ",".join(ids)
+        out = _exec(CTL, f"sacct -X -P -n -j {idcsv} -o JobID,Submit,Start,End,State 2>/dev/null")
+        records = []
+        for line in out.splitlines():
+            p = line.split("|")
+            if len(p) < 5 or not p[4].startswith("COMPLETED"):
+                continue
+            sub, sta, end = _dt(p[1]), _dt(p[2]), _dt(p[3])
+            if sub is not None and end is not None:
+                records.append({"jct": end - sub,
+                                "wait": (sta - sub if sta is not None else None)})
+    else:
+        records = collect_job_records(ids, jobs)
+    jcts = np.asarray([r["jct"] for r in records], dtype=float)
+    waits = np.asarray([r["wait"] for r in records if r["wait"] is not None], dtype=float)
+    return jcts, waits
+
+
+def collect_order_log(ids, jobs, path, records=None):
     """Per-job REALIZED dispatch record for the §5.8 B-vs-static ordering-mechanism analysis.
     Joins sacct Submit/Start/End (by JobName = sc<jid-suffix>) with each job's KNOWN runtime
     and arrival (from the deterministic gen_jobs stream), so a downstream analyzer can rank by
     the ACTUAL start time and correlate that realized order with runtime (SJF-ness) / arrival
     (FCFS-ness) and measure long-job tail protection — under whichever actuation (reorder/B vs
     priority/static) produced it. Writes one JSON object per COMPLETED job to ``path``."""
-    name2job = {f"sc{j['jid'].split('-')[-1]}": j for j in jobs}
-    idcsv = ",".join(ids)
-    out = _exec(CTL, f"sacct -X -P -n -j {idcsv} -o JobName,Submit,Start,End,State 2>/dev/null")
+    records = records if records is not None else collect_job_records(ids, jobs)
     recs = []
-    for line in out.splitlines():
-        p = line.split("|")
-        if len(p) < 5 or "COMPLETED" not in p[4]:
+    for r in records:
+        if r.get("start_ts") is None:
             continue
-        name = p[0]
-        j = name2job.get(name)
-        if j is None:
-            continue
-        sub, sta, end = _dt(p[1]), _dt(p[2]), _dt(p[3])
-        if sub is None or sta is None:
-            continue
-        recs.append({"jid": j["jid"], "cls": j.get("cls", "?"), "rt": float(j["rt"]),
-                     "arrival": float(j.get("arrival", 0.0)), "mps": int(j.get("mps", 0)),
-                     "submit": sub, "start": sta, "end": end})
+        recs.append({"jid": r["jid"], "cls": r.get("cls", "?"), "rt": r["runtime"],
+                     "arrival": r.get("arrival", 0.0), "mps": r.get("mps", 0),
+                     "submit": r["submit_ts"], "start": r["start_ts"], "end": r["end_ts"],
+                     "node": r.get("node", "")})
     with open(path, "w") as fh:
         for r in recs:
             fh.write(json.dumps(r) + "\n")
@@ -446,7 +550,7 @@ def main():
     ap.add_argument("--reload-ckpt", default="",
                     help="POST /reload this checkpoint into serve before the run; empty = no reload")
     ap.add_argument("--out-json", default="",
-                    help="write {arm,seed,jct[],wait[]} here for aggregation")
+                    help="write legacy jct/wait arrays plus metrics and per-job records here")
     ap.add_argument("--order-log", default="",
                     help="write per-job realized dispatch records (jid,cls,rt,arrival,"
                          "submit,start,end) as JSONL here — for the §5.8 B-vs-static "
@@ -463,6 +567,9 @@ def main():
                     help="MPS oversubscription factor → poisson mean gap = mean(rt)/oversub")
     ap.add_argument("--sigma", type=float, default=1.0,
                     help="lognormal σ on the REPORTED runtime estimate (drives --time)")
+    ap.add_argument("--gpu-telemetry-interval", type=float,
+                    default=float(os.environ.get("GPU_TELEMETRY_INTERVAL", "1")),
+                    help="nvidia-smi sampling interval in seconds (0 disables telemetry)")
     a = ap.parse_args()
     if a.real_workload:
         global REAL_WORKLOAD
@@ -474,6 +581,8 @@ def main():
     span = max((j.get("arrival", 0.0) for j in jobs), default=0.0)
     print(f"[{a.arm}] {len(jobs)} aimix jobs seed={a.seed} rt<={a.target_max}s "
           f"arrival={a.arrival_mode} span={span:.0f}s", flush=True)
+    telemetry_enabled = a.gpu_telemetry_interval > 0 and os.environ.get("GPU_TELEMETRY", "1") != "0"
+    telemetry = start_gpu_telemetry(a.gpu_telemetry_interval) if telemetry_enabled else None
     if a.arm == "reorder":
         ids = run_reorder_arm(jobs)
     elif a.arm == "priority":
@@ -481,7 +590,17 @@ def main():
     elif a.arm in ("backfill", "fcfs"):
         ids = run_backfill_arm(jobs)
     wait_done(ids)
-    jct, wait = collect_jct(ids)
+    if telemetry is not None:
+        stop, thread, samples = telemetry
+        stop.set()
+        thread.join(timeout=max(2.0, a.gpu_telemetry_interval * 2))
+    else:
+        samples = []
+    records = collect_job_records(ids, jobs)
+    jct = np.asarray([r["jct"] for r in records], dtype=float)
+    wait = np.asarray([r["wait"] for r in records if r["wait"] is not None], dtype=float)
+    metrics = summarize_live_records(records, a.n_jobs)
+    metrics.update(summarize_gpu_samples(samples, NODES))
     if len(jct):
         print(f"\n=== {a.arm}  n={len(jct)}  "
               f"JCT p50={np.percentile(jct,50):.0f} p95={np.percentile(jct,95):.0f} "
@@ -493,10 +612,11 @@ def main():
         with open(a.out_json, "w") as fh:
             json.dump({"arm": a.arm, "seed": a.seed, "n_jobs": a.n_jobs,
                        "reload_ckpt": a.reload_ckpt,
-                       "jct": jct.tolist(), "wait": wait.tolist()}, fh)
+                       "jct": jct.tolist(), "wait": wait.tolist(),
+                       "metrics": metrics, "jobs": records}, fh)
         print(f"[out] wrote {a.out_json} (n={len(jct)})", flush=True)
     if a.order_log:
-        collect_order_log(ids, jobs, a.order_log)
+        collect_order_log(ids, jobs, a.order_log, records=records)
 
 
 if __name__ == "__main__":

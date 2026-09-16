@@ -71,6 +71,69 @@ def summarize(
     return out
 
 
+def summarize_live_records(records: Sequence[dict], n_jobs: int | None = None) -> dict:
+    """Summarize completed Slurm records for the real-machine campaign.
+
+    Slowdown follows the simulator/Philly convention ``JCT / max(runtime, 60)``.
+    ``jain_slowdown`` is an equality indicator; the slowdown tail is reported
+    alongside it so a policy cannot hide starvation behind a single fairness score.
+    """
+    done = [r for r in records if r.get("jct") is not None]
+    jcts = np.asarray([float(r["jct"]) for r in done], dtype=float)
+    waits = np.asarray([float(r["wait"]) for r in done if r.get("wait") is not None], dtype=float)
+    slows = np.asarray(
+        [float(r["jct"]) / max(float(r.get("runtime", 0.0)), 60.0) for r in done],
+        dtype=float,
+    )
+    out = {
+        "completed": int(len(done)),
+        "completion_rate": (float(len(done) / n_jobs) if n_jobs else 0.0),
+        "jct_mean": float(jcts.mean()) if jcts.size else None,
+        "jct_p50": _pct(jcts, 50) if jcts.size else None,
+        "jct_p95": _pct(jcts, 95) if jcts.size else None,
+        "jct_p99": _pct(jcts, 99) if jcts.size else None,
+        "makespan": (
+            max(float(r["end_ts"]) for r in done) - min(float(r["submit_ts"]) for r in done)
+            if done and all(r.get("end_ts") is not None and r.get("submit_ts") is not None for r in done)
+            else None
+        ),
+        "wait_p95": _pct(waits, 95) if waits.size else None,
+        "wait_max": float(waits.max()) if waits.size else None,
+        "slowdown_mean": float(slows.mean()) if slows.size else None,
+        "slowdown_p95": _pct(slows, 95) if slows.size else None,
+        "slowdown_max": float(slows.max()) if slows.size else None,
+        "jain_slowdown": (
+            float(slows.sum() ** 2 / (slows.size * np.square(slows).sum()))
+            if slows.size and np.square(slows).sum() > 0
+            else None
+        ),
+    }
+    return out
+
+
+def summarize_gpu_samples(samples: Sequence[dict], configured_nodes: Sequence[str]) -> dict:
+    """Summarize nvidia-smi samples and mark whether both GPU nodes were observed."""
+    def values(key: str) -> np.ndarray:
+        return np.asarray([float(s[key]) for s in samples if s.get(key) is not None], dtype=float)
+
+    util = values("gpu_util_pct")
+    pressure = values("memory_pressure_pct")
+    nodes = sorted({str(s.get("node")) for s in samples if s.get("node")})
+    observed = set(nodes)
+    required = {str(n) for n in configured_nodes}
+    return {
+        "gpu_util_mean_pct": float(util.mean()) if util.size else None,
+        "gpu_util_p95_pct": _pct(util, 95) if util.size else None,
+        "gpu_util_peak_pct": float(util.max()) if util.size else None,
+        "gpu_memory_pressure_mean_pct": float(pressure.mean()) if pressure.size else None,
+        "gpu_memory_pressure_p95_pct": _pct(pressure, 95) if pressure.size else None,
+        "gpu_memory_pressure_peak_pct": float(pressure.max()) if pressure.size else None,
+        "gpu_telemetry_samples": int(len(samples)),
+        "gpu_telemetry_nodes": nodes,
+        "gpu_telemetry_complete": bool(required and required.issubset(observed)),
+    }
+
+
 def mean_makespan(records: Sequence[dict]) -> float:
     """Mean per-round makespan = max(end) − min(submit) over each round's jobs.
 

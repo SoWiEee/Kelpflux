@@ -21,8 +21,8 @@
 # comment in scontrol_ab.py `wrap_and_time`.
 #
 #   SEEDS="42 43" ARMS="backfill rdsac_cvar" PHASES="main" bash eval/scripts/run_step3_prio.sh
-#   REAL_WORKLOAD=1 bash eval/scripts/run_step3_prio.sh       # full 16 seed × 6 arm, real CUDA
-#   bash eval/scripts/run_step3_prio.sh                       # full 16 seed × 6 arm, sleep+MPS
+#   REAL_WORKLOAD=1 bash eval/scripts/run_step3_prio.sh       # full 10 seed × 6 arm, real CUDA
+#   bash eval/scripts/run_step3_prio.sh                       # full 10 seed × 6 arm, sleep+MPS
 set -uo pipefail
 cd /home/acane/Desktop/Kelpflux
 export KUBECONFIG=$HOME/.kube/config PYTHONPATH=.
@@ -40,7 +40,8 @@ ARRIVAL_MODE="${ARRIVAL_MODE:-poisson}"   # poisson (spread, matches run_heavy15
 # so bigger oversub = faster arrivals = DEEPER standing queue = more ordering leverage.
 # The sweep shows the ordering headroom EMERGE with load (live §5.6 confirmation).
 read -r -a OVERSUBS <<< "${OVERSUBS:-2 4 6}"
-read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49}"
+# The final real-machine campaign uses seeds 42–51 (10 seeds).
+read -r -a SEEDS <<< "${SEEDS:-42 43 44 45 46 47 48 49 50 51}"
 read -r -a ARMS  <<< "${ARMS:-backfill sac rdsac_mean rdsac_cvar rlpd_cvar}"
 read -r -a PHASES <<< "${PHASES:-fcfs main}"   # fcfs, main, or both
 ORIG="/tmp/slurm.conf.s3porig.$$"
@@ -48,10 +49,30 @@ CONF_FCFS="/tmp/slurm.conf.s3pfcfs.$$"; CONF_MAIN="/tmp/slurm.conf.s3pmain.$$"
 PATCHED=0
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 patch_conf(){ kubectl patch cm -n $NS $CM --type merge -p "$(python3 -c "import json;print(json.dumps({'data':{'slurm.conf':open('$1').read()}}))")" >/dev/null; }
-restart_ctl_wait(){ kubectl delete pod -n $NS $CTL >/dev/null 2>&1; for i in $(seq 1 30); do [ "$(kubectl get pod -n $NS $CTL -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)" = "true" ] && return 0; sleep 6; done; return 1; }
+controller_endpoint_ready(){
+  [ "$(kubectl get endpointslice -n $NS -l kubernetes.io/service-name=slurm-controller \
+      -o jsonpath='{.items[0].endpoints[0].conditions.ready}' 2>/dev/null)" = "true" ]
+}
+restart_ctl_wait(){
+  kubectl delete pod -n $NS $CTL >/dev/null 2>&1
+  for i in $(seq 1 30); do
+    if [ "$(kubectl get pod -n $NS $CTL -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)" = "true" ] \
+       && controller_endpoint_ready; then
+      return 0
+    fi
+    sleep 6
+  done
+  return 1
+}
 resume_nodes(){ kubectl exec -n $NS $CTL -- bash -lc 'scontrol reconfigure 2>/dev/null; for N in slurm-worker-gpu-rtx4070-0 slurm-worker-gpu-rtx3080-0; do for i in 1 2 3; do scontrol update nodename=$N state=resume 2>/dev/null; sleep 3; done; done' >/dev/null 2>&1 || true; }
-sweep(){ kubectl exec -n $NS $CTL -- bash -lc "squeue -h -o '%i %j' 2>/dev/null | awk '\$2 ~ /^sc/ {print \$1}' | xargs -r scancel 2>/dev/null" >/dev/null 2>&1 || true;
-  for i in $(seq 1 20); do L=$(kubectl exec -n $NS $CTL -- bash -lc "squeue -h -o '%j' 2>/dev/null | grep -c '^sc'" 2>/dev/null); [ "${L:-0}" = "0" ] && return 0; sleep 3; done; }
+sweep(){
+  kubectl exec -n $NS $CTL -- bash -lc "squeue -h -o '%i|%T|%j' 2>/dev/null | awk '\$2 ~ /^(PENDING|RUNNING|CONFIGURING|COMPLETING|SUSPENDED)$/ && \$3 ~ /^sc/ {print \$1}' | xargs -r scancel 2>/dev/null" >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do
+    L=$(kubectl exec -n $NS $CTL -- bash -lc "squeue -h -o '%T|%j' 2>/dev/null | awk '\$1 ~ /^(PENDING|RUNNING|CONFIGURING|COMPLETING|SUSPENDED)$/ && \$2 ~ /^sc/ {n++} END {print n+0}'" 2>/dev/null)
+    [ "${L:-0}" = "0" ] && return 0
+    sleep 3
+  done
+}
 restore(){ [ "$PATCHED" = 1 ] || return 0; log "RESTORING original slurm.conf"; patch_conf "$ORIG"; restart_ctl_wait && log "restored" || log "WARN restore"; resume_nodes; }
 cleanup(){ sweep; restore; }
 trap cleanup EXIT
