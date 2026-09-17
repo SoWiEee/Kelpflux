@@ -95,7 +95,8 @@ kubectl get cm -n $NS $CM -o jsonpath='{.data.slurm\.conf}' > "$ORIG"; [ -s "$OR
 sed -e 's|^SchedulerType=.*|SchedulerType=sched/builtin|' -e 's|^PriorityType=.*|PriorityType=priority/basic|' \
     -e '/^SchedulerParameters=/d' -e '/^JobSubmitPlugins=/d' "$ORIG" > "$CONF_FCFS"
 # main: backfill + fast-aging (so age actually bites at this job's timescale).
-cp "$ORIG" "$CONF_MAIN"; printf '\nPriorityMaxAge=%s\n' "$MAXAGE" >> "$CONF_MAIN"
+sed -e 's|^SchedulerType=.*|SchedulerType=sched/backfill|' "$ORIG" > "$CONF_MAIN"
+printf '\nPriorityMaxAge=%s\n' "$MAXAGE" >> "$CONF_MAIN"
 
 REALFLAG=(); [ "$REAL_WORKLOAD" = "1" ] && REALFLAG=(--real-workload --llm-model "$MODEL")
 ck_for(){ local arm="$1" seed="$2"; case "$arm" in backfill|fcfs) echo "";; *) echo "$CK/${arm}_s${seed}.pt";; esac; }
