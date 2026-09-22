@@ -263,7 +263,18 @@ RDSAC 採用雙頭 IQN critic 建模 reward return 與 entropy return [7]，並�
 
 在 BERT 推論、ResNet 訓練、Qwen 微調與 cuBLAS 矩陣運算四路混合工作負載（數量占比分別為 30%、30%、30%、10%）下，每個 seed 提交 150 個工作，使用 seed 42–51 進行評估。工作以 poisson 到達，平均 inter-arrival 為 mean(runtime)/oversub，故 oversub=2、4、6 分別形成淺、中、深三種 job queue 深度。所有方法使用同一 seed 的到達時刻與工作序列；實機路徑為非阻塞的動態 Slurm Priority 重排，工作由 Slurm 原生 backfill 派工與放置。
 
-JCT、P50、P95 與 P99 為各 seed 內 150 個工作的統計量，再以 10 個 seed 做未加權平均 ± 標準差；ΔmeanJCT% 為同 seed 相對 Backfill 的配對差，並附 95% CI、Wilcoxon *p* 與 P99 勝負計數。GPU telemetry 以兩個 worker pod 內的 `nvidia-smi` 每秒取樣；完成率與 telemetry 完整性均列入檢查。表 4–6 保留延遲指標，表 8 另列資源、slowdown、公平性、等待時間與完整性指標。
+JCT、P50、P95 與 P99 為各 seed 內 150 個工作的統計量，再以 10 個 seed 做未加權平均 ± 標準差；ΔmeanJCT% 為同 seed 相對 Backfill 的配對差，並附 95% CI、Wilcoxon *p* 與 P99 勝負計數。GPU telemetry 以兩個 worker pod 內的 `nvidia-smi` 每秒取樣；完成率與 telemetry 完整性均列入檢查。表 4–6 保留延遲指標，表 8 另列資源、slowdown、公平性、等待時間與完整性指標。對每個已完成工作 $i$，指標定義如下：
+
+$$
+\begin{aligned}
+\mathrm{JCT}_i &= t_i^{\mathrm{end}}-t_i^{\mathrm{submit}}, &
+\mathrm{wait}_i &= t_i^{\mathrm{start}}-t_i^{\mathrm{submit}}, \\
+s_i &= \frac{\mathrm{JCT}_i}{\max(\mathrm{runtime}_i,\,60\ \mathrm{s})}, &
+J_{\mathrm{slowdown}} &= \frac{\left(\sum_{i=1}^{n}s_i\right)^2}{n\sum_{i=1}^{n}s_i^2}.
+\end{aligned}
+$$
+
+其中 $\mathrm{runtime}_i$ 為實際執行時間、$n$ 為該 seed 的已完成工作數。$s_i$ 為 slowdown，數值越小表示工作完成時間越接近其執行時間；分母至少取 60 秒，避免短工作造成極端比值。Jain slowdown 指數 $J_{\mathrm{slowdown}}$ 衡量各工作 slowdown 的均等程度，越接近 1 代表越均等，**不是**工作不會飢餓的保證。等待 P95、slowdown P95／最大值及 JCT P99 分別取該 seed 工作分布的第 95 百分位、最大值與第 99 百分位；完成率為已完成工作數除以提交工作數。GPU 利用率為兩張 GPU 的 `nvidia-smi utilization.gpu` 樣本平均，VRAM 壓力為每筆樣本的已用記憶體除以總記憶體（再取平均或峰值）；前者是 GPU 活動率，不能視作獨立量得的 SM 使用率。
 
 表 4. 重載混合工作負載評估結果（oversub=6，動態優先權重排，10 seeds × 150 工作）
 
@@ -335,9 +346,9 @@ JCT、P50、P95 與 P99 為各 seed 內 150 個工作的統計量，再以 10 �
 
 P99 沒有跟隨平均 JCT 一起改善：oversub=2 的學習臂僅有 2–5/10 個 seed 勝過 Backfill，oversub=4 為 0–4/10，oversub=6 為 1–3/10；FCFS 在 oversub=4 更沒有任何 seed 勝過 Backfill。換言之，最新實機證據支持「學習式排序改善平均 JCT」，但不支持「學習式策略普遍降低 P99」的結論。
 
-在本研究中，P99 代表工作完成時間的尾端壓力，`P99<bf` 則表示該策略在 10 個配對 seed 中有多少次的 P99 低於 Backfill；兩者都是可能 starvation 的**間接觀察量**，不能單獨證明某一工作遭到飢餓。本文因此同時檢視等待時間 P95、slowdown P95／最大值、Jain slowdown fairness，以及兩張 GPU 的利用率、SM activity proxy 與 VRAM pressure。監控資料由 worker pod 內的 `nvidia-smi` 每秒取樣；表 8 彙整 `utilization.gpu`、VRAM 使用壓力與工作公平性，原始樣本亦保留供逐工作尾端分析。最新結果顯示，平均 JCT 的改善沒有伴隨一致的 P99 或 fairness 改善，較適當的解讀是吞吐提升與尾端／公平性的取捨，而非已消除 starvation。
+在本研究中，P99 代表工作完成時間的尾端壓力，`P99<bf` 則表示該策略在 10 個配對 seed 中有多少次的 P99 低於 Backfill；兩者都是可能 starvation 的**間接觀察量**，不能單獨證明某一工作遭到飢餓。本文因此同時檢視等待時間 P95、slowdown P95／最大值、Jain slowdown fairness，以及兩張 GPU 的活動率與 VRAM 壓力。表 8 彙整這些指標；其結果顯示，平均 JCT 的改善沒有伴隨一致的 P99 或 fairness 改善，較適當的解讀是平均完成時間與尾端／公平性的取捨，而非已消除 starvation。
 
-從彙總值看，學習式策略的 P99 在三個負載點均高於 Backfill：oversub=2 約高 3–31 秒、oversub=4 約高 89–116 秒、oversub=6 約高 46–71 秒；但由於不同 seed 的工作序列與尾端工作組成不同，仍有部分 seed 的 `P99<bf` 為真。這種「平均 JCT 較低、P99 較高」的結果，表示策略可能透過優先處理較容易完成的工作縮短整體平均時間，卻讓少數長工作承受較長等待；Jain fairness 較低及 slowdown 最大值偏高與此解讀一致。換言之，學習式策略目前學到的是偏向平均效能的排序，而非嚴格的 tail-aware 或 starvation-free 排程；P99 較差是現有 reward、訓練資料與 Slurm Priority 施行方式共同形成的可觀察限制。
+從彙總值看，學習式策略的 P99 在三個負載點均高於 Backfill：oversub=2 約高 3–31 秒、oversub=4 約高 89–116 秒、oversub=6 約高 46–71 秒；但仍有部分 seed 的 `P99<bf` 為真。這種「平均 JCT 較低、P99 較高」的結果，可能是排程順序讓多數工作較早完成，少數工作卻等待較久；Jain fairness 較低及部分策略的 slowdown 最大值偏高與此解釋相容。然而目前沒有逐工作排序與等待原因的歸因分析，不能據此斷定是長工作飢餓、GPU 共置干擾或 reward 設計所致。現有證據僅支持平均效能改善伴隨尾端代價。
 
 資源與公平性結果顯示，學習臂的 GPU 利用率相較 Backfill 約增加 0–1.0 個百分點，VRAM 平均壓力增加約 0.2–0.8 個百分點，峰值大致維持 84%，因此沒有證據顯示 P99 變差是由 GPU 記憶體耗盡或明顯過度超額配置所造成。平均 slowdown 在中、重載由 Backfill 的 4.7／5.3 降至約 4.2／4.7，等待時間 P95 也以 RDSAC-mean 在 oversub=4（497.5 s）與 oversub=6（571.4 s）最低；但 RLPD 的等待 P95 在兩個負載點分別為 628.9 s 與 669.2 s，且部分學習臂的 slowdown P95／最大值高於 Backfill，顯示平均改善不保證尾端等待改善。Jain slowdown fairness 多數學習臂約 0.7，而 FCFS／Backfill 約 0.8，表示本 campaign 存在吞吐與公平性的取捨。所有 180 個結果均完成，六種策略在三個負載點的完成率皆為 100%，兩張 GPU 的 telemetry 完整性皆為 10/10。
 
@@ -431,9 +442,7 @@ $$
 
 ### 6.2 未來展望
 
-未來工作可沿以下方向展開：
-
-本研究目前只在兩張異質 GPU 的小型叢集上驗證，結果應視為實機 proof-of-concept，而非大型叢集的效能保證。擴展到更多節點與 GPU 後，工作競爭、硬體差異、資源共享與節點間協調都會更複雜；學習式策略可能獲得更多可重排的工作，也可能面臨更大的決策不確定性與部署成本。因此，未來需要在不同規模、GPU 型號與工作負載下重新驗證平均 JCT、P99、GPU 利用率、工作公平性與失效回退行為，不能直接外推本研究的改善幅度。以下方向是可驗證的擴展路徑：
+**系統可延展性的討論。** 本研究目前只在兩張異質 GPU 的小型叢集上驗證，結果應視為實機 proof-of-concept，而非大型叢集的效能保證。擴展到更多節點與 GPU 後，候選工作與放置選項增加，排程策略必須處理更多資源狀態與不同硬體的效能差異；目前針對兩張 GPU 訓練的模型不能直接套用於不同規模。訓練時需擴充模擬環境與工作負載，重新訓練相應模型；更多候選動作與情境可能提高所需樣本量、訓練時間及運算成本，實際增幅仍需量測。部署時亦應調整決策介面與資源約束，檢查佇列重排是否仍能及時完成，並保留 Slurm 原生回退路徑。未來須在不同規模、GPU 型號與工作負載下重新比較平均 JCT、P99、GPU 利用率及工作公平性，才能確認效益是否可延伸。其他可驗證方向如下：
 
 1. **更大、更高競爭的叢集**：擴展至更多節點與 GPU，檢驗學習式策略的效益是否隨叢集規模與競爭程度進一步增強。
 2. **MIG + MPS fraction 混合 partition**：同時納入硬體級隔離與軟體級共享，建立更完整的 GPU sharing action space [3][16]。
