@@ -248,6 +248,7 @@ function gpuInfo(raw) {
   if (explicit && typeof explicit === "object") {
     const item = gpuItem(explicit);
     if (item) return { label: item.label, count: item.count };
+    return { label: "", count: 0 };
   }
   if (explicit !== null) return { label: textValue(explicit), count: 1 };
 
