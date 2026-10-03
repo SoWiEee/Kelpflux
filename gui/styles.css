@@ -594,6 +594,84 @@ td {
   text-align: right;
 }
 
+.gpu-metrics {
+  display: grid;
+  gap: 10px;
+  padding: 12px 18px 18px;
+}
+
+.gpu-card {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-strong);
+}
+
+.gpu-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.gpu-card-heading strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.gpu-state {
+  color: var(--mint);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.gpu-state--offline {
+  color: var(--coral);
+}
+
+.gpu-node {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gpu-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.gpu-stats div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.gpu-stats dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.gpu-stats dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.gpu-empty {
+  padding: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
 .note-panel {
   padding: 18px;
 }

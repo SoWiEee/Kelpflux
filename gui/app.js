@@ -28,6 +28,15 @@ const dom = {
   gpuCount: document.querySelector("#gpu-count"),
   allocatedMps: document.querySelector("#allocated-mps"),
   usageSignal: document.querySelector("#usage-signal"),
+  schedulerReady: document.querySelector("#scheduler-ready"),
+  schedulerAge: document.querySelector("#scheduler-age"),
+  schedulerFreeMps: document.querySelector("#scheduler-free-mps"),
+  schedulerAction: document.querySelector("#scheduler-action"),
+  queueOldestWait: document.querySelector("#queue-oldest-wait"),
+  queueAverageWait: document.querySelector("#queue-average-wait"),
+  queueCycle: document.querySelector("#queue-cycle"),
+  queueBackfill: document.querySelector("#queue-backfill"),
+  gpuMetrics: document.querySelector("#gpu-metrics"),
 };
 
 const monitor = {
@@ -77,7 +86,7 @@ function jobsUrl() {
 async function poll() {
   if (monitor.inFlight) return;
   monitor.inFlight = true;
-  setConnection("connecting", "Connecting");
+  setConnection("connecting", "連線中");
 
   try {
     const response = await fetch(jobsUrl(), {
@@ -92,12 +101,12 @@ async function poll() {
     monitor.loaded = true;
     monitor.lastUpdated = new Date();
     render(payload);
-    setConnection("online", "Connected");
+    setConnection("online", "已連線");
     dom.errorNotice.hidden = true;
     dom.staleNotice.hidden = true;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown API error";
-    setConnection("error", "Offline");
+    setConnection("error", "離線");
     dom.errorMessage.textContent = message;
     dom.errorNotice.hidden = false;
     dom.staleNotice.hidden = !monitor.loaded;
@@ -112,9 +121,9 @@ function setConnection(kind, label) {
   dom.statusDot.className = `status-dot is-${kind}`;
   dom.refreshButton.disabled = kind === "connecting";
   if (monitor.lastUpdated) {
-    dom.lastUpdated.textContent = `Last update ${formatClock(monitor.lastUpdated)}`;
+    dom.lastUpdated.textContent = `最後更新 ${formatClock(monitor.lastUpdated)}`;
   } else {
-    dom.lastUpdated.textContent = kind === "error" ? "No successful response" : "Waiting for data";
+    dom.lastUpdated.textContent = kind === "error" ? "尚無成功回應" : "等待資料";
   }
 }
 
@@ -271,10 +280,10 @@ function usageInfo(raw) {
   const usage = raw.resource_usage ?? raw.resourceUsage ?? raw.usage;
   const source = usage && typeof usage === "object" ? usage : raw;
   const sm = numberFrom(source, ["sm_percent", "sm_utilization", "gpu_utilization", "gpu_util"]);
-  if (sm !== null) return { value: `SM ${formatNumber(sm)}%`, reported: true };
+  if (sm !== null) return { value: `SM 使用率 ${formatNumber(sm)}%`, reported: true };
   const mps = numberFrom(source, ["mps_used", "mps_usage", "used_mps"]);
-  if (mps !== null) return { value: `MPS ${formatNumber(mps)}`, reported: true };
-  return { value: "Not reported", reported: false };
+  if (mps !== null) return { value: `GPU 分享量 ${formatNumber(mps)}%`, reported: true };
+  return { value: "尚未提供", reported: false };
 }
 
 function mpsSummary(jobs, key) {
@@ -300,18 +309,104 @@ function submittedValue(raw) {
 function render(payload) {
   renderSummary(monitor.jobs);
   renderRows(monitor.jobs);
+  renderScheduler(payload?.scheduler);
+  renderQueueMetrics(payload?.queue_metrics);
+  renderGpuMetrics(payload?.gpu_metrics);
 
-  const responseNodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
   const jobNodes = new Set(monitor.jobs.map((job) => job.node).filter(Boolean));
-  const responseGpus = responseNodes.reduce((total, node) => {
-    if (Array.isArray(node.gpus)) return total + node.gpus.length;
-    return total + (numberOrNull(node.gpus) || 0);
-  }, 0);
   const jobGpus = monitor.jobs.reduce((total, job) => total + job.gpu.count, 0);
-  dom.nodeCount.textContent = String(responseNodes.length || jobNodes.size);
-  dom.gpuCount.textContent = String(responseGpus || jobGpus);
+  dom.nodeCount.textContent = `${jobNodes.size} 個節點`;
+  dom.gpuCount.textContent = `${jobGpus} 張`;
   const usageJobs = monitor.jobs.filter((job) => job.usage.reported).length;
-  dom.usageSignal.textContent = usageJobs ? `${usageJobs} job${usageJobs === 1 ? "" : "s"} reported` : "Not reported";
+  dom.usageSignal.textContent = usageJobs ? `${usageJobs} 個工作有回報` : "尚未提供";
+}
+
+function renderScheduler(scheduler) {
+  if (!scheduler || typeof scheduler !== "object") {
+    dom.schedulerReady.textContent = "尚未提供";
+    dom.schedulerAge.textContent = "尚未提供";
+    dom.schedulerFreeMps.textContent = "尚未提供";
+    dom.schedulerAction.textContent = "尚未提供";
+    return;
+  }
+  const ready = numberOrNull(scheduler.ready);
+  const shadow = numberOrNull(scheduler.shadow_mode);
+  const age = numberOrNull(scheduler.snapshot_age_s);
+  const freeMps = numberOrNull(scheduler.free_mps);
+  const jobIndex = numberOrNull(scheduler.last_job_index);
+  const nodeIndex = numberOrNull(scheduler.last_node_index);
+  const gpuIndex = numberOrNull(scheduler.last_gpu_index);
+  dom.schedulerReady.textContent = ready === null ? "尚未提供" : ready > 0 ? "已就緒" : "未就緒";
+  if (shadow !== null && shadow > 0) dom.schedulerReady.textContent += "（觀察模式）";
+  dom.schedulerAge.textContent = age === null ? "尚未提供" : `${formatNumber(age)} 秒`;
+  dom.schedulerFreeMps.textContent = freeMps === null ? "尚未提供" : `${formatNumber(freeMps)}%`;
+  dom.schedulerAction.textContent = jobIndex === null
+    ? "尚未提供"
+    : `槽${formatNumber(jobIndex)} · 節點${formatMaybe(nodeIndex)} · GPU${formatMaybe(gpuIndex)}`;
+}
+
+function renderQueueMetrics(metrics) {
+  if (!metrics || typeof metrics !== "object") {
+    dom.queueOldestWait.textContent = "尚未提供";
+    dom.queueAverageWait.textContent = "尚未提供";
+    dom.queueCycle.textContent = "尚未提供";
+    dom.queueBackfill.textContent = "尚未提供";
+    return;
+  }
+  const seconds = (value) => {
+    const number = numberOrNull(value);
+    return number === null ? "尚未提供" : `${formatNumber(number)} 秒`;
+  };
+  dom.queueOldestWait.textContent = seconds(metrics.oldest_wait_s);
+  dom.queueAverageWait.textContent = seconds(metrics.average_wait_s);
+  dom.queueCycle.textContent = seconds(metrics.scheduler_cycle_s);
+  const backfill = numberOrNull(metrics.backfill_queue);
+  dom.queueBackfill.textContent = backfill === null ? "尚未提供" : formatNumber(backfill);
+}
+
+function renderGpuMetrics(metrics) {
+  dom.gpuMetrics.replaceChildren();
+  if (!Array.isArray(metrics) || !metrics.length) {
+    const empty = document.createElement("div");
+    empty.className = "gpu-empty";
+    empty.textContent = "尚未提供 GPU 即時資料";
+    dom.gpuMetrics.append(empty);
+    return;
+  }
+  metrics.forEach((metric) => {
+    const card = document.createElement("article");
+    card.className = "gpu-card";
+    const heading = document.createElement("div");
+    heading.className = "gpu-card-heading";
+    const name = document.createElement("strong");
+    name.textContent = `${metric.gpu_type || "GPU"} · GPU ${formatMaybe(numberOrNull(metric.gpu_index))}`;
+    const state = document.createElement("span");
+    state.className = `gpu-state${metric.available === false ? " gpu-state--offline" : ""}`;
+    state.textContent = metric.available === false ? "離線" : "即時";
+    heading.append(name, state);
+    const node = document.createElement("span");
+    node.className = "gpu-node";
+    node.textContent = metric.node || "尚未提供節點";
+    const stats = document.createElement("dl");
+    stats.className = "gpu-stats";
+    addGpuStat(stats, "SM", metric.gpu_util_percent, "%");
+    addGpuStat(stats, "VRAM", metric.vram_percent, "%");
+    addGpuStat(stats, "功耗", metric.power_w, " W");
+    addGpuStat(stats, "溫度", metric.temperature_c, " °C");
+    card.append(heading, node, stats);
+    dom.gpuMetrics.append(card);
+  });
+}
+
+function addGpuStat(list, label, value, suffix) {
+  const item = document.createElement("div");
+  const term = document.createElement("dt");
+  term.textContent = label;
+  const detail = document.createElement("dd");
+  const number = numberOrNull(value);
+  detail.textContent = number === null ? "--" : `${formatNumber(number)}${suffix}`;
+  item.append(term, detail);
+  list.append(item);
 }
 
 function renderSummary(jobs) {
@@ -321,12 +416,12 @@ function renderSummary(jobs) {
   const allocated = mpsSummary(jobs, "mpsAllocated");
 
   dom.totalJobs.textContent = String(jobs.length);
-  dom.totalMeta.textContent = `${pending} pending / ${running} running`;
+  dom.totalMeta.textContent = `${pending} 個等待 / ${running} 個執行中`;
   dom.pendingJobs.textContent = String(pending);
   dom.runningJobs.textContent = String(running);
-  dom.requestedMps.textContent = requested === null ? "--" : formatNumber(requested);
-  dom.mpsMeta.textContent = requested === null ? "No request values reported" : "Across reported jobs";
-  dom.allocatedMps.textContent = allocated === null ? "--" : formatNumber(allocated);
+  dom.requestedMps.textContent = requested === null ? "--" : `${formatNumber(requested)}%`;
+  dom.mpsMeta.textContent = requested === null ? "尚未回報需求量" : "所有工作合計（MPS 百分比總和）";
+  dom.allocatedMps.textContent = allocated === null ? "--" : `${formatNumber(allocated)}%`;
 }
 
 function renderRows(jobs) {
@@ -358,7 +453,7 @@ function renderLoading() {
   row.className = "placeholder-row";
   const tableCell = document.createElement("td");
   tableCell.colSpan = 6;
-  tableCell.innerHTML = '<div class="empty-state empty-state--loading"><span class="loading-line" aria-hidden="true"></span><strong>Connecting to the queue</strong><span>Waiting for the first response.</span></div>';
+  tableCell.innerHTML = '<div class="empty-state empty-state--loading"><span class="loading-line" aria-hidden="true"></span><strong>正在連線至工作佇列</strong><span>等待第一次回應。</span></div>';
   row.append(tableCell);
   dom.jobsBody.append(row);
 }
@@ -371,7 +466,7 @@ function renderError() {
   row.className = "placeholder-row";
   const tableCell = document.createElement("td");
   tableCell.colSpan = 6;
-  tableCell.innerHTML = '<div class="empty-state"><div class="empty-icon" aria-hidden="true">!</div><strong>Queue unavailable</strong><span>Check the API base or reconnect the backend.</span></div>';
+  tableCell.innerHTML = '<div class="empty-state"><div class="empty-icon" aria-hidden="true">!</div><strong>工作佇列無法使用</strong><span>請檢查 API 位址或重新連線後端。</span></div>';
   row.append(tableCell);
   dom.jobsBody.append(row);
 }
@@ -398,9 +493,9 @@ function placementCell(job) {
   const wrapper = document.createElement("div");
   wrapper.className = "placement";
   const node = document.createElement("strong");
-  node.textContent = job.node || "Unassigned";
+  node.textContent = job.node || "尚未分配節點";
   const gpu = document.createElement("span");
-  gpu.textContent = job.gpu.label || "GPU unassigned";
+  gpu.textContent = job.gpu.label || "尚未分配 GPU";
   wrapper.append(node, gpu);
   tableCell.append(wrapper);
   return tableCell;
@@ -411,9 +506,9 @@ function mpsCell(job) {
   const wrapper = document.createElement("div");
   wrapper.className = "mps-cell";
   const value = document.createElement("strong");
-  value.textContent = `${formatMaybe(job.mpsRequested)} / ${formatMaybe(job.mpsAllocated)}`;
+  value.textContent = `${formatMaybe(job.mpsRequested, "%")} / ${formatMaybe(job.mpsAllocated, "%")}`;
   const detail = document.createElement("span");
-  detail.textContent = "requested / allocated";
+  detail.textContent = "要求 / 已配置（MPS 百分比）";
   wrapper.append(value, detail);
   tableCell.append(wrapper);
   return tableCell;
@@ -427,7 +522,7 @@ function usageCell(job) {
   value.className = `usage-value${job.usage.reported ? "" : " usage-value--missing"}`;
   value.textContent = job.usage.value;
   const detail = document.createElement("span");
-  detail.textContent = job.usage.reported ? "reported by API" : "job-level signal";
+  detail.textContent = job.usage.reported ? "API 即時回報" : "尚無工作層級資料";
   wrapper.append(value, detail);
   tableCell.append(wrapper);
   return tableCell;
@@ -441,8 +536,8 @@ function submittedCell(date) {
   return tableCell;
 }
 
-function formatMaybe(value) {
-  return value === null ? "--" : formatNumber(value);
+function formatMaybe(value, suffix = "") {
+  return value === null ? "--" : `${formatNumber(value)}${suffix}`;
 }
 
 function formatNumber(value) {
