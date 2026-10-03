@@ -18,6 +18,32 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 _NUMBER_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _ACTIVE_STATES = {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "SUSPENDED"}
+_TERMINAL_STATES = {
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
+    "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED",
+}
+_PID_JOB_SCRIPT = r'''
+for start do
+  pid="$start"
+  job=""
+  depth=0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$depth" -lt 32 ]; do
+    if [ -r "/proc/$pid/environ" ]; then
+      job=$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^SLURM_JOB_ID=//p' | sed -n '1p')
+    fi
+    if [ -z "$job" ] && [ -r "/proc/$pid/cgroup" ]; then
+      job=$(sed -n 's/.*job[_-]\([0-9][0-9]*\).*/\1/p' "/proc/$pid/cgroup" | sed -n '1p')
+    fi
+    if [ -z "$job" ] && [ -r "/proc/$pid/cmdline" ]; then
+      job=$(tr '\0' ' ' < "/proc/$pid/cmdline" | sed -n 's/.*slurmstepd: \[\([0-9][0-9]*\)\..*/\1/p')
+    fi
+    [ -n "$job" ] && break
+    pid=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
+    depth=$((depth + 1))
+  done
+  printf '%s|%s\n' "$start" "$job"
+done
+'''.strip()
 
 
 def _number(value: object) -> float | None:
@@ -40,6 +66,15 @@ def _timestamp(value: object) -> float | None:
     if number is not None and number > 0:
         return number
     return None
+
+
+def _iso_timestamp(value: str) -> float | None:
+    if not value or value in {"Unknown", "None", "N/A"}:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
 
 
 def _first(value: object) -> object:
@@ -87,10 +122,111 @@ def _normalise_live_job(raw: dict[str, Any]) -> dict[str, object]:
         "gpu": _gpu_from_node(node, requested or allocated),
         "mps": {"requested": requested, "allocated": allocated},
         "submit_ts": submit_ts,
+        "start_ts": _timestamp(raw.get("start_time")),
+        "job_name": str(raw.get("name", "")),
+        "command": str(raw.get("command", raw.get("submit_line", ""))),
         "resource_usage": None,
         "reason": raw.get("state_reason", ""),
         "partition": raw.get("partition", ""),
     }
+
+
+def _parse_sacct_history(text: str, limit: int = 50) -> list[dict[str, object]]:
+    fields = (
+        "job_id", "job_name", "state", "submit", "start", "end", "elapsed",
+        "node", "allocated_tres", "requested_tres", "partition", "command",
+    )
+    jobs = []
+    for line in text.splitlines():
+        values = (line[:-1] if line.endswith("|") else line).split("|", len(fields) - 1)
+        if len(values) != len(fields):
+            continue
+        row = dict(zip(fields, values))
+        state = row["state"].split()[0].split("+")[0].upper()
+        if state not in _TERMINAL_STATES:
+            continue
+        submit = _iso_timestamp(row["submit"])
+        start = _iso_timestamp(row["start"])
+        end = _iso_timestamp(row["end"])
+        requested = _mps_value(row["requested_tres"])
+        allocated = _mps_value(row["allocated_tres"])
+        jobs.append({
+            "job_id": row["job_id"],
+            "job_name": row["job_name"],
+            "state": state,
+            "node": row["node"],
+            "gpu": _gpu_from_node(row["node"], requested or allocated),
+            "mps": {"requested": requested, "allocated": allocated},
+            "submit_ts": submit,
+            "start_ts": start,
+            "end_ts": end,
+            "jct_seconds": end - submit if submit is not None and end is not None else None,
+            "wait_seconds": start - submit if submit is not None and start is not None else None,
+            "runtime_seconds": end - start if start is not None and end is not None else None,
+            "elapsed_seconds": _number(row["elapsed"]),
+            "partition": row["partition"],
+            "command": row["command"],
+        })
+    jobs.sort(key=lambda job: float(job["end_ts"] or 0), reverse=True)
+    return jobs[:limit]
+
+
+def _parse_pmon(text: str) -> list[dict[str, object]]:
+    processes = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        columns = line.split()
+        if len(columns) < 10 or not columns[1].isdigit() or "C" not in columns[2]:
+            continue
+        processes.append({
+            "gpu_index": _int(columns[0], -1),
+            "pid": int(columns[1]),
+            "process_type": columns[2],
+            "sm_percent": _number(columns[3]),
+            "vram_used_mib": _number(columns[9]),
+            "command": " ".join(columns[11:]) if len(columns) > 11 else "",
+        })
+    return processes
+
+
+def _aggregate_job_usage(
+    processes: list[dict[str, object]],
+    pid_jobs: dict[int, str],
+    gpu_metrics: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    gpus = {int(item["gpu_index"]): item for item in gpu_metrics if "gpu_index" in item}
+    shared_sm = {
+        int(process["gpu_index"]): _number(process.get("sm_percent"))
+        for process in processes
+        if str(process.get("command", "")).startswith("nvidia-cuda-mps")
+        and _number(process.get("sm_percent")) is not None
+    }
+    usage: dict[str, dict[str, object]] = {}
+    for process in processes:
+        job_id = pid_jobs.get(int(process["pid"]))
+        if not job_id:
+            continue
+        gpu = gpus.get(int(process["gpu_index"]), {})
+        item = usage.setdefault(job_id, {
+            "sm_percent": None,
+            "vram_used_mib": None,
+            "gpu_uuid": gpu.get("gpu_uuid", ""),
+            "pids": [],
+        })
+        sm = _number(process.get("sm_percent"))
+        vram = _number(process.get("vram_used_mib"))
+        if sm is not None:
+            item["sm_percent"] = min(100.0, float(item["sm_percent"] or 0) + sm)
+        if vram is not None:
+            item["vram_used_mib"] = float(item["vram_used_mib"] or 0) + vram
+        item["pids"].append(process["pid"])
+        total = _number(gpu.get("memory_total_mib"))
+        if total and item["vram_used_mib"] is not None:
+            item["vram_percent"] = float(item["vram_used_mib"]) / total * 100.0
+        if item["sm_percent"] is None and int(process["gpu_index"]) in shared_sm:
+            item["shared_gpu_sm_percent"] = shared_sm[int(process["gpu_index"])]
+    return usage
 
 
 def _parse_key_values(line: str) -> dict[str, str]:
@@ -177,7 +313,7 @@ class LiveCollector:
         count = _gpu_count_from_gres(node.get("Gres", ""))
         query = (
             "nvidia-smi",
-            "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,"
+            "--query-gpu=index,uuid,name,utilization.gpu,utilization.memory,memory.used,"
             "memory.total,power.draw,temperature.gpu",
             "--format=csv,noheader,nounits",
         )
@@ -197,32 +333,56 @@ class LiveCollector:
 
         metrics: list[dict[str, object]] = []
         for row in csv.reader(output.splitlines(), skipinitialspace=True):
-            if len(row) < 8:
+            if len(row) < 9:
                 continue
-            used = _number(row[4])
-            total = _number(row[5])
+            used = _number(row[5])
+            total = _number(row[6])
             vram = (used / total * 100.0) if used is not None and total else None
             metrics.append(
                 {
                     "node": name,
                     "gpu_type": gpu_type,
                     "gpu_index": _int(row[0]),
+                    "gpu_uuid": row[1].strip(),
                     "available": True,
-                    "gpu_util_percent": _number(row[2]),
-                    "memory_util_percent": _number(row[3]),
+                    "gpu_util_percent": _number(row[3]),
+                    "memory_util_percent": _number(row[4]),
                     "memory_used_mib": used,
                     "memory_total_mib": total,
                     "vram_percent": vram,
-                    "power_w": _number(row[6]),
-                    "temperature_c": _number(row[7]),
+                    "power_w": _number(row[7]),
+                    "temperature_c": _number(row[8]),
                 }
             )
         return metrics
+
+    def _job_gpu_usage(
+        self, node_name: str, gpu_metrics: list[dict[str, object]],
+    ) -> dict[str, dict[str, object]]:
+        try:
+            processes = _parse_pmon(self._exec(node_name, "nvidia-smi", "pmon", "-c", "1", "-s", "um"))
+            if not processes:
+                return {}
+            pids = [str(process["pid"]) for process in processes]
+            mapped = self._exec(node_name, "sh", "-c", _PID_JOB_SCRIPT, "sh", *pids)
+        except LiveCollectionError:
+            return {}
+        pid_jobs = {}
+        for line in mapped.splitlines():
+            pid, separator, job_id = line.partition("|")
+            if separator and pid.isdigit() and job_id.isdigit():
+                pid_jobs[int(pid)] = job_id
+        return _aggregate_job_usage(processes, pid_jobs, gpu_metrics)
 
     def collect(self) -> dict[str, object]:
         try:
             queue = json.loads(self._exec(self.controller, "squeue", "--json"))
             node_text = self._exec(self.controller, "scontrol", "show", "node", "--oneliner")
+            history_text = self._exec(
+                self.controller,
+                "sacct", "-X", "-P", "-n", "-S", "now-1day",
+                "-o", "JobIDRaw,JobName,State,Submit,Start,End,ElapsedRaw,NodeList,AllocTRES,ReqTRES,Partition,SubmitLine",
+            )
         except (json.JSONDecodeError, LiveCollectionError) as exc:
             raise LiveCollectionError(f"Slurm query failed: {exc}") from exc
 
@@ -234,6 +394,7 @@ class LiveCollector:
         nodes = [_parse_key_values(line) for line in node_text.splitlines() if line.strip()]
         nodes = [node for node in nodes if node.get("NodeName")]
         gpu_metrics: list[dict[str, object]] = []
+        usage_by_job: dict[str, dict[str, object]] = {}
         node_views: list[dict[str, object]] = []
         for node in nodes:
             capacity = _mps_value(node.get("CfgTRES"), node.get("Gres")) or 0
@@ -242,6 +403,7 @@ class LiveCollector:
             if "gpu:" in node.get("Gres", ""):
                 node_gpu_metrics = self._gpu_metrics(node)
                 gpu_metrics.extend(node_gpu_metrics)
+                usage_by_job.update(self._job_gpu_usage(node["NodeName"], node_gpu_metrics))
             node_views.append(
                 {
                     "name": node.get("NodeName"),
@@ -253,6 +415,9 @@ class LiveCollector:
                     "gpu_metrics": node_gpu_metrics,
                 }
             )
+
+        for job in jobs:
+            job["resource_usage"] = usage_by_job.get(str(job["job_id"]))
 
         scheduler_text = ""
         exporter_text = ""
@@ -289,6 +454,7 @@ class LiveCollector:
             "updated_at": now.isoformat(),
             "source": "live-slurm-kubernetes",
             "jobs": jobs,
+            "history": _parse_sacct_history(history_text),
             "nodes": node_views,
             "gpu_metrics": gpu_metrics,
             "scheduler": scheduler,
@@ -314,7 +480,6 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

@@ -14,8 +14,8 @@
         <div class="brand-lockup">
           <span class="brand-mark" aria-hidden="true">K</span>
           <div>
-            <p class="eyebrow">Kelpflux 控制平面</p>
-            <h1>工作監控</h1>
+            <h1>Kelpflux</h1>
+            <p class="brand-subtitle">工作監控</p>
           </div>
         </div>
         <div class="connection-status" aria-live="polite">
@@ -40,22 +40,22 @@
         </section>
 
         <section class="summary-grid" aria-label="佇列摘要">
-          <article class="summary-card summary-card--accent">
+          <article class="summary-card summary-card--total">
             <p class="summary-label">工作總數</p>
             <p class="summary-value" id="total-jobs">--</p>
             <p class="summary-meta" id="total-meta">等待 API</p>
           </article>
-          <article class="summary-card">
+          <article class="summary-card summary-card--running">
             <p class="summary-label">執行中</p>
             <p class="summary-value" id="running-jobs">--</p>
             <p class="summary-meta">目前執行的工作</p>
           </article>
-          <article class="summary-card">
+          <article class="summary-card summary-card--pending">
             <p class="summary-label">等待中</p>
             <p class="summary-value" id="pending-jobs">--</p>
             <p class="summary-meta">排隊等待的工作</p>
           </article>
-          <article class="summary-card">
+          <article class="summary-card summary-card--mps">
             <p class="summary-label">工作要求的 GPU 分享量</p>
             <p class="summary-value" id="requested-mps">--</p>
             <p class="summary-meta" id="mps-meta">所有工作合計（MPS 百分比總和）</p>
@@ -65,10 +65,7 @@
         <section class="content-grid">
           <article class="queue-panel panel">
             <div class="panel-heading">
-              <div>
-                <p class="eyebrow">即時佇列</p>
-                <h2>工作</h2>
-              </div>
+              <h2>即時排程流向</h2>
               <span class="poll-chip"><span class="pulse-ring" aria-hidden="true"></span>更新中</span>
             </div>
 
@@ -80,46 +77,87 @@
               API 重連中，先顯示上一次成功取得的資料。
             </div>
 
-            <div class="table-wrap">
-              <table>
-                <caption class="sr-only">目前 Slurm 工作佇列與資源配置</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">工作編號</th>
-                    <th scope="col">狀態</th>
-                    <th scope="col">分配位置</th>
-                    <th scope="col">GPU 分享量</th>
-                    <th scope="col">實際使用量</th>
-                    <th scope="col">提交時間</th>
-                  </tr>
-                </thead>
-                <tbody id="jobs-body">
-                  <tr class="placeholder-row">
-                    <td colspan="6">
-                      <div class="empty-state empty-state--loading">
-                        <span class="loading-line" aria-hidden="true"></span>
-                        <strong>正在連線至工作佇列</strong>
-                        <span>等待第一次回應。</span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+            <div class="queue-visual" id="queue-visual" aria-live="polite">
+              <section class="pending-stage" aria-labelledby="pending-stage-title">
+                <div class="stage-heading">
+                  <h3 id="pending-stage-title">等待排程</h3>
+                  <span class="stage-count" id="pending-stage-count">0 個工作</span>
+                </div>
+                <div class="pending-stream" id="pending-stream">
+                  <div class="stage-empty">正在取得工作佇列</div>
+                </div>
+              </section>
+
+              <div class="dispatch-bridge" aria-hidden="true">
+                <span>DRL 排序</span>
+                <i></i>
+                <span>Slurm 配置</span>
+              </div>
+
+              <section class="node-stage" aria-labelledby="node-stage-title">
+                <div class="stage-heading">
+                  <h3 id="node-stage-title">GPU 資源配置</h3>
+                  <span class="slot-legend"><i aria-hidden="true"></i>25% MPS</span>
+                </div>
+                <div class="node-board" id="node-board">
+                  <div class="stage-empty">正在取得 GPU node 狀態</div>
+                </div>
+              </section>
             </div>
-            <div class="empty-state" id="empty-state" hidden>
-              <div class="empty-icon" aria-hidden="true">0</div>
-              <strong>目前沒有活動中的工作</strong>
-              <span>API 已連線，但目前佇列是空的。</span>
-            </div>
+
+            <details class="job-details">
+              <summary>工作明細 <span id="job-detail-count">0</span></summary>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">目前 Slurm 工作佇列與資源配置</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">工作編號</th>
+                      <th scope="col">狀態</th>
+                      <th scope="col">分配位置</th>
+                      <th scope="col">GPU 分享量</th>
+                      <th scope="col">實際使用量</th>
+                      <th scope="col">提交時間</th>
+                    </tr>
+                  </thead>
+                  <tbody id="jobs-body">
+                    <tr class="placeholder-row">
+                      <td colspan="6">等待第一次回應。</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+
+            <details class="job-history" open>
+              <summary>最近完成 <span id="history-count">0</span></summary>
+              <div class="table-wrap">
+                <table class="history-table">
+                  <caption class="sr-only">最近 24 小時完成的 Slurm 工作紀錄</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">工作</th>
+                      <th scope="col">狀態</th>
+                      <th scope="col" title="JCT = 完成時間 − 提交時間">工作周轉時間 (JCT)</th>
+                      <th scope="col">等待</th>
+                      <th scope="col">執行</th>
+                      <th scope="col">完成時間</th>
+                    </tr>
+                  </thead>
+                  <tbody id="history-body">
+                    <tr class="placeholder-row">
+                      <td colspan="6">正在取得完成紀錄。</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
           </article>
 
           <aside class="info-rail">
             <section class="panel rail-panel">
               <div class="panel-heading panel-heading--compact">
-                  <div>
-                  <p class="eyebrow">資源配置</p>
-                  <h2>叢集狀態</h2>
-                </div>
+                <h2>叢集資源</h2>
               </div>
               <dl class="signal-list">
                 <div>
@@ -142,10 +180,7 @@
             </section>
             <section class="panel rail-panel">
               <div class="panel-heading panel-heading--compact">
-                <div>
-                  <p class="eyebrow">排程器訊號</p>
-                  <h2>DRL 狀態</h2>
-                </div>
+                <h2>DRL 排程器</h2>
               </div>
               <dl class="signal-list">
                 <div>
@@ -168,10 +203,7 @@
             </section>
             <section class="panel rail-panel">
               <div class="panel-heading panel-heading--compact">
-                <div>
-                  <p class="eyebrow">佇列訊號</p>
-                  <h2>排程指標</h2>
-                </div>
+                <h2>佇列指標</h2>
               </div>
               <dl class="signal-list">
                 <div>
@@ -194,20 +226,17 @@
             </section>
             <section class="panel gpu-panel">
               <div class="panel-heading panel-heading--compact">
-                <div>
-                  <p class="eyebrow">GPU 即時狀態</p>
-                  <h2>硬體使用率</h2>
-                </div>
+                <h2>GPU 使用率</h2>
               </div>
               <div class="gpu-metrics" id="gpu-metrics">
                 <div class="gpu-empty">尚未提供 GPU telemetry</div>
               </div>
             </section>
             <section class="panel note-panel">
-              <p class="eyebrow">資料範圍</p>
-              <h2>配置量不等於實際使用量</h2>
-              <p>GPU 分享量來自 Slurm 的工作資料；工作層級的 SM 或 VRAM 使用率，只有在 API 明確回報工作與 GPU 的對應關係時才會顯示。</p>
-              <p class="note-foot">目前不會用 Slurm 配置量推測實際使用率。</p>
+              <h2>資料邊界</h2>
+              <p class="note-lead">配置量與實際使用量分開呈現。</p>
+              <p>Job VRAM 依 PID 明確歸屬；MPS 會合併 client kernel，因此 SM 顯示該 GPU 的共享即時值，不會假裝是單一工作的使用率。</p>
+              <p class="note-foot">不會用 Slurm 配置量推測實際使用率。</p>
             </section>
           </aside>
         </section>
@@ -218,5 +247,6 @@
         <span id="api-label">API base: /api</span>
       </footer>
     </div>
+    <div class="job-tooltip" id="job-tooltip" role="tooltip" hidden></div>
   </body>
 </html>

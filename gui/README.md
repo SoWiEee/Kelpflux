@@ -48,9 +48,9 @@ The preferred response is:
 }
 ```
 
-`resource_usage` is optional. It may contain `sm_percent` (or
-`sm_utilization`/`gpu_utilization`) or `mps_used`; without one of those fields
-the GUI displays `尚無工作層級資料`.
+`resource_usage` is optional. It may contain `sm_percent`, `vram_used_mib`,
+`vram_percent`, or `mps_used`; without one of those fields the GUI displays
+`尚無工作層級資料`.
 
 For convenience, the GUI also accepts a direct Slurm REST jobs response
 (`{"jobs": [...]}`), using `job_state`, `nodes`, `gres_detail`,
@@ -58,10 +58,13 @@ For convenience, the GUI also accepts a direct Slurm REST jobs response
 normally needs a same-origin adapter or reverse proxy for slurmrestd, both for
 CORS and for `X-SLURM-USER-*` authentication headers.
 
-Per-job SM utilization is deliberately not derived from allocated GPU/MPS
-values. The existing DCGM exporter reports device-level metrics, so an
-adapter must provide an explicit job-to-device/resource mapping before those
-values can be shown as job-level usage.
+Per-job SM/VRAM utilization is never derived from allocated GPU/MPS values.
+The live collector samples `nvidia-smi pmon` on each GPU worker and maps its
+compute PID to `SLURM_JOB_ID` through the process environment, cgroup, or
+`slurmstepd` ancestry. Processes without a Slurm job ID are excluded. Under
+MPS, NVIDIA exposes SM utilization for the shared MPS server rather than each
+client, so the API labels it `shared_gpu_sm_percent`; VRAM remains attributed
+to the client job PID.
 
 ## 即時資料
 
@@ -69,13 +72,12 @@ GUI 每 4 秒讀取一次 `/api/jobs`，後端即時彙整：
 
 - 「工作要求的 GPU 分享量」與「已配置 GPU 分享量」來自 Slurm 工作資料，代表工作要求或拿到的 MPS 百分比，不是實際算力使用率。
 - `gpu_metrics`：由 GPU worker 的 `nvidia-smi` 回報 SM、VRAM、功耗與溫度。
+- `resource_usage`：由 GPU worker 的 MPS client PID 對應至 Slurm job，回報 Job VRAM；MPS 下的 SM 以「共享 SM」標示，不冒充單一 job 用量。
+- `history`：由 `sacct` 讀取最近 24 小時、最多 50 筆終止工作；JCT 定義為完成時間減提交時間。
 - `scheduler`：由 RL scheduler 的 Prometheus metrics 回報就緒狀態、快照年齡、可用 MPS 與最近動作。
 - `queue_metrics`：由 Slurm exporter 回報等待時間、排程週期與 backfill queue。
-- 「實際使用量」只有在 API 的工作資料中提供 `resource_usage.sm_percent`、`sm_utilization`、`gpu_utilization` 或 `mps_used` 時才會顯示。
+- 「實際使用量」只顯示可由 PID 明確歸屬的工作，不會用 MPS 配置量推估。
 - 介面中的「資料範圍」是說明文字，不是另一個監控指標；它提醒使用者配置量與硬體實際使用量是兩件事。
 
-DCGM exporter 可以即時提供整張 GPU 的 SM、VRAM、功耗等裝置層級指標，但預設沒有
-`slurm_job_id`。若要顯示單一工作使用率，後端還需要透過 cgroup/PID 或 GPU UUID
-將 Slurm 工作與 GPU 指標做對應，再把上述 `resource_usage` 欄位回傳給 GUI。
-因此目前工作列表可能顯示「尚無工作層級資料」；這代表尚未建立工作到
-GPU UUID 的對應，不代表整張 GPU 的即時 telemetry 無法取得。
+工作方塊支援滑鼠 hover 與鍵盤 focus，可查看工作類型、提交命令、partition、提交時間與即時用量。
+Slurm 23.11 的歷史命令欄位使用 `sacct SubmitLine`；若上游沒有保存該欄位，介面會明確顯示未提供。

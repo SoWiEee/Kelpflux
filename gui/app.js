@@ -16,8 +16,13 @@ const dom = {
   errorMessage: document.querySelector("#error-message"),
   staleNotice: document.querySelector("#stale-notice"),
   jobsBody: document.querySelector("#jobs-body"),
-  tableWrap: document.querySelector(".table-wrap"),
-  emptyState: document.querySelector("#empty-state"),
+  pendingStream: document.querySelector("#pending-stream"),
+  pendingStageCount: document.querySelector("#pending-stage-count"),
+  nodeBoard: document.querySelector("#node-board"),
+  jobDetailCount: document.querySelector("#job-detail-count"),
+  historyBody: document.querySelector("#history-body"),
+  historyCount: document.querySelector("#history-count"),
+  jobTooltip: document.querySelector("#job-tooltip"),
   totalJobs: document.querySelector("#total-jobs"),
   totalMeta: document.querySelector("#total-meta"),
   runningJobs: document.querySelector("#running-jobs"),
@@ -42,9 +47,13 @@ const dom = {
 const monitor = {
   apiBase: readApiBase(),
   jobs: [],
+  history: [],
   loaded: false,
   inFlight: false,
   lastUpdated: null,
+  placements: new Map(),
+  knownJobs: new Set(),
+  boardRendered: false,
 };
 
 dom.apiBase.value = monitor.apiBase;
@@ -98,6 +107,7 @@ async function poll() {
     const payload = await response.json();
     const rawJobs = extractJobs(payload);
     monitor.jobs = rawJobs.map(normaliseJob).filter(Boolean);
+    monitor.history = extractHistory(payload).map(normaliseJob).filter(Boolean);
     monitor.loaded = true;
     monitor.lastUpdated = new Date();
     render(payload);
@@ -133,6 +143,10 @@ function extractJobs(payload) {
   throw new Error("Response must contain a jobs array");
 }
 
+function extractHistory(payload) {
+  return payload && Array.isArray(payload.history) ? payload.history : [];
+}
+
 function normaliseJob(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = raw.job_id ?? raw.id ?? raw.name;
@@ -149,6 +163,14 @@ function normaliseJob(raw) {
     mpsAllocated: mpsValue(raw, "allocated"),
     usage: usageInfo(raw),
     submitted: submittedValue(raw),
+    started: dateValue(raw, ["start_time", "started_at", "start_ts"]),
+    ended: dateValue(raw, ["end_time", "completed_at", "end_ts"]),
+    name: textValue(firstDefined(raw, ["job_name", "name", "type"])) || "未命名工作",
+    command: textValue(firstDefined(raw, ["command", "command_line", "cmd"])),
+    partition: textValue(raw.partition),
+    jctSeconds: numberFrom(raw, ["jct_seconds", "jct"]),
+    waitSeconds: numberFrom(raw, ["wait_seconds", "queue_seconds"]),
+    runtimeSeconds: numberFrom(raw, ["runtime_seconds", "elapsed_seconds", "elapsed"]),
   };
 }
 
@@ -281,7 +303,15 @@ function usageInfo(raw) {
   const usage = raw.resource_usage ?? raw.resourceUsage ?? raw.usage;
   const source = usage && typeof usage === "object" ? usage : raw;
   const sm = numberFrom(source, ["sm_percent", "sm_utilization", "gpu_utilization", "gpu_util"]);
-  if (sm !== null) return { value: `SM 使用率 ${formatNumber(sm)}%`, reported: true };
+  const sharedSm = numberFrom(source, ["shared_gpu_sm_percent"]);
+  const vram = numberFrom(source, ["vram_used_mib", "gpu_memory_used_mib"]);
+  const vramPercent = numberFrom(source, ["vram_percent", "gpu_memory_percent"]);
+  const parts = [];
+  if (sm !== null) parts.push(`SM ${formatNumber(sm)}%`);
+  else if (sharedSm !== null) parts.push(`共享 SM ${formatNumber(sharedSm)}%`);
+  if (vram !== null) parts.push(`VRAM ${formatNumber(vram)} MiB`);
+  else if (vramPercent !== null) parts.push(`VRAM ${formatNumber(vramPercent)}%`);
+  if (parts.length) return { value: parts.join(" · "), reported: true };
   const mps = numberFrom(source, ["mps_used", "mps_usage", "used_mps"]);
   if (mps !== null) return { value: `GPU 分享量 ${formatNumber(mps)}%`, reported: true };
   return { value: "尚未提供", reported: false };
@@ -293,7 +323,11 @@ function mpsSummary(jobs, key) {
 }
 
 function submittedValue(raw) {
-  const value = firstDefined(raw, ["submit_time", "submitted_at", "submitted", "submit_ts"]);
+  return dateValue(raw, ["submit_time", "submitted_at", "submitted", "submit_ts"]);
+}
+
+function dateValue(raw, keys) {
+  const value = firstDefined(raw, keys);
   const number = numberOrNull(value);
   if (number !== null && number > 0) {
     const timestamp = number < 1e12 ? number * 1000 : number;
@@ -309,7 +343,9 @@ function submittedValue(raw) {
 
 function render(payload) {
   renderSummary(monitor.jobs);
+  renderFlow(monitor.jobs, payload?.nodes);
   renderRows(monitor.jobs);
+  renderHistory(monitor.history);
   renderScheduler(payload?.scheduler);
   renderQueueMetrics(payload?.queue_metrics);
   renderGpuMetrics(payload?.gpu_metrics);
@@ -320,6 +356,154 @@ function render(payload) {
   dom.gpuCount.textContent = `${jobGpus} 張`;
   const usageJobs = monitor.jobs.filter((job) => job.usage.reported).length;
   dom.usageSignal.textContent = usageJobs ? `${usageJobs} 個工作有回報` : "尚未提供";
+}
+
+function renderFlow(jobs, rawNodes) {
+  const pending = jobs.filter((job) => job.state === "PENDING");
+  const nodes = normaliseGpuNodes(rawNodes, jobs);
+  renderPendingJobs(pending);
+  renderNodeBoard(nodes, jobs);
+  monitor.placements = new Map(jobs.map((job) => [job.id, job.node]));
+  monitor.knownJobs = new Set(jobs.map((job) => job.id));
+  monitor.boardRendered = true;
+}
+
+function renderPendingJobs(jobs) {
+  dom.pendingStream.replaceChildren();
+  dom.pendingStageCount.textContent = `${jobs.length} 個工作`;
+  if (!jobs.length) {
+    dom.pendingStream.append(stageEmpty("目前沒有等待中的工作"));
+    return;
+  }
+  jobs.forEach((job, index) => {
+    const tile = document.createElement("article");
+    const isNew = monitor.boardRendered && !monitor.knownJobs.has(job.id);
+    tile.className = `pending-job${isNew ? " is-new" : ""}`;
+    tile.style.animationDelay = `${Math.min(index, 7) * 45}ms`;
+    tile.setAttribute("aria-label", `佇列第 ${index + 1} 位，工作 ${job.id}，要求 ${formatMaybe(job.mpsRequested, "% MPS")}`);
+    attachJobTooltip(tile, job);
+    const order = document.createElement("span");
+    order.className = "pending-order";
+    order.textContent = `Q${index + 1}`;
+    const id = document.createElement("strong");
+    id.textContent = `#${job.id}`;
+    const mps = document.createElement("span");
+    mps.className = "pending-mps";
+    mps.textContent = formatMaybe(job.mpsRequested, "% MPS");
+    tile.append(order, id, mps);
+    dom.pendingStream.append(tile);
+  });
+}
+
+function normaliseGpuNodes(rawNodes, jobs) {
+  const source = Array.isArray(rawNodes) ? rawNodes : [];
+  const nodes = source
+    .map((node) => ({
+      name: textValue(node.name ?? node.node_name ?? node.NodeName),
+      state: textValue(node.state ?? node.State) || "UNKNOWN",
+      capacity: numberOrNull(node.mps_capacity ?? node.capacity) ?? 0,
+      allocated: numberOrNull(node.mps_allocated ?? node.allocated) ?? 0,
+      gpuMetrics: Array.isArray(node.gpu_metrics) ? node.gpu_metrics : [],
+    }))
+    .filter((node) => node.name && (node.capacity > 0 || node.gpuMetrics.length || node.name.includes("-gpu-")));
+  if (nodes.length) return nodes;
+  return [...new Set(jobs.map((job) => job.node).filter(Boolean))].map((name) => ({
+    name,
+    state: "ALLOCATED",
+    capacity: 100,
+    allocated: mpsSummary(jobs.filter((job) => job.node === name), "mpsAllocated") ?? 0,
+    gpuMetrics: [],
+  }));
+}
+
+function renderNodeBoard(nodes, jobs) {
+  dom.nodeBoard.replaceChildren();
+  if (!nodes.length) {
+    dom.nodeBoard.append(stageEmpty("尚未取得 GPU node 狀態"));
+    return;
+  }
+  nodes.forEach((node) => {
+    const assigned = jobs.filter((job) => job.node === node.name && job.state !== "PENDING");
+    const lane = document.createElement("article");
+    lane.className = "node-lane";
+
+    const header = document.createElement("header");
+    const identity = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = gpuDisplayName(node.name);
+    const hostname = document.createElement("span");
+    hostname.textContent = node.name;
+    identity.append(name, hostname);
+    const capacity = document.createElement("div");
+    capacity.className = "node-capacity";
+    const state = document.createElement("span");
+    state.textContent = nodeStateLabel(node.state);
+    const usage = document.createElement("strong");
+    usage.textContent = `${formatNumber(node.allocated)} / ${formatNumber(node.capacity || 100)}%`;
+    capacity.append(state, usage);
+    header.append(identity, capacity);
+
+    const track = document.createElement("div");
+    track.className = "mps-track";
+    const slots = document.createElement("div");
+    slots.className = "capacity-slots";
+    slots.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 4; index += 1) {
+      const slot = document.createElement("span");
+      slot.textContent = "25%";
+      slots.append(slot);
+    }
+    const allocations = document.createElement("div");
+    allocations.className = "allocation-grid";
+    assigned.forEach((job) => allocations.append(allocationBlock(job, node.name)));
+    track.append(slots, allocations);
+    lane.append(header, track);
+    if (!assigned.length) lane.append(stageEmpty("100% MPS 可用", "node-empty"));
+    dom.nodeBoard.append(lane);
+  });
+}
+
+function allocationBlock(job, nodeName) {
+  const allocated = job.mpsAllocated ?? job.mpsRequested ?? 25;
+  const slots = Math.max(1, Math.min(4, Math.ceil(allocated / 25)));
+  const previousNode = monitor.placements.get(job.id);
+  const isDispatched = monitor.boardRendered && previousNode !== nodeName;
+  const block = document.createElement("article");
+  block.className = `allocation-job${isDispatched ? " is-dispatched" : ""}`;
+  block.style.gridColumn = `span ${slots}`;
+  block.setAttribute("aria-label", `工作 ${job.id} 已配置至 ${nodeName}，使用 ${allocated}% MPS`);
+  attachJobTooltip(block, job);
+  const id = document.createElement("strong");
+  id.textContent = `#${job.id}`;
+  const mps = document.createElement("span");
+  mps.textContent = `${formatNumber(allocated)}% MPS`;
+  block.append(id, mps);
+  return block;
+}
+
+function stageEmpty(message, className = "stage-empty") {
+  const empty = document.createElement("div");
+  empty.className = className;
+  empty.textContent = message;
+  return empty;
+}
+
+function gpuDisplayName(nodeName) {
+  const match = /gpu-([^-]+)-/i.exec(nodeName);
+  if (!match) return "GPU Node";
+  return match[1].replace(/^rtx/i, "RTX ").toUpperCase();
+}
+
+function nodeStateLabel(value) {
+  const state = String(value || "").toUpperCase().split(/[+\/]/)[0];
+  return {
+    IDLE: "可用",
+    MIXED: "部分使用",
+    ALLOCATED: "已滿載",
+    COMPLETING: "工作結束中",
+    DOWN: "離線",
+    FUTURE: "未啟用",
+  }[state] || state;
 }
 
 function renderScheduler(scheduler) {
@@ -427,9 +611,17 @@ function renderSummary(jobs) {
 
 function renderRows(jobs) {
   dom.jobsBody.replaceChildren();
-  dom.emptyState.hidden = jobs.length !== 0;
-  dom.tableWrap.hidden = jobs.length === 0;
-  if (!jobs.length) return;
+  dom.jobDetailCount.textContent = String(jobs.length);
+  if (!jobs.length) {
+    const row = document.createElement("tr");
+    row.className = "placeholder-row";
+    const tableCell = document.createElement("td");
+    tableCell.colSpan = 6;
+    tableCell.textContent = "目前沒有活動中的工作。";
+    row.append(tableCell);
+    dom.jobsBody.append(row);
+    return;
+  }
 
   jobs.forEach((job, index) => {
     const row = document.createElement("tr");
@@ -446,28 +638,135 @@ function renderRows(jobs) {
   });
 }
 
+function renderHistory(jobs) {
+  dom.historyBody.replaceChildren();
+  dom.historyCount.textContent = String(jobs.length);
+  if (!jobs.length) {
+    const row = document.createElement("tr");
+    row.className = "placeholder-row";
+    const tableCell = document.createElement("td");
+    tableCell.colSpan = 6;
+    tableCell.textContent = "最近 24 小時沒有完成紀錄。";
+    row.append(tableCell);
+    dom.historyBody.append(row);
+    return;
+  }
+  jobs.forEach((job) => {
+    const row = document.createElement("tr");
+    row.setAttribute("aria-label", `已完成工作 ${job.id}，${job.name}`);
+    attachJobTooltip(row, job);
+    row.append(
+      historyJobCell(job),
+      stateCell(job.state),
+      cell("duration-cell", formatDuration(job.jctSeconds)),
+      cell("duration-cell", formatDuration(job.waitSeconds)),
+      cell("duration-cell", formatDuration(job.runtimeSeconds)),
+      submittedCell(job.ended),
+    );
+    dom.historyBody.append(row);
+  });
+}
+
+function historyJobCell(job) {
+  const tableCell = document.createElement("td");
+  const wrapper = document.createElement("div");
+  wrapper.className = "history-job";
+  const id = document.createElement("strong");
+  id.textContent = `#${job.id}`;
+  const name = document.createElement("span");
+  name.textContent = job.name;
+  wrapper.append(id, name);
+  tableCell.append(wrapper);
+  return tableCell;
+}
+
+function attachJobTooltip(element, job) {
+  element.tabIndex = 0;
+  element.addEventListener("mouseenter", () => showJobTooltip(element, job));
+  element.addEventListener("mouseleave", hideJobTooltip);
+  element.addEventListener("focus", () => showJobTooltip(element, job));
+  element.addEventListener("blur", hideJobTooltip);
+}
+
+function showJobTooltip(anchor, job) {
+  dom.jobTooltip.replaceChildren(
+    tooltipRow("工作類型", job.name),
+    tooltipRow("命令", job.command || "Slurm 未提供"),
+    tooltipRow("Partition", job.partition || "--"),
+    tooltipRow("提交時間", job.submitted ? formatDate(job.submitted) : "--"),
+    tooltipRow("即時用量", job.usage.value),
+  );
+  dom.jobTooltip.hidden = false;
+  const anchorRect = anchor.getBoundingClientRect();
+  const tooltipRect = dom.jobTooltip.getBoundingClientRect();
+  const margin = 10;
+  const left = Math.min(
+    window.innerWidth - tooltipRect.width - margin,
+    Math.max(margin, anchorRect.left + (anchorRect.width - tooltipRect.width) / 2),
+  );
+  const below = anchorRect.bottom + margin;
+  const top = below + tooltipRect.height <= window.innerHeight
+    ? below
+    : Math.max(margin, anchorRect.top - tooltipRect.height - margin);
+  dom.jobTooltip.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
+}
+
+function hideJobTooltip() {
+  dom.jobTooltip.hidden = true;
+}
+
+function tooltipRow(label, value) {
+  const row = document.createElement("div");
+  const term = document.createElement("span");
+  term.textContent = label;
+  const detail = document.createElement("strong");
+  detail.textContent = value;
+  row.append(term, detail);
+  return row;
+}
+
 function renderLoading() {
+  dom.pendingStageCount.textContent = "--";
+  dom.pendingStream.replaceChildren(stageEmpty("正在取得工作佇列"));
+  dom.nodeBoard.replaceChildren(stageEmpty("正在取得 GPU node 狀態"));
+  dom.jobDetailCount.textContent = "--";
+  dom.historyCount.textContent = "--";
+  dom.historyBody.replaceChildren();
+  const historyRow = document.createElement("tr");
+  const historyCell = document.createElement("td");
+  historyCell.colSpan = 6;
+  historyCell.textContent = "正在取得完成紀錄。";
+  historyRow.append(historyCell);
+  dom.historyBody.append(historyRow);
   dom.jobsBody.replaceChildren();
-  dom.tableWrap.hidden = false;
-  dom.emptyState.hidden = true;
   const row = document.createElement("tr");
   row.className = "placeholder-row";
   const tableCell = document.createElement("td");
   tableCell.colSpan = 6;
-  tableCell.innerHTML = '<div class="empty-state empty-state--loading"><span class="loading-line" aria-hidden="true"></span><strong>正在連線至工作佇列</strong><span>等待第一次回應。</span></div>';
+  tableCell.textContent = "正在連線至工作佇列。";
   row.append(tableCell);
   dom.jobsBody.append(row);
 }
 
 function renderError() {
+  dom.pendingStageCount.textContent = "--";
+  dom.pendingStream.replaceChildren(stageEmpty("工作佇列目前無法使用"));
+  dom.nodeBoard.replaceChildren(stageEmpty("GPU node 狀態目前無法使用"));
+  dom.jobDetailCount.textContent = "--";
+  dom.historyCount.textContent = "--";
+  dom.historyBody.replaceChildren();
+  const historyRow = document.createElement("tr");
+  const historyCell = document.createElement("td");
+  historyCell.colSpan = 6;
+  historyCell.textContent = "完成紀錄目前無法使用。";
+  historyRow.append(historyCell);
+  dom.historyBody.append(historyRow);
   dom.jobsBody.replaceChildren();
-  dom.tableWrap.hidden = false;
-  dom.emptyState.hidden = true;
   const row = document.createElement("tr");
   row.className = "placeholder-row";
   const tableCell = document.createElement("td");
   tableCell.colSpan = 6;
-  tableCell.innerHTML = '<div class="empty-state"><div class="empty-icon" aria-hidden="true">!</div><strong>工作佇列無法使用</strong><span>請檢查 API 位址或重新連線後端。</span></div>';
+  tableCell.textContent = "請檢查 API 位址或重新連線後端。";
   row.append(tableCell);
   dom.jobsBody.append(row);
 }
@@ -552,6 +851,17 @@ function formatDate(date) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function formatDuration(value) {
+  const seconds = numberOrNull(value);
+  if (seconds === null) return "--";
+  if (seconds < 60) return `${formatNumber(seconds)} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  if (minutes < 60) return `${minutes} 分 ${remainder} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 時 ${minutes % 60} 分`;
 }
 
 function formatClock(date) {
