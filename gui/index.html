@@ -56,7 +56,7 @@
               <input id="api-base" name="api-base" type="text" inputmode="url" spellcheck="false" autocomplete="off" placeholder="/api 或 https://gateway.example/slurm/v0.0.39">
               <button type="submit">套用</button>
             </div>
-            <p class="control-hint">每 4 秒從 <code>/api/jobs</code> 更新工作狀態。</p>
+            <p class="control-hint">排程狀態變更時即時更新，並每 4 秒校正完整資料。</p>
           </form>
           <button class="refresh-button" id="refresh-button" type="button">立即更新</button>
         </section>
@@ -179,10 +179,8 @@
           </article>
 
           <aside class="info-rail">
-            <section class="panel rail-panel">
-              <div class="panel-heading panel-heading--compact">
-                <h2><svg class="ui-icon" aria-hidden="true"><use href="#icon-server"/></svg>叢集資源</h2>
-              </div>
+            <details class="panel rail-panel toggle-panel" open>
+              <summary><span><svg class="ui-icon" aria-hidden="true"><use href="#icon-server"/></svg>叢集資源</span></summary>
               <dl class="signal-list">
                 <div>
                     <dt>工作使用節點</dt>
@@ -201,7 +199,7 @@
                     <dd id="usage-signal">尚未提供</dd>
                 </div>
               </dl>
-            </section>
+            </details>
             <section class="panel rail-panel">
               <div class="panel-heading panel-heading--compact">
                 <h2><svg class="ui-icon" aria-hidden="true"><use href="#icon-list"/></svg>佇列指標</h2>
@@ -219,10 +217,6 @@
                   <dt>最近排程週期</dt>
                   <dd id="queue-cycle">尚未提供</dd>
                 </div>
-                <div>
-                  <dt>Backfill 佇列</dt>
-                  <dd id="queue-backfill">尚未提供</dd>
-                </div>
               </dl>
             </section>
             <section class="panel gpu-panel">
@@ -233,7 +227,7 @@
                 <div class="gpu-empty">尚未提供 GPU telemetry</div>
               </div>
             </section>
-            <details class="panel rail-panel scheduler-panel">
+            <details class="panel rail-panel toggle-panel">
               <summary>
                 <span><svg class="ui-icon" aria-hidden="true"><use href="#icon-brain"/></svg>DRL 排程器</span>
                 <strong id="scheduler-ready">尚未提供</strong>

@@ -170,7 +170,7 @@ h2 {
 
 .panel-heading h2,
 .summary-label,
-.scheduler-panel summary span {
+.toggle-panel summary span {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1294,7 +1294,7 @@ td {
   text-align: center;
 }
 
-.scheduler-panel summary {
+.toggle-panel summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1304,11 +1304,11 @@ td {
   list-style: none;
 }
 
-.scheduler-panel summary::-webkit-details-marker {
+.toggle-panel summary::-webkit-details-marker {
   display: none;
 }
 
-.scheduler-panel summary::after {
+.toggle-panel summary::after {
   width: 7px;
   height: 7px;
   border-right: 1px solid var(--muted-strong);
@@ -1318,33 +1318,33 @@ td {
   transition: transform 180ms ease;
 }
 
-.scheduler-panel[open] summary::after {
+.toggle-panel[open] summary::after {
   transform: rotate(225deg);
 }
 
-.scheduler-panel summary:hover {
+.toggle-panel summary:hover {
   background: var(--surface-strong);
 }
 
-.scheduler-panel summary:focus-visible {
+.toggle-panel summary:focus-visible {
   outline: 2px solid var(--mint);
   outline-offset: -3px;
 }
 
-.scheduler-panel summary span {
+.toggle-panel summary span {
   color: var(--text);
   font-size: 14px;
   font-weight: 700;
 }
 
-.scheduler-panel summary strong {
+.toggle-panel summary strong {
   margin-left: auto;
   color: var(--mint);
   font-size: 11px;
   font-weight: 700;
 }
 
-.scheduler-panel[open] summary {
+.toggle-panel[open] summary {
   border-bottom: 1px solid var(--line);
 }
 

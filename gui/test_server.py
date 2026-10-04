@@ -1,9 +1,17 @@
 import unittest
 
-from gui.server import _aggregate_job_usage, _parse_pmon, _parse_sacct_history
+from gui.server import EventBroker, _aggregate_job_usage, _parse_pmon, _parse_sacct_history
 
 
 class SacctHistoryTest(unittest.TestCase):
+    def test_event_broker_advances_after_publish(self):
+        broker = EventBroker()
+        previous = broker.version
+
+        broker.publish()
+
+        self.assertEqual(broker.wait(previous, timeout=0), previous + 1)
+
     def test_computes_jct_and_keeps_command_pipes(self):
         text = (
             "42|bert-train|COMPLETED|2026-10-04T10:00:00|2026-10-04T10:00:10|"

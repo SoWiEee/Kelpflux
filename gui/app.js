@@ -1,6 +1,6 @@
 "use strict";
 
-const POLL_INTERVAL_MS = 4000;
+const RECONCILE_INTERVAL_MS = 4000;
 const API_STORAGE_KEY = "kelpflux.monitor.apiBase";
 const DEFAULT_API_BASE = "/api";
 
@@ -40,7 +40,6 @@ const dom = {
   queueOldestWait: document.querySelector("#queue-oldest-wait"),
   queueAverageWait: document.querySelector("#queue-average-wait"),
   queueCycle: document.querySelector("#queue-cycle"),
-  queueBackfill: document.querySelector("#queue-backfill"),
   gpuMetrics: document.querySelector("#gpu-metrics"),
 };
 
@@ -54,6 +53,9 @@ const monitor = {
   placements: new Map(),
   knownJobs: new Set(),
   boardRendered: false,
+  pollTimer: null,
+  pollPending: false,
+  eventSource: null,
 };
 
 dom.apiBase.value = monitor.apiBase;
@@ -68,13 +70,14 @@ dom.apiForm.addEventListener("submit", (event) => {
   monitor.loaded = false;
   monitor.jobs = [];
   renderLoading();
+  connectEvents();
   poll();
 });
 
 dom.refreshButton.addEventListener("click", () => poll());
 
+connectEvents();
 poll();
-window.setInterval(poll, POLL_INTERVAL_MS);
 
 function readApiBase() {
   const queryValue = new URLSearchParams(window.location.search).get("api");
@@ -92,10 +95,28 @@ function jobsUrl() {
     : `${monitor.apiBase}/jobs`;
 }
 
+function eventsUrl() {
+  return monitor.apiBase.toLowerCase().endsWith("/jobs")
+    ? `${monitor.apiBase.slice(0, -5)}/events`
+    : `${monitor.apiBase}/events`;
+}
+
+function connectEvents() {
+  monitor.eventSource?.close();
+  if (!("EventSource" in window)) return;
+  monitor.eventSource = new EventSource(eventsUrl());
+  monitor.eventSource.addEventListener("jobs", () => poll());
+}
+
 async function poll() {
-  if (monitor.inFlight) return;
+  window.clearTimeout(monitor.pollTimer);
+  monitor.pollTimer = null;
+  if (monitor.inFlight) {
+    monitor.pollPending = true;
+    return;
+  }
   monitor.inFlight = true;
-  setConnection("connecting", "連線中");
+  if (!monitor.loaded) setConnection("connecting", "連線中");
 
   try {
     const response = await fetch(jobsUrl(), {
@@ -123,6 +144,12 @@ async function poll() {
     if (!monitor.loaded) renderError();
   } finally {
     monitor.inFlight = false;
+    if (monitor.pollPending) {
+      monitor.pollPending = false;
+      void poll();
+    } else {
+      monitor.pollTimer = window.setTimeout(poll, RECONCILE_INTERVAL_MS);
+    }
   }
 }
 
@@ -351,7 +378,11 @@ function render(payload) {
   renderGpuMetrics(payload?.gpu_metrics);
 
   const jobNodes = new Set(monitor.jobs.map((job) => job.node).filter(Boolean));
-  const jobGpus = monitor.jobs.reduce((total, job) => total + job.gpu.count, 0);
+  const gpusByNode = new Map();
+  monitor.jobs.filter((job) => job.node).forEach((job) => {
+    gpusByNode.set(job.node, Math.max(gpusByNode.get(job.node) ?? 0, job.gpu.count));
+  });
+  const jobGpus = [...gpusByNode.values()].reduce((total, count) => total + count, 0);
   dom.nodeCount.textContent = `${jobNodes.size} 個節點`;
   dom.gpuCount.textContent = `${jobGpus} 張`;
   const usageJobs = monitor.jobs.filter((job) => job.usage.reported).length;
@@ -535,7 +566,6 @@ function renderQueueMetrics(metrics) {
     dom.queueOldestWait.textContent = "尚未提供";
     dom.queueAverageWait.textContent = "尚未提供";
     dom.queueCycle.textContent = "尚未提供";
-    dom.queueBackfill.textContent = "尚未提供";
     return;
   }
   const seconds = (value) => {
@@ -545,8 +575,6 @@ function renderQueueMetrics(metrics) {
   dom.queueOldestWait.textContent = seconds(metrics.oldest_wait_s);
   dom.queueAverageWait.textContent = seconds(metrics.average_wait_s);
   dom.queueCycle.textContent = seconds(metrics.scheduler_cycle_s);
-  const backfill = numberOrNull(metrics.backfill_queue);
-  dom.queueBackfill.textContent = backfill === null ? "尚未提供" : formatNumber(backfill);
 }
 
 function renderGpuMetrics(metrics) {

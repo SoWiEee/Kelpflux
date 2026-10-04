@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -257,6 +258,49 @@ class LiveCollectionError(RuntimeError):
     """Raised when the live Slurm source cannot be queried."""
 
 
+class EventBroker:
+    """Wake connected SSE clients when the Slurm queue signature changes."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._version = 0
+
+    @property
+    def version(self) -> int:
+        with self._condition:
+            return self._version
+
+    def publish(self) -> None:
+        with self._condition:
+            self._version += 1
+            self._condition.notify_all()
+
+    def wait(self, after: int, timeout: float = 15.0) -> int:
+        with self._condition:
+            self._condition.wait_for(lambda: self._version > after, timeout=timeout)
+            return self._version
+
+
+class QueueWatcher(threading.Thread):
+    def __init__(self, signature_provider: Callable[[], str], broker: EventBroker) -> None:
+        super().__init__(name="slurm-queue-watcher", daemon=True)
+        self.signature_provider = signature_provider
+        self.broker = broker
+        self.stopped = threading.Event()
+
+    def run(self) -> None:
+        previous: str | None = None
+        while not self.stopped.is_set():
+            try:
+                current = self.signature_provider()
+            except LiveCollectionError:
+                current = previous
+            if previous is not None and current != previous:
+                self.broker.publish()
+            previous = current
+            self.stopped.wait(1.0)
+
+
 class LiveCollector:
     """Read the existing Slurm, worker, and scheduler endpoints for the GUI."""
 
@@ -374,6 +418,9 @@ class LiveCollector:
                 pid_jobs[int(pid)] = job_id
         return _aggregate_job_usage(processes, pid_jobs, gpu_metrics)
 
+    def queue_signature(self) -> str:
+        return self._exec(self.controller, "squeue", "-h", "-o", "%i|%T|%N|%Q").strip()
+
     def collect(self) -> dict[str, object]:
         try:
             queue = json.loads(self._exec(self.controller, "squeue", "--json"))
@@ -447,7 +494,6 @@ class LiveCollector:
             "oldest_wait_s": _parse_prometheus(exporter_text, "slurm_job_queue_oldest_wait_seconds"),
             "average_wait_s": _parse_prometheus(exporter_text, "slurm_job_queue_avg_wait_seconds"),
             "scheduler_cycle_s": _parse_prometheus(exporter_text, "slurm_scheduler_cycle_last_seconds"),
-            "backfill_queue": _parse_prometheus(exporter_text, "slurm_backfill_queue_length"),
         }
         now = datetime.now(timezone.utc)
         return {
@@ -463,13 +509,38 @@ class LiveCollector:
 
 
 class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     payload_provider: Callable[[], dict[str, object]] = LiveCollector().collect
+    event_broker = EventBroker()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path.rstrip("/") == "/api/jobs":
+        path = urlsplit(self.path).path.rstrip("/")
+        if path == "/api/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            version = self.event_broker.version
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                while True:
+                    current = self.event_broker.wait(version)
+                    message = (
+                        f"id: {current}\nevent: jobs\ndata: {{}}\n\n"
+                        if current > version else ": keepalive\n\n"
+                    )
+                    self.wfile.write(message.encode("utf-8"))
+                    self.wfile.flush()
+                    version = current
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if path == "/api/jobs":
             try:
                 payload = self.payload_provider()
                 status = 200
@@ -504,15 +575,21 @@ def main() -> None:
         namespace=args.namespace,
         controller=args.controller,
     )
+    broker = EventBroker()
+    watcher = QueueWatcher(collector.queue_signature, broker)
     Handler.payload_provider = collector.collect
+    Handler.event_broker = broker
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.daemon_threads = True
+    watcher.start()
     print(f"Kelpflux GUI listening at http://{args.host}:{args.port}/ (live Slurm/Kubernetes telemetry)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        watcher.stopped.set()
         server.server_close()
 
 

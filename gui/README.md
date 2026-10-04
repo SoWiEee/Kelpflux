@@ -68,14 +68,14 @@ to the client job PID.
 
 ## 即時資料
 
-GUI 每 4 秒讀取一次 `/api/jobs`，後端即時彙整：
+GUI 透過 `/api/events` 接收 Slurm queue 變更的 SSE 通知並立即重讀 `/api/jobs`，另每 4 秒校正完整狀態；後端即時彙整：
 
 - 「工作要求的 GPU 分享量」與「已配置 GPU 分享量」來自 Slurm 工作資料，代表工作要求或拿到的 MPS 百分比，不是實際算力使用率。
 - `gpu_metrics`：由 GPU worker 的 `nvidia-smi` 回報 SM、VRAM、功耗與溫度。
 - `resource_usage`：由 GPU worker 的 MPS client PID 對應至 Slurm job，回報 Job VRAM；MPS 下的 SM 以「共享 SM」標示，不冒充單一 job 用量。
 - `history`：由 `sacct` 讀取最近 24 小時、最多 50 筆終止工作；JCT 定義為完成時間減提交時間。
 - `scheduler`：由 RL scheduler 的 Prometheus metrics 回報就緒狀態、快照年齡、可用 MPS 與最近動作。
-- `queue_metrics`：由 Slurm exporter 回報等待時間、排程週期與 backfill queue。
+- `queue_metrics`：由 Slurm exporter 回報等待時間與排程週期。
 - 「實際使用量」只顯示可由 PID 明確歸屬的工作，不會用 MPS 配置量推估。
 - 介面中的「資料範圍」是說明文字，不是另一個監控指標；它提醒使用者配置量與硬體實際使用量是兩件事。
 
