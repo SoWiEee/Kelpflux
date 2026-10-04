@@ -604,6 +604,8 @@ function renderSummary(jobs) {
   dom.totalMeta.textContent = `${pending} 個等待 / ${running} 個執行中`;
   dom.pendingJobs.textContent = String(pending);
   dom.runningJobs.textContent = String(running);
+  dom.pendingJobs.closest(".summary-card").classList.toggle("is-active", pending > 0);
+  dom.runningJobs.closest(".summary-card").classList.toggle("is-active", running > 0);
   dom.requestedMps.textContent = requested === null ? "--" : `${formatNumber(requested)}%`;
   dom.mpsMeta.textContent = requested === null ? "尚未回報需求量" : "所有工作合計（MPS 百分比總和）";
   dom.allocatedMps.textContent = allocated === null ? "--" : `${formatNumber(allocated)}%`;
