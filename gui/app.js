@@ -22,6 +22,13 @@ const dom = {
   jobDetailCount: document.querySelector("#job-detail-count"),
   historyBody: document.querySelector("#history-body"),
   historyCount: document.querySelector("#history-count"),
+  traceDialog: document.querySelector("#trace-dialog"),
+  traceClose: document.querySelector("#trace-close"),
+  traceTitle: document.querySelector("#trace-title"),
+  traceContext: document.querySelector("#trace-context"),
+  traceStatus: document.querySelector("#trace-status"),
+  traceList: document.querySelector("#trace-list"),
+  traceId: document.querySelector("#trace-id"),
   jobTooltip: document.querySelector("#job-tooltip"),
   totalJobs: document.querySelector("#total-jobs"),
   totalMeta: document.querySelector("#total-meta"),
@@ -60,6 +67,7 @@ const monitor = {
 
 dom.apiBase.value = monitor.apiBase;
 dom.apiLabel.textContent = `API base: ${monitor.apiBase}`;
+dom.traceClose.addEventListener("click", () => dom.traceDialog.close());
 
 dom.apiForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -198,6 +206,7 @@ function normaliseJob(raw) {
     jctSeconds: numberFrom(raw, ["jct_seconds", "jct"]),
     waitSeconds: numberFrom(raw, ["wait_seconds", "queue_seconds"]),
     runtimeSeconds: numberFrom(raw, ["runtime_seconds", "elapsed_seconds", "elapsed"]),
+    traceId: textValue(raw.trace_id),
   };
 }
 
@@ -646,7 +655,7 @@ function renderRows(jobs) {
     const row = document.createElement("tr");
     row.className = "placeholder-row";
     const tableCell = document.createElement("td");
-    tableCell.colSpan = 6;
+    tableCell.colSpan = 7;
     tableCell.textContent = "目前沒有活動中的工作。";
     row.append(tableCell);
     dom.jobsBody.append(row);
@@ -663,6 +672,7 @@ function renderRows(jobs) {
       mpsCell(job),
       usageCell(job),
       submittedCell(job.submitted),
+      traceCell(job),
     );
     dom.jobsBody.append(row);
   });
@@ -675,7 +685,7 @@ function renderHistory(jobs) {
     const row = document.createElement("tr");
     row.className = "placeholder-row";
     const tableCell = document.createElement("td");
-    tableCell.colSpan = 6;
+    tableCell.colSpan = 7;
     tableCell.textContent = "最近 24 小時沒有完成紀錄。";
     row.append(tableCell);
     dom.historyBody.append(row);
@@ -692,9 +702,62 @@ function renderHistory(jobs) {
       cell("duration-cell", formatDuration(job.waitSeconds)),
       cell("duration-cell", formatDuration(job.runtimeSeconds)),
       submittedCell(job.ended),
+      traceCell(job),
     );
     dom.historyBody.append(row);
   });
+}
+
+function traceCell(job) {
+  const tableCell = document.createElement("td");
+  if (!/^[0-9a-f]{32}$/.test(job.traceId)) {
+    tableCell.textContent = "—";
+    return tableCell;
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "trace-link";
+  button.textContent = "查看追蹤";
+  button.title = `查看工作 ${job.id} 的分散式追蹤`;
+  button.addEventListener("click", () => openTrace(job));
+  tableCell.append(button);
+  return tableCell;
+}
+
+async function openTrace(job) {
+  dom.traceTitle.textContent = `工作 #${job.id} 追蹤`;
+  const context = [job.name, job.partition, job.node, job.mpsAllocated !== null ? `${job.mpsAllocated}% MPS` : ""];
+  dom.traceContext.textContent = context.filter(Boolean).join(" · ");
+  dom.traceId.textContent = `Trace ID ${job.traceId}`;
+  dom.traceStatus.textContent = "正在取得追蹤資料。";
+  dom.traceList.replaceChildren();
+  dom.traceDialog.showModal();
+  try {
+    const response = await fetch(`${monitor.apiBase}/traces/${job.traceId}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Tempo 回應 ${response.status}`);
+    const payload = await response.json();
+    const spans = (payload.batches || []).flatMap((batch) => {
+      const service = (batch.resource?.attributes || []).find((item) => item.key === "service.name")?.value?.stringValue || "未知服務";
+      return (batch.scopeSpans || []).flatMap((scope) => (scope.spans || []).map((span) => ({ ...span, service })));
+    }).sort((a, b) => Number(a.startTimeUnixNano) - Number(b.startTimeUnixNano));
+    if (!spans.length) {
+      dom.traceStatus.textContent = "尚無追蹤片段；工作執行中時，資料可能尚未寫入。";
+      return;
+    }
+    dom.traceStatus.textContent = `${spans.length} 個追蹤階段`;
+    for (const span of spans) {
+      const item = document.createElement("li");
+      const heading = document.createElement("strong");
+      heading.textContent = ({ job_submit: "工作提交", queue_wait: "佇列等待", job_running: "工作執行", pod_ready: "資源準備" })[span.name] || span.name;
+      const detail = document.createElement("span");
+      const duration = (Number(span.endTimeUnixNano) - Number(span.startTimeUnixNano)) / 1e9;
+      detail.textContent = `${span.service} · ${new Date(Number(span.startTimeUnixNano) / 1e6).toLocaleTimeString("zh-TW")} · ${formatDuration(duration)}`;
+      item.append(heading, detail);
+      dom.traceList.append(item);
+    }
+  } catch (error) {
+    dom.traceStatus.textContent = `無法取得追蹤：${error.message}`;
+  }
 }
 
 function historyJobCell(job) {
@@ -764,7 +827,7 @@ function renderLoading() {
   dom.historyBody.replaceChildren();
   const historyRow = document.createElement("tr");
   const historyCell = document.createElement("td");
-  historyCell.colSpan = 6;
+  historyCell.colSpan = 7;
   historyCell.textContent = "正在取得完成紀錄。";
   historyRow.append(historyCell);
   dom.historyBody.append(historyRow);
@@ -787,7 +850,7 @@ function renderError() {
   dom.historyBody.replaceChildren();
   const historyRow = document.createElement("tr");
   const historyCell = document.createElement("td");
-  historyCell.colSpan = 6;
+  historyCell.colSpan = 7;
   historyCell.textContent = "完成紀錄目前無法使用。";
   historyRow.append(historyCell);
   dom.historyBody.append(historyRow);

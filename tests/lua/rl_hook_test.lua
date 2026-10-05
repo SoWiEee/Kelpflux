@@ -126,6 +126,17 @@ it("rl_apply leaves priority alone when abstaining", function()
   assert(info.abstain == true)
 end)
 
+it("rl_apply preserves traceparent when abstaining", function()
+  RL_ENABLED = true
+  _rl_io_popen = mock_popen(
+    '{"priority_boost":0,"rl_selected":false,"abstain":true,' ..
+    '"otel_traceparent":"00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"}')
+  local jd = {job_id=8, priority=100}
+  local applied = rl_apply(jd, 4, 1, 60)
+  assert(applied == false)
+  assert(jd.admin_comment == "otel=00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
+end)
+
 it("rl_apply tolerates empty curl response (timeout/network failure)",
    function()
   RL_ENABLED = true

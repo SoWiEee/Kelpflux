@@ -23,6 +23,8 @@ _TERMINAL_STATES = {
     "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
     "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED",
 }
+_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_TRACEPARENT_RE = re.compile(r"(?:^|\s)otel=00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}(?:\s|$)")
 _PID_JOB_SCRIPT = r'''
 for start do
   pid="$start"
@@ -110,6 +112,11 @@ def _gpu_from_node(node: str, mps: int | None) -> dict[str, object]:
     return {"count": 1 if mps is not None else 0}
 
 
+def _trace_id(comment: object) -> str:
+    match = _TRACEPARENT_RE.search(str(comment or ""))
+    return match.group(1) if match else ""
+
+
 def _normalise_live_job(raw: dict[str, Any]) -> dict[str, object]:
     requested = _mps_value(raw.get("tres_req_str"), raw.get("tres_per_node"))
     allocated = _mps_value(raw.get("tres_alloc_str"), raw.get("gres_detail"))
@@ -129,13 +136,14 @@ def _normalise_live_job(raw: dict[str, Any]) -> dict[str, object]:
         "resource_usage": None,
         "reason": raw.get("state_reason", ""),
         "partition": raw.get("partition", ""),
+        "trace_id": _trace_id(raw.get("admin_comment")),
     }
 
 
 def _parse_sacct_history(text: str, limit: int = 50) -> list[dict[str, object]]:
     fields = (
         "job_id", "job_name", "state", "submit", "start", "end", "elapsed",
-        "node", "allocated_tres", "requested_tres", "partition", "command",
+        "node", "allocated_tres", "requested_tres", "partition", "admin_comment", "command",
     )
     jobs = []
     for line in text.splitlines():
@@ -167,6 +175,7 @@ def _parse_sacct_history(text: str, limit: int = 50) -> list[dict[str, object]]:
             "elapsed_seconds": _number(row["elapsed"]),
             "partition": row["partition"],
             "command": row["command"],
+            "trace_id": _trace_id(row["admin_comment"]),
         })
     jobs.sort(key=lambda job: float(job["end_ts"] or 0), reverse=True)
     return jobs[:limit]
@@ -312,6 +321,8 @@ class LiveCollector:
         controller: str = "slurm-controller-0",
         scheduler: str = "deploy/rl-scheduler",
         exporter: str = "deploy/slurm-exporter",
+        tempo_namespace: str = "monitoring",
+        tempo_client: str = "deploy/grafana",
         timeout: float = 8.0,
     ) -> None:
         self.kubeconfig = kubeconfig or os.environ.get("KUBECONFIG")
@@ -319,7 +330,21 @@ class LiveCollector:
         self.controller = controller
         self.scheduler = scheduler
         self.exporter = exporter
+        self.tempo_namespace = tempo_namespace
+        self.tempo_client = tempo_client
         self.timeout = timeout
+
+    def trace(self, trace_id: str) -> dict[str, object]:
+        if not _TRACE_ID_RE.fullmatch(trace_id):
+            raise ValueError("invalid trace ID")
+        try:
+            data = self._kubectl(
+                "-n", self.tempo_namespace, "exec", self.tempo_client, "--",
+                "wget", "-qO-", f"http://tempo:3200/api/traces/{trace_id}",
+            )
+            return json.loads(data)
+        except (json.JSONDecodeError, LiveCollectionError) as exc:
+            raise LiveCollectionError(f"Tempo query failed: {exc}") from exc
 
     def _kubectl(self, *args: str) -> str:
         command = ["kubectl"]
@@ -428,7 +453,7 @@ class LiveCollector:
             history_text = self._exec(
                 self.controller,
                 "sacct", "-X", "-P", "-n", "-S", "now-1day",
-                "-o", "JobIDRaw,JobName,State,Submit,Start,End,ElapsedRaw,NodeList,AllocTRES,ReqTRES,Partition,SubmitLine",
+                "-o", "JobIDRaw,JobName,State,Submit,Start,End,ElapsedRaw,NodeList,AllocTRES,ReqTRES,Partition,AdminComment,SubmitLine",
             )
         except (json.JSONDecodeError, LiveCollectionError) as exc:
             raise LiveCollectionError(f"Slurm query failed: {exc}") from exc
@@ -511,6 +536,7 @@ class LiveCollector:
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     payload_provider: Callable[[], dict[str, object]] = LiveCollector().collect
+    trace_provider: Callable[[str], dict[str, object]] = LiveCollector().trace
     event_broker = EventBroker()
 
     def __init__(self, *args, **kwargs):
@@ -518,6 +544,19 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path.rstrip("/")
+        if path.startswith("/api/traces/"):
+            trace_id = path.removeprefix("/api/traces/")
+            if not _TRACE_ID_RE.fullmatch(trace_id):
+                self.send_error(400, "Invalid trace ID")
+                return
+            try:
+                payload = self.trace_provider(trace_id)
+                status = 200
+            except LiveCollectionError as exc:
+                payload = {"error": str(exc)}
+                status = 503
+            self._send_json(payload, status)
+            return
         if path == "/api/events":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -547,15 +586,21 @@ class Handler(SimpleHTTPRequestHandler):
             except LiveCollectionError as exc:
                 payload = {"error": str(exc), "jobs": [], "source": "live-slurm-kubernetes"}
                 status = 503
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(payload, status)
             return
         super().do_GET()
+
+    def _send_json(self, payload: dict[str, object], status: int) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[gui] {self.address_string()} - {format % args}")
@@ -578,6 +623,7 @@ def main() -> None:
     broker = EventBroker()
     watcher = QueueWatcher(collector.queue_signature, broker)
     Handler.payload_provider = collector.collect
+    Handler.trace_provider = collector.trace
     Handler.event_broker = broker
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -142,11 +142,12 @@
                       <th scope="col">GPU 分享量</th>
                       <th scope="col">實際使用量</th>
                       <th scope="col">提交時間</th>
+                      <th scope="col">追蹤</th>
                     </tr>
                   </thead>
                   <tbody id="jobs-body">
                     <tr class="placeholder-row">
-                      <td colspan="6">等待第一次回應。</td>
+                      <td colspan="7">等待第一次回應。</td>
                     </tr>
                   </tbody>
                 </table>
@@ -166,11 +167,12 @@
                       <th scope="col">等待</th>
                       <th scope="col">執行</th>
                       <th scope="col">完成時間</th>
+                      <th scope="col">追蹤</th>
                     </tr>
                   </thead>
                   <tbody id="history-body">
                     <tr class="placeholder-row">
-                      <td colspan="6">正在取得完成紀錄。</td>
+                      <td colspan="7">正在取得完成紀錄。</td>
                     </tr>
                   </tbody>
                 </table>
@@ -257,5 +259,18 @@
       </footer>
     </div>
     <div class="job-tooltip" id="job-tooltip" role="tooltip" hidden></div>
+    <dialog class="trace-dialog" id="trace-dialog" aria-labelledby="trace-title">
+      <div class="trace-heading">
+        <div>
+          <span class="trace-eyebrow">分散式追蹤</span>
+          <h2 id="trace-title">工作追蹤</h2>
+        </div>
+        <button class="trace-close" id="trace-close" type="button" aria-label="關閉追蹤視窗" title="關閉">&times;</button>
+      </div>
+      <p class="trace-context" id="trace-context"></p>
+      <p class="trace-status" id="trace-status" role="status">正在取得追蹤資料。</p>
+      <ol class="trace-list" id="trace-list"></ol>
+      <p class="trace-id" id="trace-id"></p>
+    </dialog>
   </body>
 </html>

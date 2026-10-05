@@ -119,15 +119,14 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
     _log("[rl] skipped (" .. tostring(reason) .. ")")
     return false, nil
   end
+  -- Keep the submit trace even when the scheduling policy abstains.
+  if rl.otel_traceparent and rl.otel_traceparent ~= "" then
+    job_desc.admin_comment = "otel=" .. rl.otel_traceparent
+  end
   if rl.abstain then
     _log(string.format("[rl] abstain (value=%.3f entropy=%.3f)",
                        rl.value, rl.entropy))
     return false, rl
-  end
-  -- Write OTel traceparent into admin_comment so the Operator
-  -- can continue the trace when it first sees this job in squeue.
-  if rl.otel_traceparent and rl.otel_traceparent ~= "" then
-    job_desc.admin_comment = "otel=" .. rl.otel_traceparent
   end
   -- Submit-time explicit placement (opt-in via RL_PLACEMENT). When RL selected
   -- THIS job and returned a node choice, pin it via job_desc.req_nodes. Slurm

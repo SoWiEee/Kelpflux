@@ -14,6 +14,17 @@ KUBECONFIG=/home/acane/.kube/config python3 gui/server.py --port 8080
 
 Open <http://127.0.0.1:8080/>. The server queries Slurm and Kubernetes GPU
 workers directly; `kubectl` access and the `slurm` namespace are required.
+「最近完成」列表會替含 OpenTelemetry context 的工作顯示「查看追蹤」。後端透過
+`GET /api/traces/<trace_id>` 向 Tempo 查詢該工作；瀏覽器不需 Grafana 憑證。
+示範完整工作生命週期時，先提交暫停的 CPU 工作，等 operator 觀察到等待狀態後再釋放：
+
+```sh
+kubectl -n slurm exec slurm-controller-0 -- sbatch --parsable -H --partition=cpu --job-name=otel-lifecycle-demo --wrap='sleep 15'
+kubectl -n slurm exec slurm-controller-0 -- scontrol release <job-id>
+```
+
+工作完成後，從「最近完成」開啟追蹤。立即啟動的工作可能沒有 `queue_wait` span；
+暫停後釋放的工作應會顯示等待階段。Tempo 資料有保留期限。
 
 For a different cluster context, set `KUBECONFIG` or pass the kubeconfig path:
 
@@ -74,6 +85,7 @@ GUI 透過 `/api/events` 接收 Slurm queue 變更的 SSE 通知並立即重讀 
 - `gpu_metrics`：由 GPU worker 的 `nvidia-smi` 回報 SM、VRAM、功耗與溫度。
 - `resource_usage`：由 GPU worker 的 MPS client PID 對應至 Slurm job，回報 Job VRAM；MPS 下的 SM 以「共享 SM」標示，不冒充單一 job 用量。
 - `history`：由 `sacct` 讀取最近 24 小時、最多 50 筆終止工作；JCT 定義為完成時間減提交時間。
+- `trace_id`：從 Slurm `AdminComment` 的 OTel context 取得；有值時可直接查看 Tempo 工作時間線。
 - `scheduler`：由 RL scheduler 的 Prometheus metrics 回報就緒狀態、快照年齡、可用 MPS 與最近動作。
 - `queue_metrics`：由 Slurm exporter 回報等待時間與排程週期。
 - 「實際使用量」只顯示可由 PID 明確歸屬的工作，不會用 MPS 配置量推估。

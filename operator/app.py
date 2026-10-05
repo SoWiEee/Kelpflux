@@ -156,6 +156,8 @@ class OperatorApp(
             )
             if cfg.slurm_rest_url else None
         )
+        self._configured_rest = self.rest
+        self._rest_retry_at = 0.0
         self.collector = ClusterStateCollector(self.client, self.partition_cfgs, self.rest)
         self.policy = CheckpointAwareQueuePolicy(cfg.checkpoint_guard_enabled)
         self.actuator = StatefulSetActuator(self.client)
@@ -309,6 +311,7 @@ class OperatorApp(
             )
             self.rest = None
             self.collector._rest = None
+            self._rest_retry_at = time.monotonic() + 30
         # Warn if checkpoint guard is enabled but no path is configured — the guard
         # will be silently skipped for those pools at runtime.
         if self.cfg.checkpoint_guard_enabled:
@@ -369,6 +372,8 @@ class OperatorApp(
                 pool_keys, source, event_ts = [item[0]], item[1], item[2]
                 _EVENT_LAG_SECONDS.labels(source=source).observe(_loop_start - event_ts)
 
+            self._restore_rest_if_available()
+
             try:
                 all_states = self.collector.collect_all_partition_states()
             except Exception as exc:  # noqa: BLE001  — circuit breaker
@@ -403,3 +408,22 @@ class OperatorApp(
             _POLL_DURATION.observe(time.time() - _loop_start)
             pathlib.Path("/tmp/operator-alive").touch()
             pathlib.Path("/tmp/operator-ready").touch()
+
+    def _restore_rest_if_available(self) -> None:
+        if self.rest is not None or self._configured_rest is None:
+            return
+        now = time.monotonic()
+        if now < self._rest_retry_at:
+            return
+        self._rest_retry_at = now + 30
+        candidate = self._configured_rest
+        original_timeout = candidate.timeout
+        try:
+            candidate.timeout = min(original_timeout, 2)
+            available = candidate.ping(retries=1)
+        finally:
+            candidate.timeout = original_timeout
+        if available:
+            self.rest = self._configured_rest
+            self.collector._rest = self.rest
+            self.logger.emit("slurm_rest_recovered", query_mode="rest")

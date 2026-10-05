@@ -94,9 +94,9 @@ class SlurmRestClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return _json.loads(resp.read().decode()) if resp.length else {}
 
-    def ping(self) -> bool:
+    def ping(self, *, retries: int = 3) -> bool:
         try:
-            self._get(f"/slurm/{self.api_version}/diag")
+            self._get(f"/slurm/{self.api_version}/diag", retries=retries)
             return True
         except Exception:
             return False

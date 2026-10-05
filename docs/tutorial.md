@@ -279,7 +279,9 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 ## 10. 查看 OpenTelemetry Trace
 
-一般使用者平常看 `squeue`、job output 和 Grafana dashboard 就夠了；當 job 等待時間異常、DSAC placement 看起來不符合預期、或需要向管理者回報一次完整決策流程時，再查 OTel trace。
+一般使用者可在監控 GUI 的「最近完成」或「工作明細」找到工作，點「查看追蹤」直接看提交、等待與執行時間線。GUI 從 Slurm `AdminComment` 取得 trace ID，後端向 Tempo 查詢；瀏覽器不需連入叢集網路。若工作立即啟動，可能沒有 `queue_wait` 階段。
+
+需要進一步檢查原始 spans 時，可使用 Grafana Explore：
 
 在 Grafana Explore 選擇 Tempo datasource，使用 TraceQL 以 job id 查詢：
 
@@ -298,13 +300,15 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 | `job_running` | job 進入 running，表示 Slurm 已完成 placement / allocation |
 | `scale_up_decision` / `k8s_provisioning` | 若 worker 需要啟動，會看到 operator 擴容與 pod ready 的耗時 |
 
-實測範例：OpenMP job `135` 在 `slurm-worker-cpu-0` 上執行，Tempo trace id 是 `462ec09dba445df68352c97812568f5a`。這筆 trace 的完整資料存放在 Tempo；本文件只記錄可重查的 trace id、查詢方式與關鍵 span 摘要。
+正式 demo 可在監控 GUI 的「最近完成」點 RTX 4070、25% MPS 工作 `27781` 的「查看追蹤」；[畫面截圖](../assets/otel-trace-demo.png)保留了提交、等待及執行階段。Tempo 有資料保留期限，因此長期展示請重新提交工作，不要依賴固定 trace ID。
 
-可用 Tempo API 取回完整 trace：
+以下 OpenMP job `135` 與 trace ID `462ec09dba445df68352c97812568f5a` 為歷史資料格式範例，可能已超出 Tempo 保留期限。
+
+可用 Tempo API 取回仍在保留期限內的 trace（將 `<trace_id>` 換成 GUI 顯示的值）：
 
 ```bash
 kubectl -n monitoring exec deploy/grafana -- \
-  wget -qO- http://tempo:3200/api/traces/462ec09dba445df68352c97812568f5a
+  wget -qO- http://tempo:3200/api/traces/<trace_id>
 ```
 
 Tempo 實際記錄的關鍵 span：

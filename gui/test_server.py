@@ -1,6 +1,13 @@
 import unittest
 
-from gui.server import EventBroker, _aggregate_job_usage, _parse_pmon, _parse_sacct_history
+from gui.server import (
+    EventBroker,
+    _aggregate_job_usage,
+    _normalise_live_job,
+    _parse_pmon,
+    _parse_sacct_history,
+    _trace_id,
+)
 
 
 class SacctHistoryTest(unittest.TestCase):
@@ -16,7 +23,7 @@ class SacctHistoryTest(unittest.TestCase):
         text = (
             "42|bert-train|COMPLETED|2026-10-04T10:00:00|2026-10-04T10:00:10|"
             "2026-10-04T10:02:00|110|slurm-worker-gpu-rtx4070-0|gres/mps=50|"
-            "gres/mps=50|gpu|python train.py --name a|b|\n"
+            "gres/mps=50|gpu|otel=00-21566b75c6e996b5eaefaaefacf15e90-0123456789abcdef-01|python train.py --name a|b|\n"
         )
 
         job = _parse_sacct_history(text)[0]
@@ -25,11 +32,12 @@ class SacctHistoryTest(unittest.TestCase):
         self.assertEqual(job["wait_seconds"], 10)
         self.assertEqual(job["runtime_seconds"], 110)
         self.assertEqual(job["command"], "python train.py --name a|b")
+        self.assertEqual(job["trace_id"], "21566b75c6e996b5eaefaaefacf15e90")
 
     def test_preserves_trailing_pipe_and_terminal_states(self):
         rows = "\n".join(
             f"{index}|job-{state}|{state}|2026-10-04T10:00:00|2026-10-04T10:00:01|"
-            f"2026-10-04T10:00:02|1|node||gpu|gpu|printf foo ||"
+            f"2026-10-04T10:00:02|1|node||gpu|gpu||printf foo ||"
             for index, state in enumerate(("BOOT_FAIL", "DEADLINE", "REVOKED"), 1)
         )
 
@@ -37,6 +45,18 @@ class SacctHistoryTest(unittest.TestCase):
 
         self.assertEqual({job["state"] for job in jobs}, {"BOOT_FAIL", "DEADLINE", "REVOKED"})
         self.assertTrue(all(job["command"] == "printf foo |" for job in jobs))
+
+    def test_rejects_invalid_trace_context(self):
+        self.assertEqual(_trace_id("otel=00-xyz-0123456789abcdef-01"), "")
+        self.assertEqual(_trace_id("prefixotel=00-21566b75c6e996b5eaefaaefacf15e90-0123456789abcdef-01"), "")
+
+    def test_pending_job_keeps_trace_id(self):
+        job = _normalise_live_job({
+            "job_id": 42,
+            "job_state": ["PENDING"],
+            "admin_comment": "otel=00-21566b75c6e996b5eaefaaefacf15e90-0123456789abcdef-01",
+        })
+        self.assertEqual(job["trace_id"], "21566b75c6e996b5eaefaaefacf15e90")
 
     def test_attributes_process_metrics_only_to_mapped_jobs(self):
         pmon = """
